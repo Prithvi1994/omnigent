@@ -1388,8 +1388,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .all()
                 )
         meta_by_id = {m.id: m for m in meta_rows}
+        # Key by the caller's spelling, not the bare hex the column reads back.
+        # A Uuid16 column resolves a dashed or legacy ``conv_``-prefixed id on
+        # the way in, so the row is found either way — but a caller indexing the
+        # result with the id it passed would miss, and silently treat an
+        # existing conversation as absent.
+        caller_spelling = {normalize_uuid(cid): cid for cid in unique_ids}
         return {
-            row.id: _to_conversation(
+            caller_spelling[row.id]: _to_conversation(
                 row,
                 meta_by_id.get(row.id),
                 labels_by_conv.get(row.id, {}),
