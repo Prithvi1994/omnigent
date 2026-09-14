@@ -498,6 +498,14 @@ def _kiro_active_permission_tool_line(pane: str) -> str:
                 continue
             command_lines.append(stripped.lstrip("↓●○✓✗ ").strip())
         return " ".join(command_lines)
+    # The supported Kiro E2E shim renders the ACP request title directly,
+    # without a leading tool-status glyph. Keep that explicit title shape as a
+    # narrow fallback; do not fall back to arbitrary command fragments or
+    # metadata, which caused false correlations in the native TUI.
+    for index in range(approval_index - 1, max(-1, approval_index - 24), -1):
+        stripped = lines[index].strip()
+        if stripped.startswith("Running:"):
+            return stripped
     return ""
 
 
