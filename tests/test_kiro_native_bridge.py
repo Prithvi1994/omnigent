@@ -54,6 +54,14 @@ _JOINED_PERMISSION_PANE = _PERMISSION_PANE.replace(
     "↓ Shell pwd",
     "↓ Shell cd /private/tmp/review && git status --short && git log -1 --oneline",
 )
+_PERMISSION_PANE_WITH_WORKDIR = _PERMISSION_PANE.replace(
+    "↓ Shell pwd\n\n shell requires approval",
+    "↓ Shell cd /private/tmp/review && git status --short &&\n"
+    "  git log -1 --oneline\n"
+    "    ╰ working_dir=/private/tmp/review\n\n"
+    "────────────────────────────────────────────────────────────────────────────────\n"
+    " shell requires approval",
+)
 
 
 @pytest.fixture
@@ -150,6 +158,40 @@ def test_send_kiro_permission_verdict_accepts_default_option(
 
     sent_keys = [call[-1] for call in calls if "send-keys" in call]
     assert sent_keys == ["Enter"]
+
+
+def test_send_kiro_permission_verdict_ignores_working_dir_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kiro renders working_dir between the command and approval panel."""
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[
+            _PERMISSION_PANE_WITH_WORKDIR,
+            _PERMISSION_PANE_WITH_WORKDIR,
+            _READY_PANE,
+        ],
+    )
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    send_kiro_permission_verdict(
+        bridge_dir,
+        action="accept",
+        expected_title=(
+            "Running: cd /private/tmp/review && git status --short && git log -1 --oneline"
+        ),
+        timeout_s=0.1,
+    )
+
+    assert [call[-1] for call in calls if "send-keys" in call] == ["Enter"]
 
 
 def test_send_kiro_permission_verdict_retries_ignored_enter(

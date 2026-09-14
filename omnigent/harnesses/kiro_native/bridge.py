@@ -480,11 +480,24 @@ def _kiro_active_permission_tool_line(pane: str) -> str:
             approval_index = index
     if approval_index < 0:
         return ""
-    for line in reversed(lines[:approval_index]):
-        stripped = line.strip()
-        if not stripped or _KIRO_SEPARATOR in stripped:
-            continue
-        return stripped.lstrip("↓●○✓✗ ").strip()
+    tool_index = -1
+    # Kiro separates the tool block from the approval picker with a horizontal
+    # rule, and may render metadata (for example ``working_dir``) after the
+    # command. Search only the nearby block instead of treating the line
+    # immediately above ``requires approval`` as the command.
+    for index in range(approval_index - 1, max(-1, approval_index - 24), -1):
+        stripped = lines[index].strip()
+        if stripped.startswith(("↓ ", "● ", "○ ", "✓ ", "✗ ")):
+            tool_index = index
+            break
+    if tool_index >= 0:
+        command_lines: list[str] = []
+        for line in lines[tool_index:approval_index]:
+            stripped = line.strip()
+            if not stripped or _KIRO_SEPARATOR in stripped or stripped.startswith(("╰ ", "↳ ")):
+                continue
+            command_lines.append(stripped.lstrip("↓●○✓✗ ").strip())
+        return " ".join(command_lines)
     return ""
 
 
