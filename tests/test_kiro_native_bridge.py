@@ -63,6 +63,25 @@ _PERMISSION_PANE_WITH_WORKDIR = _PERMISSION_PANE.replace(
     " shell requires approval",
 )
 _PERMISSION_PANE_WITH_PLAIN_TITLE = _PERMISSION_PANE.replace("↓ Shell pwd", "Running: pwd")
+# The reported pane shape: a plain ``Running:`` title broken mid-token across
+# physical lines (so ``capture-pane -J`` cannot rejoin it), with a working_dir
+# metadata row and a separator before the approval panel.
+_PERMISSION_PANE_WITH_HARD_WRAPPED_TITLE = _PERMISSION_PANE.replace(
+    "↓ Shell pwd\n\n shell requires approval",
+    "Running: cd /private/tmp/omnigent-e2e-worktrees/fix-kiro-native-\n"
+    "verdict && git status --porcelain=v1 --untracked-files=all\n"
+    "╰ working_dir=/private/tmp/omnigent-e2e-worktrees/fix-kiro-native-verdict\n\n"
+    "────────────────────────────────────────────────────────────────────────────────\n"
+    " shell requires approval",
+)
+_HARD_WRAPPED_TITLE = (
+    "Running: cd /private/tmp/omnigent-e2e-worktrees/fix-kiro-native-verdict"
+    " && git status --porcelain=v1 --untracked-files=all"
+)
+_PERMISSION_PANE_WITH_MID_TOKEN_WRAPPED_TOOL_BLOCK = _PERMISSION_PANE.replace(
+    "↓ Shell pwd",
+    "↓ Shell cd /private/tmp/review && git status --porce\n  lain=v1",
+)
 
 
 @pytest.fixture
@@ -221,6 +240,70 @@ def test_send_kiro_permission_verdict_accepts_plain_running_title(
         bridge_dir,
         action="accept",
         expected_title="Running: pwd",
+        timeout_s=0.1,
+    )
+
+    assert [call[-1] for call in calls if "send-keys" in call] == ["Enter"]
+
+
+def test_send_kiro_permission_verdict_accepts_hard_wrapped_running_title(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A title broken mid-token across physical lines must still correlate."""
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[
+            _PERMISSION_PANE_WITH_HARD_WRAPPED_TITLE,
+            _PERMISSION_PANE_WITH_HARD_WRAPPED_TITLE,
+            _READY_PANE,
+        ],
+    )
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    send_kiro_permission_verdict(
+        bridge_dir,
+        action="accept",
+        expected_title=_HARD_WRAPPED_TITLE,
+        timeout_s=0.1,
+    )
+
+    assert [call[-1] for call in calls if "send-keys" in call] == ["Enter"]
+
+
+def test_send_kiro_permission_verdict_matches_mid_token_wrapped_tool_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A glyph tool block wrapped mid-token must still match the ACP title."""
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[
+            _PERMISSION_PANE_WITH_MID_TOKEN_WRAPPED_TOOL_BLOCK,
+            _PERMISSION_PANE_WITH_MID_TOKEN_WRAPPED_TOOL_BLOCK,
+            _READY_PANE,
+        ],
+    )
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    send_kiro_permission_verdict(
+        bridge_dir,
+        action="accept",
+        expected_title="Running: cd /private/tmp/review && git status --porcelain=v1",
         timeout_s=0.1,
     )
 

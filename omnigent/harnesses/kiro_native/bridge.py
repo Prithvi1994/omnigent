@@ -490,23 +490,31 @@ def _kiro_active_permission_tool_line(pane: str) -> str:
         if stripped.startswith(("↓ ", "● ", "○ ", "✓ ", "✗ ")):
             tool_index = index
             break
-    if tool_index >= 0:
-        command_lines: list[str] = []
-        for line in lines[tool_index:approval_index]:
-            stripped = line.strip()
-            if not stripped or _KIRO_SEPARATOR in stripped or stripped.startswith(("╰ ", "↳ ")):
-                continue
-            command_lines.append(stripped.lstrip("↓●○✓✗ ").strip())
-        return " ".join(command_lines)
-    # The supported Kiro E2E shim renders the ACP request title directly,
-    # without a leading tool-status glyph. Keep that explicit title shape as a
-    # narrow fallback; do not fall back to arbitrary command fragments or
-    # metadata, which caused false correlations in the native TUI.
-    for index in range(approval_index - 1, max(-1, approval_index - 24), -1):
-        stripped = lines[index].strip()
-        if stripped.startswith("Running:"):
-            return stripped
-    return ""
+    if tool_index < 0:
+        # The supported Kiro E2E shim renders the ACP request title directly,
+        # without a leading tool-status glyph. Keep that explicit title shape
+        # as a narrow fallback; do not fall back to arbitrary command fragments
+        # or metadata, which caused false correlations in the native TUI.
+        for index in range(approval_index - 1, max(-1, approval_index - 24), -1):
+            if lines[index].strip().startswith("Running:"):
+                tool_index = index
+                break
+    if tool_index < 0:
+        return ""
+    # Long titles can reach the capture as several physical lines even with
+    # ``capture-pane -J`` (the TUI may emit its own line breaks), so join the
+    # whole block between the tool line and the approval panel.
+    command_lines: list[str] = []
+    for line in lines[tool_index:approval_index]:
+        stripped = line.strip()
+        if not stripped or _KIRO_SEPARATOR in stripped or stripped.startswith(("╰ ", "↳ ")):
+            continue
+        command_lines.append(stripped.lstrip("↓●○✓✗ ").strip())
+    return " ".join(command_lines)
+
+
+def _squash_whitespace(text: str) -> str:
+    return "".join(text.split())
 
 
 def _kiro_permission_prompt_matches_title(pane: str, expected_title: str | None) -> bool:
@@ -519,12 +527,16 @@ def _kiro_permission_prompt_matches_title(pane: str, expected_title: str | None)
     tool_line = _kiro_active_permission_tool_line(pane)
     if not tool_line:
         return False
-    if title == tool_line:
+    # Rejoined wrapped lines carry a space at each break, and a break can fall
+    # mid-token, so compare the shapes without whitespace.
+    squashed_title = _squash_whitespace(title)
+    squashed_tool_line = _squash_whitespace(tool_line)
+    if squashed_title == squashed_tool_line:
         return True
     if title.startswith("Running:"):
-        command = title.removeprefix("Running:").strip()
-        return bool(command and (tool_line == command or tool_line.endswith(f" {command}")))
-    return title in tool_line
+        command = _squash_whitespace(title.removeprefix("Running:"))
+        return bool(command and squashed_tool_line.endswith(command))
+    return squashed_title in squashed_tool_line
 
 
 def _wait_for_kiro_permission_prompt(
