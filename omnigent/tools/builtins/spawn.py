@@ -641,7 +641,7 @@ class SysSessionListTool(Tool):
             # never re-surface to the LLM.
             if child.title is None or ":" not in child.title:
                 continue
-            if is_session_closed(child.labels, child.title):
+            if is_session_closed(child.labels, child.title, child.id):
                 continue
             sa_agent, _, sa_title = child.title.partition(":")
             result.append(
@@ -1162,7 +1162,7 @@ def _find_open_child_by_title(
         limit=1,
     )
     return next(
-        (c for c in children.data if not is_session_closed(c.labels, c.title)),
+        (c for c in children.data if not is_session_closed(c.labels, c.title, c.id)),
         None,
     )
 
