@@ -1370,7 +1370,9 @@ def _stringify_tool_payload(value: Any) -> str:
                 path = block.get("path")
                 new_text = block.get("newText")
                 line_count = len(new_text.splitlines()) if isinstance(new_text, str) else 0
-                label = f"diff {path} ({line_count} lines)" if path else f"diff ({line_count} lines)"
+                label = (
+                    f"diff {path} ({line_count} lines)" if path else f"diff ({line_count} lines)"
+                )
                 if isinstance(new_text, str) and new_text:
                     text_parts.append(f"{label}\n{new_text}")
                 else:
