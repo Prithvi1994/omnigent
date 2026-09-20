@@ -25,6 +25,7 @@ from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
     CLOSED_TITLE_INFIX,
+    closed_title_marker,
     is_session_closed,
 )
 
@@ -1253,7 +1254,7 @@ def _agent_title_from_conversation(child: Conversation) -> _AgentTitle:
             f"{child.title!r} — expected '<agent>:<title>' format"
         )
     sa_agent, _, remainder = child.title.partition(":")
-    sa_title, _, _closed_marker = remainder.partition(_CLOSED_TITLE_INFIX)
+    sa_title = remainder.removesuffix(closed_title_marker(child.id))
     return _AgentTitle(agent=sa_agent, title=sa_title)
 
 
