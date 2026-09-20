@@ -1096,9 +1096,7 @@ def test_close_keeps_user_title_text_containing_closed_infix(
     row's own suffix is stripped for display.
     """
     user_title = "researcher:my :closed: notes"
-    session_fixture.conv_store.update_conversation(
-        session_fixture.child_conv_id, title=user_title
-    )
+    session_fixture.conv_store.update_conversation(session_fixture.child_conv_id, title=user_title)
     raw = SysSessionCloseTool().invoke(
         json.dumps({"conversation_id": session_fixture.child_conv_id}),
         session_fixture.ctx,
@@ -1109,9 +1107,7 @@ def test_close_keeps_user_title_text_containing_closed_infix(
 
     refreshed = session_fixture.conv_store.get_conversation(session_fixture.child_conv_id)
     assert refreshed is not None
-    assert refreshed.title == (
-        f"{user_title}{_CLOSED_TITLE_INFIX}{session_fixture.child_conv_id}"
-    )
+    assert refreshed.title == (f"{user_title}{_CLOSED_TITLE_INFIX}{session_fixture.child_conv_id}")
 
 
 def test_close_succeeds_regardless_of_session_state(session_fixture: _Fixture) -> None:

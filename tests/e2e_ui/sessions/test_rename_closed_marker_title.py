@@ -53,8 +53,9 @@ def _rename_via_sidebar(page: Page, base_url: str, session_id: str, title: str) 
     expect(edit).to_be_visible()
     edit.fill(title)
     with page.expect_response(
-        lambda r: r.request.method == "PATCH"
-        and urlparse(r.url).path == f"/v1/sessions/{session_id}"
+        lambda r: (
+            r.request.method == "PATCH" and urlparse(r.url).path == f"/v1/sessions/{session_id}"
+        )
     ) as patch_info:
         edit.press("Enter")
     assert patch_info.value.status == 200, (
@@ -89,8 +90,7 @@ def test_rename_with_closed_infix_preserves_title(
     snap = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
     snap.raise_for_status()
     assert snap.json().get("title") == _TITLE, (
-        f"server should return the title as written {_TITLE!r}, "
-        f"got {snap.json().get('title')!r}"
+        f"server should return the title as written {_TITLE!r}, got {snap.json().get('title')!r}"
     )
 
 
@@ -124,8 +124,10 @@ def test_rename_with_closed_infix_keeps_session_open(
 
     composer.fill(_FOLLOWUP)
     with page.expect_response(
-        lambda r: r.request.method == "POST"
-        and urlparse(r.url).path == f"/v1/sessions/{session_id}/events"
+        lambda r: (
+            r.request.method == "POST"
+            and urlparse(r.url).path == f"/v1/sessions/{session_id}/events"
+        )
     ) as post_info:
         page.get_by_role("button", name="Send", exact=True).click()
     assert post_info.value.status < 400, (
