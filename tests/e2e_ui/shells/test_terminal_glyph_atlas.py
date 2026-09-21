@@ -23,6 +23,7 @@ import re
 import time
 from pathlib import Path
 
+import pytest
 from PIL import Image
 from playwright.sync_api import Page, expect
 
@@ -414,3 +415,101 @@ def test_atlas_page_repack_rebinds_swapped_textures(page: Page, tmp_path: Path) 
     assert merges >= 5, (
         f"atlas churn produced only {merges} page merges; the repack path was not exercised"
     )
+
+
+@pytest.mark.parametrize("bundle", ["js", "mjs"])
+def test_shared_atlas_invalidates_each_renderer_once(page: Page, bundle: str) -> None:
+    """Clearing a shared atlas refreshes both terminals once, then stays incremental."""
+    page.set_content(
+        "<style>.terminal { width: 960px; height: 480px; }</style>"
+        '<div id="a" class="terminal"></div><div id="b" class="terminal"></div>'
+    )
+    page.add_style_tag(path=str(_XTERM_LIB / "css" / "xterm.css"))
+    page.add_script_tag(path=str(_XTERM_LIB / "lib" / "xterm.js"))
+    if bundle == "js":
+        page.add_script_tag(path=str(_WEBGL_LIB / "lib" / "addon-webgl.js"))
+    else:
+        page.evaluate(
+            """async source => {
+              const url = URL.createObjectURL(new Blob([source], {type: 'text/javascript'}));
+              try { window.WebglAddon = await import(url); }
+              finally { URL.revokeObjectURL(url); }
+            }""",
+            (_WEBGL_LIB / "lib" / "addon-webgl.mjs").read_text(encoding="utf-8"),
+        )
+
+    result = page.evaluate(
+        """async () => {
+          const terms = [], addons = [];
+          try {
+            for (const id of ['a', 'b']) {
+              const term = new Terminal({cols: 100, rows: 30, fontFamily: 'monospace'});
+              terms.push(term);
+              term.open(document.getElementById(id));
+              const addon = new WebglAddon.WebglAddon();
+              term.loadAddon(addon);
+              addons.push(addon);
+              await new Promise(resolve => term.write('Static text 日本語', resolve));
+            }
+            await new Promise(resolve => {
+              requestAnimationFrame(() => requestAnimationFrame(resolve));
+            });
+            const renderers = addons.map(addon => addon._renderer);
+            const shared = renderers[0]._charAtlas === renderers[1]._charAtlas;
+            const calls = renderers.map(renderer => {
+              const updates = [];
+              const original = renderer._updateModel;
+              renderer._updateModel = function(start, end) {
+                updates.push([start, end]);
+                return original.call(this, start, end);
+              };
+              return updates;
+            });
+            const render = () => {
+              calls.forEach(updates => { updates.length = 0; });
+              renderers.forEach(renderer => renderer.renderRows(10, 10));
+              return calls.map(updates => updates.slice());
+            };
+            const before = render();
+            addons[0].clearTextureAtlas();
+            const afterClear = render();
+            const nextFrame = render();
+            addons[1].clearTextureAtlas();
+            const afterSiblingClear = render();
+            const nextSiblingFrame = render();
+            renderers.forEach(renderer => {
+              renderer._glyphRenderer.value.setAtlas(renderer._charAtlas);
+            });
+            const afterReattach = render();
+            const nextReattachFrame = render();
+            const originalUpdate = renderers[0]._updateModel;
+            let clearDuringUpdate = true;
+            renderers[0]._updateModel = function(start, end) {
+              originalUpdate.call(this, start, end);
+              if (clearDuringUpdate) {
+                clearDuringUpdate = false;
+                this._charAtlas.clearTexture();
+              }
+            };
+            const afterMidFrameClear = render();
+            const nextMidFrame = render();
+            return {shared, before, afterClear, nextFrame, afterSiblingClear,
+                    nextSiblingFrame, afterReattach, nextReattachFrame,
+                    afterMidFrameClear, nextMidFrame};
+          } finally {
+            terms.forEach(term => term.dispose());
+          }
+        }"""
+    )
+    assert result["shared"], "the terminals must exercise the same pooled atlas"
+    partial = [[[10, 10]], [[10, 10]]]
+    full = [[[0, 29]], [[0, 29]]]
+    assert result["before"] == partial
+    assert result["afterClear"] == full
+    assert result["nextFrame"] == partial, "atlas clear must not force full redraws forever"
+    assert result["afterSiblingClear"] == full
+    assert result["nextSiblingFrame"] == partial
+    assert result["afterReattach"] == full
+    assert result["nextReattachFrame"] == partial
+    assert result["afterMidFrameClear"] == [[[10, 10], [0, 29]], [[0, 29]]]
+    assert result["nextMidFrame"] == partial
