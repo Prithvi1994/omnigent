@@ -78,7 +78,7 @@ _HARD_WRAPPED_TITLE = (
     "Running: cd /private/tmp/omnigent-e2e-worktrees/fix-kiro-native-verdict"
     " && git status --porcelain=v1 --untracked-files=all"
 )
-_PERMISSION_PANE_WITH_MID_TOKEN_WRAPPED_TOOL_BLOCK = _PERMISSION_PANE.replace(
+_PERMISSION_PANE_WITH_MID_WORD_WRAP = _PERMISSION_PANE.replace(
     "↓ Shell pwd",
     "↓ Shell cd /private/tmp/review && git status --porce\n  lain=v1",
 )
@@ -289,8 +289,8 @@ def test_send_kiro_permission_verdict_matches_mid_token_wrapped_tool_block(
     calls = _install_fake_tmux(
         monkeypatch,
         pane_outputs=[
-            _PERMISSION_PANE_WITH_MID_TOKEN_WRAPPED_TOOL_BLOCK,
-            _PERMISSION_PANE_WITH_MID_TOKEN_WRAPPED_TOOL_BLOCK,
+            _PERMISSION_PANE_WITH_MID_WORD_WRAP,
+            _PERMISSION_PANE_WITH_MID_WORD_WRAP,
             _READY_PANE,
         ],
     )
