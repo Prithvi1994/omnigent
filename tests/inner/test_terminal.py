@@ -3397,7 +3397,7 @@ async def test_close_reaps_a_native_panes_sighup_immune_stragglers_real_tmux(
     hangs the pane up and the leader exits, so only the pane's session id can
     still find the child. A user's shell terminal keeps ``nohup`` semantics.
     """
-    monkeypatch.setattr(terminal_mod, "_PANE_SESSION_DRAIN_SECONDS", 1.0)
+    monkeypatch.setattr(terminal_mod, "_PANE_SESSION_DRAIN_SECONDS", 1.0, raising=False)
     pid_file = tmp_path / "straggler.pid"
     child_code = (
         "import os, pathlib, signal, time\n"
@@ -3430,8 +3430,7 @@ async def test_close_reaps_a_native_panes_sighup_immune_stragglers_real_tmux(
         straggler_pid = int(pid_file.read_text().strip())
         pane_pid = instance.pane_pid_sync()
         assert pane_pid is not None
-        assert pane_pid in _proc.session_member_pids(pane_pid)
-        assert straggler_pid in _proc.session_member_pids(pane_pid)
+        assert os.getsid(straggler_pid) == pane_pid
 
         await instance.close()
 

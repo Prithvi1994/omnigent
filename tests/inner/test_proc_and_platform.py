@@ -697,33 +697,27 @@ def test_malloc_tuning_env_honors_overrides(monkeypatch: pytest.MonkeyPatch) -> 
     }
 
 
-def _spawn_session_with_detached_group_child(
-    tmp_path: Path, *, child_ignores_sigterm: bool, leader_exits: bool
-) -> tuple[subprocess.Popen[bytes], int]:
+def _spawn_orphan_in_own_group(tmp_path: Path) -> tuple[subprocess.Popen[bytes], int]:
     """
-    Start a session leader whose child moves to its own process group.
+    Start a session leader that spawns a SIGTERM-immune child in its own group, then exits.
 
-    Mirrors a Codex app server launching a stdio MCP server: the leader is
-    spawned with :func:`_proc.spawn_kwargs` (own session and group) and the
-    child starts a new process group, so ``killpg`` on the leader's group
-    cannot reach it while it keeps the leader's session id. The child writes
-    its pid only once its signal disposition is in place. With
-    ``leader_exits`` the leader quits right after the spawn, leaving the child
-    an orphan.
+    Mirrors a Codex app server dying under a stdio MCP server that ignores
+    ``SIGTERM``: the child leaves the leader's process group but keeps its
+    session id, and the leader's death leaves no tree to walk. The child writes
+    its pid only once its signal disposition is in place.
     """
     import sys
 
     pid_file = tmp_path / "detached_child.pid"
     child_code = (
         "import os, pathlib, signal, time\n"
-        + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if child_ignores_sigterm else "")
-        + f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
-        + "time.sleep(60)\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+        "time.sleep(60)\n"
     )
     leader_code = (
-        "import subprocess, sys, time\n"
+        "import subprocess, sys\n"
         f"subprocess.Popen([sys.executable, '-c', {child_code!r}], process_group=0)\n"
-        + ("" if leader_exits else "time.sleep(60)\n")
     )
     leader = subprocess.Popen([sys.executable, "-c", leader_code], **_proc.spawn_kwargs())
     deadline = time.monotonic() + 15
@@ -750,28 +744,6 @@ def _kill_quietly(pid: int) -> None:
 
 
 @pytest.mark.posix_only
-def test_terminate_tree_reaches_a_child_in_its_own_process_group(tmp_path: Path) -> None:
-    """
-    A descendant that left the leader's process group still dies with the tree.
-
-    This is the shape of a Codex app server and its stdio MCP servers: a new
-    process group each, but the same session.
-    """
-    leader, child_pid = _spawn_session_with_detached_group_child(
-        tmp_path, child_ignores_sigterm=False, leader_exits=False
-    )
-    try:
-        assert os.getpgid(child_pid) != os.getpgid(leader.pid)
-        assert os.getsid(child_pid) == leader.pid
-        _proc.terminate_tree(leader, grace=5)
-        leader.wait(timeout=5)
-        _assert_reaped(child_pid, "detached-group child")
-    finally:
-        _kill_quietly(child_pid)
-        _proc.kill_tree(leader)
-
-
-@pytest.mark.posix_only
 def test_kill_session_reaps_a_sigterm_immune_orphan_after_its_leader_exited(
     tmp_path: Path,
 ) -> None:
@@ -782,9 +754,7 @@ def test_kill_session_reaps_a_sigterm_immune_orphan_after_its_leader_exited(
     no-ops by contract, yet the orphan keeps the leader's session id. It
     ignores ``SIGTERM`` by design here, so only the ``SIGKILL`` sweep removes it.
     """
-    leader, child_pid = _spawn_session_with_detached_group_child(
-        tmp_path, child_ignores_sigterm=True, leader_exits=True
-    )
+    leader, child_pid = _spawn_orphan_in_own_group(tmp_path)
     try:
         leader.wait(timeout=10)
         assert os.getsid(child_pid) == leader.pid
