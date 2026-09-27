@@ -7963,14 +7963,16 @@ async def _relay_response_policy_deny_reason(
 
     Fails OPEN (returns ``None``) on an evaluation error, matching the LLM
     phases' advisory default: a policy-engine hiccup must not destroy the
-    narration the user already watched. The read-only stage (the
+    narration the user already watched. The preparation stage (the
     conversation row, the agent spec and the engine build) is retried on
     the short :data:`_RESPONSE_POLICY_RETRY_DELAYS_S` schedule when an
     upstream throttle (a store or gateway answering ``RESOURCE_EXHAUSTED``
     / HTTP 429 under a burst) rejects it, so a momentary request-limit
-    rejection does not skip the gate. The evaluation itself is never
-    retried: it applies label and session-state writes, so repeating it
-    after a partial failure could double-apply a committed increment. The
+    rejection does not skip the gate. Repeating that stage is safe: its
+    only write is the engine build's seed of missing initial labels, an
+    UPSERT of absent keys. The evaluation itself is never retried: it
+    applies label and session-state writes, so repeating it after a
+    partial failure could double-apply a committed increment. The
     fail-open log line names the upstream cause either way.
 
     :param conversation_store: Store for the conversation/labels lookup.
@@ -7995,8 +7997,8 @@ async def _relay_response_policy_deny_reason(
     delays = _RESPONSE_POLICY_RETRY_DELAYS_S
     attempts = len(delays) + 1
     for attempt in range(1, attempts + 1):
-        # Reads only: the row, the spec and the engine build. Nothing here
-        # writes, so a throttled attempt can be repeated safely.
+        # Safe to repeat: the row and spec are reads, and the engine build's
+        # only write seeds missing initial labels (an UPSERT of absent keys).
         try:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None or conv.agent_id is None:
@@ -8970,9 +8972,10 @@ async def _prepare_output_policy_engine(
     Resolve the session's spec and build its engine for an OUTPUT phase
     evaluation.
 
-    Read-only: the spec lookup, the cheap skip check and the engine build
-    only read the stores, so a caller may repeat this after a transient
-    store failure without side effects.
+    Safe to repeat after a transient store failure: the spec lookup and
+    the cheap skip check only read, and the engine build's only write
+    seeds missing initial labels (an UPSERT of absent keys), so a retry
+    cannot double-apply anything.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.

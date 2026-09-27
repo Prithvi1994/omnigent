@@ -307,7 +307,7 @@ def _no_retry_pause() -> Any:
     )
 
 
-# Seams of the read-only stage, patched on the facade the helpers proxy through.
+# Seams of the preparation stage, patched on the facade the helpers proxy through.
 _LOADER_PATCH = "omnigent.server.routes.sessions._load_agent_spec_for_session"
 _BUILDER_PATCH = "omnigent.server.routes.sessions._build_policy_engine_from_spec"
 _GOVERNED_SPEC = AgentSpec(spec_version=1, name="test-agent", guardrails=GuardrailsSpec())
@@ -357,7 +357,7 @@ def _governed_session(
     """
     Run the real RESPONSE-phase pipeline against a governed spec.
 
-    Only the read-only seams are scripted: *load_spec* replaces the spec
+    Only the preparation seams are scripted: *load_spec* replaces the spec
     lookup and *build_engine* the engine build. The evaluation runs the real
     ``_evaluate_output_policy`` over the engine *build_engine* returns.
     """
