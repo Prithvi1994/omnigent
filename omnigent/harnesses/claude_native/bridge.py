@@ -4400,16 +4400,17 @@ def _normalized_delivery_prompt(prompt: str) -> str:
 
 def _collapsed_delivery_prompt(prompt: str) -> str:
     """
-    Collapse prompt text to a whitespace-free comparison key.
+    Collapse prompt text to a whitespace-normalized comparison key.
 
     Drops the zero-width characters the slash-command escape prepends
-    and every whitespace run, so rendering-level differences (wrapping,
-    trailing spaces, a stripped BOM) cannot defeat receipt matching.
+    and folds every whitespace run to one space, so rendering-level
+    differences (wrapping, trailing spaces, a stripped BOM) cannot defeat
+    receipt matching while word boundaries still have to agree.
 
     :param prompt: Injected text or a ``UserPromptSubmit`` prompt.
     :returns: The collapsed key; empty for whitespace-only text.
     """
-    return "".join(prompt.replace("﻿", "").replace("​", "").split())
+    return " ".join(prompt.replace("﻿", "").replace("​", "").split())
 
 
 def _delivery_prompts_match(prompt: str, expected: str) -> bool:
@@ -4460,6 +4461,9 @@ def _confirm_message_delivery(
     and a lone new session id never triggers a re-delivery — the two
     failure modes that made earlier delivery gates raise false
     "message may not have been delivered" banners on healthy sessions.
+    The accepted residual gap: a restart that fires before the booting
+    session logged its own id shows a single new id, reads as that boot,
+    and still loses the message.
 
     :param bridge_dir: Bridge directory path.
     :param socket_path: Absolute path to the tmux socket.
@@ -4484,6 +4488,7 @@ def _confirm_message_delivery(
     restart_seen = False
     start = time.monotonic()
     while True:
+        _check_injection_cancelled()
         result = read_hook_events_from_offset(bridge_dir, offset, start_event_count=0)
         offset = result.byte_offset
         for record in result.records:
@@ -4529,7 +4534,9 @@ def _confirm_message_delivery(
     )
     # The replacement process may still be booting; wait for its composer
     # before pasting again, then run the full verified delivery against it.
-    _wait_for_claude_prompt_ready(socket_path, tmux_target, timeout_s=_TMUX_READY_TIMEOUT_S)
+    _wait_for_claude_prompt_ready(
+        socket_path, tmux_target, timeout_s=_TMUX_READY_TIMEOUT_S, bridge_dir=bridge_dir
+    )
     _paste_and_submit(
         bridge_dir,
         socket_path,

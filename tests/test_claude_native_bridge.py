@@ -5143,6 +5143,7 @@ def test_inject_user_message_raises_after_redelivery_budget_exhausted(
         # A stripped/kept BOM or reflowed whitespace still matches.
         ("﻿fix the flaky test", "fix the flaky test", True),
         ("fix  the\n flaky test", "fix the flaky test", True),
+        ("ab c", "a bc", False),
         ("a different message", "fix the flaky test", False),
         ("", "fix the flaky test", False),
     ],
