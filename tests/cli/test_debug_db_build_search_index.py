@@ -1,6 +1,5 @@
-"""Tests for ``omnigent debug db-build-search-index``: it refuses non-PostgreSQL
-databases with a clear message and, on PostgreSQL, builds a valid ``gin_trgm_ops``
-index idempotently and can drop it again.
+"""Tests for ``omnigent debug db-build-search-index``: refuses non-PostgreSQL
+databases and, on PostgreSQL, builds and drops the ``gin_trgm_ops`` index idempotently.
 """
 
 from __future__ import annotations

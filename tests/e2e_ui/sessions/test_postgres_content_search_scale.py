@@ -1,12 +1,5 @@
-"""E2E: an absent-term content search on a large PostgreSQL deployment answers in time.
-
-Unindexed, ``search_text ILIKE '%term%'`` reads every item; around a million
-items that outlives the client's 10 s deadline and the 15 s ``statement_timeout``,
-and the palette shows an error instead of "No results found". This test
-provisions a throwaway PostgreSQL cluster, runs a real ``omnigent server`` with
-``OMNIGENT_PG_CONTENT_SEARCH=auto``, seeds ~985k items (~3 GB of text), builds
-the index through ``omnigent debug db-build-search-index``, then searches an
-absent term via the palette and HTTP. Nightly-only; skips without Postgres.
+"""E2E: an absent-term session search on a ~985k-item PostgreSQL deployment answers in
+time once the trigram index is built and ``OMNIGENT_PG_CONTENT_SEARCH=auto`` is set.
 """
 
 from __future__ import annotations
@@ -72,8 +65,7 @@ SELECT 0,
            FROM generate_series(1, %(words)s) k, (SELECT %(vocab)s::text[] AS v) vv
        ),
        NULL
-FROM generate_series(0, %(count)s - 1) g
-"""
+FROM generate_series(0, %(count)s - 1) g"""
 
 
 @dataclass(frozen=True)
@@ -254,10 +246,8 @@ def postgres_search_server(
     postgres_uri: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[_SearchServer]:
-    """Spawn ``omnigent server`` on the seeded cluster with the fast path enabled.
-
-    The index is built through the CLI after seeding, as an operator would; the
-    outcome is recorded so the journey still runs and reports in the test body.
+    """Spawn ``omnigent server`` on the seeded cluster in ``auto`` mode, then build the
+    index through the CLI as an operator would; its outcome is asserted in the test body.
     """
     workdir = tmp_path_factory.mktemp("pg_search_server")
     agent_yaml = workdir / "hello_world.yaml"

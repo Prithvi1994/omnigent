@@ -153,10 +153,9 @@ def _encode_session_state(
     return json.dumps(payload, separators=(",", ":"))
 
 
-# Server-side deadline (ms) for content-search statements in ``list_conversations``:
-# without the opt-in trigram index (``pg_content_search``) a rare term scans every
-# item, and a worker-thread query outlives a client disconnect. Longer than the
-# client's ``SEARCH_FETCH_TIMEOUT_MS`` so the browser gives up first.
+# Server-side deadline (ms) for content-search statements in ``list_conversations``: an
+# unindexed rare term scans every item, and a worker-thread query outlives a client
+# disconnect. Longer than the client's ``SEARCH_FETCH_TIMEOUT_MS`` so the browser quits first.
 _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
 
 # Upper bound on rows fetched per SQL statement when listing conversation
@@ -684,13 +683,9 @@ def _fetch_search_snippets(
         ).all()
     else:
         pattern = f"%{query.lower()}%"
-        # workspace_id leads the (workspace_id, conversation_id, position) index.
-        # Both the aggregate and the join-back below must include it or Postgres
-        # can't use that index and falls back to a full table scan of every item.
-        # ILIKE on the raw column rather than ``lower(search_text) LIKE`` for the
-        # same reason as the content match in ``list_conversations``: the lower()
-        # form matches the pg_trgm index expression, and the planner then scans the
-        # whole workspace even though this is already scoped to one page of ids.
+        # workspace_id must appear in both the aggregate and the join-back so Postgres
+        # stays on the (workspace_id, conversation_id, position) index. Raw-column ILIKE,
+        # not ``lower(search_text) LIKE``: see the content match in ``list_conversations``.
         match_pred = and_(
             SqlConversationItem.workspace_id == workspace_id,
             SqlConversationItem.conversation_id.in_(conversation_ids),
@@ -2952,11 +2947,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                         else false()
                     )
                 else:
-                    # Correlated EXISTS, not ``id IN (SELECT ...)``: the IN form
-                    # builds the match set for the whole workspace before the ACL
-                    # discards rows. Raw-column ILIKE, not ``lower(search_text)
-                    # LIKE``: the lower() form matched the old pg_trgm expression
-                    # index and made the planner scan it whole; see the covering test.
+                    # Correlated EXISTS, not ``id IN (SELECT ...)``, so the match set is
+                    # not built for the whole workspace before the ACL applies. Raw-column
+                    # ILIKE, not ``lower(search_text) LIKE``; see the covering test.
                     content_match = (
                         select(SqlConversationItem.conversation_id)
                         .where(

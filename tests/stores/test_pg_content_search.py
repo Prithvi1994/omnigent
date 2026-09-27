@@ -1,9 +1,5 @@
-"""Tests for the opt-in PostgreSQL trigram fast path of session content search.
-
-With ``OMNIGENT_PG_CONTENT_SEARCH=auto`` and the index built, the store probes
-the index and filters on the matched ids with identical results, permissions
-and snippets; every other configuration keeps the legacy scan. The SQL-shape
-tests are PostgreSQL-only; the mode and eligibility helpers run everywhere.
+"""Opt-in PostgreSQL trigram fast path for session content search: mode parsing and
+eligibility run everywhere; SQL-shape, fallback and parity tests are PostgreSQL-only.
 """
 
 from __future__ import annotations

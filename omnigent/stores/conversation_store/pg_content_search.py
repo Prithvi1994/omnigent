@@ -1,12 +1,5 @@
-"""Opt-in PostgreSQL trigram fast path for session content search.
-
-Unindexed ``search_text ILIKE '%term%'`` reads every item for a rare or absent
-term. Operators build a raw-column ``gin_trgm_ops`` index with ``omnigent debug
-db-build-search-index`` and set ``OMNIGENT_PG_CONTENT_SEARCH=auto``; the listing
-then probes the index for matching ``(conversation_id, position)`` rows, capped
-at :data:`CONTENT_SEARCH_PROBE_CAP`. A complete probe filters on those ids and
-supplies snippet positions; an overflow (a common term) keeps the legacy query.
-See ``docs/postgres-session-search.md``.
+"""Opt-in PostgreSQL trigram fast path for session content search (see
+``docs/postgres-session-search.md``): probe an operator-built index instead of scanning.
 """
 
 from __future__ import annotations
@@ -92,12 +85,8 @@ def probe_content_matches(
     *,
     cap: int | None = None,
 ) -> dict[str, int] | None:
-    """Look up matching items through the trigram index.
-
-    :param pattern: The ``ILIKE`` pattern the legacy predicate uses, e.g. ``"%term%"``.
-    :param cap: Matching item rows accepted as complete; defaults to the module cap.
-    :returns: ``{conversation_id: earliest matching position}`` (empty when nothing
-        matches), or ``None`` when more than *cap* items match.
+    """Return ``{conversation_id: earliest matching position}`` for the ``ILIKE``
+    *pattern* via the trigram index, or ``None`` when more than *cap* items match.
     """
     if cap is None:
         cap = CONTENT_SEARCH_PROBE_CAP
@@ -127,11 +116,8 @@ def _autocommit_connection(engine: Engine) -> Connection:
 
 
 def build_content_search_index(engine: Engine) -> bool:
-    """Create the trigram index (and ``pg_trgm``) with ``CREATE INDEX CONCURRENTLY``.
-
-    An interrupted concurrent build leaves an INVALID index that ``IF NOT
-    EXISTS`` would keep, so such a leftover is dropped first.
-    :returns: ``True`` when created, ``False`` when it already existed.
+    """Create the trigram index (and ``pg_trgm``) concurrently; ``True`` when created,
+    ``False`` when a valid one already existed.
     """
     if engine.dialect.name != "postgresql":
         raise ValueError("The session content search index requires PostgreSQL.")
@@ -145,6 +131,8 @@ def build_content_search_index(engine: Engine) -> bool:
             {"index_name": CONTENT_SEARCH_INDEX},
         ).scalar()
         if valid is not None and not valid:
+            # An interrupted CONCURRENTLY build leaves an INVALID index that
+            # IF NOT EXISTS would keep; replace it.
             conn.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS {CONTENT_SEARCH_INDEX}"))
             valid = None
         if valid:

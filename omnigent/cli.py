@@ -11390,14 +11390,8 @@ def debug_db_upgrade(url: str) -> None:
 @click.argument("url")
 @click.option("--drop", is_flag=True, help="Drop the index instead of building it.")
 def debug_db_build_search_index(url: str, drop: bool) -> None:
-    """
-    Build the PostgreSQL trigram index behind the opt-in session content
-    search fast path (docs/postgres-session-search.md). URL is the
-    conversations database, e.g. ``postgresql://<user>:<password>@host/db``.
-
-    \b
-    Uses CREATE INDEX CONCURRENTLY, so the server can keep serving; a large
-    table still takes minutes. Then set OMNIGENT_PG_CONTENT_SEARCH=auto.
+    """Build the PostgreSQL trigram index for the opt-in session content search
+    fast path; URL is the conversations database. See docs/postgres-session-search.md.
     """
     from sqlalchemy import create_engine
 

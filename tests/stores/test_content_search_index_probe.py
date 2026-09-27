@@ -1,10 +1,5 @@
-"""The opted-in PostgreSQL content search answers from the trigram index probe.
-
-With the ``gin_trgm_ops`` index built and ``OMNIGENT_PG_CONTENT_SEARCH=auto``,
-``list_conversations`` must filter on the probed ids instead of the correlated
-``ILIKE`` ``EXISTS`` scan, with identical sessions and snippets. The module
-imports only long-standing symbols and creates the index in SQL, so on a build
-without the fast path it fails on the query shape rather than on an import.
+"""Opted-in PostgreSQL content search must probe the trigram index, not scan items. Uses
+only long-standing symbols and raw SQL so an unfixed build fails on query shape, not import.
 """
 
 from __future__ import annotations
