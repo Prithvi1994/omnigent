@@ -813,12 +813,9 @@ class _ForwardDedupeState:
     # sub-agent spend so the gate can block mid-turn. Separate baseline
     # because it can advance while ``posted_cost`` (S) is frozen.
     posted_policy_cost: float | None = None
-    # Per-model transcript-cost snapshot (C's split) taken at the last
-    # successful display-cost post. The next display advance sends the
-    # per-model GROWTH since this snapshot as ``cost_by_model`` attribution
-    # weights, so each advance is attributed to the models that produced it
-    # (not the whole session's historical mix). ``None`` until the first
-    # display post with sub-agents tracked.
+    # Per-model split of C at the last successful display-cost post; the next
+    # display advance sends only the growth since then as ``cost_by_model``
+    # weights. ``None`` until the first display post with sub-agents tracked.
     posted_cost_by_model: dict[str, float] | None = None
     # Last permission mode POSTed as ``external_permission_mode_change`` —
     # mirrors the launch mode and any in-pane shift+tab switch, neither of
@@ -2956,32 +2953,14 @@ async def _forward_session_cost(
         payload["policy_cost_usd"] = policy_cost
     if not payload:
         return
-    # Attribute a display-cost (S) advance per-model. claude-native sends no
-    # token counts with its cost, so the server has nothing to attribute the
-    # cost to per-model on its own — leaving it out of the TOKEN USAGE
-    # breakdown while the session total still counts it. Attribution data is
-    # sent only when the display cost moves: that is the value being
-    # attributed (``policy_cost_usd``-only mid-turn posts carry no new
-    # display cost).
-    #
-    # - With sub-agents tracked, send ``cost_by_model`` — each model's
-    #   transcript-estimate GROWTH since the last display post. The server
-    #   splits the S delta across these weights, so each model gets its own
-    #   share. S is a flat total tagged with the statusLine's ACTIVE model
-    #   only, and a Task sub-agent pinned to a different model runs with the
-    #   statusLine frozen on the orchestrator's model: tagging the settled S
-    #   with that one model would fold the sub-agent's spend into the
-    #   orchestrator's bucket (and drop its model from the per-model cost
-    #   breakdown entirely). When only some transcripts are priceable, the
-    #   weights cover just those models, so an advance can skew toward them;
-    #   later advances self-correct once the others price.
-    # - Without sub-agents (or when nothing in the transcripts could be
-    #   priced), keep the single ``model`` tag from the statusLine
-    #   (``{"model": "claude-opus-4-8", ...}`` in context.json) — everything
-    #   in the advance belongs to the active model, no transcript walk needed.
+    # S has no token counts and is tagged with the ACTIVE model only, so a display
+    # advance carries its own attribution: per-model transcript-estimate growth as
+    # ``cost_by_model`` weights when sub-agents are tracked, else the statusLine model.
     if "cumulative_cost_usd" in payload:
         cost_growth_by_model: dict[str, float] = {}
         if cost_by_model:
+            # Only priceable transcripts contribute weights, so an advance can skew
+            # toward them until the others price.
             baseline = dedupe.posted_cost_by_model or {}
             for model_id, model_cost in cost_by_model.items():
                 growth = model_cost - baseline.get(model_id, 0.0)
@@ -3021,10 +3000,9 @@ async def _forward_session_cost(
     if "cumulative_cost_usd" in payload:
         dedupe.posted_cost = display_cost
         if cost_by_model:
-            # Snapshot C's split at this display post, so the next advance
-            # attributes only its own growth (merge over the prior snapshot:
-            # a transcript that was rotated away must not resurrect as
-            # negative growth).
+            # Snapshot C's split at this display post so the next advance attributes
+            # only its own growth; merging with max() keeps a rotated-away transcript
+            # from reappearing as negative growth.
             merged = dict(dedupe.posted_cost_by_model or {})
             for model_id, model_cost in cost_by_model.items():
                 merged[model_id] = max(merged.get(model_id, 0.0), model_cost)

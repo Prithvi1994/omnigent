@@ -8790,14 +8790,7 @@ def test_compute_transcript_cumulative_cost_none_when_nothing_priceable(
 def test_compute_transcript_cost_by_model_keys_each_response_by_its_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """
-    Per-model costs aggregate by each response's own ``message.model``.
-
-    Same pricing walk as the flat total (requestId dedup included), split
-    per model — this split is what surfaces a Task sub-agent that ran on
-    a different model in the per-model cost breakdown. The buckets must
-    sum to the flat total.
-    """
+    """Per-model costs key each response by ``message.model`` and sum to the flat total."""
     from omnigent.llms.context_window import ModelPricing
 
     pricing = ModelPricing(input_per_token=10.0, output_per_token=20.0)

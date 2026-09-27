@@ -1,9 +1,7 @@
 """A Task sub-agent using another model appears in the session cost breakdown.
 
-Drive a real Claude CLI against a mock model with a scripted Task/Agent
-call selecting opus, then inspect the SPA usage panel. The parent uses
-sonnet; its flat statusLine total must not hide the child model allocation.
-Requires mock mode (LLM_API_KEY unset)."""
+A real Claude CLI on sonnet runs a scripted Task/Agent call on opus (both served by the
+mock); the SPA usage panel must list opus instead of folding it into sonnet."""
 
 from __future__ import annotations
 
@@ -49,12 +47,7 @@ _BREAKDOWN_SETTLE_TIMEOUT_S = 30.0
 
 
 def _session_snapshot(base_url: str, session_id: str) -> dict:
-    """Fetch the session snapshot the web UI's cost panel is seeded from.
-
-    :param base_url: Spawned server base URL.
-    :param session_id: Parent session id.
-    :returns: The ``SessionResponse`` JSON dict.
-    """
+    """Fetch the ``SessionResponse`` snapshot the web UI's cost panel is seeded from."""
     resp = httpx.get(
         f"{base_url}/v1/sessions/{session_id}",
         params={"include_items": "false"},
@@ -89,15 +82,9 @@ def _wait_for_priced_cost(
 
 
 def _spawn_tool_name(mock_llm_server_url: str) -> str:
-    """Return the sub-agent spawn tool name this Claude CLI advertises.
+    """Return the spawn tool name this CLI advertises (``Task`` became ``Agent`` in 2.1.63).
 
-    ``Task`` was renamed to ``Agent`` in CLI 2.1.63 (both stay callable), and
-    the scripted ``tool_use`` must quote the name the CLI actually sent in its
-    request's ``tools`` list, so read it from the captured baseline request.
-
-    :param mock_llm_server_url: Mock LLM server base URL.
-    :returns: ``"Task"`` or ``"Agent"``.
-    """
+    The scripted ``tool_use`` must quote the name the CLI sent in its ``tools`` list."""
     resp = httpx.get(f"{mock_llm_server_url}/mock/requests", timeout=10.0)
     resp.raise_for_status()
     for req in reversed(resp.json()["requests"]):
@@ -189,17 +176,12 @@ def test_task_subagent_on_other_model_appears_in_cost_breakdown(
     spawn_tool = _spawn_tool_name(mock_llm_server_url)
     _log.info("CLI advertises spawn tool: %s", spawn_tool)
 
-    # --- Turn 2: scripted fan-out. The orchestrator's next response is a real
-    # spawn tool_use pinned to the OTHER model family; the sub-agent's own
-    # request (routed by its unique prompt marker) gets a text reply; the
-    # orchestrator's post-Task continuations drain the queued final texts. ---
+    # --- Turn 2: scripted fan-out. A real spawn tool_use pinned to the OTHER model
+    # family; the sub-agent's own request is routed by its unique prompt marker. ---
     fanout_text = f"fan out one sub-agent {nonce}"
-    # Content-routed on the Agent-tool system reminder, which ONLY the
-    # parent's real conversation-turn requests carry. Claude's background
-    # requests (title generation etc.) replay the user's message text, so
-    # matching on the message would let them steal the scripted tool_use;
-    # they never carry this reminder. The first matching request drains the
-    # tool_use; the parent's post-Task continuations drain the finals.
+    # Route on the Agent-tool system reminder: only the parent's real turns carry it,
+    # while Claude's background requests (title generation etc.) replay the user text
+    # and would otherwise steal the scripted tool_use.
     configure_mock_llm(
         mock_llm_server_url,
         [

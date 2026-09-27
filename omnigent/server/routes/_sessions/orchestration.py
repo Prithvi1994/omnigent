@@ -1757,12 +1757,9 @@ def _persist_native_cumulative_usage(
     )
     # A known zero cost must remain distinct from an unpriced model.
     if "total_cost_usd" in current:
-        # Split the growth across the reported per-model weights when present
-        # (a claude-native turn that ran Task sub-agents on other models);
-        # otherwise the whole growth belongs to the single active model. The
-        # weights are proportions, not absolute figures: the persisted growth
-        # stays the authoritative (monotonic-clamped) flat delta, so per-model
-        # buckets keep summing to the flat total.
+        # Split the growth across the per-model weights (a claude-native turn that ran
+        # Task sub-agents on other models), else give it all to the active model. Weights
+        # are proportions: the clamped flat delta stays authoritative, so buckets sum to it.
         if cost_by_model_weights:
             weight_total = sum(cost_by_model_weights.values())
             for weight_model, weight in cost_by_model_weights.items():

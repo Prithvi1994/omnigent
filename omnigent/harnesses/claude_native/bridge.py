@@ -3406,11 +3406,9 @@ def compute_transcript_cost_by_model(
     *,
     include_sidechains: bool,
 ) -> dict[str, float]:
-    """Aggregate transcript cost by the model that produced each billed response.
+    """Sum transcript cost per ``message.model``; empty when nothing is priceable.
 
-    Deduplicate by requestId with the same sidechain rules as
-    compute_transcript_cumulative_cost. Return an empty dict when unpriceable;
-    the statusLine total alone cannot identify a sub-agent's model."""
+    Same ``requestId`` dedupe and sidechain rules as ``compute_transcript_cumulative_cost``."""
     cost_by_request = _transcript_costs_by_request(
         transcript_path, include_sidechains=include_sidechains
     )
@@ -3425,10 +3423,8 @@ def _transcript_costs_by_request(
     *,
     include_sidechains: bool,
 ) -> dict[str, tuple[str, float]]:
-    """Price transcript responses once per requestId; the last priceable record wins.
-
-    Return request keys mapped to (model, USD). With include_sidechains=False,
-    exclude records marked isSidechain."""
+    """Price each response once per ``requestId`` (last priceable record wins) as
+    ``{request_key: (model, usd)}``; ``include_sidechains=False`` skips sidechain records."""
     read_result = _read_complete_jsonl_records(
         transcript_path,
         byte_offset=0,

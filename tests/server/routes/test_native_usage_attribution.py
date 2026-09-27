@@ -228,12 +228,9 @@ def test_cost_by_model_weights_split_the_growth(db_uri: str) -> None:
         {"cumulative_cost_usd": 0.20, "model": "claude-sonnet-4-6"},
         store,
     )
-    # A turn that fanned out a Task sub-agent pinned to opus: the flat
-    # cumulative total advances by 0.80, and the report carries per-model
-    # weights (the forwarder's transcript-estimated growth per model). The
-    # delta must split across the weights instead of landing on the
-    # statusLine's active model — otherwise the sub-agent's model never
-    # gets a bucket in the per-model breakdown (the bug this guards).
+    # Fan-out turn: the flat total advances by 0.80 and the report carries per-model
+    # weights. The delta must split across them instead of landing on the active
+    # model, or the sub-agent's model never gets a bucket (the bug this guards).
     _persist_native_cumulative_usage(
         conv.id,
         {
@@ -257,10 +254,9 @@ def test_cost_by_model_weights_are_proportions_not_absolutes(db_uri: str) -> Non
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="weights-scale", agent_id=_AGENT_ID)
 
-    # The transcript estimate can disagree with Claude's own billing (S): the
-    # weights sum to 1.30 here while the authoritative flat growth is 1.00.
-    # The split must scale to the flat growth so per-model buckets keep
-    # summing to the (monotonic-clamped) session total.
+    # The transcript estimate can disagree with Claude's billing (S): weights sum to
+    # 1.30 while the flat growth is 1.00. The split scales to the flat growth so the
+    # buckets keep summing to the clamped session total.
     _persist_native_cumulative_usage(
         conv.id,
         {

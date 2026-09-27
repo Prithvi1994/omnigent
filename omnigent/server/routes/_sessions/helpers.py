@@ -2263,10 +2263,9 @@ def _usage_by_model_for_display(usage: dict[str, Any]) -> dict[str, ModelUsage] 
 
 
 def _coerce_cost_by_model(data: dict[str, Any]) -> dict[str, float] | None:
-    """Validate optional per-model weights for splitting a display-cost advance.
-
-    Return positive finite weights, or None if absent or empty. Raise
-    OmnigentError for a non-mapping, non-string key, negative or nonfinite value."""
+    """Validate optional ``cost_by_model`` weights: positive finite entries, or None when
+    absent or empty; raises OmnigentError for a non-mapping, non-string key, or a
+    negative or non-finite value."""
     value = data.get("cost_by_model")
     if value is None:
         return None
