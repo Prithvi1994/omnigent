@@ -7963,11 +7963,15 @@ async def _relay_response_policy_deny_reason(
 
     Fails OPEN (returns ``None``) on an evaluation error, matching the LLM
     phases' advisory default: a policy-engine hiccup must not destroy the
-    narration the user already watched. An upstream throttle (a store or
-    gateway answering ``RESOURCE_EXHAUSTED`` / HTTP 429 under a burst) is
-    first retried on the short :data:`_RESPONSE_POLICY_RETRY_DELAYS_S`
-    schedule, so a momentary request-limit rejection does not skip the
-    gate; the fail-open log line names the upstream cause.
+    narration the user already watched. The read-only stage (the
+    conversation row, the agent spec and the engine build) is retried on
+    the short :data:`_RESPONSE_POLICY_RETRY_DELAYS_S` schedule when an
+    upstream throttle (a store or gateway answering ``RESOURCE_EXHAUSTED``
+    / HTTP 429 under a burst) rejects it, so a momentary request-limit
+    rejection does not skip the gate. The evaluation itself is never
+    retried: it applies label and session-state writes, so repeating it
+    after a partial failure could double-apply a committed increment. The
+    fail-open log line names the upstream cause either way.
 
     :param conversation_store: Store for the conversation/labels lookup.
     :param session_id: Session/conversation identifier.
@@ -7986,33 +7990,19 @@ async def _relay_response_policy_deny_reason(
             extra={"session_id": session_id},
         )
         return None
-    verdict: dict[str, Any] | None = None
+    conv: Conversation | None = None
+    engine: PolicyEngine | None = None
     delays = _RESPONSE_POLICY_RETRY_DELAYS_S
     attempts = len(delays) + 1
     for attempt in range(1, attempts + 1):
+        # Reads only: the row, the spec and the engine build. Nothing here
+        # writes, so a throttled attempt can be repeated safely.
         try:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None or conv.agent_id is None:
                 return None
-            body = SessionEventInput(
-                type="message",
-                data={
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": text}],
-                },
-            )
-            # The relay has no HTTP caller: gate per-user policies on the
-            # turn-initiating human persisted at forward time (the same label
-            # the policy-evaluate route falls back to).
-            turn_actor = (conv.labels or {}).get(_TURN_ACTOR_LABEL)
-            verdict = await _evaluate_output_policy(
-                session_id,
-                conv,
-                body,
-                conversation_store,
-                _agent_store,
-                None,
-                actor=_build_actor(turn_actor),
+            engine = await _prepare_output_policy_engine(
+                session_id, conv, conversation_store, _agent_store
             )
             break
         except Exception as exc:  # noqa: BLE001 — fail open: output phases are advisory
@@ -8039,6 +8029,43 @@ async def _relay_response_policy_deny_reason(
                 extra={"session_id": session_id},
             )
             return None
+    if conv is None or engine is None:
+        # No guardrails, default policies, or policy store apply here.
+        return None
+    body = SessionEventInput(
+        type="message",
+        data={
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+        },
+    )
+    # The relay has no HTTP caller: gate per-user policies on the
+    # turn-initiating human persisted at forward time (the same label
+    # the policy-evaluate route falls back to).
+    turn_actor = (conv.labels or {}).get(_TURN_ACTOR_LABEL)
+    try:
+        verdict = await _evaluate_output_policy(
+            session_id,
+            conv,
+            body,
+            conversation_store,
+            _agent_store,
+            None,
+            actor=_build_actor(turn_actor),
+            engine=engine,
+        )
+    except Exception as exc:  # noqa: BLE001 — fail open: output phases are advisory
+        # Never retried: the evaluation applies label and session-state
+        # writes, and a repeat could double-apply one that already landed.
+        _logger.exception(
+            "Relay: RESPONSE-phase policy evaluation failed for session=%s "
+            "during evaluation (%s); not retried because policy writes may "
+            "already be applied; persisting the text unmodified",
+            session_id,
+            _error_summary(exc),
+            extra={"session_id": session_id},
+        )
+        return None
     if verdict is None:
         return None
     return str(verdict.get("reason") or "Denied by policy")
@@ -8933,6 +8960,42 @@ def _replace_text_in_message_body(
     return type(body)(type=body.type, data=new_data)
 
 
+async def _prepare_output_policy_engine(
+    session_id: str,
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    agent_store: AgentStore,
+) -> PolicyEngine | None:
+    """
+    Resolve the session's spec and build its engine for an OUTPUT phase
+    evaluation.
+
+    Read-only: the spec lookup, the cheap skip check and the engine build
+    only read the stores, so a caller may repeat this after a transient
+    store failure without side effects.
+
+    :param session_id: Session/conversation identifier,
+        e.g. ``"conv_abc123"``.
+    :param conv: The session's :class:`Conversation` entity.
+    :param conversation_store: Store for label state.
+    :param agent_store: Store for agent spec lookups.
+    :returns: The engine, or ``None`` when no policy could fire for the
+        session (no spec, or no guardrails, default policies, or policy
+        store).
+    """
+    # Resolve the agent spec off the event loop (blocking DB + cold-cache
+    # bundle fetch). Spec only, so the cheap skip check below runs before
+    # the more expensive engine build.
+    spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+    if spec is None:
+        return None
+    if not spec.guardrails and not get_caps().default_policies and get_policy_store() is None:
+        return None
+    return await asyncio.to_thread(
+        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
+    )
+
+
 async def _evaluate_output_policy(
     session_id: str,
     conv: Conversation,
@@ -8942,6 +9005,7 @@ async def _evaluate_output_policy(
     _runner_router: RunnerRouter | None,
     *,
     actor: dict[str, str] | None = None,
+    engine: PolicyEngine | None = None,
 ) -> dict[str, Any] | None:
     """
     Evaluate an assistant message against OUTPUT phase policies.
@@ -8963,6 +9027,9 @@ async def _evaluate_output_policy(
     :param actor: Authenticated principal, e.g.
         ``{"run_as": "alice@example.com"}``. ``None`` when
         identity is unknown.
+    :param engine: An engine already built by
+        :func:`_prepare_output_policy_engine` for this session;
+        ``None`` builds one here.
     :returns: ``None`` on ALLOW (fall through). Verdict dict
         with ``_denied_body`` on DENY.
     """
@@ -8971,18 +9038,12 @@ async def _evaluate_output_policy(
     if not assistant_text:
         return None
 
-    # Resolve the agent spec off the event loop (blocking DB + cold-cache
-    # bundle fetch). Spec only, so the cheap skip check below runs before
-    # the more expensive engine build.
-    spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
-    if spec is None:
-        return None
-    if not spec.guardrails and not get_caps().default_policies and get_policy_store() is None:
-        return None
-
-    engine = await asyncio.to_thread(
-        _build_policy_engine_from_spec, spec, session_id, conversation_store, conv
-    )
+    if engine is None:
+        engine = await _prepare_output_policy_engine(
+            session_id, conv, conversation_store, agent_store
+        )
+        if engine is None:
+            return None
     ctx = EvaluationContext(
         phase=Phase.RESPONSE,
         content=assistant_text,
