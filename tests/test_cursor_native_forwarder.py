@@ -1100,8 +1100,6 @@ class TestPostExternalSessionRotated:
             async def post(self, url: str, *, json: dict) -> httpx.Response:
                 return httpx.Response(400, request=httpx.Request("POST", url))
 
-        import logging
-
         with caplog.at_level(logging.ERROR):
             settled = await fwd._post_external_session_rotated(
                 _RejectingClient(),  # type: ignore[arg-type]
@@ -1110,6 +1108,23 @@ class TestPostExternalSessionRotated:
             )
         assert settled is True
         assert any("400" in rec.getMessage() for rec in caplog.records)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [429, 500, 502, 503])
+    async def test_transient_rejection_asks_for_retry(self, status: int) -> None:
+        # A momentary rate-limit or server error must not settle: settling would
+        # advance patched_chat_id and strand the cold resume against the
+        # write-once PATCH. The next poll retries.
+        class _TransientClient:
+            async def post(self, url: str, *, json: dict) -> httpx.Response:
+                return httpx.Response(status, request=httpx.Request("POST", url))
+
+        settled = await fwd._post_external_session_rotated(
+            _TransientClient(),  # type: ignore[arg-type]
+            session_id="conv_x",
+            chat_id="cid",
+        )
+        assert settled is False
 
     @pytest.mark.asyncio
     async def test_transport_failure_asks_for_retry(self) -> None:

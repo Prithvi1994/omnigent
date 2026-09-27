@@ -309,7 +309,11 @@ def _chat_claimed_by_any(bridge_dir: Path, store_path: Path) -> bool:
     """Whether any live sibling owns this rotation candidate.
 
     Unlike initial discovery, rotation cannot take an existing chat from a
-    sibling, regardless of which session launched first."""
+    sibling, regardless of which session launched first.
+
+    Best-effort against a concurrent claim: a sibling that just discovered this
+    same store but hasn't written its claim yet reads as unclaimed here, so a
+    brief same-cwd race is possible — consistent with the filesystem-claim design."""
     return bool(_live_sibling_claims(bridge_dir, store_path))
 
 
@@ -798,9 +802,12 @@ async def _post_external_session_rotated(
 ) -> bool:
     """Update the cold-resume target after a TUI rotation; plain PATCH is write-once.
 
-    Return False for transport failures that should retry next poll. Return
-    True for acknowledgements or HTTP rejections, including old servers that
-    reject this event and retain the previous target."""
+    Return False for failures that should retry on the next poll: transport
+    errors and transient server rejections (429 or 5xx). Return True only once
+    the overwrite is settled — a 2xx acknowledgement, or a deterministic 4xx
+    that retrying cannot change (an old server that rejects this event type
+    keeps the previous target). Settling on a transient rejection would advance
+    ``patched_chat_id`` and strand the cold resume against the write-once PATCH."""
     try:
         resp = await client.post(
             f"/v1/sessions/{session_id}/events",
@@ -812,6 +819,13 @@ async def _post_external_session_rotated(
     except httpx.HTTPError:
         _logger.warning(
             "Transient error posting external_session_rotated; session=%s — retrying next poll",
+            session_id,
+        )
+        return False
+    if resp.status_code == 429 or resp.status_code >= 500:
+        _logger.warning(
+            "Transient %s posting external_session_rotated; session=%s — retrying next poll",
+            resp.status_code,
             session_id,
         )
         return False
@@ -1285,6 +1299,8 @@ async def forward_cursor_store_to_session(
                         )
                         # Rotate only after draining the backlog, with a fresh cursor/model
                         # state and cold-resume target. Never take a live sibling's chat.
+                        # A row landing in the old store between the drain and this rebind
+                        # would be lost, but /clear freezes the old chat, so it never is.
                         if not retrying_items:
                             rotated = await asyncio.to_thread(
                                 _discover_rotated_store, store_path, launch_epoch_ms

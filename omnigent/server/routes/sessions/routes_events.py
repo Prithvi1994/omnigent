@@ -1490,6 +1490,15 @@ def register_events_routes(
             # current chat. This is the one sanctioned overwrite of
             # ``external_session_id``; the PATCH endpoint keeps its
             # write-once, loud-failure contract for every other caller.
+            # Restrict it to the wrapper bridge running under the session's
+            # runner (the same runner-tunnel authority that gates
+            # ``created_by``); a generic ``LEVEL_EDIT`` collaborator must not
+            # be able to redirect the owner's cold-resume ``--resume`` target.
+            if not _has_runner_created_by_authority(request, conv):
+                raise OmnigentError(
+                    "external_session_rotated is reserved for the session's runner bridge",
+                    code=ErrorCode.FORBIDDEN,
+                )
             rotated_external_id = body.data.get("external_session_id")
             if not isinstance(rotated_external_id, str) or not rotated_external_id.strip():
                 raise OmnigentError(
