@@ -1369,12 +1369,18 @@ class PolicySpec:
         ``GuardrailsSpec.ask_timeout``. Useful when some ASKs
         are cheap (yes/no) and some expensive (review a 50 KB
         document).
+    :param workspace_id: Databricks workspace id that owns a
+        DB-stored policy row (populated when the spec is built
+        from a stored policy). ``None`` for YAML / agent-spec
+        policies, which are not workspace-scoped rows. Surfaced
+        so a denial can be attributed to the owning workspace.
     """
 
     name: str
     on: list[PhaseSelector] | None
     condition: dict[str, str | list[str]] | None = None
     ask_timeout: int | None = None
+    workspace_id: int | None = None
 
 
 @dataclass
@@ -1597,6 +1603,9 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     guardrails: GuardrailsSpec | None = None
     async_enabled: bool = True
     os_env: OSEnvSpec | None = None
+    # Operator-approved model-signing authority. Separate from sandbox
+    # egress_rules so generic network access cannot authorize credentials.
+    model_egress: list[str] | None = None
     terminals: dict[str, TerminalEnvSpec] | None = None
     timers: bool = False
     spawn: bool = False
