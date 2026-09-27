@@ -1,21 +1,39 @@
-"""Real runner fan-out must parse each shared agent bundle only once.
+"""
+A live runner must not re-parse a shared agent bundle for every sub-agent
+session, and its spec parser must use the libyaml loader when available.
 
-A sitecustomize shim counts parser calls in a real server/runner journey
-with a mock model and three sub-agents. A separate check verifies that
-libyaml is selected when available."""
+Journey: register a directory bundle whose parent fans out to three
+sub-agents, bind it to a real runner, run one warm-up turn so the parent
+session has already resolved the bundle, then send the turn that dispatches
+all three sub-agents via ``sys_session_send``. Every sub-agent session shares
+the parent's ``(agent_id, version)`` bundle, so a runner that memoizes the
+parsed spec per bundle parses nothing new during the fan-out.
+
+The runner under test is a real ``omnigent.runner._entry`` subprocess. A
+test-only ``sitecustomize`` shim on its ``PYTHONPATH`` records each
+``omnigent.spec.parser.parse`` call (the bundle directory it parsed, and the
+runner functions on the stack) and the YAML loader class the parser uses;
+product code is not modified.
+
+Run::
+
+    .venv/bin/python -m pytest tests/e2e/test_runner_spec_reparse_fanout.py -v
+"""
 
 from __future__ import annotations
 
 import io
 import json
 import os
+import secrets
 import signal
 import subprocess
 import tarfile
 import time
 import uuid
+from collections import Counter
 from collections.abc import Iterator
-from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -23,579 +41,509 @@ import httpx
 import pytest
 import yaml
 
-from omnigent.runner.identity import (
-    OMNIGENT_INTERNAL_WS_ORIGIN,
-    token_bound_runner_id,
-)
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
 from tests._helpers.compat import (
     apply_runner_env,
     apply_server_env,
     compat_runner_cwd,
     compat_server_cwd,
+    pinned_runner_version,
     runner_executable,
     server_executable,
 )
 from tests.e2e.conftest import (
     configure_mock_llm,
+    create_runner_bound_session,
+    find_free_port,
+    poll_session_until_terminal,
     reset_mock_llm,
+    send_user_message_to_session,
     set_fallback_mock_llm,
 )
-from tests.e2e.helpers import POLL_INTERVAL_S
+from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S
 
-# Turn dispatch + three sub-agent session creates + the parent auto-wake are
-# several serial mock-LLM turns, so give the journey generous headroom.
 pytestmark = pytest.mark.timeout(600, method="signal")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# Number of sub-agents the parent fans out to. Each fan-out creates one
-# sub-agent session that shares the parent's (agent_id, version) bundle and
-# therefore re-resolves -> re-parses it on the buggy build.
-_N_SUBAGENTS = 3
+_SUB_AGENTS = ("alpha", "beta", "gamma")
 
-# Sentinel the parent's final scripted turn emits, so the poll can tell the
-# fan-out dispatch turn actually ran to completion.
+_WARMUP_DONE = "REPARSE_WARMUP_DONE"
 _PARENT_DONE = "REPARSE_PARENT_DONE"
+_SUB_AGENT_DONE = "REPARSE_SUB_AGENT_DONE"
 
-# sitecustomize shim: injected onto the runner subprocess's PYTHONPATH so the
-# runner records every omnigent.spec.parser.parse() call (root path) to a
-# JSONL file, and dumps the _ConfigYamlLoader identity once. Gated on the
-# OMNIGENT_SPEC_PARSE_LOG env var so it is inert in any other process that
-# happens to see this directory on its path. Patches BOTH omnigent.spec.parser
-# and the re-exported name in omnigent.spec, because omnigent.spec.load() calls
-# the parse name bound in the omnigent.spec namespace.
+_PARSE_LOG_ENV = "OMNIGENT_SPEC_PARSE_LOG"
+
+# Runs inside the runner subprocess at interpreter start-up. ``omnigent.spec.load``
+# calls the ``parse`` name bound in the ``omnigent.spec`` namespace, while the
+# sub-agent recursion calls it through ``omnigent.spec.parser``, so both are patched.
 _SITECUSTOMIZE_SRC = r"""
 import json
 import os
+import sys
 import time
+import traceback
 
 _LOG = os.environ.get("OMNIGENT_SPEC_PARSE_LOG")
+
+
+def _record(kind, **fields):
+    with open(_LOG, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"kind": kind, "pid": os.getpid(), "t": time.time(), **fields}) + "\n")
+
+
 if _LOG:
     try:
-        import omnigent.spec.parser as _parser
+        import yaml
         import omnigent.spec as _spec
+        import omnigent.spec.parser as _parser
 
         _orig_parse = _parser.parse
 
-        def _counting_parse(root, *args, **kwargs):
-            try:
-                with open(_LOG, "a") as _fh:
-                    _fh.write(json.dumps({"root": str(root), "t": time.time()}) + "\n")
-            except Exception:
-                pass
+        def _recording_parse(root, *args, **kwargs):
+            runner_frames = [
+                f.name
+                for f in traceback.extract_stack()
+                if f.filename.endswith(("omnigent/runner/app.py", "omnigent/runner/_entry.py"))
+            ]
+            _record("parse", root=str(root), runner_callers=runner_frames)
             return _orig_parse(root, *args, **kwargs)
 
-        _parser.parse = _counting_parse
-        # omnigent.spec.load() references the parse name in the omnigent.spec
-        # module namespace; patch it there too.
-        _spec.parse = _counting_parse
+        _parser.parse = _recording_parse
+        _spec.parse = _recording_parse
 
-        _info_path = os.environ.get("OMNIGENT_SPEC_LOADER_INFO")
-        if _info_path:
-            import yaml as _yaml
-
-            _loader = _parser._ConfigYamlLoader
-            _csafe = getattr(_yaml, "CSafeLoader", None)
-            with open(_info_path, "w") as _fh:
-                json.dump(
-                    {
-                        "with_libyaml": bool(getattr(_yaml, "__with_libyaml__", False)),
-                        "mro": [c.__name__ for c in _loader.__mro__],
-                        "is_pure_safeloader": issubclass(_loader, _yaml.SafeLoader),
-                        "is_csafeloader": bool(_csafe) and issubclass(_loader, _csafe),
-                    },
-                    _fh,
-                )
-    except Exception:
-        # Never let instrumentation break the runner under test.
-        pass
+        _loader = _parser._ConfigYamlLoader
+        _csafe = getattr(yaml, "CSafeLoader", None)
+        _record(
+            "loader",
+            argv=sys.argv,
+            with_libyaml=bool(getattr(yaml, "__with_libyaml__", False)),
+            mro=[f"{c.__module__}.{c.__name__}" for c in _loader.__mro__],
+            is_csafeloader=_csafe is not None and issubclass(_loader, _csafe),
+        )
+    except Exception as exc:  # noqa: BLE001 - instrumentation must never break the runner
+        _record("error", error=repr(exc))
 """
 
 
-def _parent_config(name: str, sub_names: list[str], model: str) -> dict[str, Any]:
-    """Build the parent ``config.yaml`` dict (spec_version:1 directory format).
-
-    :param name: Unique parent agent name.
-    :param sub_names: Sub-agent directory/agent names referenced by ``tools.agents``.
-    :param model: Mock-LLM model key for the parent's response queue.
-    :returns: The parent config mapping.
-    """
-    return {
-        "spec_version": 1,
-        "name": name,
-        "prompt": (
-            "You are a dispatcher. When the user asks you to run, dispatch EACH "
-            "of your sub-agents exactly once via sys_session_send, then wait for "
-            "their replies and report done."
-        ),
-        "executor": {"type": "omnigent", "model": model, "config": {"harness": "openai-agents"}},
-        "tools": {"agents": list(sub_names)},
-        "os_env": {"type": "caller_process", "cwd": "."},
-    }
+@dataclass
+class _Stack:
+    base_url: str
+    client: httpx.Client
+    runner_id: str
+    runner_pid: int
+    parse_log: Path
+    runner_log: Path
+    server_log: Path
 
 
-def _sub_config(name: str, model: str) -> dict[str, Any]:
-    """Build one sub-agent ``config.yaml`` dict.
-
-    :param name: Sub-agent name.
-    :param model: Mock-LLM model key for this sub-agent's queue.
-    :returns: The sub-agent config mapping.
-    """
-    return {
-        "spec_version": 1,
-        "name": name,
-        "description": f"Echo sub-agent {name}.",
-        "prompt": "You are an echo bot. Reply with a short acknowledgement.",
-        "executor": {"type": "omnigent", "model": model, "config": {"harness": "openai-agents"}},
-        "os_env": {"type": "caller_process", "cwd": "."},
-    }
+def _read_records(parse_log: Path, *, pid: int) -> list[dict[str, Any]]:
+    if not parse_log.exists():
+        return []
+    records = [json.loads(line) for line in parse_log.read_text().splitlines() if line.strip()]
+    return [r for r in records if r.get("pid") == pid]
 
 
-def _build_bundle(parent_cfg: dict[str, Any], subs: dict[str, dict[str, Any]]) -> bytes:
-    """Pack root and child config.yaml files into a directory-format agent bundle."""
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-
-        def _add(arcname: str, cfg: dict[str, Any]) -> None:
-            data = yaml.safe_dump(cfg, sort_keys=False).encode()
-            info = tarfile.TarInfo(arcname)
-            info.size = len(data)
-            tar.addfile(info, io.BytesIO(data))
-
-        _add("config.yaml", parent_cfg)
-        for sub_name, sub_cfg in subs.items():
-            _add(f"agents/{sub_name}/config.yaml", sub_cfg)
-    return buf.getvalue()
+def _bundle_root_parses(records: list[dict[str, Any]]) -> Counter[str]:
+    """Count parses per bundle root, excluding the ``agents/<name>`` sub-agent dirs."""
+    return Counter(
+        r["root"]
+        for r in records
+        if r["kind"] == "parse" and Path(r["root"]).parent.name != "agents"
+    )
 
 
-@contextmanager
-def _live_server_and_instrumented_runner(
-    tmp_path: Path,
+def _wait_online(base_url: str, runner_id: str, server_proc: subprocess.Popen[bytes]) -> None:
+    deadline = time.monotonic() + HEALTH_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if server_proc.poll() is not None:
+            raise RuntimeError(f"server exited early with code {server_proc.returncode}")
+        try:
+            health = httpx.get(f"{base_url}/health", timeout=2)
+            status = httpx.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2)
+            if (
+                health.status_code == 200
+                and status.status_code == 200
+                and status.json().get("online") is True
+            ):
+                return
+        except httpx.HTTPError:
+            pass
+        time.sleep(POLL_INTERVAL_S)
+    raise RuntimeError(f"server + runner did not come online within {HEALTH_TIMEOUT_S}s")
+
+
+def _terminate(proc: subprocess.Popen[bytes], *, timeout: float) -> None:
+    if proc.poll() is not None:
+        return
+    proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="module")
+def instrumented_stack(
+    tmp_path_factory: pytest.TempPathFactory,
     mock_llm_server_url: str,
-) -> Iterator[tuple[str, httpx.Client, str]]:
-    """Run a real server and runner against a mock model, counting spec parses.
+) -> Iterator[_Stack]:
+    """A real server plus a real runner whose spec parses are recorded."""
+    if pinned_runner_version() is not None or os.environ.get("OMNIGENT_COMPAT_SERVER_VERSION"):
+        pytest.skip(
+            "compat mode pins an older build; this stack runs the worktree's server + runner"
+        )
 
-    Yields (base_url, http_client, runner_id); the runner imports an isolated
-    sitecustomize shim through PYTHONPATH."""
-    import secrets
+    tmp_path = tmp_path_factory.mktemp("spec_reparse")
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    (shim_dir / "sitecustomize.py").write_text(_SITECUSTOMIZE_SRC)
+    parse_log = tmp_path / "spec_parses.jsonl"
 
-    # Counter shim on a dir we prepend to the runner's PYTHONPATH.
-    counter_dir = tmp_path / "instrument"
-    counter_dir.mkdir(parents=True)
-    (counter_dir / "sitecustomize.py").write_text(_SITECUSTOMIZE_SRC)
-    parse_log = tmp_path / "parse_log.jsonl"
-    loader_info = tmp_path / "loader_info.json"
-
-    port = _find_free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
-    db_path = tmp_path / "e2e.db"
     artifact_dir = tmp_path / "artifacts"
-    artifact_dir.mkdir(parents=True)
+    artifact_dir.mkdir()
     server_log = tmp_path / "server.log"
     runner_log = tmp_path / "runner.log"
 
     binding_token = secrets.token_urlsafe(32)
     runner_id = token_bound_runner_id(binding_token)
 
-    # Server env: point all LLM traffic at the mock gateway.
-    server_env = {
+    env = {
         **os.environ,
         "OPENAI_API_KEY": "mock-key",
         "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
-        "ANTHROPIC_API_KEY": "",
     }
-    apply_server_env(server_env, _REPO_ROOT)
-    server_env["OMNIGENT_RUNNER_TUNNEL_TOKEN"] = binding_token
+    apply_server_env(env, _REPO_ROOT)
 
-    # Server-level llm block for the prompt-policy classifier (kept parallel to
-    # the conftest live_server so nothing 401s trying to reach api.openai.com).
     server_cfg = tmp_path / "server.yaml"
     server_cfg.write_text(
         yaml.safe_dump(
             {
                 "llm": {
                     "model": "_policy_llm_",
-                    "connection": {
-                        "base_url": f"{mock_llm_server_url}/v1",
-                        "api_key": "mock-key",
-                    },
+                    "connection": {"base_url": f"{mock_llm_server_url}/v1", "api_key": "mock-key"},
                 }
             }
         )
     )
-
-    server_argv = [
-        server_executable(),
-        "-m",
-        "omnigent.cli",
-        "server",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        str(port),
-        "--database-uri",
-        f"sqlite:///{db_path}",
-        "--artifact-location",
-        str(artifact_dir),
-        "--config",
-        str(server_cfg),
-    ]
-
-    # Runner env: same LLM wiring, plus the parse-counter shim on PYTHONPATH.
-    runner_pythonpath = os.pathsep.join(
-        [str(counter_dir), str(_REPO_ROOT), os.environ.get("PYTHONPATH", "")]
+    server_handle = open(server_log, "w")  # noqa: SIM115
+    server_proc = subprocess.Popen(
+        [
+            server_executable(),
+            "-m",
+            "omnigent.cli",
+            "server",
+            "--port",
+            str(port),
+            "--database-uri",
+            f"sqlite:///{tmp_path / 'e2e.db'}",
+            "--artifact-location",
+            str(artifact_dir),
+            "--config",
+            str(server_cfg),
+        ],
+        env={**env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token},
+        cwd=compat_server_cwd(),
+        stdout=server_handle,
+        stderr=subprocess.STDOUT,
     )
+
     runner_env = apply_runner_env(
         {
-            **server_env,
-            "PYTHONPATH": runner_pythonpath,
+            **env,
             "OMNIGENT_RUNNER_ID": runner_id,
             "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
             "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
             "RUNNER_SERVER_URL": base_url,
-            "OMNIGENT_SPEC_PARSE_LOG": str(parse_log),
-            "OMNIGENT_SPEC_LOADER_INFO": str(loader_info),
+            _PARSE_LOG_ENV: str(parse_log),
         }
     )
-
-    server_log_fh = open(server_log, "w")  # noqa: SIM115 -- closed in finally
-    runner_log_fh = open(runner_log, "w")  # noqa: SIM115 -- closed in finally
-    server_proc = subprocess.Popen(
-        server_argv,
-        env=server_env,
-        cwd=compat_server_cwd(),
-        stdout=server_log_fh,
-        stderr=subprocess.STDOUT,
+    runner_env["PYTHONPATH"] = os.pathsep.join(
+        [str(shim_dir), *filter(None, [runner_env.get("PYTHONPATH")])]
     )
+    runner_handle = open(runner_log, "w")  # noqa: SIM115
     runner_proc = subprocess.Popen(
         [runner_executable(), "-m", "omnigent.runner._entry"],
         env=runner_env,
         cwd=compat_runner_cwd(),
-        stdout=runner_log_fh,
+        stdout=runner_handle,
         stderr=subprocess.STDOUT,
     )
 
     client = httpx.Client(base_url=base_url, timeout=30.0)
     try:
-        deadline = time.monotonic() + 90.0
-        ready = False
-        last = "not polled"
-        while time.monotonic() < deadline:
-            if server_proc.poll() is not None:
-                last = f"server exited early ({server_proc.returncode})"
-                break
-            if runner_proc.poll() is not None:
-                last = f"runner exited early ({runner_proc.returncode})"
-                break
-            try:
-                health = httpx.get(f"{base_url}/health", timeout=2)
-                status = httpx.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2)
-                if (
-                    health.status_code == 200
-                    and status.status_code == 200
-                    and status.json().get("online") is True
-                ):
-                    ready = True
-                    break
-                last = f"health={health.status_code} status={status.status_code}"
-            except httpx.HTTPError as exc:
-                last = f"{type(exc).__name__}: {exc}"
-            time.sleep(POLL_INTERVAL_S)
-        if not ready:
-            srv = server_log.read_text()[-3000:] if server_log.exists() else ""
-            run = runner_log.read_text()[-3000:] if runner_log.exists() else ""
+        try:
+            _wait_online(base_url, runner_id, server_proc)
+        except RuntimeError as exc:
             raise RuntimeError(
-                f"server/runner did not come online within 90s (last={last}).\n"
-                f"--- server.log ---\n{srv}\n--- runner.log ---\n{run}"
-            )
-
-        # Never let the server-side classifier queue starve the turn.
+                f"{exc}\nserver log:\n{server_log.read_text()[-3000:]}\n"
+                f"runner log:\n{runner_log.read_text()[-3000:]}"
+            ) from exc
         set_fallback_mock_llm(
             mock_llm_server_url, "_policy_llm_", '{"action": "allow", "reason": ""}'
         )
-
-        yield base_url, client, runner_id
+        yield _Stack(
+            base_url=base_url,
+            client=client,
+            runner_id=runner_id,
+            runner_pid=runner_proc.pid,
+            parse_log=parse_log,
+            runner_log=runner_log,
+            server_log=server_log,
+        )
     finally:
         client.close()
-        for proc in (runner_proc, server_proc):
-            if proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=5)
-        server_log_fh.close()
-        runner_log_fh.close()
+        _terminate(runner_proc, timeout=5)
+        runner_handle.close()
+        _terminate(server_proc, timeout=10)
+        server_handle.close()
 
 
-def _find_free_port() -> int:
-    """Bind to port 0 to obtain a free TCP port.
+def _agent_config(
+    *,
+    name: str,
+    prompt: str,
+    model: str,
+    mock_llm_base_url: str,
+    sub_agents: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "spec_version": 1,
+        "name": name,
+        "description": f"Fan-out fixture agent {name}.",
+        "executor": {
+            "type": "omnigent",
+            "model": model,
+            "auth": {"type": "api_key", "api_key": "mock-key", "base_url": mock_llm_base_url},
+            "config": {"harness": "openai-agents"},
+        },
+        "prompt": prompt,
+        "os_env": {"type": "caller_process", "cwd": "."},
+    }
+    if sub_agents:
+        config["tools"] = {"agents": list(sub_agents)}
+    return config
 
-    :returns: An available port number.
-    """
-    import socket
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _create_runner_bound_session_from_bundle(
+def _register_fanout_bundle(
     client: httpx.Client,
-    bundle: bytes,
-    runner_id: str,
+    *,
+    name: str,
+    parent_model: str,
+    sub_model: str,
+    mock_llm_base_url: str,
 ) -> str:
-    """Upload *bundle* (creating a session + agent) and bind it to *runner_id*.
+    """Upload a directory bundle: a parent whose ``tools.agents`` fan out to three sub-agents."""
+    parent_cfg = _agent_config(
+        name=name,
+        prompt=(
+            "You are an orchestrator. When asked to run, dispatch each of your "
+            "sub-agents exactly once via sys_session_send and then finish."
+        ),
+        model=parent_model,
+        mock_llm_base_url=mock_llm_base_url,
+        sub_agents=_SUB_AGENTS,
+    )
+    with io.BytesIO() as buf:
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
 
-    :param client: HTTP client pointed at the live server.
-    :param bundle: gzip tarball bytes for the directory-format bundle.
-    :param runner_id: Runner id to bind the session to.
-    :returns: The parent session/conversation id.
-    """
-    create = client.post(
+            def _add_yaml(arcname: str, config: dict[str, Any]) -> None:
+                data = yaml.safe_dump(config, sort_keys=False).encode()
+                info = tarfile.TarInfo(arcname)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+
+            _add_yaml("config.yaml", parent_cfg)
+            for sub in _SUB_AGENTS:
+                _add_yaml(
+                    f"agents/{sub}/config.yaml",
+                    _agent_config(
+                        name=sub,
+                        prompt="You are a worker. Acknowledge the task and finish.",
+                        model=sub_model,
+                        mock_llm_base_url=mock_llm_base_url,
+                    ),
+                )
+        bundle = buf.getvalue()
+
+    resp = client.post(
         "/v1/sessions",
         data={"metadata": json.dumps({})},
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
         headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
     )
-    create.raise_for_status()
-    session_id = str(create.json()["session_id"])
-    patch = client.patch(f"/v1/sessions/{session_id}", json={"runner_id": runner_id})
-    patch.raise_for_status()
-    return session_id
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"bundle register failed: {resp.status_code} {resp.text[:500]}")
+    return name
 
 
-def _dispatch_turn(client: httpx.Client, session_id: str, text: str) -> None:
-    """POST a user message to *session_id* to start a turn.
-
-    :param client: HTTP client pointed at the live server.
-    :param session_id: Runner-bound session id.
-    :param text: User prompt text.
-    """
-    body = {
-        "type": "message",
-        "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
-    }
-    resp = client.post(f"/v1/sessions/{session_id}/events", json=body)
+def _child_sessions(client: httpx.Client, *, parent_session_id: str) -> list[dict[str, Any]]:
+    resp = client.get(
+        "/v1/sessions", params={"visibility": "all", "kind": "sub_agent", "limit": 1000}
+    )
     resp.raise_for_status()
+    children = []
+    for item in resp.json().get("data", []):
+        snap = client.get(f"/v1/sessions/{item['id']}")
+        snap.raise_for_status()
+        if snap.json().get("parent_session_id") == parent_session_id:
+            children.append(snap.json())
+    return children
 
 
-def _wait_for_child_sessions(
-    client: httpx.Client,
-    parent_session_id: str,
-    expected: int,
-    timeout: float = 240.0,
-) -> list[str]:
-    """Poll until the expected number of child sessions appears or timeout expires."""
+def _wait_for_finished_children(
+    client: httpx.Client, *, parent_session_id: str, expected: int, timeout: float = 240.0
+) -> list[dict[str, Any]]:
+    """Wait until *expected* sub-agent sessions exist and each has replied."""
     deadline = time.monotonic() + timeout
-    seen: set[str] = set()
+    children: list[dict[str, Any]] = []
     while time.monotonic() < deadline:
-        resp = client.get(
-            "/v1/sessions", params={"kind": "sub_agent", "limit": 1000, "visibility": "all"}
-        )
-        resp.raise_for_status()
-        for item in resp.json().get("data", []):
-            cid = str(item.get("id"))
-            if cid in seen:
-                continue
-            snap = client.get(f"/v1/sessions/{cid}")
-            if snap.status_code != 200:
-                continue
-            if snap.json().get("parent_session_id") == parent_session_id:
-                seen.add(cid)
-        if len(seen) >= expected:
-            return sorted(seen)
-        time.sleep(POLL_INTERVAL_S)
-    return sorted(seen)
-
-
-def _wait_for_parent_done(
-    client: httpx.Client,
-    session_id: str,
-    timeout: float = 240.0,
-) -> None:
-    """Poll the parent session until it is idle after having run its turn.
-
-    :param client: HTTP client pointed at the live server.
-    :param session_id: The parent session id.
-    :param timeout: Max seconds to wait.
-    """
-    deadline = time.monotonic() + timeout
-    seen_running = False
-    while time.monotonic() < deadline:
-        resp = client.get(f"/v1/sessions/{session_id}")
-        resp.raise_for_status()
-        body = resp.json()
-        status = body.get("status")
-        if status in ("running", "waiting"):
-            seen_running = True
-        blob = json.dumps(body.get("items", []))
-        if _PARENT_DONE in blob:
-            return
-        if status == "idle" and seen_running:
-            return
-        time.sleep(POLL_INTERVAL_S)
-
-
-def _parse_counts_by_root(parse_log: Path) -> dict[str, int]:
-    """Read the runner's parse-log JSONL into a per-root call count.
-
-    :param parse_log: Path to the JSONL parse log the runner wrote.
-    :returns: Mapping of parsed directory path -> number of parse() calls.
-    """
-    counts: dict[str, int] = {}
-    if not parse_log.exists():
-        return counts
-    for line in parse_log.read_text().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            root = json.loads(line)["root"]
-        except (json.JSONDecodeError, KeyError):
-            continue
-        counts[root] = counts.get(root, 0) + 1
-    return counts
-
-
-def _parent_bundle_root(counts: dict[str, int]) -> str | None:
-    """Find the parsed root containing the child agents/ directories."""
-    roots = list(counts)
-    for root in roots:
-        needle = os.path.join(root, "agents")
-        if any(other != root and other.startswith(needle) for other in roots):
-            return root
-    return None
-
-
-def test_config_loader_uses_libyaml_csafeloader() -> None:
-    """Use CSafeLoader when libyaml is available."""
-    from omnigent.spec.parser import _ConfigYamlLoader
-
-    assert yaml.__with_libyaml__, (
-        "libyaml is not available in this runtime; the CSafeLoader speedup "
-        "cannot apply. (Not the bug -- an environment prerequisite.)"
-    )
-    assert hasattr(yaml, "CSafeLoader"), "yaml.CSafeLoader missing despite libyaml"
-
-    is_csafe = issubclass(_ConfigYamlLoader, yaml.CSafeLoader)
-    assert is_csafe, (
-        "_ConfigYamlLoader is built on the pure-Python yaml.SafeLoader "
-        f"(MRO={[c.__name__ for c in _ConfigYamlLoader.__mro__]}) even though "
-        "the libyaml CSafeLoader is available -- spec parsing pays the ~20x "
-        "pure-Python tax. It should subclass yaml.CSafeLoader."
+        children = _child_sessions(client, parent_session_id=parent_session_id)
+        finished = [c for c in children if _SUB_AGENT_DONE in json.dumps(c.get("items", []))]
+        if len(children) >= expected and len(finished) >= expected:
+            return children
+        time.sleep(0.5)
+    raise AssertionError(
+        f"expected {expected} finished sub-agent sessions under {parent_session_id}; "
+        f"saw {len(children)}: {[(c['id'], c['status']) for c in children]}"
     )
 
 
-def test_runner_does_not_reparse_shared_bundle_per_session(
-    tmp_path: Path,
-    mock_llm_server_url: str,
+def _wait_for_idle(client: httpx.Client, *, session_id: str, timeout: float = 120.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        snap = client.get(f"/v1/sessions/{session_id}")
+        snap.raise_for_status()
+        if snap.json().get("status") == "idle":
+            return
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(f"session {session_id} did not return to idle within {timeout}s")
+
+
+def test_subagent_fanout_does_not_reparse_shared_bundle(
+    instrumented_stack: _Stack, mock_llm_server_url: str
 ) -> None:
-    """Parent and three child sessions sharing a bundle must parse its root once."""
-    uid = uuid.uuid4().hex[:8]
-    parent_token = f"reparse-run-{uid}"
+    """
+    Sub-agent sessions created from an already-resolved bundle must not make
+    the runner parse that bundle's YAML again.
+    """
+    stack = instrumented_stack
+    uid = uuid.uuid4().hex[:6]
     parent_model = f"mock-reparse-parent-{uid}"
-    sub_names = [f"echo_{i}_{uid}" for i in range(_N_SUBAGENTS)]
-    sub_tokens = [f"reparse-echo-{i}-{uid}" for i in range(_N_SUBAGENTS)]
-    sub_models = [f"mock-reparse-echo-{i}-{uid}" for i in range(_N_SUBAGENTS)]
+    sub_model = f"mock-reparse-sub-{uid}"
 
     reset_mock_llm(mock_llm_server_url)
+    agent_name = _register_fanout_bundle(
+        stack.client,
+        name=f"reparse-fanout-{uid}",
+        parent_model=parent_model,
+        sub_model=sub_model,
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
+    )
+    set_fallback_mock_llm(mock_llm_server_url, parent_model, _PARENT_DONE)
+    set_fallback_mock_llm(mock_llm_server_url, sub_model, _SUB_AGENT_DONE)
 
-    # Parent: one response dispatching all three sub-agents, then two texts
-    # (dispatch ack + the post-wake done sentinel).
+    session_id = create_runner_bound_session(
+        stack.client, agent_name=agent_name, runner_id=stack.runner_id
+    )
+
+    configure_mock_llm(mock_llm_server_url, [{"text": _WARMUP_DONE}], key=parent_model)
+    warmup = poll_session_until_terminal(
+        stack.client,
+        session_id=session_id,
+        response_id=send_user_message_to_session(
+            stack.client, session_id=session_id, content="Say hello and stop."
+        ),
+        timeout=240,
+    )
+    assert warmup["status"] == "completed", f"warm-up turn failed: {warmup.get('error')!r}"
+
+    records_before = _read_records(stack.parse_log, pid=stack.runner_pid)
+    assert any(r["kind"] == "loader" for r in records_before), (
+        f"parse recorder did not load in the runner; records={records_before!r}\n"
+        f"runner log:\n{stack.runner_log.read_text()[-3000:]}"
+    )
+    roots_before = _bundle_root_parses(records_before)
+    assert len(roots_before) == 1, (
+        f"expected the runner to have resolved exactly one bundle root, got {roots_before!r}"
+    )
+    (bundle_root, parses_before) = next(iter(roots_before.items()))
+
     configure_mock_llm(
         mock_llm_server_url,
         [
             {
                 "tool_calls": [
                     {
-                        "call_id": f"call_dispatch_{i}",
+                        "call_id": f"call_dispatch_{sub}",
                         "name": "sys_session_send",
                         "arguments": json.dumps(
                             {
-                                "agent": sub_names[i],
-                                "title": "dispatch",
-                                "args": f"Please acknowledge. Routing marker: {sub_tokens[i]}",
+                                "agent": sub,
+                                "title": f"fanout-{sub}",
+                                "args": "Acknowledge and finish.",
                             }
                         ),
                     }
-                    for i in range(_N_SUBAGENTS)
+                    for sub in _SUB_AGENTS
                 ]
-            },
-            {"text": "Dispatched all sub-agents; waiting for replies."},
-            {"text": _PARENT_DONE},
+            }
         ],
         key=parent_model,
-        match=parent_token,
     )
-    # Each sub-agent: a single scripted acknowledgement, content-routed.
-    for i in range(_N_SUBAGENTS):
-        configure_mock_llm(
-            mock_llm_server_url,
-            [{"text": f"echo {i} acknowledged: {sub_tokens[i]}"}],
-            key=sub_models[i],
-            match=sub_tokens[i],
+    fanout = poll_session_until_terminal(
+        stack.client,
+        session_id=session_id,
+        response_id=send_user_message_to_session(
+            stack.client, session_id=session_id, content="RUN: dispatch every sub-agent once."
+        ),
+        timeout=240,
+    )
+    assert fanout["status"] == "completed", f"fan-out turn failed: {fanout.get('error')!r}"
+
+    children = _wait_for_finished_children(
+        stack.client, parent_session_id=session_id, expected=len(_SUB_AGENTS)
+    )
+    _wait_for_idle(stack.client, session_id=session_id)
+
+    records_after = _read_records(stack.parse_log, pid=stack.runner_pid)
+    parses_after = _bundle_root_parses(records_after)[bundle_root]
+    reparses = parses_after - parses_before
+    new_parses = [r for r in records_after[len(records_before) :] if r["kind"] == "parse"]
+    call_paths = sorted({" -> ".join(r["runner_callers"]) for r in new_parses})
+    assert reparses == 0, (
+        f"creating {len(children)} sub-agent sessions that share the parent's already-resolved "
+        f"bundle {bundle_root} made the runner parse that bundle {reparses} more time(s) "
+        f"(root parses before fan-out: {parses_before}, after: {parses_after}; "
+        f"parse() calls during the fan-out: {len(new_parses)}; runner call paths: {call_paths})"
+    )
+
+
+def test_runner_parses_spec_yaml_with_libyaml_loader(instrumented_stack: _Stack) -> None:
+    """The runner's spec YAML loader must be libyaml-backed when libyaml is available."""
+    stack = instrumented_stack
+    deadline = time.monotonic() + HEALTH_TIMEOUT_S
+    loader: dict[str, Any] | None = None
+    while loader is None and time.monotonic() < deadline:
+        loader = next(
+            (
+                r
+                for r in _read_records(stack.parse_log, pid=stack.runner_pid)
+                if r["kind"] == "loader"
+            ),
+            None,
         )
-
-    parent_name = f"reparse-parent-{uid}"
-    parent_cfg = _parent_config(parent_name, sub_names, parent_model)
-    subs = {name: _sub_config(name, sub_models[i]) for i, name in enumerate(sub_names)}
-    bundle = _build_bundle(parent_cfg, subs)
-
-    parse_log = tmp_path / "parse_log.jsonl"
-
-    with _live_server_and_instrumented_runner(tmp_path, mock_llm_server_url) as (
-        _base_url,
-        client,
-        runner_id,
-    ):
-        parent_session_id = _create_runner_bound_session_from_bundle(client, bundle, runner_id)
-        _dispatch_turn(
-            client,
-            parent_session_id,
-            f"RUN: dispatch every sub-agent exactly once. Routing marker: {parent_token}",
-        )
-        _wait_for_parent_done(client, parent_session_id)
-        children = _wait_for_child_sessions(client, parent_session_id, _N_SUBAGENTS)
-
-        # Give the last child's session-create resolve a moment to land in the
-        # parse log before we read it.
-        time.sleep(3.0)
-        counts = _parse_counts_by_root(parse_log)
-
-    assert children, (
-        "No sub-agent sessions were created for the parent -- the fan-out "
-        "journey did not run, so the re-parse could not be exercised. "
-        f"parse counts: {counts}"
+        time.sleep(POLL_INTERVAL_S)
+    assert loader is not None, (
+        f"parse recorder did not report the runner's loader\nrunner log:\n"
+        f"{stack.runner_log.read_text()[-3000:]}"
     )
-
-    parent_root = _parent_bundle_root(counts)
-    assert parent_root is not None, (
-        "Could not identify the parent bundle directory among the runner's "
-        f"parsed roots. parse counts: {counts}"
-    )
-
-    parent_parses = counts[parent_root]
-    # The defect is that the parse count *scales with the number of sessions*:
-    # the runner re-parses the identical bundle YAML once per session (parent
-    # create + every sub-agent session), because the session-spec cache is
-    # keyed by session_id and the parsed AgentSpec is not memoized by
-    # (agent_id, version). A correct memoization parses the shared bundle a
-    # small, constant number of times regardless of how many sessions or
-    # sub-agents reference it -- once, or at most twice if the extract-validate
-    # and resolve steps parse separately on the first miss. We assert the
-    # count does not scale with sessions (<= 2). On the buggy build this count
-    # equals the number of resolving sessions (13 for parent + 3 sub-agents in
-    # a representative run) and grows as more sessions/sub-agents fan out.
-    _MAX_ALLOWED_PARSES = 2
-    assert parent_parses <= _MAX_ALLOWED_PARSES, (
-        f"The runner parsed the shared bundle directory {parent_root!r} "
-        f"{parent_parses} times across the parent + {len(children)} sub-agent "
-        "sessions that share its (agent_id, version). The parsed AgentSpec is "
-        "not memoized by (agent_id, version): the session-spec cache is keyed "
-        "by session_id, so every session re-parses the identical bundle YAML, "
-        "and the parse count scales with the number of sessions instead of "
-        f"staying constant (expected <= {_MAX_ALLOWED_PARSES}). "
-        f"Full parse counts by root: {counts}"
+    if not loader["with_libyaml"]:
+        pytest.skip("libyaml is not available in the runner's runtime")
+    assert loader["is_csafeloader"], (
+        f"the runner parses agent-bundle YAML with the pure-Python SafeLoader although libyaml "
+        f"is available; _ConfigYamlLoader MRO: {loader['mro']}"
     )
