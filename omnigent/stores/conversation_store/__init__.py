@@ -6,7 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from omnigent.entities import (
     Agent,
@@ -16,6 +16,9 @@ from omnigent.entities import (
     PagedList,
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
+
+if TYPE_CHECKING:
+    from omnigent.db.account_authority import AccountAuthority
 
 # Label set on a fork of a session that had a working directory, or a
 # runner-bound native session whose working-directory metadata was lost.
@@ -407,6 +410,13 @@ class ConversationStore(ABC):
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
         project_id: str | None = None,
+        inference_snapshot: dict[str, Any] | None = None,
+        labels: dict[str, str] | None = None,
+        reasoning_effort: str | None = None,
+        model_override: str | None = None,
+        cost_control_mode_override: str | None = None,
+        subagent_routing_override: str | None = None,
+        harness_override: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation. Generates a unique
@@ -462,6 +472,13 @@ class ConversationStore(ABC):
         :param conversation_id: Optional caller-supplied identifier.
             ``None`` generates a new random id. Reserved for flows that
             require database-enforced idempotency.
+        :param labels: Initial conversation labels to persist with the
+            conversation.
+        :param reasoning_effort: Optional per-session reasoning effort.
+        :param model_override: Optional per-session model override.
+        :param cost_control_mode_override: Optional per-session cost-control mode.
+        :param subagent_routing_override: Optional per-session sub-agent routing mode.
+        :param harness_override: Optional per-session harness override.
         :returns: The newly created :class:`Conversation`.
         :raises NameAlreadyExistsError: If
             ``parent_conversation_id`` is not ``None`` and a
@@ -1183,9 +1200,8 @@ class ConversationStore(ABC):
         exists, otherwise increments the existing ``cost_usd`` by
         ``delta_usd`` in a single atomic statement (no
         read-modify-write, so concurrent turns and replicas don't lose
-        updates). Powers cost-aware policies' per-user daily budget
-        reads. Callers gate this on the session running under at least
-        one policy, so the table is untouched when no policy exists.
+        updates). Records every priced turn and powers per-user daily
+        budget reads, including sessions without a budget policy.
 
         :param user_id: The user the cost is attributed to (the session
             creator), e.g. ``"alice@example.com"``.
@@ -1292,6 +1308,18 @@ class ConversationStore(ABC):
         :param conversation_id: The session to look up, e.g. ``"conv_abc123"``.
         :param owner_only: Require an explicit owner-level grant.
         :returns: The grantee's user id, or ``None`` if no qualifying grant exists.
+        """
+        ...
+
+    @abstractmethod
+    def get_session_owner_authority(
+        self, conversation_id: str, *, owner_only: bool = False
+    ) -> "AccountAuthority | None":
+        """Capture the session owner's username and registration in one read.
+
+        Session-attributed writes must retain this snapshot in a target account
+        scope until the write validates it under the account lock. A null
+        generation represents an external identity, not a future registration.
         """
         ...
 
@@ -1447,11 +1475,8 @@ class ConversationStore(ABC):
         bound and the binding fields persisted, but the launch
         failed and any worktree was rolled back. Clearing all four
         fields in one transaction keeps the row consistent with the
-        host's actual state (no runner, no worktree) and, unlike
-        :meth:`set_host_id` (which treats ``None`` as "leave
-        untouched" and so cannot clear ``git_branch``), lets a later
-        rebind that omits a worktree start from a clean slate rather
-        than inheriting a stale branch. Nulling ``host_id`` and
+        host's actual state (no runner, no worktree) and lets a later
+        rebind start from a clean slate. Nulling ``host_id`` and
         ``workspace`` together never violates
         ``ck_conversations_workspace_required_for_host`` (workspace
         is only required while ``host_id`` is set).
@@ -1523,8 +1548,9 @@ class ConversationStore(ABC):
         :param git_branch: Optional git branch checked out in a
             server-created worktree, e.g. ``"feature/login"``. Set
             when binding an existing session to a freshly created
-            worktree (the fork resume path). ``None`` leaves it
-            untouched.
+            worktree (the fork resume path). ``None`` preserves the
+            branch on the same host/workspace, but clears it when
+            the host or an explicitly supplied workspace changes.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.
@@ -1578,12 +1604,15 @@ class ConversationStore(ABC):
         title: str | None = None,
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
+        model_override: str | None = None,
         workspace: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
         project_id: str | None = None,
         host_id: str | None = None,
+        inference_snapshot: dict[str, Any] | None = None,
+        created_by: str | None = None,
     ) -> CreatedSession:
         """
         Atomically create a session and its session-scoped agent.
@@ -1625,6 +1654,9 @@ class ConversationStore(ABC):
         :param host_id: Optional external host the session binds to,
             e.g. ``"host_a1b2c3d4..."``. Requires a non-``None``
             ``workspace``. ``None`` leaves the session unbound.
+        :param created_by: Identity of the creating user, recorded on the
+            session-scoped agent so its code can only be mutated by the
+            owner. ``None`` in single-user mode.
         :returns: The committed conversation and agent entities.
         :raises ConversationNotFoundError: If
             ``parent_conversation_id`` is set but no such
@@ -1659,6 +1691,7 @@ class ConversationStore(ABC):
         up_to_response_id: str | None = None,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
+        created_by: str | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
@@ -1768,6 +1801,9 @@ class ConversationStore(ABC):
             blocks, file resource events) are rewritten to the fork's copy,
             so the fork never references files it does not own. ``None`` or
             empty leaves every copied payload verbatim.
+        :param created_by: Identity of the forking user, recorded on the
+            cloned session-scoped agent so its code can only be mutated by
+            the owner. ``None`` in single-user mode or when no clone is made.
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.
@@ -1797,14 +1833,18 @@ class ConversationStore(ABC):
         conversation row — the transcript, comments, files, host,
         and workspace are untouched; only the agent/harness changes.
         In one transaction it: deletes the session's current
-        session-scoped agent (the unique ``session_id`` index forbids
-        two agents on one session, so the old must go before the new
-        binds), creates a new session-scoped agent from the supplied
-        bundle, points ``agent_id`` at it, applies the model-settings
-        and label deltas below, and clears ``external_session_id``
-        (the old harness's native runtime state). The whole operation
-        is atomic: any failure rolls back and the session stays on its
-        current agent.
+        session-scoped agent (now unreferenced once ``agent_id`` is
+        repointed), creates a new session-scoped agent from the
+        supplied bundle, points ``agent_id`` at it, applies the
+        model-settings and label deltas below, and clears
+        ``external_session_id`` (the old harness's native runtime
+        state). The whole operation is atomic: any failure rolls back
+        and the session stays on its current agent.
+
+        The replacement agent's ``created_by`` is left unset, so it is
+        admin-only to mutate until a full switch implementation assigns
+        the session owner (the delete is also not yet reference-safe for
+        an agent shared via reuse or named sub-agents).
 
         :param conversation_id: Session to switch, e.g.
             ``"conv_abc123"``.

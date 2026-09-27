@@ -277,7 +277,7 @@ def create_host_tunnel_router(
                 return
 
             stage = "registration"
-            await asyncio.to_thread(
+            persisted_host = await asyncio.to_thread(
                 host_store.upsert_on_connect,
                 host_id=host_id,
                 name=frame.name,
@@ -287,6 +287,10 @@ def create_host_tunnel_router(
                 managed_token=managed_token,
             )
             host_persisted = True
+            if persisted_host.account_generation is not None:
+                from omnigent.db.account_authority import bind_account_authority
+
+                bind_account_authority(tunnel_owner, persisted_host.account_generation)
 
             stage = "registry"
             conn = host_registry.register(
@@ -294,6 +298,9 @@ def create_host_tunnel_router(
                 ws,
                 frame,
                 owner=tunnel_owner,
+                # A resolved launch token is proof this is a server-provisioned
+                # sandbox, not a user machine reconnecting on a managed host id.
+                registered_with_managed_token=managed_token is not None,
             )
             # Delivered on the handshake, never persisted: a replica that just
             # started learns the host's gateway backing here, so a server
