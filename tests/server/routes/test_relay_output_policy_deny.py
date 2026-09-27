@@ -25,8 +25,9 @@ denied content.
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
-from types import TracebackType
+from types import SimpleNamespace, TracebackType
 from typing import Any
 from unittest.mock import patch
 
@@ -210,8 +211,10 @@ async def test_flush_response_phase_failure_fails_open() -> None:
     advisory on evaluation error, matching the LLM phases' default).
     """
     store = _FakeConversationStore()
+    calls = {"n": 0}
 
     async def _boom(*args: Any, **kwargs: Any) -> None:
+        calls["n"] += 1
         raise RuntimeError("engine construction failed")
 
     with (
@@ -231,6 +234,178 @@ async def test_flush_response_phase_failure_fails_open() -> None:
         )
 
     assert _persisted_texts(store) == ["survives engine failure"]
+    assert calls["n"] == 1, "a non-transient failure must not be retried"
+
+
+# ── RESPONSE-phase evaluation under an upstream request-limit throttle ──────
+
+
+class _ThrottledRpcError(Exception):
+    """gRPC-shaped ``RESOURCE_EXHAUSTED`` error; grpcio is not a test dependency."""
+
+    def code(self) -> Any:
+        return SimpleNamespace(name="RESOURCE_EXHAUSTED")
+
+    def __str__(self) -> str:
+        return (
+            "<_InactiveRpcError of RPC that terminated with:\n"
+            "\tstatus = StatusCode.RESOURCE_EXHAUSTED\n"
+            '\tdetails = "REQUEST_LIMIT_EXCEEDED: Workspace 1965859176160743 '
+            'exceeded the concurrent limit of 60 requests."\n>'
+        )
+
+
+class _Http429Error(Exception):
+    """HTTP-client-shaped rejection whose response carries a 429 status."""
+
+    def __init__(self) -> None:
+        super().__init__("Client error '429' for url 'https://gateway.example/evaluate'")
+        self.response = SimpleNamespace(status_code=429)
+
+
+_THROTTLE_ERRORS = [
+    pytest.param(_ThrottledRpcError(), id="grpc-resource-exhausted"),
+    pytest.param(_Http429Error(), id="http-429"),
+    pytest.param(
+        RuntimeError("REQUEST_LIMIT_EXCEEDED: workspace exceeded its concurrent limit"),
+        id="request-limit-text",
+    ),
+]
+
+
+@dataclass
+class _ThrottledConversationStore(_FakeConversationStore):
+    """Store whose first ``throttled_reads`` conversation lookups hit the request limit."""
+
+    throttled_reads: int = 1
+    reads: int = 0
+
+    def get_conversation(self, conversation_id: str) -> Conversation:
+        self.reads += 1
+        if self.reads <= self.throttled_reads:
+            raise _ThrottledRpcError()
+        return super().get_conversation(conversation_id)
+
+
+def _no_retry_pause() -> Any:
+    """Drop the real retry pauses so a throttled evaluation retries immediately."""
+    return patch(
+        "omnigent.server.routes._sessions.helpers._RESPONSE_POLICY_RETRY_DELAYS_S",
+        (0.0, 0.0),
+        create=True,
+    )
+
+
+async def test_flush_response_phase_retries_throttled_conversation_read() -> None:
+    """A throttled conversation lookup is retried, so the retry's DENY still gates the text."""
+    store = _ThrottledConversationStore(throttled_reads=1)
+
+    async def _deny(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"verdict": "deny", "reason": "gated after throttle", "_denied_body": None}
+
+    with (
+        patch(
+            "omnigent.server.routes._sessions.helpers._evaluate_output_policy",
+            _deny,
+        ),
+        patch("omnigent.runtime._globals._agent_store", object()),
+        patch("omnigent.server.routes._sessions.helpers._publish_policy_deny"),
+        _no_retry_pause(),
+    ):
+        await _flush_relay_text(
+            store,  # type: ignore[arg-type]
+            "conv_throttled_read_1",
+            [_DENIED_TEXT],
+            "resp_7",
+            "test-agent",
+            evaluate_response_phase=True,
+        )
+
+    texts = _persisted_texts(store)
+    assert texts == ["[Denied by policy: gated after throttle]"], (
+        f"a throttled lookup must not bypass the output policy, got {texts!r}"
+    )
+    assert store.reads == 2, "the throttled lookup must be retried"
+
+
+@pytest.mark.parametrize("throttle", _THROTTLE_ERRORS)
+async def test_flush_response_phase_retries_throttled_evaluation(throttle: Exception) -> None:
+    """A throttled evaluation is retried in every transport shape; its DENY gates the text."""
+    store = _FakeConversationStore()
+    calls = {"n": 0}
+
+    async def _throttled_then_deny(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise throttle
+        return {"verdict": "deny", "reason": "gated after throttle", "_denied_body": None}
+
+    with (
+        patch(
+            "omnigent.server.routes._sessions.helpers._evaluate_output_policy",
+            _throttled_then_deny,
+        ),
+        patch("omnigent.runtime._globals._agent_store", object()),
+        patch("omnigent.server.routes._sessions.helpers._publish_policy_deny"),
+        _no_retry_pause(),
+    ):
+        await _flush_relay_text(
+            store,  # type: ignore[arg-type]
+            "conv_throttled_eval_1",
+            [_DENIED_TEXT],
+            "resp_8",
+            "test-agent",
+            evaluate_response_phase=True,
+        )
+
+    texts = _persisted_texts(store)
+    assert texts == ["[Denied by policy: gated after throttle]"], (
+        f"a throttled evaluation must not bypass the output policy, got {texts!r}"
+    )
+    assert calls["n"] == 2, "the throttled evaluation must be retried"
+
+
+async def test_flush_response_phase_persistent_throttle_fails_open_with_cause(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A persistent throttle still fails open, and the fail-open log line names the cause."""
+    store = _FakeConversationStore()
+    calls = {"n": 0}
+
+    async def _always_throttled(*args: Any, **kwargs: Any) -> None:
+        calls["n"] += 1
+        raise _ThrottledRpcError()
+
+    caplog.set_level(logging.WARNING, logger="omnigent.server.routes.sessions")
+    with (
+        patch(
+            "omnigent.server.routes._sessions.helpers._evaluate_output_policy",
+            _always_throttled,
+        ),
+        patch("omnigent.runtime._globals._agent_store", object()),
+        _no_retry_pause(),
+    ):
+        await _flush_relay_text(
+            store,  # type: ignore[arg-type]
+            "conv_throttled_persist_1",
+            ["narration survives a long throttle"],
+            "resp_9",
+            "test-agent",
+            evaluate_response_phase=True,
+        )
+
+    assert _persisted_texts(store) == ["narration survives a long throttle"]
+    assert calls["n"] == 3, "one attempt per retry pause plus the initial attempt"
+    failures = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.ERROR
+        and "persisting the text unmodified" in record.getMessage()
+    ]
+    assert len(failures) == 1, f"expected one fail-open record, got {failures!r}"
+    assert "RESOURCE_EXHAUSTED" in failures[0] and "REQUEST_LIMIT_EXCEEDED" in failures[0], (
+        f"the fail-open line must name the upstream throttle, got {failures[0]!r}"
+    )
 
 
 # ── Full relay loop: deny marker consumed at the terminal flush ──────

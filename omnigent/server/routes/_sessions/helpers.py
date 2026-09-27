@@ -7914,6 +7914,37 @@ async def _relay_persist(
         )
 
 
+# Pause before each RESPONSE-evaluation retry after an upstream throttle
+# (e.g. a store's concurrent-request limit) rejected the attempt.
+_RESPONSE_POLICY_RETRY_DELAYS_S: tuple[float, ...] = (0.5, 1.0)
+
+_UPSTREAM_THROTTLE_MARKERS = re.compile(
+    r"RESOURCE_EXHAUSTED|REQUEST_LIMIT_EXCEEDED|too many requests", re.IGNORECASE
+)
+
+
+def _is_upstream_throttle(exc: BaseException) -> bool:
+    """Whether *exc* is a gRPC RESOURCE_EXHAUSTED, HTTP 429, or request-limit-text rejection."""
+    code = getattr(exc, "code", None)
+    if callable(code):
+        try:
+            status_name = getattr(code(), "name", None)
+        except Exception:  # noqa: BLE001 — not a gRPC-shaped error after all
+            status_name = None
+        if status_name == "RESOURCE_EXHAUSTED":
+            return True
+    response = getattr(exc, "response", None)
+    if 429 in (getattr(response, "status_code", None), getattr(exc, "status_code", None)):
+        return True
+    return _UPSTREAM_THROTTLE_MARKERS.search(str(exc)) is not None
+
+
+def _error_summary(exc: BaseException) -> str:
+    """One-line ``Type: message`` for a log record; whitespace collapsed, message bounded."""
+    text = " ".join(str(exc).split())[:240]
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
 async def _relay_response_policy_deny_reason(
     conversation_store: ConversationStore,
     session_id: str,
@@ -7930,9 +7961,13 @@ async def _relay_response_policy_deny_reason(
     becomes durable — making a spec's ``response``-phase policy enforceable
     in the runner topology.
 
-    Fails OPEN (returns ``None``) on any evaluation error, matching the LLM
+    Fails OPEN (returns ``None``) on an evaluation error, matching the LLM
     phases' advisory default: a policy-engine hiccup must not destroy the
-    narration the user already watched.
+    narration the user already watched. An upstream throttle (a store or
+    gateway answering ``RESOURCE_EXHAUSTED`` / HTTP 429 under a burst) is
+    first retried on the short :data:`_RESPONSE_POLICY_RETRY_DELAYS_S`
+    schedule, so a momentary request-limit rejection does not skip the
+    gate; the fail-open log line names the upstream cause.
 
     :param conversation_store: Store for the conversation/labels lookup.
     :param session_id: Session/conversation identifier.
@@ -7951,39 +7986,59 @@ async def _relay_response_policy_deny_reason(
             extra={"session_id": session_id},
         )
         return None
-    try:
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        if conv is None or conv.agent_id is None:
+    verdict: dict[str, Any] | None = None
+    delays = _RESPONSE_POLICY_RETRY_DELAYS_S
+    attempts = len(delays) + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None or conv.agent_id is None:
+                return None
+            body = SessionEventInput(
+                type="message",
+                data={
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text}],
+                },
+            )
+            # The relay has no HTTP caller: gate per-user policies on the
+            # turn-initiating human persisted at forward time (the same label
+            # the policy-evaluate route falls back to).
+            turn_actor = (conv.labels or {}).get(_TURN_ACTOR_LABEL)
+            verdict = await _evaluate_output_policy(
+                session_id,
+                conv,
+                body,
+                conversation_store,
+                _agent_store,
+                None,
+                actor=_build_actor(turn_actor),
+            )
+            break
+        except Exception as exc:  # noqa: BLE001 — fail open: output phases are advisory
+            if attempt < attempts and _is_upstream_throttle(exc):
+                delay = delays[attempt - 1]
+                _logger.warning(
+                    "Relay: RESPONSE-phase policy evaluation throttled upstream for "
+                    "session=%s (%s); retrying in %.1fs (attempt %d of %d)",
+                    session_id,
+                    _error_summary(exc),
+                    delay,
+                    attempt,
+                    attempts,
+                    extra={"session_id": session_id},
+                )
+                await asyncio.sleep(delay)
+                continue
+            _logger.exception(
+                "Relay: RESPONSE-phase policy evaluation failed for session=%s "
+                "after %d attempt(s) (%s); persisting the text unmodified",
+                session_id,
+                attempt,
+                _error_summary(exc),
+                extra={"session_id": session_id},
+            )
             return None
-        body = SessionEventInput(
-            type="message",
-            data={
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": text}],
-            },
-        )
-        # The relay has no HTTP caller; the acting principal is the
-        # turn-initiating human persisted at forward time (same label the
-        # policy-evaluate route falls back to), so per-user policies gate
-        # on the correct actor.
-        turn_actor = (conv.labels or {}).get(_TURN_ACTOR_LABEL)
-        verdict = await _evaluate_output_policy(
-            session_id,
-            conv,
-            body,
-            conversation_store,
-            _agent_store,
-            None,
-            actor=_build_actor(turn_actor),
-        )
-    except Exception:  # noqa: BLE001 — fail open: output phases are advisory on error
-        _logger.exception(
-            "Relay: RESPONSE-phase policy evaluation failed for session=%s; "
-            "persisting the text unmodified",
-            session_id,
-            extra={"session_id": session_id},
-        )
-        return None
     if verdict is None:
         return None
     return str(verdict.get("reason") or "Denied by policy")
