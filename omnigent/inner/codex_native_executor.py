@@ -753,10 +753,9 @@ def _latest_user_content(messages: list[Message]) -> object:
     return None
 
 
-# Leading "/<skill-name>" interception for the chat path. Codex's TUI sends a
-# structured skill input item for slash invocations; the app-server's text
-# path leaves the literal "/name" in the prompt, so a skill command typed in
-# the web chat silently does nothing.
+# A standalone leading "/<skill>" from chat is sent as the TUI's structured
+# skill input item; as literal text the app-server would keep "/name" in the
+# prompt and the skill would never run.
 _SLASH_SKILL_RE = re.compile(r"^/([^\s/]+)(?:\s+(.*))?$", re.DOTALL)
 
 

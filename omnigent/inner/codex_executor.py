@@ -739,11 +739,8 @@ def codex_skill_sources(
     host = (codex_home if codex_home is not None else home / ".codex") / "skills"
     if host.is_dir():
         sources.append(host)
-    # Vendor-neutral shared skills (the same ``~/.agents/skills`` tree the
-    # Antigravity provider and the agents skill spec read). Lowest priority so
-    # a Codex-specific skill of the same name wins; without it, a skill
-    # installed only in the shared tree is invisible to Codex sessions while
-    # being available to other harnesses.
+    # Shared vendor-neutral skills (the tree the Antigravity provider also
+    # reads) come last so a Codex-specific skill of the same name wins.
     shared = home / ".agents" / "skills"
     if shared.is_dir():
         sources.append(shared)
