@@ -64,6 +64,7 @@ from filelock import Timeout as FileLockTimeout
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
+from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
 from omnigent.harnesses.kiro_native.bridge import bridge_root as kiro_bridge_root
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
@@ -216,6 +217,8 @@ _MCP_PROTOCOL_VERSION = "2024-11-05"
 # uses.
 _TOOLS_CHANGED_READY_TIMEOUT_S = 30.0
 _TOOLS_CHANGED_POST_TIMEOUT_S = 10.0
+# The control POST carries an empty JSON object; anything larger is not ours.
+_TOOLS_CHANGED_BODY_MAX_BYTES = 4096
 # Ceiling the relay HTTP handler (``_run_relay_tool``) waits for a single
 # tool dispatch to complete on the harness event loop.
 _TOOL_CALL_TIMEOUT_S = 300.0
@@ -563,6 +566,30 @@ class ClaudeTerminalDialog(RuntimeError):
     """
 
 
+class ClaudeSignInPending(RuntimeError):
+    """
+    Claude Code's terminal is parked on a launcher sign-in prompt.
+
+    A wrapper in front of the ``claude`` binary printed an address to open
+    (often with a device code) and is waiting for the person to sign in.
+    Like :class:`ClaudeTerminalDialog` this is deliberately not a
+    :class:`ClaudePromptTimeout`: the pane is alive and the sign-in is
+    finished from the card's link, so delivery handlers must not reap it.
+
+    :param message: Human-readable failure text.
+    :param title: Card headline, e.g.
+        ``"Claude Code can't start until you sign in to Databricks"``.
+    :param remediation: The link (and code) to open, phrased as the next step.
+    """
+
+    code = "databricks_sign_in_pending"
+
+    def __init__(self, message: str, *, title: str, remediation: str) -> None:
+        super().__init__(message)
+        self.title = title
+        self.remediation = remediation
+
+
 class ClaudeInjectionCancelled(RuntimeError):
     """The caller cancelled delivery before the injection worker finished."""
 
@@ -901,6 +928,11 @@ class ClaudeHookRecord:
         each counted entry (see :func:`_normalize_background_task`), so the UI
         can name them. ``None`` for non-``Stop`` events, when the array is
         absent, or when no counted entry carried a usable field.
+    :param failure_category: ``StopFailure`` error category, e.g.
+        ``"rate_limit"``. ``None`` for other events or when absent.
+    :param failure_message: ``StopFailure`` error text Claude Code rendered
+        for the turn (the payload's ``last_assistant_message``), e.g.
+        ``"API Error: 500 Internal server error"``. ``None`` when absent.
     """
 
     event_cursor: int
@@ -921,6 +953,8 @@ class ClaudeHookRecord:
     task_status: str | None = None
     background_task_count: int = 0
     background_tasks: list[_JsonObject] | None = None
+    failure_category: str | None = None
+    failure_message: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1287,23 +1321,36 @@ def _ensure_secure_dir(target: Path) -> None:
     getuid = getattr(os, "getuid", None)
     my_uid = getuid() if getuid is not None else None
     for ancestor in ancestors:
-        try:
-            os.mkdir(ancestor, mode=0o700)
-            continue
-        except FileExistsError:
-            pass
-        st = os.lstat(ancestor)
-        if stat.S_ISLNK(st.st_mode):
-            raise RuntimeError(f"refusing to use bridge ancestor {ancestor!s}: is a symlink")
-        if not stat.S_ISDIR(st.st_mode):
-            raise RuntimeError(f"refusing to use bridge ancestor {ancestor!s}: not a directory")
-        if my_uid is not None and st.st_uid != my_uid:
-            raise RuntimeError(
-                f"refusing to use bridge ancestor {ancestor!s}: owned by uid "
-                f"{st.st_uid}, not current user ({my_uid})"
-            )
-        if my_uid is not None and (st.st_mode & 0o077) != 0:
-            os.chmod(ancestor, 0o700)
+        _ensure_private_dir(ancestor, my_uid)
+
+
+def _ensure_private_dir(path: Path, my_uid: int | None) -> None:
+    """
+    Create ``path`` as a 0o700 directory, or validate an existing one.
+
+    :param path: Directory that must be owner-only, e.g. one bridge ancestor
+        or the harness socket root.
+    :param my_uid: Current uid, or ``None`` where POSIX ownership does not
+        apply (Windows), which skips the owner and mode checks.
+    :raises RuntimeError: If ``path`` exists as a symlink, a non-directory,
+        or a directory owned by another uid.
+    """
+    try:
+        os.mkdir(path, mode=0o700)
+        return
+    except FileExistsError:
+        pass
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode):
+        raise RuntimeError(f"refusing to use {path!s}: is a symlink")
+    if not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError(f"refusing to use {path!s}: not a directory")
+    if my_uid is not None and st.st_uid != my_uid:
+        raise RuntimeError(
+            f"refusing to use {path!s}: owned by uid {st.st_uid}, not current user ({my_uid})"
+        )
+    if my_uid is not None and (st.st_mode & 0o077) != 0:
+        os.chmod(path, 0o700)
 
 
 def ensure_secure_dir(target: Path) -> None:
@@ -3694,6 +3741,18 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
                 if (detail := _normalize_background_task(task)) is not None
             ]
             background_tasks = details or None
+    failure_category: str | None = None
+    failure_message: str | None = None
+    if event_name == "StopFailure" and isinstance(payload, dict):
+        failure_category = _bounded_hook_text(payload.get("error"), _FAILURE_CATEGORY_MAX_CHARS)
+        # The CLI renders this text for its own error, so it reads like the
+        # mirrored API-error message.
+        raw_message = _bounded_hook_text(
+            payload.get("last_assistant_message"), _FAILURE_MESSAGE_MAX_CHARS
+        )
+        failure_message = (
+            _display_text(raw_message, is_api_error=True) if raw_message is not None else None
+        )
     return ClaudeHookRecord(
         event_cursor=record.line_number,
         byte_offset=record.next_byte_offset,
@@ -3737,7 +3796,28 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_status=task_status,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
+        failure_category=failure_category,
+        failure_message=failure_message,
     )
+
+
+# Bounds on ``StopFailure`` text copied into the failed status edge.
+_FAILURE_CATEGORY_MAX_CHARS = 100
+_FAILURE_MESSAGE_MAX_CHARS = 4000
+
+
+def _bounded_hook_text(value: object, max_chars: int) -> str | None:
+    """
+    Return a stripped, length-bounded hook string field.
+
+    :param value: Raw payload value, e.g. ``"rate_limit"``.
+    :param max_chars: Maximum characters kept, e.g. ``100``.
+    :returns: The trimmed text, or ``None`` when absent, blank, or not a string.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text[:max_chars] if text else None
 
 
 def _read_complete_jsonl_records(
@@ -5058,7 +5138,7 @@ def _run_tmux(socket_path: str, *args: str) -> None:
         raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
 
 
-def _capture_pane(socket_path: str, tmux_target: str) -> str:
+def _capture_pane(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
     """
     Capture the current visible contents of a tmux pane.
 
@@ -5069,14 +5149,20 @@ def _capture_pane(socket_path: str, tmux_target: str) -> str:
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param join_wrapped: Join rows the pane wrapped at its width back into one
+        line (``capture-pane -J``), so an address wider than the pane reads
+        back whole.
     :returns: The pane's visible text, or ``""`` if capture failed.
     """
     import subprocess
 
     _check_injection_cancelled()
+    args = ["tmux", "-S", socket_path, "capture-pane", "-t", tmux_target, "-p"]
+    if join_wrapped:
+        args.append("-J")
     try:
         proc = subprocess.run(
-            ["tmux", "-S", socket_path, "capture-pane", "-t", tmux_target, "-p"],
+            args,
             check=False,
             capture_output=True,
             text=True,
@@ -5756,6 +5842,10 @@ def _wait_for_claude_prompt_ready(
         consecutive polls. Raised within a poll interval instead of waiting
         out the budget, so the person can answer the dialog in the embedded
         terminal and resend; the pane is left alive.
+    :raises ClaudeSignInPending: If a launcher sign-in prompt (an address to
+        open, often with a device code) holds the pane on two consecutive
+        polls. Raised within a poll interval with the link attached, so the
+        card can offer it; the pane is left alive for the sign-in to finish.
     :raises ClaudePromptTimeout: If the prompt never renders in time
         (Claude failed to boot, or a slow boot outlasted even the hard
         cap). The message carries the seconds actually waited, a poll
@@ -5780,6 +5870,7 @@ def _wait_for_claude_prompt_ready(
     exited_status: str | None = None
     pane_exited = False
     dialog_headline: str | None = None
+    sign_in_url: str | None = None
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
@@ -5811,6 +5902,24 @@ def _wait_for_claude_prompt_ready(
                 "prompt, then resend your message." + _format_terminal_failure_tail(pane)
             )
         dialog_headline = headline
+        # A launcher sign-in prompt printed before Claude Code runs: an address
+        # to open, often with a device code. Real when the same address shows
+        # on two consecutive polls. Fail now with the link rather than wait out
+        # the budget and reap the pane the person needs to finish signing in.
+        # The joined capture keeps an address wider than the pane in one piece.
+        sign_in = (
+            detect_sign_in_prompt(_capture_pane(socket_path, tmux_target, join_wrapped=True))
+            if "http" in pane
+            else None
+        )
+        if sign_in is not None and sign_in.url == sign_in_url:
+            raise ClaudeSignInPending(
+                "Claude Code is waiting for a sign-in in this session's terminal, "
+                "so the message was not delivered.",
+                title="Claude Code can't start until you sign in to Databricks",
+                remediation=sign_in_next_step("Claude Code"),
+            )
+        sign_in_url = sign_in.url if sign_in is not None else None
         now = time.monotonic()
         if now >= hard_deadline:
             break
@@ -5922,6 +6031,7 @@ def start_tool_relay(
     loop: asyncio.AbstractEventLoop,
     policy_client: httpx.AsyncClient | None = None,
     session_id: str | None = None,
+    file_change_observer: Callable[[_JsonObject], Awaitable[None]] | None = None,
 ) -> ClaudeNativeToolRelay:
     """
     Start a relay for Omnigent tool calls from Claude.
@@ -5944,6 +6054,10 @@ def start_tool_relay(
     :param policy_client: Runner's async httpx client for policy eval proxy.
     :param session_id: Session id written into ``tool_relay.json`` so hook
         subprocesses can construct the correct ``/policies/evaluate`` URL.
+    :param file_change_observer: Optional coroutine callback run on *loop*
+        for each ``/hook/observe-tool`` payload; the runner uses it to
+        record native file-mutating tool calls in the session's filesystem
+        registry.
     :returns: Started relay handle. Call :meth:`close` when done.
     """
     token = secrets.token_urlsafe(32)
@@ -5954,6 +6068,7 @@ def start_tool_relay(
         policy_client=policy_client,
         session_id=session_id,
         bridge_dir=bridge_dir,
+        file_change_observer=file_change_observer,
     )
     httpd, advertised_url = _start_bridge_http_server(handler_cls)
     relay_info: _JsonObject = {
@@ -6100,17 +6215,23 @@ def _start_unix_control_server(
 
     The socket lives directly under the harness socket root — short by
     design, since ``sun_path`` caps at 104 bytes on macOS — as
-    ``mcp-<pid>.sock``. Sockets left behind by ``serve-mcp`` processes that
-    died without cleanup (a killed pane) are reaped first, by owner pid.
+    ``mcp-<pid>.sock``. The root is made absolute (the runner reads the path
+    from its own working directory) and validated as an owner-only directory,
+    since a pre-created root would let another local user swap the socket.
+    Sockets left behind by ``serve-mcp`` processes that died without cleanup
+    (a killed pane) are reaped first, by owner pid.
 
     :param handler_cls: Request handler class.
     :returns: The bound, listening server and its socket path (mode 0600).
     """
     from omnigent.inner._proc import process_alive
-    from omnigent.runtime.harnesses.paths import harness_tmp_parent
+    from omnigent.runtime.harnesses.paths import resolve_harness_tmp_parent
 
-    root = harness_tmp_parent()
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    root = resolve_harness_tmp_parent()
+    # A configured root may be nested (``OMNIGENT_HARNESS_TMP_PARENT=.tmp/oa``);
+    # only the leaf must be owner-only.
+    root.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(root, os.getuid())
     for stale in root.glob(f"{_MCP_SOCKET_PREFIX}*{_MCP_SOCKET_SUFFIX}"):
         try:
             owner = int(stale.name[len(_MCP_SOCKET_PREFIX) : -len(_MCP_SOCKET_SUFFIX)])
@@ -6183,13 +6304,17 @@ def _handler_factory(
             if self.path != "/tools-changed":
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
-            # Drain the body before answering: the client writes it after the
-            # headers, and closing first turns that write into EPIPE on a Unix
-            # socket (TCP only surfaced it as a reset after the response).
-            self.rfile.read(int(self.headers.get("Content-Length") or 0))
             if self.headers.get("Authorization") != f"Bearer {token}":
                 self.send_error(HTTPStatus.UNAUTHORIZED)
                 return
+            length = int(self.headers.get("Content-Length") or 0)
+            if not 0 <= length <= _TOOLS_CHANGED_BODY_MAX_BYTES:
+                self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                return
+            # Drain the body before answering: the client writes it after the
+            # headers, and closing first turns that write into EPIPE on a Unix
+            # socket (TCP only surfaced it as a reset after the response).
+            self.rfile.read(length)
             notification_queue.put(
                 {
                     "jsonrpc": "2.0",
@@ -6221,6 +6346,12 @@ def _handler_factory(
 # never cut mid-reason by the truncation.
 _POLICY_PROXY_ERROR_DETAIL_MAX = 400
 
+# How long /hook/observe-tool waits for the file-change observer before
+# answering. Generous enough for a first-call registry resolution (one server
+# round trip); each request runs on its own ThreadingHTTPServer thread, so
+# waiting never stalls other relay traffic.
+_FILE_CHANGE_OBSERVER_TIMEOUT_S = 10.0
+
 
 def _tool_relay_handler_factory(
     token: str,
@@ -6230,6 +6361,7 @@ def _tool_relay_handler_factory(
     policy_client: httpx.AsyncClient | None = None,
     session_id: str | None = None,
     bridge_dir: Path | None = None,
+    file_change_observer: Callable[[_JsonObject], Awaitable[None]] | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """
     Create an HTTP handler class for active-turn tool calls.
@@ -6241,6 +6373,10 @@ def _tool_relay_handler_factory(
     :param policy_client: Optional async httpx client for proxying
         ``/policies/evaluate`` to the Omnigent server.
     :param session_id: Session id for the ``/policies/evaluate`` path.
+    :param file_change_observer: Optional coroutine callback run on *loop*
+        for each ``/hook/observe-tool`` payload, so the runner can record
+        native file-mutating tool calls in the session's filesystem
+        registry.
     :returns: A concrete :class:`BaseHTTPRequestHandler` subclass.
     """
 
@@ -6284,6 +6420,16 @@ def _tool_relay_handler_factory(
 
                 if session_id is not None:
                     observe_hook(session_id, payload)
+                    if file_change_observer is not None:
+                        # Wait so the record lands before the hook returns and
+                        # the panel's next fetch can see it; the observer owns
+                        # its own error handling, so a timeout only means the
+                        # recording finishes in the background.
+                        future = asyncio.run_coroutine_threadsafe(
+                            _await_tool_result(file_change_observer(payload)), loop
+                        )
+                        with contextlib.suppress(Exception):
+                            future.result(timeout=_FILE_CHANGE_OBSERVER_TIMEOUT_S)
                 self._send_json({})
                 return
             if self.path == "/hook/claude/evaluate-policy":
@@ -8611,22 +8757,35 @@ def _assistant_message_item(
         text.
     :returns: Parsed transcript item.
     """
-    display_text = text
-    stripped = text.strip()
-    if _CONTEXT_OVERFLOW_RE.match(stripped):
-        display_text = _CONTEXT_OVERFLOW_REPLACEMENT
-    elif is_api_error and _LOGIN_COMMAND_RE.search(stripped):
-        display_text = f"{text.rstrip()}\n\n{_LOGIN_GUIDANCE}"
     return ClaudeTranscriptItem(
         source_id=_source_id(source_key, item_index, "message"),
         item_type="message",
         data={
             "role": "assistant",
             "agent": agent_name,
-            "content": [{"type": "output_text", "text": display_text}],
+            "content": [
+                {"type": "output_text", "text": _display_text(text, is_api_error=is_api_error)}
+            ],
         },
         response_id=response_id,
     )
+
+
+def _display_text(text: str, *, is_api_error: bool) -> str:
+    """
+    Rewrite Claude text whose own remedy is a dead end in the web chat.
+
+    :param text: Assistant or CLI error text, e.g. ``"Prompt is too long"``.
+    :param is_api_error: Whether Claude Code authored the text as its own
+        error; gates the ``/login`` guidance append.
+    :returns: The text to show, e.g. the context-overflow guidance.
+    """
+    stripped = text.strip()
+    if _CONTEXT_OVERFLOW_RE.match(stripped):
+        return _CONTEXT_OVERFLOW_REPLACEMENT
+    if is_api_error and _LOGIN_COMMAND_RE.search(stripped):
+        return f"{text.rstrip()}\n\n{_LOGIN_GUIDANCE}"
+    return text
 
 
 def _stripped_image_placeholder(source: _JsonObject) -> str:
