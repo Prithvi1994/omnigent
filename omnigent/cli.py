@@ -11386,6 +11386,49 @@ def debug_db_upgrade(url: str) -> None:
     click.echo("Upgrade complete.")
 
 
+@debug.command("db-build-search-index")
+@click.argument("url")
+@click.option("--drop", is_flag=True, help="Drop the index instead of building it.")
+def debug_db_build_search_index(url: str, drop: bool) -> None:
+    """
+    Build the PostgreSQL trigram index behind the opt-in session content
+    search fast path (docs/postgres-session-search.md). URL is the
+    conversations database, e.g. ``postgresql://<user>:<password>@host/db``.
+
+    \b
+    Uses CREATE INDEX CONCURRENTLY, so the server can keep serving; a large
+    table still takes minutes. Then set OMNIGENT_PG_CONTENT_SEARCH=auto.
+    """
+    from sqlalchemy import create_engine
+
+    from omnigent.db.utils import normalize_database_url
+    from omnigent.stores.conversation_store.pg_content_search import (
+        CONTENT_SEARCH_INDEX,
+        CONTENT_SEARCH_MODE_ENV,
+        build_content_search_index,
+        drop_content_search_index,
+    )
+
+    engine = create_engine(normalize_database_url(url))
+    try:
+        if engine.dialect.name != "postgresql":
+            raise click.ClickException(
+                "The session content search index requires PostgreSQL; "
+                f"{engine.dialect.name} databases keep the built-in search."
+            )
+        if drop:
+            click.echo(f"Dropping {CONTENT_SEARCH_INDEX} ...")
+            dropped = drop_content_search_index(engine)
+            click.echo("Dropped." if dropped else "No index to drop.")
+            return
+        click.echo(f"Building {CONTENT_SEARCH_INDEX} on conversation_items (CONCURRENTLY) ...")
+        created = build_content_search_index(engine)
+        click.echo("Created." if created else "Index already exists.")
+        click.echo(f"Set {CONTENT_SEARCH_MODE_ENV}=auto on the server to use it.")
+    finally:
+        engine.dispose()
+
+
 @debug.command("migrate-accounts-to-oidc")
 @click.argument("url")
 @click.option(
