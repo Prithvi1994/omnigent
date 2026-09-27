@@ -2123,7 +2123,10 @@ async def test_server_survives_inner_process_exit_real_tmux(
             "exit-empty/remain-on-exit were not applied: "
             f"{probe.stderr.decode().strip()!r}"
         )
-        assert instance._pane_is_dead() is True
+        capture = instance._capture_pane_state_or_none()
+        assert capture is not None, "pane probe reported tmux gone"
+        pane_dead, _snapshot = capture
+        assert pane_dead is True
         assert instance.last_exit_status() == exit_status
         final_frame = await instance._tmux_output(
             "capture-pane", "-t", instance.tmux_target, "-p", "-S", "-100"
