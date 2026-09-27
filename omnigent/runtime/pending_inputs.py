@@ -72,6 +72,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from omnigent.db.workspace_cache import WorkspaceScopedCache
+
 # A pending entry is evicted this many seconds after it was recorded
 # if it was never drained by a matching persisted message. Covers the
 # vendor-TUI-never-accepted-the-message ghost; long enough that a slow
@@ -167,7 +169,7 @@ class _Entry:
 # inner dict is insertion-ordered (FIFO), which :func:`resolve_oldest`
 # relies on to drain the oldest matching message first. Empty inner
 # dicts are popped eagerly so the index doesn't accrete stale keys.
-_pending: dict[str, dict[str, _Entry]] = {}
+_pending: WorkspaceScopedCache[str, dict[str, _Entry]] = WorkspaceScopedCache()
 _lock = threading.Lock()
 
 
@@ -246,26 +248,51 @@ def record(
     return pending_id
 
 
-def resolve(conversation_id: str, pending_id: str) -> None:
+def pending_id_for_stable_id(conversation_id: str, stable_id: str) -> str | None:
     """
-    Drop a pending entry by id.
+    Return the live pending id recorded for a web client's stable message id.
 
-    Called to roll back a :func:`record` whose runner forward failed
-    (so a never-delivered message doesn't replay as a ghost bubble).
-    Idempotent: dropping an unknown id is a no-op.
+    Called by the native message route before it records a send. A stable id
+    that is already queued is a client retry of a message the runner already
+    received (the first response was lost in flight); forwarding it again
+    would run the prompt twice, so the route answers with the queued entry.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param stable_id: The client's stable 32-char hex message id.
+    :returns: The matching entry's pending id, or ``None`` when the message
+        is not queued (never sent, already mirrored, or settled after a failure).
+    """
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        for entry in _pending.get(conversation_id, {}).values():
+            if entry.stable_id == stable_id:
+                return entry.pending_id
+    return None
+
+
+def resolve(conversation_id: str, pending_id: str) -> DrainedInput | None:
+    """
+    Drop a pending entry by id and return it.
+
+    Called to roll back a :func:`record` whose runner forward failed (so a
+    never-delivered message doesn't replay as a ghost bubble), and to settle
+    the exact entry a failed native turn named. Idempotent: dropping an
+    unknown id is a no-op.
 
     :param conversation_id: Conversation/session id, e.g.
         ``"conv_abc123"``.
     :param pending_id: The id returned by :func:`record`, e.g.
         ``"pending_a1b2c3"``.
+    :returns: The dropped entry, or ``None`` when no entry had that id.
     """
     with _lock:
         entries = _pending.get(conversation_id)
         if entries is None:
-            return
-        entries.pop(pending_id, None)
+            return None
+        entry = entries.pop(pending_id, None)
         if not entries:
             _pending.pop(conversation_id, None)
+        return _drained_input(entry) if entry is not None else None
 
 
 def resolve_oldest(conversation_id: str) -> DrainedInput | None:

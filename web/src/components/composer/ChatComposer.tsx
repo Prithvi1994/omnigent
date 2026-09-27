@@ -12,10 +12,31 @@ import { ArrowUpIcon, Loader2Icon, SquareIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { isComposerSendKey } from "@/lib/composerSendShortcutPreferences";
+import { isComposerSendKey, isComposerSteerAllKey } from "@/lib/composerSendShortcutPreferences";
 import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 
 export const COMPOSER_COLUMN_WIDTH = `w-full ${CHAT_COLUMN_WIDTH}`;
+
+/**
+ * The composer layout contract: one 12px inset, two roles.
+ *
+ * Inside the card, every content row - the input text, chip rows
+ * (attachment/mention chips), feedback rows (attachment/command errors), and
+ * the action row's controls - aligns to a shared left/right inset line 12px
+ * from the card's edges. Outside the card, the docked trays (workspace bar,
+ * queued-messages strip, sub-agent tray) nest 12px in from the card's outer
+ * edges: a tray is a shelf peeking above the card, not a content row, so it
+ * keeps its own inset rather than sharing the card's border box.
+ *
+ * Padding vs margin follows what each row's border box must coincide with:
+ * chip and action rows are measured through their children (chips, buttons),
+ * so they pad; a feedback row's own box sits on the inset line, so it uses
+ * margins. Vertical rhythm: the input area is `pt-3 pb-1`, each content row
+ * carries `pb-2`, and the action row is `pt-1 pb-2`.
+ */
+export const COMPOSER_CONTENT_INSET_CLASS = "px-3";
+export const COMPOSER_BLOCK_INSET_CLASS = "mx-3";
+export const COMPOSER_TRAY_INSET_CLASS = "mx-3";
 
 /**
  * Minimum free space (px) the action row keeps between its leading and
@@ -28,13 +49,18 @@ export const COMPOSER_LABELS_MIN_GAP_PX = 24;
 export const COMPOSER_COLLAPSED_LABEL_CLASS =
   "group-data-[labels=collapsed]/composer-actions:hidden";
 
-/** Hides a workspace-bar chip's text label while the bar is collapsed to icons. */
+/**
+ * Hides a workspace-bar chip's text label while the bar is collapsed to icons.
+ * Only the directory and branch chips carry it: the PR number and the context
+ * percentage are short and informative, so they stay visible.
+ */
 export const COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS =
   "group-data-[labels=collapsed]/composer-workspace:hidden";
 
 export interface ComposerKeyIntent {
   shouldSubmitFromKeyboard: boolean;
   shouldPreferSendOverCompletion: boolean;
+  shouldSteerAllFromKeyboard: boolean;
 }
 
 interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "children"> {
@@ -78,7 +104,7 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
       ref={ref}
       data-composer-card
       className={cn(
-        "composer-reference-surface relative flex w-full flex-col rounded-2xl border transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
+        "composer-reference-surface relative flex w-full flex-col rounded-2xl border transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)] md:min-h-[105px]",
         className,
       )}
       {...props}
@@ -158,11 +184,13 @@ function useCollapsedComposerLabels(
 }
 
 /**
- * Collapse the workspace bar's chip labels to icons whenever the bar cannot
- * show every label in full — a chip is truncating, or the row overflows its
- * width — and restore them once they fit again. The verdict lands on the bar
- * as `data-labels="collapsed"`, which `COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS`
- * turns into `display: none` on each chip label.
+ * Collapse the workspace bar's directory and branch labels to icons whenever
+ * the bar cannot show every label in full — a label is truncating (the PR
+ * number included, since freeing the directory and branch text gives it room),
+ * or the row overflows its width — and restore them once they fit again. The
+ * verdict lands on the bar as `data-labels="collapsed"`, which
+ * `COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS` turns into `display: none` on the
+ * labels that carry it.
  *
  * The bar's height is fixed, so it is safe to resize-observe directly — the
  * collapse never changes the observed box, so there is no probe element and no
@@ -213,9 +241,15 @@ export function ComposerTextInput({
           keyboard.submitWithModEnter,
           keyboard.preventsKeyboardSubmit,
         );
+        const shouldSteerAllFromKeyboard = isComposerSteerAllKey(
+          { ...event, isComposing: event.nativeEvent.isComposing },
+          keyboard.submitWithModEnter,
+          keyboard.preventsKeyboardSubmit,
+        );
         input.onKeyDown?.(event, {
           shouldSubmitFromKeyboard,
           shouldPreferSendOverCompletion: keyboard.submitWithModEnter && shouldSubmitFromKeyboard,
+          shouldSteerAllFromKeyboard,
         });
       }}
     />
@@ -226,7 +260,49 @@ export function ComposerInputArea({ className, ...props }: ComponentPropsWithout
   return (
     <div
       className={cn(
-        "composer-input-text relative overflow-hidden px-3 pt-3 pb-1 text-ui",
+        "composer-input-text relative overflow-hidden pt-3 pb-1 text-ui",
+        COMPOSER_CONTENT_INSET_CLASS,
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
+/**
+ * One wrapping row of chips (attachment tiles, mention chips) on the shared
+ * inset line. Chips are measured through their own boxes, so the row pads
+ * rather than margins; the chip type picks its gap via ``className``.
+ */
+export function ComposerChipRow({ className, ...props }: ComponentPropsWithoutRef<"div">) {
+  return (
+    <div
+      className={cn(
+        "flex flex-wrap items-start gap-2 pb-2",
+        COMPOSER_CONTENT_INSET_CLASS,
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
+/**
+ * One feedback line under the input (rejected attachments, slash-command
+ * errors and /help output). The row's own border box sits on the shared
+ * inset line, so it margins rather than pads.
+ */
+export function ComposerFeedbackRow({
+  tone = "muted",
+  className,
+  ...props
+}: ComponentPropsWithoutRef<"div"> & { tone?: "muted" | "error" }) {
+  return (
+    <div
+      className={cn(
+        "pb-2 text-sm whitespace-pre-wrap",
+        COMPOSER_BLOCK_INSET_CLASS,
+        tone === "error" ? "text-destructive" : "text-muted-foreground",
         className,
       )}
       {...props}
@@ -246,7 +322,7 @@ export const ComposerTextarea = forwardRef<
     <textarea
       ref={ref}
       className={cn(
-        "composer-input-text relative max-h-[180px] w-full resize-none overflow-y-auto border-none bg-transparent p-0 text-ui text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 md:select-text [&::-webkit-scrollbar]:hidden",
+        "composer-input-text relative max-h-[180px] w-full resize-none overflow-y-auto border-none bg-transparent p-0 text-ui text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 md:min-h-[42px] md:select-text [&::-webkit-scrollbar]:hidden",
         className,
       )}
       {...props}
@@ -271,7 +347,8 @@ export const ComposerActionRow = forwardRef<HTMLDivElement, ComponentPropsWithou
       <div
         ref={ref}
         className={cn(
-          "group/composer-actions @container/composer-actions relative flex min-w-0 flex-nowrap items-center justify-between gap-2 px-2 pt-1 pb-2",
+          "group/composer-actions @container/composer-actions relative flex min-w-0 flex-nowrap items-center justify-between gap-2 pt-1 pb-2",
+          COMPOSER_CONTENT_INSET_CLASS,
           className,
         )}
         {...props}
@@ -317,7 +394,7 @@ export const ComposerSendButton = forwardRef<
       className={cn(
         "size-8 shrink-0 rounded-lg transition-opacity md:size-7",
         !interrupt &&
-          "bg-foreground hover:opacity-80 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
+          "hover:opacity-80 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
         className,
       )}
       aria-label={label}
