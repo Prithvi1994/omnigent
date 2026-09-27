@@ -1721,6 +1721,28 @@ async def test_create_terminal_surfaces_runner_error_without_crashing(
 
 
 @pytest.mark.asyncio
+async def test_sign_in_link_proxies_to_runner(
+    client: httpx.AsyncClient,
+) -> None:
+    """GET /sign-in-link validates the session, then asks the runner for the live prompt."""
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/sign-in-link"
+    payload = {
+        "pending": True,
+        "url": "https://signin.example.com/device",
+        "code": "HQ7M-2KPD",
+        "terminal_id": "terminal_claude_main",
+    }
+    fake_runner = _FakeRunnerClient(responses={path: (200, payload)})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(path)
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+    assert fake_runner.calls == [("GET", path)]
+
+
+@pytest.mark.asyncio
 async def test_delete_terminal_proxies_to_runner(
     client: httpx.AsyncClient,
 ) -> None:
@@ -5959,6 +5981,268 @@ async def test_relay_fences_cancelled_turn_and_resumes_on_next_turn(
         f"cancelled-turn delta must not be forwarded; got {published_deltas}"
     )
     assert "REAL REPLY" in published_deltas
+
+
+@pytest.mark.asyncio
+async def test_relay_settles_queued_native_message_on_failed_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed native turn commits the queued web message ahead of its error item.
+
+    Native sessions do not persist a web message at POST time; the transcript
+    forwarder mirrors it back and drains its queued entry. When the runner
+    reports the turn failed, the harness never received the message, so the
+    relay commits the queued entry as the user message (sender intact),
+    publishes the consumed event that swaps the optimistic bubble, and leaves
+    nothing queued for a later mirrored message to drain by mistake.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    store = _ConversationStore()
+    content = [{"type": "input_text", "text": "set up the worktree"}]
+    pending_id = pending_inputs.record(
+        sid,
+        content,
+        created_by="alice@example.com",
+        stable_id="7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+    )
+    # A second message the runner is still holding for the next turn.
+    queued_next = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "then run the tests"}],
+        created_by="alice@example.com",
+        stable_id="8a4b0d2f6c3e5a7b9d1f2e3c4b5a6d7e",
+    )
+    published: list[dict[str, Any]] = []
+    real_publish = session_stream.publish
+
+    def _capture(session_id: str, event: dict[str, Any]) -> None:
+        published.append(event)
+        real_publish(session_id, event)
+
+    monkeypatch.setattr("omnigent.server.routes.sessions.session_stream.publish", _capture)
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame(
+                {"type": "response.in_progress", "response": {"id": "resp_fail", "model": "codex"}}
+            ),
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    # The runner names the message this turn carried.
+                    "input_stable_id": "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+                    "response": {
+                        "id": "resp_fail",
+                        "model": "codex",
+                        "error": {
+                            "code": "databricks_sign_in_pending",
+                            "message": "Codex is waiting for a sign-in in the terminal.",
+                            # The harness says the message never reached it.
+                            "undelivered": True,
+                        },
+                    },
+                }
+            ),
+            _sse_frame(
+                {
+                    "type": "session.status",
+                    "status": "failed",
+                    "response_id": "resp_fail",
+                    "error": {
+                        "code": "databricks_sign_in_pending",
+                        "message": "Codex is waiting for a sign-in in the terminal.",
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    try:
+        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+
+        types = [i.type for i in store.appended_items]
+        assert types == ["message", "error"], types
+        # The runner's failed edge names its turn; the relay keeps that id so the
+        # web folds the edge into the response's own error card.
+        failed_edges = [
+            e
+            for e in published
+            if e.get("type") == "session.status" and e.get("status") == "failed"
+        ]
+        assert [e.get("response_id") for e in failed_edges] == ["resp_fail"]
+        message, error = store.appended_items
+        assert message.data.role == "user"
+        assert "".join(b["text"] for b in message.data.content) == "set up the worktree"
+        assert message.created_by == "alice@example.com"
+        # Both items share the failed turn's id so they group in one bubble.
+        assert message.response_id == "resp_fail"
+        assert error.response_id == "resp_fail"
+        assert error.data.code == "databricks_sign_in_pending"
+        # Only the failed turn's own message settled; the next one stays queued.
+        assert [e["pending_id"] for e in pending_inputs.snapshot_for(sid)] == [queued_next]
+        consumed = [e for e in published if e.get("type") == "session.input.consumed"]
+        assert len(consumed) == 1
+        assert consumed[0]["data"]["cleared_pending_id"] == pending_id
+        assert consumed[0]["data"]["created_by"] == "alice@example.com"
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_relay_leaves_the_queue_alone_when_the_harness_may_have_the_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A failure the harness does not mark undelivered settles nothing, even with the id.
+
+    Codex can accept a turn and fail before its mirror arrives. The stamped id
+    says which message the turn carried, not that it never got through; if the
+    relay settled it, the late mirror would drain the next queued entry and
+    give this message that entry's identity and attachments. So the message
+    stays queued for its own mirror, and the entry behind it is untouched.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    sid = "86c9a6e5cc129f3996166535768169e8"
+    store = _ConversationStore()
+    a_stable = "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d"
+    a_pending = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "A"}],
+        created_by="alice@example.com",
+        stable_id=a_stable,
+    )
+    b_pending = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "B"}],
+        created_by="alice@example.com",
+        stable_id="5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e",
+    )
+    published: list[dict[str, Any]] = []
+    real_publish = session_stream.publish
+
+    def _capture(session_id: str, event: dict[str, Any]) -> None:
+        published.append(event)
+        real_publish(session_id, event)
+
+    monkeypatch.setattr("omnigent.server.routes.sessions.session_stream.publish", _capture)
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame(
+                {"type": "response.in_progress", "response": {"id": "resp_a", "model": "codex"}}
+            ),
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    "input_stable_id": a_stable,
+                    "response": {
+                        "id": "resp_a",
+                        "model": "codex",
+                        "error": {
+                            "code": "codex_turn_error",
+                            "message": "Codex native executor error: connection reset.",
+                        },
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+    try:
+        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+        assert [i.type for i in store.appended_items] == ["error"]
+        assert [e["pending_id"] for e in pending_inputs.snapshot_for(sid)] == [
+            a_pending,
+            b_pending,
+        ]
+        assert not any(e.get("type") == "session.input.consumed" for e in published)
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_relay_leaves_later_queued_messages_when_a_delivered_turn_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A turn that fails after its message was mirrored settles nothing.
+
+    Message A reached the harness and was mirrored back (its entry drained);
+    B and C are still queued because the runner holds them for later turns.
+    When A then fails mid-turn, settling by queue order would commit B under
+    A's response and let B's own mirror consume C. Settlement is by the id
+    the runner stamps on the failure, so B and C stay queued, in order.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    sid = "75b895d4bb018e2885055424657058d7"
+    store = _ConversationStore()
+    a_stable = "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
+    a_pending = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "A"}],
+        created_by="alice@example.com",
+        stable_id=a_stable,
+    )
+    b_pending = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "B"}],
+        created_by="alice@example.com",
+        stable_id="2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b",
+    )
+    c_pending = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "C"}],
+        created_by="alice@example.com",
+        stable_id="3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+    )
+    # A's mirror already drained its entry before the turn failed.
+    assert pending_inputs.resolve(sid, a_pending) is not None
+    published: list[dict[str, Any]] = []
+    real_publish = session_stream.publish
+
+    def _capture(session_id: str, event: dict[str, Any]) -> None:
+        published.append(event)
+        real_publish(session_id, event)
+
+    monkeypatch.setattr("omnigent.server.routes.sessions.session_stream.publish", _capture)
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame(
+                {"type": "response.in_progress", "response": {"id": "resp_a", "model": "codex"}}
+            ),
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    "input_stable_id": a_stable,
+                    "response": {
+                        "id": "resp_a",
+                        "model": "codex",
+                        "error": {"code": "codex_turn_error", "message": "Codex crashed."},
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+    try:
+        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+        assert [i.type for i in store.appended_items] == ["error"]
+        assert [e["pending_id"] for e in pending_inputs.snapshot_for(sid)] == [
+            b_pending,
+            c_pending,
+        ]
+        assert not any(e.get("type") == "session.input.consumed" for e in published)
+    finally:
+        pending_inputs.reset_for_tests()
 
 
 @pytest.mark.asyncio
