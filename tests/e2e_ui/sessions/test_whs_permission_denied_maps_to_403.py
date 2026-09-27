@@ -228,7 +228,9 @@ def test_whs_permission_denied_is_handled_not_500(
     #    PERMISSION_DENIED escapes to _handle_unhandled_exception and the
     #    endpoint answers 500 internal_error; once mapped to a handled error it
     #    must answer a coded 403 naming the resource, never a raw 500.
-    resp = httpx.get(f"{whs_403_server}/v1/sessions", params={"limit": 30}, timeout=15.0)
+    resp = httpx.get(
+        f"{whs_403_server}/v1/sessions", params={"limit": 30, "visibility": "all"}, timeout=15.0
+    )
     body = resp.json()
     error_code = body.get("error", {}).get("code")
 
