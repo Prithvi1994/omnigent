@@ -1,268 +1,253 @@
-r"""UI journey: codex-native chat invokes an explicit slash skill.
+"""UI journey: codex-native chat invokes explicit slash skills.
 
-Two user-observable facets of the same defect:
+Two user-observable outcomes of the same defect:
 
 1. **Explicit slash-skill invocation from chat view.** A Codex host skill
-   (``~/.codex/skills/<name>/SKILL.md``) is offered by the web composer's
-   slash menu, but sending ``/<name> <args>`` from chat view forwards the
-   literal text to the Codex app-server (``ChatPage.handleSendSlashCommand``
-   is gated off for native wrappers, so the composer falls through to the
-   plaintext send, and ``codex_native_executor._content_to_input_items``
-   forwards it verbatim to ``turn/start``). Codex never receives a
-   structured skill input, so the skill's ``SKILL.md`` instructions never
-   reach the model. The test drives the real journey — install skill, start
-   a codex-native session, see the skill in the composer menu, send — and
-   asserts the skill *body* reaches the LLM (captured by the mock LLM
-   server). Reproduced ⇒ only the literal ``/<name> …`` text arrives and
-   the assertion fails.
+   (``~/.codex/skills/<name>/SKILL.md``) sent as ``/<name> <args>`` from the
+   web chat view must invoke the skill, so its ``SKILL.md`` instructions
+   reach the model exactly as they do for Codex's own ``$<name>`` mention.
+   Forwarding the command to the app-server as literal text silently drops
+   the skill.
 
-2. **Shared Agent Skills discovery.** A skill installed under
-   ``~/.agents/skills/<name>/SKILL.md`` (the cross-agent shared location the
-   generic host walk already understands) never appears in a codex-native
-   session's slash menu, because ``codex_host_skills`` only scans
-   ``<bundle>/skills`` + ``~/.codex/skills``. The test installs a shared
-   skill, opens the composer, types ``/<name>`` and asserts the menu offers
-   it.
+2. **Shared Agent Skills discovery.** A skill installed only under
+   ``~/.agents/skills/<name>/SKILL.md`` must be discovered by codex-native
+   sessions: seeded into the session's ``$CODEX_HOME/skills`` and invocable
+   with ``/<name>`` from chat like any host skill.
 
-Both tests ride the ``native_codex_mock_session`` fixture (real ``codex``
-CLI, mock LLM backend when ``LLM_API_KEY`` is absent), matching the native
-codex render-parity suite. Facet 1 inspects the mock LLM's captured
-requests, so it is skipped in real-gateway mode.
+Both journeys drive a real ``codex`` CLI against a capturing mock LLM and
+assert at the model boundary. Each skill body carries a unique marker that
+can only reach the model when the skill is expanded; each turn carries a
+nonce, and a marker counts only inside that turn's captured request, so an
+earlier turn's transcript cannot satisfy a later assertion. A ``$<skill>``
+control turn proves the capture path and skill registration work before the
+slash form is checked.
+
+The composer's slash menu is discovered on the session host, and the
+runner-bound sessions this harness creates have none, so the menu is not part
+of these journeys; ``tests/spec/test_skill_sources.py`` covers the provider
+the menu reads.
 """
 
 from __future__ import annotations
 
 import json
-import logging
 import os
 import shutil
 import uuid
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm, set_fallback_mock_llm
-
-_log = logging.getLogger(__name__)
-
-_COMPOSER = "Send a message…"
-_ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
-_WORKING = '[data-testid="working-indicator"]'
-
-# Mock LLM responds instantly; budget covers native CLI boot + turn settle.
-_MOCK_TURN_TIMEOUT_MS = 60_000
-# Codex boots in the terminal on bind; the auto-launch + first-run
-# pre-accept can take a while on a cold CI runner.
-_TERMINAL_READY_TIMEOUT_MS = 120_000
-# Runner-resolved skills land via the background skills fetch after bind —
-# give the menu time to receive them.
-_SKILL_MENU_TIMEOUT_MS = 90_000
-
-# Must match the model in the mock openai provider config written by the
-# native_codex_mock_session fixture (conftest._CODEX_MOCK_MODEL).
-_CODEX_MOCK_MODEL = "gpt-4o"
+from tests.e2e_ui.messages.test_message_render_parity import (
+    _ASSISTANT,
+    _WORKING,
+    _ensure_chat_view,
+)
+from tests.e2e_ui.messages.test_native_codex_render_parity import (
+    _CODEX_MOCK_MODEL,
+    _MOCK_TURN_TIMEOUT_MS,
+    _open_terminal_view,
+    _wait_terminal_connected,
+)
 
 
-def _write_skill(root: Path, name: str, description: str, body: str) -> Path:
-    """Write ``<root>/<name>/SKILL.md`` with frontmatter and *body*.
+@dataclass(frozen=True)
+class _InstalledSkills:
+    """Skill names and the unique body markers that prove each was expanded."""
+
+    control: str
+    control_marker: str
+    slash: str
+    slash_marker: str
+    shared: str
+    shared_marker: str
+
+
+def _write_skill(root: Path, name: str, marker: str) -> Path:
+    """Write ``<root>/<name>/SKILL.md`` whose body (never its description) carries *marker*.
 
     :param root: Skills root, e.g. ``~/.codex/skills``.
-    :param name: Skill (directory and frontmatter) name.
-    :param description: One-line frontmatter description.
-    :param body: Markdown instruction body below the frontmatter.
+    :param name: Skill directory and frontmatter name.
+    :param marker: Unique token embedded only in the instruction body.
     :returns: The created skill directory.
     """
     skill_dir = root / name
     skill_dir.mkdir(parents=True, exist_ok=False)
     (skill_dir / "SKILL.md").write_text(
-        f"---\nname: {name}\ndescription: {description}\n---\n\n{body}\n",
+        f"---\nname: {name}\ndescription: probe skill {name}\n---\n\n"
+        f"{marker}: read the named service manifest and report its version.\n",
         encoding="utf-8",
     )
     return skill_dir
 
 
 @pytest.fixture
-def installed_codex_host_skill() -> Iterator[tuple[str, str]]:
-    """Install a uniquely-named Codex host skill under ``~/.codex/skills``.
+def installed_codex_skills() -> Iterator[_InstalledSkills]:
+    """Install the journey's skills before the session launches.
 
-    Installed BEFORE the session fixture runs (declare it first in the test
-    signature) so the runner's skill discovery and the codex-native launch
-    both see it.
+    Declare this fixture ahead of ``native_codex_mock_session`` in a test
+    signature: the codex-native launch seeds ``$CODEX_HOME/skills`` once, so
+    the skills must already be on disk. Two distinct ``~/.codex/skills``
+    skills keep the control turn's marker out of the slash turn's check; the
+    third lives only in the shared ``~/.agents/skills`` tree.
 
-    :returns: ``(skill_name, body_marker)`` — the marker is a unique token
-        embedded only in the SKILL.md *body* (never the description, which
-        Codex advertises in its system prompt), so it can only reach the
-        model if the skill is actually invoked/expanded.
+    :returns: The installed skill names and markers.
     """
-    nonce = uuid.uuid4().hex[:8]
-    name = f"ask-matt-{nonce}"
-    body_marker = f"SKILL-BODY-{nonce}"
-    skill_dir = _write_skill(
-        Path.home() / ".codex" / "skills",
-        name,
-        "Verify a service like Matt would",
-        f"When invoked, reply including the token {body_marker} and audit the service.",
+    suffix = uuid.uuid4().hex[:8]
+    skills = _InstalledSkills(
+        control=f"ctrl-skill-{suffix}",
+        control_marker=f"CTRLBODY{uuid.uuid4().hex[:10]}",
+        slash=f"slash-skill-{suffix}",
+        slash_marker=f"SLASHBODY{uuid.uuid4().hex[:10]}",
+        shared=f"shared-skill-{suffix}",
+        shared_marker=f"SHAREDBODY{uuid.uuid4().hex[:10]}",
     )
+    codex_root = Path.home() / ".codex" / "skills"
+    shared_root = Path.home() / ".agents" / "skills"
+    created = [
+        _write_skill(codex_root, skills.control, skills.control_marker),
+        _write_skill(codex_root, skills.slash, skills.slash_marker),
+        _write_skill(shared_root, skills.shared, skills.shared_marker),
+    ]
     try:
-        yield (name, body_marker)
+        yield skills
     finally:
-        shutil.rmtree(skill_dir, ignore_errors=True)
+        for skill_dir in created:
+            shutil.rmtree(skill_dir, ignore_errors=True)
 
 
-@pytest.fixture
-def installed_shared_agents_skill() -> Iterator[str]:
-    """Install a uniquely-named shared Agent Skill under ``~/.agents/skills``.
+def _open_chat_composer(page: Page, base_url: str, session_id: str) -> Locator:
+    """Open the session, wait for the live Codex TUI, then switch to chat view.
 
-    :returns: The skill name.
+    :param page: The Playwright page.
+    :param base_url: Spawned server base URL.
+    :param session_id: The codex-native session id.
+    :returns: The focused chat composer.
     """
-    nonce = uuid.uuid4().hex[:8]
-    name = f"shared-agents-{nonce}"
-    skill_dir = _write_skill(
-        Path.home() / ".agents" / "skills",
-        name,
-        "A shared Agent Skill available to every harness",
-        "When invoked, say SHARED-AGENTS-SKILL ran.",
-    )
-    try:
-        yield name
-    finally:
-        shutil.rmtree(skill_dir, ignore_errors=True)
-
-
-def _open_chat_view(page: Page) -> None:
-    """Switch the terminal-first codex session to its Chat view.
-
-    :param page: The Playwright page, freshly navigated to ``/c/{id}``.
-    """
-    expect(page.get_by_test_id("view-mode-toggle")).to_be_visible(
-        timeout=_TERMINAL_READY_TIMEOUT_MS
-    )
-    segment = page.get_by_test_id("view-mode-chat")
-    expect(segment).to_be_enabled(timeout=30_000)
-    segment.click()
-
-
-def _composer(page: Page):
-    """Return the chat composer textarea locator (visible-checked).
-
-    :param page: The Playwright page, on the session's Chat view.
-    :returns: The composer locator.
-    """
-    composer = page.get_by_placeholder(_COMPOSER)
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_terminal_view(page)
+    _wait_terminal_connected(page)
+    _ensure_chat_view(page)
+    composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible(timeout=30_000)
+    composer.click()
     return composer
+
+
+def _send_and_capture_marker(
+    page: Page,
+    composer: Locator,
+    mock_url: str,
+    text: str,
+    nonce: str,
+    marker: str,
+) -> bool:
+    """Send *text* as a chat turn and report whether *marker* reached the model.
+
+    Only a captured request carrying this turn's *nonce* counts, so an earlier
+    turn's transcript cannot produce a false pass.
+
+    :param page: The Playwright page, on the session's chat view.
+    :param composer: The chat composer.
+    :param mock_url: Mock LLM server base URL.
+    :param text: The chat turn to send; must contain *nonce*.
+    :param nonce: Per-turn token routing the mock reply and filtering captures.
+    :param marker: The skill body marker expected in the turn's model request.
+    :returns: ``True`` when *marker* appears alongside *nonce* in a capture.
+    """
+    token = f"ack-{nonce}"
+    configure_mock_llm(mock_url, [{"text": token}], key=f"turn-{nonce}", match=nonce)
+    composer.fill(text)
+    page.wait_for_timeout(400)
+    page.get_by_role("button", name="Send", exact=True).click()
+    expect(page.locator(_ASSISTANT, has_text=token).first).to_be_visible(
+        timeout=_MOCK_TURN_TIMEOUT_MS
+    )
+    expect(page.locator(_WORKING)).to_have_count(0, timeout=_MOCK_TURN_TIMEOUT_MS)
+    page.wait_for_timeout(1_000)
+    captured = httpx.get(f"{mock_url}/mock/requests", timeout=10).json()["requests"]
+    return any(nonce in (blob := json.dumps(req)) and marker in blob for req in captured)
+
+
+_needs_mock_capture = pytest.mark.skipif(
+    bool(os.environ.get("LLM_API_KEY")),
+    reason="inspects the mock LLM's captured requests; real-gateway mode has no capture",
+)
 
 
 @pytest.mark.nightly
 @pytest.mark.timeout(300)
-@pytest.mark.skipif(
-    bool(os.environ.get("LLM_API_KEY")),
-    reason="inspects the mock LLM's captured requests; real-gateway mode has no capture",
-)
+@_needs_mock_capture
 def test_codex_native_chat_slash_skill_reaches_model(
-    installed_codex_host_skill: tuple[str, str],
+    installed_codex_skills: _InstalledSkills,
     native_codex_mock_session: tuple[str, str],
     mock_llm_server_url: str,
     page: Page,
 ) -> None:
-    """An explicit ``/<skill> <args>`` sent from chat view must invoke the skill.
-
-    Journey: install an enabled Codex skill → start a codex-native session →
-    the composer's slash menu offers the skill → send ``/<name> …`` from chat
-    view → the skill's instructions (its SKILL.md body) must reach the model.
-
-    Today the composer falls through to the plaintext send for native
-    wrappers, so the model only ever receives the literal ``/<name> …`` text
-    and the body marker never appears in any captured LLM request.
-    """
-    skill_name, body_marker = installed_codex_host_skill
+    """``/<skill> <args>`` from chat view invokes the skill like ``$<skill>`` does."""
+    skills = installed_codex_skills
     base_url, session_id = native_codex_mock_session
-    _log.info(
-        "codex-native session ready: base_url=%s session_id=%s skill=%s",
-        base_url,
-        session_id,
-        skill_name,
-    )
-
-    nonce = uuid.uuid4().hex[:8]
-    arg_marker = f"ARG-{nonce}"
-    assistant_token = f"AST-{nonce}"
+    composer = _open_chat_composer(page, base_url, session_id)
     reset_mock_llm(mock_llm_server_url)
-    # Content-routed queue: whichever internal call carries our turn's arg
-    # marker gets the settle token; everything else falls back to "".
-    configure_mock_llm(
+    set_fallback_mock_llm(mock_llm_server_url, _CODEX_MOCK_MODEL, "ready")
+
+    control_nonce = uuid.uuid4().hex[:8]
+    control_reached = _send_and_capture_marker(
+        page,
+        composer,
         mock_llm_server_url,
-        [{"text": assistant_token}],
-        key=arg_marker,
-        match=arg_marker,
+        f"${skills.control} verify this service {control_nonce}",
+        control_nonce,
+        skills.control_marker,
     )
-    set_fallback_mock_llm(mock_llm_server_url, _CODEX_MOCK_MODEL, "")
+    assert control_reached, "precondition: `$<skill>` from chat should invoke the skill"
 
-    page.goto(f"{base_url}/c/{session_id}")
-    _open_chat_view(page)
-    composer = _composer(page)
-
-    # Precondition: the ~/.codex host skill surfaces in the slash menu (this
-    # part of discovery works today — the menu is exactly what tells the user
-    # the command is available).
-    composer.fill(f"/{skill_name}")
-    expect(page.get_by_test_id(f"slash-menu-item-{skill_name}")).to_be_visible(
-        timeout=_SKILL_MENU_TIMEOUT_MS
+    slash_nonce = uuid.uuid4().hex[:8]
+    slash_reached = _send_and_capture_marker(
+        page,
+        composer,
+        mock_llm_server_url,
+        f"/{skills.slash} verify this service {slash_nonce}",
+        slash_nonce,
+        skills.slash_marker,
     )
-    _log.info("slash menu offers /%s — sending the command", skill_name)
-
-    # The user journey: send the advertised command with arguments.
-    composer.fill(f"/{skill_name} verify this service {arg_marker}")
-    page.get_by_role("button", name="Send", exact=True).click()
-
-    # Let the turn settle so codex has made its model call(s).
-    expect(page.locator(_ASSISTANT, has_text=assistant_token).first).to_be_visible(
-        timeout=_MOCK_TURN_TIMEOUT_MS
-    )
-    expect(page.locator(_WORKING)).to_have_count(0, timeout=_MOCK_TURN_TIMEOUT_MS)
-
-    # The bug: the skill's SKILL.md body never reaches the model — codex
-    # received the literal "/<name> …" text, not a structured skill input.
-    captured = httpx.get(f"{mock_llm_server_url}/mock/requests", timeout=10.0).json()
-    serialized = json.dumps(captured)
-    assert arg_marker in serialized, (
-        "harness plumbing broke: the sent turn text never reached the mock LLM"
-    )
-    assert body_marker in serialized, (
-        f"explicit slash skill was not invoked: /{skill_name} was forwarded to "
-        f"Codex as literal text and its SKILL.md instructions (marker "
-        f"{body_marker}) never reached the model"
+    assert slash_reached, (
+        f"/{skills.slash} was forwarded to Codex as literal text: "
+        "its SKILL.md body never reached the model"
     )
 
 
 @pytest.mark.nightly
 @pytest.mark.timeout(300)
-def test_codex_native_shared_agents_skill_discovered(
-    installed_shared_agents_skill: str,
+@_needs_mock_capture
+def test_codex_native_shared_agents_skill_invocable_from_chat(
+    installed_codex_skills: _InstalledSkills,
     native_codex_mock_session: tuple[str, str],
+    mock_llm_server_url: str,
     page: Page,
 ) -> None:
-    """A shared Agent Skill under ``~/.agents/skills`` must be discoverable.
-
-    Journey: install a shared Agent Skill → start a codex-native session →
-    type ``/<name>`` in the chat composer → the slash menu must offer it.
-
-    Today ``codex_host_skills`` scans only ``<bundle>/skills`` and
-    ``~/.codex/skills``, so the shared skill never surfaces.
-    """
-    skill_name = installed_shared_agents_skill
+    """A skill installed only under ``~/.agents/skills`` is discovered and invocable."""
+    skills = installed_codex_skills
     base_url, session_id = native_codex_mock_session
+    composer = _open_chat_composer(page, base_url, session_id)
+    reset_mock_llm(mock_llm_server_url)
+    set_fallback_mock_llm(mock_llm_server_url, _CODEX_MOCK_MODEL, "ready")
 
-    page.goto(f"{base_url}/c/{session_id}")
-    _open_chat_view(page)
-    composer = _composer(page)
-
-    composer.fill(f"/{skill_name}")
-    # A regression here means the menu never offers the shared skill and this
-    # expect times out: ~/.agents/skills absent from codex-native discovery.
-    expect(page.get_by_test_id(f"slash-menu-item-{skill_name}")).to_be_visible(
-        timeout=_SKILL_MENU_TIMEOUT_MS
+    nonce = uuid.uuid4().hex[:8]
+    shared_reached = _send_and_capture_marker(
+        page,
+        composer,
+        mock_llm_server_url,
+        f"/{skills.shared} verify this service {nonce}",
+        nonce,
+        skills.shared_marker,
+    )
+    assert shared_reached, (
+        f"/{skills.shared} is installed only under ~/.agents/skills and was not "
+        "invoked: shared Agent Skills are missing from Codex skill discovery"
     )
