@@ -158,19 +158,12 @@ _SKIP_DIRS: frozenset[str] = frozenset(
         # These are never agent-edited source files and must not appear
         # in the Files panel.
         "terminals",
-        # Omnigent's own workspace-local scratch namespace (harness runtime
-        # dirs, bootstrap markers) — runner infrastructure, never user content.
-        ".omnigent",
     }
 )
 
-# Workspace-relative paths of cursor plumbing that Omnigent itself writes at
-# session launch: the MCP relay config, the usage/policy hooks, and the hook
-# wrapper script.  cursor-agent only discovers project config under
-# ``<workspace>/.cursor``, so these have to live in the user's workspace — but
-# they are session infrastructure, not user or agent edits, and must not show
-# up as the session's "changed files".  Only these exact paths are hidden; the
-# user's own ``.cursor`` content (rules, plans, …) keeps normal tracking.
+# Cursor plumbing Omnigent writes into ``<workspace>/.cursor`` at session launch
+# (cursor-agent reads project config only there). Session infrastructure, not
+# user edits; only these exact paths are hidden, other ``.cursor`` content shows.
 _CURSOR_PLUMBING_PATHS: frozenset[str] = frozenset(
     {
         ".cursor/hooks.json",
@@ -199,7 +192,7 @@ def _is_harness_plumbing(path: str) -> bool:
     :param path: Workspace-relative path, e.g. ``".cursor/mcp.json"``.
     :returns: ``True`` when the path is in :data:`_CURSOR_PLUMBING_PATHS`.
     """
-    return path in _CURSOR_PLUMBING_PATHS
+    return Path(path).as_posix() in _CURSOR_PLUMBING_PATHS
 
 
 def _net_operation(first: str, last: str) -> str | None:

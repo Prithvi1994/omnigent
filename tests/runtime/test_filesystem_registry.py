@@ -529,14 +529,10 @@ def test_git_changed_files_suppress_ephemeral_files(tmp_path: Path) -> None:
 def test_git_changed_files_hide_omnigent_cursor_plumbing(tmp_path: Path) -> None:
     """Omnigent-written ``.cursor`` session plumbing must not appear as changes.
 
-    Launching a Cursor session writes ``.cursor/mcp.json`` (MCP relay),
-    ``.cursor/hooks.json`` (usage/policy hooks), and ``.cursor/omnigent-hook.sh``
-    into the workspace because cursor-agent only discovers project config
-    there.  Those files are session infrastructure, not user or agent edits;
-    surfacing them means every Cursor session's side panel opens with a
-    changed-files badge pointing at a hidden ``.cursor`` directory the user
-    never touched.  The user's own ``.cursor`` content (e.g. rules) must keep
-    showing.
+    A Cursor session writes ``.cursor/mcp.json``, ``.cursor/hooks.json`` and
+    ``.cursor/omnigent-hook.sh`` into the workspace because cursor-agent only
+    reads project config there. Only those exact paths are hidden; the user's
+    own ``.cursor`` content (e.g. rules) must keep showing.
     """
     env = _git_env()
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
@@ -577,40 +573,6 @@ def test_git_changed_files_hide_omnigent_cursor_plumbing(tmp_path: Path) -> None
             f"Expected get_changed_file to hide .cursor/{name}, got {record!r}. "
             "Direct file lookup should match the changed-files list."
         )
-
-
-def test_git_list_changed_files_excludes_workspace_omnigent_dir(tmp_path: Path) -> None:
-    """Files under a workspace-local ``.omnigent/`` directory are never changes.
-
-    ``.omnigent`` is Omnigent's own scratch namespace (harness runtime dirs,
-    CI bootstrap markers).  Like ``terminals/``, its contents are runner
-    infrastructure and must be pruned from the Files panel.
-    """
-    env = _git_env()
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
-    subprocess.run(
-        ["git", "commit", "--allow-empty", "-m", "init"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-        env=env,
-    )
-
-    internal = tmp_path / ".omnigent" / "harness-runtime"
-    internal.mkdir(parents=True)
-    (internal / "state.json").write_text("{}")
-    (tmp_path / "real_change.py").write_text("agent wrote this")
-
-    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
-    results = reg.list_changed_files("any-conv", limit=100)
-
-    paths = [r["path"] for r in results]
-    assert "real_change.py" in paths
-    internal_paths = [p for p in paths if p.startswith(".omnigent/")]
-    assert internal_paths == [], (
-        f"Expected no .omnigent/ paths but got {internal_paths}. "
-        "Omnigent-internal workspace state is leaking into the Files panel."
-    )
 
 
 def test_agent_edit_registry_hides_omnigent_cursor_plumbing(
