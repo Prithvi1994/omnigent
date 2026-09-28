@@ -26,6 +26,7 @@ def test_prune_preserves_bridge_owned_in_another_namespace(
     sweeper_namespace: str | None,
     sweeper_boot: str,
 ) -> None:
+    """A live owner in another namespace or boot is kept even when its pid reads dead here."""
     bridge = tmp_path / "live-session"
     bridge.mkdir()
     state = bridge / "bridge.json"
@@ -44,6 +45,7 @@ def test_prune_preserves_bridge_owned_in_another_namespace(
 def test_prune_preserves_legacy_owner_claim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A bare-pid marker cannot place its owner in this namespace, so the dir is kept."""
     bridge = tmp_path / "legacy-session"
     bridge.mkdir()
     (bridge / "owner.pid").write_text("123")
@@ -165,8 +167,8 @@ def test_prune_retains_entry_reclaimed_during_eligibility_check(
     marker.write_text("999999", encoding="utf-8")
     monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
 
-    def _reclaim(_bridge_dir: Path) -> bool:
-        marker.write_text(str(os.getpid()), encoding="utf-8")
+    def _reclaim(bridge_dir: Path) -> bool:
+        native_bridge_common.write_owner_pid_marker(bridge_dir)
         return True
 
     assert native_bridge_common.prune_orphaned_dirs(root, should_prune=_reclaim) == 0
