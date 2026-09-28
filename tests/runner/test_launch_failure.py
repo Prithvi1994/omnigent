@@ -86,6 +86,51 @@ def test_root_wins_over_generic_auth_when_both_markers_present() -> None:
     assert diagnosis.title == "Claude Code can't run as root"
 
 
+def test_classifies_dbcert_expired_as_non_fatal() -> None:
+    diagnosis = classify_terminal_failure(
+        command="claude",
+        exit_status=1,
+        output="dbcert expired on Arca\nPlease run `dbcert && dbcert sync-arca`",
+    )
+    assert diagnosis is not None
+    assert diagnosis.title == "Sandbox certificate expired"
+    assert diagnosis.remediation is not None
+    assert diagnosis.fatal is False
+
+
+def test_classifies_hosting_workspace_auth_as_non_fatal() -> None:
+    diagnosis = classify_terminal_failure(
+        command="claude",
+        exit_status=1,
+        output="RuntimeError: Authentication with the hosting workspace failed.",
+    )
+    assert diagnosis is not None
+    assert diagnosis.title == "Workspace authentication failed"
+    assert diagnosis.fatal is False
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        _ROOT_REFUSAL_OUTPUT,
+        "Not logged in · Please run /login",
+        "bash: qwen: command not found",
+    ],
+)
+def test_user_actionable_exits_are_non_fatal(output: str) -> None:
+    # Every recognized user-actionable exit downgrades to WARNING (non-fatal),
+    # so it stays out of the reliability error KPI.
+    diagnosis = classify_terminal_failure(command="claude", exit_status=1, output=output)
+    assert diagnosis is not None
+    assert diagnosis.fatal is False
+
+
+def test_failure_diagnosis_defaults_to_fatal() -> None:
+    # An unrecognized exit has no diagnosis; the caller treats that as fatal.
+    # A diagnosis constructed without an explicit flag is fatal by default.
+    assert FailureDiagnosis(title="x", cause="y").fatal is True
+
+
 def test_unclassified_failure_returns_none() -> None:
     assert (
         classify_terminal_failure(

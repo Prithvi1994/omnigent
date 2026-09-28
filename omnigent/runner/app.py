@@ -3416,13 +3416,19 @@ def create_runner_app(
             )
         return "\n".join(parts)
 
-    def _build_required_terminal_error(event: TerminalExitEvent) -> dict[str, str]:
+    def _build_required_terminal_error(event: TerminalExitEvent) -> tuple[dict[str, str], bool]:
         """Build the structured ``session.status`` error for a required-terminal exit.
 
         Always carries ``code`` + a fully-composed ``message`` (back-compat: the
         REPL and older clients render it verbatim). When the failure is
         recognized, also carries ``title`` / ``cause`` / ``remediation`` so the
         web UI can render a friendly card instead of the raw enum + blob.
+
+        :returns: The error dict and an ``is_fatal`` flag. A recognized
+            user-actionable exit (expired credential, missing binary, ...) is
+            non-fatal: the user can recover, so it is logged at ``WARNING`` and
+            kept out of the error KPI. An unrecognized exit has no diagnosis and
+            stays fatal (``ERROR``), preserving the investigation signal.
         """
         # Classify once; the message formatter reuses the same diagnosis.
         diagnosis = classify_terminal_failure(
@@ -3437,7 +3443,8 @@ def create_runner_app(
             error["cause"] = diagnosis.cause
             if diagnosis.remediation:
                 error["remediation"] = diagnosis.remediation
-        return error
+        is_fatal = diagnosis is None or diagnosis.fatal
+        return error, is_fatal
 
     def _live_terminal_pane_snapshot(conv_id: str) -> str | None:
         """Return the first captured pane text among the conversation's terminals.
@@ -3537,7 +3544,7 @@ def create_runner_app(
         # Record the exit before releasing the harness: the release severs any
         # in-flight turn stream, whose failure handler then reports this exit
         # instead of the transport error the severed socket raises.
-        error = _build_required_terminal_error(event)
+        error, is_fatal = _build_required_terminal_error(event)
         _required_terminal_exit_errors[event.session_id] = error
         # A dead required terminal cannot still be working a turn.
         _native_pane_status.pop(event.session_id, None)
@@ -3577,7 +3584,11 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
-        _logger.error(
+        # A user-actionable exit (expired credential, missing binary, ...) is
+        # non-fatal: log at WARNING so it stays out of the reliability error
+        # KPI. An unrecognized exit is a genuine crash and stays at ERROR.
+        _log_terminal_exit = _logger.error if is_fatal else _logger.warning
+        _log_terminal_exit(
             "required terminal %s exited; failing turn for %s: %s",
             event.terminal_name,
             event.session_id,

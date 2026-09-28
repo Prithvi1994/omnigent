@@ -39,11 +39,19 @@ class FailureDiagnosis:
         the user can act on.
     :param remediation: The concrete next step, e.g. a command to run or a
         config to change. ``None`` when there is no single clear fix.
+    :param fatal: ``True`` when the exit blocks the session with no user
+        action available (a genuine crash worth investigating — logged at
+        ``ERROR`` and counted in the reliability KPI). ``False`` for a
+        user-actionable/environment failure the user can recover from (e.g.
+        an expired credential); those are logged at ``WARNING`` and excluded
+        from the error KPI. Recognized user-actionable matchers set this to
+        ``False``; an unrecognized exit has no diagnosis and stays fatal.
     """
 
     title: str
     cause: str
     remediation: str | None = None
+    fatal: bool = True
 
 
 @dataclass(frozen=True)
@@ -103,6 +111,22 @@ _MISSING_MARKERS = (
     "executable file not found",
 )
 
+# --- expired dbcert certificate (Databricks sandbox) --------------------------
+# The dbexec/dbcert wrapper refuses to launch the CLI when the sandbox's
+# certificate has expired, printing this banner and exiting non-zero. The fix
+# is entirely on the user's side (refresh dbcert on their laptop).
+_DBCERT_MARKERS = (
+    "dbcert expired",
+    "dbcert refresh failed",
+    "certificate expired",
+    "dbcert && dbcert sync-arca",
+)
+
+# --- hosting-workspace auth failed --------------------------------------------
+# The Claude Code agent's prepare_environment raises this when it cannot
+# authenticate to the hosting workspace; the wording doesn't hit _AUTH_MARKERS.
+_HOSTING_AUTH_MARKERS = ("authentication with the hosting workspace failed",)
+
 
 # Ordered most-specific first: the root case also reads like a permission /
 # auth problem, so it must win over the broader rules below it.
@@ -117,6 +141,7 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "--dangerously-skip-permissions when running as the root user."
             ),
             remediation="Run the host as a non-root user (uid != 0).",
+            fatal=False,
         ),
     ),
     _TerminalMatcher(
@@ -129,6 +154,33 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "exited before the session could start."
             ),
             remediation=f"Install the harness on the host (e.g. run `{cli_invocation()} setup`).",
+            fatal=False,
+        ),
+    ),
+    _TerminalMatcher(
+        "dbcert_expired",
+        lambda s: s.output_contains_any(_DBCERT_MARKERS),
+        FailureDiagnosis(
+            title="Sandbox certificate expired",
+            cause=(
+                "The agent CLI couldn't launch because the sandbox's dbcert "
+                "certificate has expired."
+            ),
+            remediation="Run `dbcert && dbcert sync-arca` on your laptop, then try again.",
+            fatal=False,
+        ),
+    ),
+    _TerminalMatcher(
+        "hosting_workspace_auth",
+        lambda s: s.output_contains_any(_HOSTING_AUTH_MARKERS),
+        FailureDiagnosis(
+            title="Workspace authentication failed",
+            cause=(
+                "The agent CLI exited during setup because it couldn't authenticate "
+                "to the hosting workspace."
+            ),
+            remediation="Re-authenticate to the workspace, then start a new session.",
+            fatal=False,
         ),
     ),
     _TerminalMatcher(
@@ -144,6 +196,7 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 f"Sign the agent in on the host (e.g. run its `/login`, "
                 f"or `{cli_invocation()} login`)."
             ),
+            fatal=False,
         ),
     ),
 )
