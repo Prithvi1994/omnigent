@@ -261,7 +261,10 @@ def _completion_from_requests(
                                 "kind": "notification",
                                 "text": notification,
                             }
-                elif tool_result and expected_text in text:
+                plain_result = re.sub(
+                    r"<task-notification>.*?</task-notification>", "", text, flags=re.S
+                )
+                if tool_result and expected_text in plain_result:
                     return {"request_index": index, "kind": "tool_result", "text": text}
     return None
 

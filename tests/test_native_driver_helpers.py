@@ -262,3 +262,47 @@ def test_plain_or_malformed_notification_is_not_completion(text):
     ) as client:
         with pytest.raises(AssertionError, match="did not receive completion"):
             wait_claude_completion(client, call_id="call", expected_text="worker reply", timeout=0)
+
+
+@pytest.mark.parametrize(
+    "notification",
+    [
+        "<task-notification><tool-use-id>other</tool-use-id><status>completed</status>"
+        "<result>worker reply</result></task-notification>",
+        "<task-notification><result>unescaped & content</result></task-notification>",
+    ],
+)
+@pytest.mark.parametrize("reply", ["worker reply", "still waiting"])
+def test_synchronous_reply_outside_unrelated_notification(notification, reply):
+    requests = [
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call",
+                            "content": reply + notification,
+                        }
+                    ],
+                }
+            ]
+        }
+    ]
+    with httpx.Client(
+        base_url="http://mock",
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"requests": requests})),
+    ) as client:
+        if reply == "worker reply":
+            assert (
+                wait_claude_completion(
+                    client, call_id="call", expected_text="worker reply", timeout=0
+                )["kind"]
+                == "tool_result"
+            )
+        else:
+            with pytest.raises(AssertionError, match="did not receive completion"):
+                wait_claude_completion(
+                    client, call_id="call", expected_text="worker reply", timeout=0
+                )
