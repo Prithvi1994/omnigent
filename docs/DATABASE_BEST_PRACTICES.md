@@ -353,13 +353,10 @@ without invisible indexes, provide a staged validation and rollback plan that
 demonstrates queries remain supported. Never emit unsupported DDL merely to
 follow this process.
 
-**Required:** Put schema changes in a standalone PR. Do not bundle them with
-business logic, protobuf definitions, or other changes to the application
-binary. Migration tests and documentation belong with the schema change.
-Document deployment order and compatibility so schema and application releases
-can be deployed and rolled back independently. Plan additive changes and
-backfills before switching callers; defer destructive cleanup until the
-compatibility window has elapsed. Follow the
+**Required:** Document the migration's application compatibility and rollback
+assumptions in the PR. Migration tests and documentation belong with the schema
+change. Plan additive changes and backfills before switching callers; defer
+destructive cleanup until the compatibility window has elapsed. Follow the
 [database migration review requirements](../CONTRIBUTING.md#database-migration-reviews).
 
 ## Stored procedures
