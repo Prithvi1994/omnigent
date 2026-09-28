@@ -98,15 +98,21 @@ def test_classifies_dbcert_expired_as_non_fatal() -> None:
     assert diagnosis.fatal is False
 
 
-def test_classifies_hosting_workspace_auth_as_non_fatal() -> None:
+def test_classifies_hosting_workspace_auth_as_fatal_with_card() -> None:
+    # A helpful card, but fatal: the failure escalates to #ai-devtools rather
+    # than offering a self-serve fix, so it stays in the error KPI.
     diagnosis = classify_terminal_failure(
         command="claude",
         exit_status=1,
-        output="RuntimeError: Authentication with the hosting workspace failed.",
+        output=(
+            "An error occurred while running Claude Code: Authentication with the "
+            "hosting workspace failed. Please reach out to #ai-devtools if the issue persists."
+        ),
     )
     assert diagnosis is not None
     assert diagnosis.title == "Workspace authentication failed"
-    assert diagnosis.fatal is False
+    assert diagnosis.fatal is True
+    assert diagnosis.remediation is not None
 
 
 @pytest.mark.parametrize(

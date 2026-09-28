@@ -128,8 +128,12 @@ _DBCERT_MARKERS = (
 )
 
 # --- hosting-workspace auth failed --------------------------------------------
-# The Claude Code agent's prepare_environment raises this when it cannot
-# authenticate to the hosting workspace; the wording doesn't hit _AUTH_MARKERS.
+# The Claude Code agent's prepare_environment raises this from the gateway/token
+# setup path when it can't authenticate to the hosting workspace; the wording
+# doesn't hit _AUTH_MARKERS. Unlike a plain "not signed in", the product's own
+# guidance is to escalate ("reach out to #ai-devtools"), so there's no reliable
+# user self-serve action — it stays fatal and visible in the error KPI, but a
+# recognized diagnosis still gives it a clearer card than the raw enum.
 _HOSTING_AUTH_MARKERS = ("authentication with the hosting workspace failed",)
 
 
@@ -184,8 +188,10 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "The agent CLI exited during setup because it couldn't authenticate "
                 "to the hosting workspace."
             ),
-            remediation="Re-authenticate to the workspace, then start a new session.",
-            fatal=False,
+            # Fatal: the product's own guidance is to escalate, not a self-serve
+            # fix, and this is often a platform/token condition worth keeping in
+            # the error KPI. Mirror that guidance rather than inventing a step.
+            remediation="Start a new session; if it persists, reach out to #ai-devtools.",
         ),
     ),
     _TerminalMatcher(
