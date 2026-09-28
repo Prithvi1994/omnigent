@@ -4036,6 +4036,140 @@ async def test_non_claude_terminal_with_resume_banner_still_fails() -> None:
 
 
 @pytest.mark.asyncio
+async def test_user_actionable_required_exit_logs_warning_and_still_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A recognized user-actionable required-terminal exit logs WARNING, not ERROR.
+
+    Expired-credential and similar exits are things only the user can fix, so
+    they stay out of the reliability error KPI (which keys on ERROR). The turn
+    must still fail — the terminal is dead — and no ERROR record may be emitted.
+    """
+    import logging
+
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import (
+        TerminalExitEvent,
+        TerminalLifecycle,
+    )
+
+    conv_id = uuid.uuid4().hex
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    resource_registry = app.state.session_resource_registry
+    publish_exit = resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+
+    try:
+        with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+            publish_exit(
+                TerminalExitEvent(
+                    session_id=conv_id,
+                    terminal_id="terminal_claude_main",
+                    terminal_name="claude",
+                    session_key="main",
+                    lifecycle=TerminalLifecycle.REQUIRED,
+                    command="claude",
+                    exit_status=1,
+                    session_was_idle=False,
+                    last_output="dbcert expired on Arca\nPane is dead (status 1)",
+                )
+            )
+            queued_events: list[dict[str, Any]] = []
+            for _ in range(1000):
+                queued_events.extend(
+                    _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+                )
+                if pm.released:
+                    break
+                await asyncio.sleep(0)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+        runner_app.unregister_child_session(conv_id)
+
+    # Turn still fails: the required terminal is gone.
+    assert [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ] != []
+    # But it is logged at WARNING, not ERROR, so it never reaches the error KPI.
+    assert [record for record in caplog.records if record.levelno >= logging.ERROR] == []
+    assert any(
+        "required terminal" in record.getMessage() and record.levelno == logging.WARNING
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_unrecognized_required_exit_logs_error_and_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unrecognized required-terminal crash stays ERROR and fails the turn."""
+    import logging
+
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import (
+        TerminalExitEvent,
+        TerminalLifecycle,
+    )
+
+    conv_id = uuid.uuid4().hex
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    resource_registry = app.state.session_resource_registry
+    publish_exit = resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+
+    try:
+        with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+            publish_exit(
+                TerminalExitEvent(
+                    session_id=conv_id,
+                    terminal_id="terminal_claude_main",
+                    terminal_name="claude",
+                    session_key="main",
+                    lifecycle=TerminalLifecycle.REQUIRED,
+                    command="claude",
+                    exit_status=139,
+                    session_was_idle=False,
+                    last_output="Segmentation fault (core dumped)",
+                )
+            )
+            queued_events: list[dict[str, Any]] = []
+            for _ in range(1000):
+                queued_events.extend(
+                    _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+                )
+                if pm.released:
+                    break
+                await asyncio.sleep(0)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+        runner_app.unregister_child_session(conv_id)
+
+    assert [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ] != []
+    assert any(
+        "required terminal" in record.getMessage() and record.levelno == logging.ERROR
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
 async def test_external_idle_status_makes_required_terminal_exit_clean(tmp_path: Path) -> None:
     """
     A structured native ``idle`` status prevents a later pane close from failing.

@@ -131,6 +131,36 @@ def test_failure_diagnosis_defaults_to_fatal() -> None:
     assert FailureDiagnosis(title="x", cause="y").fatal is True
 
 
+def test_generic_missing_file_traceback_is_not_downgraded() -> None:
+    # A bare "no such file or directory" from an app-level crash must stay
+    # unclassified (→ fatal ERROR), not masquerade as a missing binary and get
+    # excluded from the error KPI.
+    assert (
+        classify_terminal_failure(
+            command="claude",
+            exit_status=1,
+            output=(
+                "FileNotFoundError: [Errno 2] No such file or directory: '/work/config.json'\n"
+                "exited with status 1"
+            ),
+        )
+        is None
+    )
+
+
+def test_dbcert_advice_above_unrelated_crash_is_not_downgraded() -> None:
+    # The dbcert remediation command in earlier scrollback must not classify a
+    # later segfault as an expired-certificate exit.
+    assert (
+        classify_terminal_failure(
+            command="claude",
+            exit_status=139,
+            output="hint: run `dbcert && dbcert sync-arca`\nSegmentation fault (core dumped)",
+        )
+        is None
+    )
+
+
 def test_unclassified_failure_returns_none() -> None:
     assert (
         classify_terminal_failure(

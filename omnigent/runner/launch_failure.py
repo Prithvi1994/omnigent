@@ -104,9 +104,13 @@ _AUTH_MARKERS = (
 )
 
 # --- binary missing -----------------------------------------------------------
+# Only unambiguous "the launched executable isn't there" evidence. A bare
+# "no such file or directory" is deliberately excluded: it also appears in an
+# ordinary app crash (e.g. a missing config file in a traceback), so treating
+# it as a missing-binary — and thus a non-fatal, KPI-excluded exit — would hide
+# a genuine crash. Exit code 127 is handled separately in the predicate.
 _MISSING_MARKERS = (
     "command not found",
-    "no such file or directory",
     "not recognized as an internal or external command",
     "executable file not found",
 )
@@ -114,12 +118,13 @@ _MISSING_MARKERS = (
 # --- expired dbcert certificate (Databricks sandbox) --------------------------
 # The dbexec/dbcert wrapper refuses to launch the CLI when the sandbox's
 # certificate has expired, printing this banner and exiting non-zero. The fix
-# is entirely on the user's side (refresh dbcert on their laptop).
+# is entirely on the user's side (refresh dbcert on their laptop). Match only
+# the specific failure lines — not the generic "certificate expired" nor the
+# remediation advice "dbcert && dbcert sync-arca", either of which can sit in
+# earlier pane scrollback above an unrelated crash and wrongly downgrade it.
 _DBCERT_MARKERS = (
     "dbcert expired",
     "dbcert refresh failed",
-    "certificate expired",
-    "dbcert && dbcert sync-arca",
 )
 
 # --- hosting-workspace auth failed --------------------------------------------
