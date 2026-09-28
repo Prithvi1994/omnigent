@@ -4038,6 +4038,7 @@ def _fake_sessions_chat_cls(
     query_impl: Callable[[str], object],
     *,
     extra_turns: list[str] | None = None,
+    terminal_status: str = "idle",
 ) -> type:
     """
     Build a ``SessionsChat`` replacement whose ``query`` is ``query_impl``.
@@ -4067,7 +4068,7 @@ def _fake_sessions_chat_cls(
             # Mirrors the real snapshot: "running" while sub-agents are pending
             # (the runner emits "waiting" → relay collapses to "running"),
             # "idle" when done.
-            return "running" if self._pending else "idle"
+            return "running" if self._pending else terminal_status
 
         async def refresh(self) -> None:
             pass  # status is derived from _pending; no fetch needed.
@@ -4110,6 +4111,7 @@ async def _run_one_shot(
     monkeypatch: pytest.MonkeyPatch,
     *,
     strict_completion: bool = False,
+    terminal_status: str = "idle",
 ) -> str | None:
     """
     Drive ``_query_sessions_once`` with a faked ``SessionsChat.query``.
@@ -4122,7 +4124,10 @@ async def _run_one_shot(
     # chat.py does ``from omnigent_client import SessionsChat`` inside
     # the function, so patch the attribute on the package (resolved at
     # call time), not a chat-module-local alias.
-    monkeypatch.setattr("omnigent_client.SessionsChat", _fake_sessions_chat_cls(query_impl))
+    monkeypatch.setattr(
+        "omnigent_client.SessionsChat",
+        _fake_sessions_chat_cls(query_impl, terminal_status=terminal_status),
+    )
     monkeypatch.setattr(
         chat_module,
         "_STRICT_PROMPT_COMPLETION",
@@ -4274,6 +4279,30 @@ async def test_query_sessions_once_does_not_recover_preamble_after_failure(monke
     )
     with pytest.raises(ClientOmnigentError, match="Prompt is too long"):
         await _run_one_shot(client, _raise_turn_failed, monkeypatch, strict_completion=True)
+
+
+@pytest.mark.parametrize("query_impl", [_return_text, _raise_turn_failed])
+@pytest.mark.parametrize("terminal_status", ["failed", "running", "launching", "unknown"])
+async def test_strict_prompt_rejects_unsuccessful_status_without_error_item(
+    monkeypatch, query_impl, terminal_status
+):
+    client = _FakeAPClient([_item_user("hi"), _item_assistant("preamble")])
+    with pytest.raises(ClientOmnigentError, match="terminal completion"):
+        await _run_one_shot(
+            client,
+            query_impl,
+            monkeypatch,
+            strict_completion=True,
+            terminal_status=terminal_status,
+        )
+
+
+async def test_strict_prompt_reconciles_transport_failure_only_after_idle(monkeypatch):
+    client = _FakeAPClient([_item_user("hi"), _item_assistant("completed answer")])
+    assert (
+        await _run_one_shot(client, _raise_turn_failed, monkeypatch, strict_completion=True)
+        == "completed answer"
+    )
 
 
 @pytest.mark.parametrize("query_impl", [_return_text, _raise_turn_failed])
