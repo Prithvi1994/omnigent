@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from contextvars import ContextVar
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -4107,6 +4108,8 @@ async def _run_one_shot(
     client: _FakeAPClient,
     query_impl: Callable[[str], object],
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    strict_completion: bool = False,
 ) -> str | None:
     """
     Drive ``_query_sessions_once`` with a faked ``SessionsChat.query``.
@@ -4120,6 +4123,11 @@ async def _run_one_shot(
     # the function, so patch the attribute on the package (resolved at
     # call time), not a chat-module-local alias.
     monkeypatch.setattr("omnigent_client.SessionsChat", _fake_sessions_chat_cls(query_impl))
+    monkeypatch.setattr(
+        chat_module,
+        "_STRICT_PROMPT_COMPLETION",
+        ContextVar("test_completion", default=strict_completion),
+    )
     return await _query_sessions_once(
         client=client,
         agent_name="hello_world",
@@ -4144,8 +4152,8 @@ async def test_query_sessions_once_reconciles_persisted_text_on_failed_status(
     client = _FakeAPClient([_item_user("say hi"), _item_assistant("hi there")])
     result = await _run_one_shot(client, _raise_turn_failed, monkeypatch)
     assert result == "hi there"  # the persisted assistant text, not an error
-    # Two reads: terminal-error verification, then text reconciliation.
-    assert client.sessions.list_items_calls == 2
+    # Legacy callers retain text reconciliation without strict verification.
+    assert client.sessions.list_items_calls == 1
 
 
 async def test_query_sessions_once_reconciles_persisted_text_on_empty_result(
@@ -4211,7 +4219,7 @@ async def test_query_sessions_once_checks_terminal_error_even_with_text(monkeypa
         [_item_user("say hi"), _item_assistant("preamble"), _item_error("Prompt is too long")]
     )
     with pytest.raises(ClientOmnigentError, match="Prompt is too long"):
-        await _run_one_shot(client, _return_text, monkeypatch)
+        await _run_one_shot(client, _return_text, monkeypatch, strict_completion=True)
 
 
 async def test_query_sessions_once_unreadable_terminal_outcome_is_failure(monkeypatch):
@@ -4222,7 +4230,7 @@ async def test_query_sessions_once_unreadable_terminal_outcome_is_failure(monkey
 
     client.sessions.list_items = unreadable
     with pytest.raises(ClientOmnigentError, match="Could not verify"):
-        await _run_one_shot(client, _return_text, monkeypatch)
+        await _run_one_shot(client, _return_text, monkeypatch, strict_completion=True)
 
 
 async def test_query_sessions_once_preserves_failure_when_transcript_is_unreadable(monkeypatch):
@@ -4233,7 +4241,7 @@ async def test_query_sessions_once_preserves_failure_when_transcript_is_unreadab
 
     client.sessions.list_items = unreadable
     with pytest.raises(ClientOmnigentError, match="auth misconfigured"):
-        await _run_one_shot(client, _raise_genuine_failure, monkeypatch)
+        await _run_one_shot(client, _raise_genuine_failure, monkeypatch, strict_completion=True)
 
 
 async def test_query_sessions_once_recovered_error_and_info_are_not_terminal(monkeypatch):
@@ -4245,12 +4253,18 @@ async def test_query_sessions_once_recovered_error_and_info_are_not_terminal(mon
             dict(_item_error("workspace reset"), level="info"),
         ]
     )
-    assert await _run_one_shot(client, _return_text, monkeypatch) == "direct answer"
+    assert (
+        await _run_one_shot(client, _return_text, monkeypatch, strict_completion=True)
+        == "direct answer"
+    )
 
 
 async def test_query_sessions_once_returns_text_after_terminal_check(monkeypatch):
     client = _FakeAPClient([_item_user("say hi"), _item_assistant("direct answer")])
-    assert await _run_one_shot(client, _return_text, monkeypatch) == "direct answer"
+    assert (
+        await _run_one_shot(client, _return_text, monkeypatch, strict_completion=True)
+        == "direct answer"
+    )
     assert client.sessions.list_items_calls == 1
 
 
@@ -4259,7 +4273,27 @@ async def test_query_sessions_once_does_not_recover_preamble_after_failure(monke
         [_item_user("say hi"), _item_assistant("preamble"), _item_error("Prompt is too long")]
     )
     with pytest.raises(ClientOmnigentError, match="Prompt is too long"):
-        await _run_one_shot(client, _raise_turn_failed, monkeypatch)
+        await _run_one_shot(client, _raise_turn_failed, monkeypatch, strict_completion=True)
+
+
+@pytest.mark.parametrize("query_impl", [_return_text, _raise_turn_failed])
+async def test_legacy_prompt_retains_text_despite_later_error(monkeypatch, query_impl):
+    client = _FakeAPClient(
+        [_item_user("hi"), _item_assistant("preamble"), _item_error("Prompt is too long")]
+    )
+    result = await _run_one_shot(client, query_impl, monkeypatch)
+    assert result == ("direct answer" if query_impl is _return_text else "preamble")
+
+
+async def test_legacy_prompt_does_not_require_readable_terminal_outcome(monkeypatch):
+    client = _FakeAPClient([])
+
+    async def unreadable(*args, **kwargs):
+        raise ClientOmnigentError("unavailable")
+
+    client.sessions.list_items = unreadable
+    assert await _run_one_shot(client, _return_text, monkeypatch) == "direct answer"
+    assert await _run_one_shot(client, _return_empty, monkeypatch) is None
 
 
 @pytest.mark.parametrize("fails", [False, True])
@@ -4267,6 +4301,7 @@ def test_prompt_result_preserves_terminal_outcome(monkeypatch, fails):
     from omnigent import chat
 
     def run(**kwargs):
+        assert chat._STRICT_PROMPT_COMPLETION.get()
         print("preamble")
         if fails:
             print("Prompt is too long", file=__import__("sys").stderr)
@@ -4279,6 +4314,7 @@ def test_prompt_result_preserves_terminal_outcome(monkeypatch, fails):
     assert result.error == ("Prompt is too long" if fails else None)
     assert result.elapsed_seconds >= 0
     assert result.usage is None and result.cost is None
+    assert not chat._STRICT_PROMPT_COMPLETION.get()
 
 
 def test_prompt_result_sigterm_unwinds_and_restores_handler(monkeypatch):
@@ -4379,6 +4415,9 @@ async def test_query_sessions_once_raises_on_lost_terminal_event_without_text(
 
 
 async def test_query_sessions_once_deadline_does_not_approve_persisted_preamble(monkeypatch):
+    monkeypatch.setattr(
+        chat_module, "_STRICT_PROMPT_COMPLETION", ContextVar("test_completion", default=True)
+    )
     monkeypatch.setattr(chat_module, "_PER_TURN_TIMEOUT_S", 0.01)
     monkeypatch.setattr(chat_module, "_LOOP_TIMEOUT_S", 0.02)
     client = _FakeAPClient([_item_user("hi"), _item_assistant("preamble")])
