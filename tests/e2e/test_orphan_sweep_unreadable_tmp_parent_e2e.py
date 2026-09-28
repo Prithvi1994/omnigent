@@ -17,6 +17,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omnigent.native.owner_claim import current_boot_id, current_pid_namespace
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # A failing boot dies in a few seconds; a healthy boot serves /health well
@@ -173,7 +175,10 @@ def test_server_boot_survives_inaccessible_ap_sibling(tmp_path: Path) -> None:
     # every real pid_max default, so it is reliably not alive.
     dead = parent / "ap-orphan-dead"
     dead.mkdir(mode=0o700)
-    (dead / "AP_PID").write_text(str(2**22 + 5), encoding="utf-8")
+    (dead / "AP_PID").write_text(
+        f"{2**22 + 5}\npid_ns={current_pid_namespace()}\nboot={current_boot_id() or ''}\n",
+        encoding="utf-8",
+    )
     boot = _boot_server_and_wait_health(parent, tmp_path)
     try:
         _proc, outcome, log_path = next(boot)

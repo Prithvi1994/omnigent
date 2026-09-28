@@ -37,6 +37,8 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.native import owner_claim
+from omnigent.native.owner_claim import current_boot_id, current_pid_namespace
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses.paths import resolve_harness_tmp_parent
 from omnigent.runtime.harnesses.process_manager import (
@@ -55,6 +57,11 @@ from omnigent.runtime.harnesses.process_manager import (
 
 _TEST_HARNESS_NAME = "test"
 _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_harness"
+
+
+def _sentinel_for(pid: int) -> str:
+    """AP_PID contents naming *pid* in this process's own namespace and boot."""
+    return f"{pid}\npid_ns={current_pid_namespace()}\nboot={current_boot_id() or ''}\n"
 
 
 @pytest.fixture
@@ -158,9 +165,12 @@ async def test_start_creates_instance_dir_with_sentinel(
         assert manager.instance_dir.is_dir()
         sentinel = manager.instance_dir / _AP_PID_FILE
         assert sentinel.exists()
-        # The recorded PID is this process — proves the sweep on
-        # a sibling Omnigent boot would correctly identify us as alive.
-        assert sentinel.read_text(encoding="utf-8").strip() == str(os.getpid())
+        # The recorded owner is this process in its own namespace — proves the
+        # sweep on a sibling Omnigent boot would correctly identify us as alive.
+        claim = owner_claim.parse_owner_claim(sentinel.read_text(encoding="utf-8"))
+        assert claim is not None
+        assert claim.pid == os.getpid()
+        assert claim.pid_ns == current_pid_namespace()
     finally:
         await manager.shutdown()
 
@@ -169,7 +179,7 @@ async def test_start_can_delegate_orphan_sweep_to_host(short_tmp_parent: Path) -
     """Host-spawned runners can start without scanning machine-global state."""
     stale_dir = short_tmp_parent / "ap-dead"
     stale_dir.mkdir(mode=0o700)
-    (stale_dir / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    (stale_dir / _AP_PID_FILE).write_text(_sentinel_for(99999999), encoding="utf-8")
 
     manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
     await manager.start(sweep_orphans=False)
@@ -1060,7 +1070,7 @@ async def test_orphan_sweep_removes_dead_omnigent_dirs(
     """
     fake_dir = short_tmp_parent / "ap-deaduuid"
     fake_dir.mkdir(mode=0o700)
-    (fake_dir / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    (fake_dir / _AP_PID_FILE).write_text(_sentinel_for(99999999), encoding="utf-8")
     # Plant a stale socket file too so the sweep has something to
     # try-and-clean (no live runner to kill, but the dir removal
     # path is what matters).
@@ -1089,7 +1099,7 @@ async def test_orphan_sweep_preserves_live_omnigent_dirs(
     """
     sibling_dir = short_tmp_parent / "ap-livepid"
     sibling_dir.mkdir(mode=0o700)
-    (sibling_dir / _AP_PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
+    (sibling_dir / _AP_PID_FILE).write_text(_sentinel_for(os.getpid()), encoding="utf-8")
 
     fresh = HarnessProcessManager(tmp_parent=short_tmp_parent)
     await fresh.start()
@@ -1101,6 +1111,51 @@ async def test_orphan_sweep_preserves_live_omnigent_dirs(
         assert (sibling_dir / _AP_PID_FILE).exists()
     finally:
         await fresh.shutdown()
+
+
+async def test_orphan_sweep_preserves_instance_dir_owned_in_another_namespace(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live sibling whose owner runs in another PID namespace is never swept.
+
+    Its pid is invisible from the sweeping namespace, so a local liveness
+    probe reports it absent; the namespace recorded in the sentinel must keep
+    the live instance's sockets intact.
+    """
+    live = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    await live.start(sweep_orphans=False)
+    try:
+        (live.instance_dir / "conv-live.sock").write_text("", encoding="utf-8")
+        monkeypatch.setattr(owner_claim, "current_pid_namespace", lambda: "pid:[elsewhere]")
+        monkeypatch.setattr(
+            "omnigent.runtime.harnesses.process_manager._pid_alive", lambda _pid: False
+        )
+
+        await sweep_orphaned_harness_processes(tmp_parent=short_tmp_parent)
+
+        assert live.instance_dir.exists(), "live sibling swept from a foreign namespace"
+        assert (live.instance_dir / "conv-live.sock").exists()
+    finally:
+        monkeypatch.undo()
+        await live.shutdown()
+
+
+async def test_orphan_sweep_preserves_legacy_bare_pid_sentinel(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bare-pid sentinel from an older build cannot prove its owner dead here."""
+    legacy_dir = short_tmp_parent / "ap-legacy"
+    legacy_dir.mkdir(mode=0o700)
+    (legacy_dir / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses.process_manager._pid_alive", lambda _pid: False
+    )
+
+    await sweep_orphaned_harness_processes(tmp_parent=short_tmp_parent)
+
+    assert legacy_dir.exists()
 
 
 @pytest.mark.posix_only
@@ -1170,16 +1225,16 @@ async def test_orphan_sweep_skips_unreadable_sibling_and_still_sweeps(
         pytest.skip("permission checks do not apply to root")
     inaccessible = short_tmp_parent / "ap-inaccessible"
     inaccessible.mkdir(mode=0o700)
-    (inaccessible / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    (inaccessible / _AP_PID_FILE).write_text(_sentinel_for(99999999), encoding="utf-8")
     inaccessible.chmod(0o000)
 
     dead = short_tmp_parent / "ap-deadsibling"
     dead.mkdir(mode=0o700)
-    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    (dead / _AP_PID_FILE).write_text(_sentinel_for(99999999), encoding="utf-8")
 
     live = short_tmp_parent / "ap-livesibling"
     live.mkdir(mode=0o700)
-    (live / _AP_PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
+    (live / _AP_PID_FILE).write_text(_sentinel_for(os.getpid()), encoding="utf-8")
 
     manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
     try:
@@ -1204,10 +1259,10 @@ async def test_orphan_sweep_treats_vanishing_child_as_benign_race(
     """An injected is_dir race must not prevent cleanup of the next dead orphan."""
     vanishing = short_tmp_parent / "ap-avanishing"
     vanishing.mkdir(mode=0o700)
-    (vanishing / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    (vanishing / _AP_PID_FILE).write_text(_sentinel_for(99999999), encoding="utf-8")
     dead = short_tmp_parent / "ap-zzdead"
     dead.mkdir(mode=0o700)
-    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    (dead / _AP_PID_FILE).write_text(_sentinel_for(99999999), encoding="utf-8")
 
     real_is_dir = Path.is_dir
 

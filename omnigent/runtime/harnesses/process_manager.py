@@ -43,6 +43,7 @@ from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
 from omnigent.inner.agent_env import strip_desktop_session_env
+from omnigent.native import owner_claim
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._harness_zygote_client import (
@@ -83,10 +84,9 @@ _TMP_PARENT_ENV_VAR = HARNESS_TMP_PARENT_ENV_VAR
 # depth.
 _HARNESS_AUTH_TOKEN_ENV = "OMNIGENT_HARNESS_AUTH_TOKEN"
 
-# Sentinel file the Omnigent instance writes into its subdir on boot. The
-# orphan sweep uses it to tell whether a sibling subdir belongs to
-# a still-running Omnigent (leave alone) or a crashed one (kill its
-# children, remove the dir).
+# Sentinel the Omnigent instance writes into its subdir on boot: an owner
+# claim (pid, PID namespace, boot) the orphan sweep uses to tell a live
+# sibling (leave alone) from a crashed one (kill its children, remove the dir).
 _AP_PID_FILE = "AP_PID"
 
 # Mode bits applied to the per-AP subdir and the per-conversation
@@ -687,12 +687,11 @@ class HarnessProcessManager:
             # whose dir uuid happens to collide with ours gets cleaned first.
             await sweep_orphaned_harness_processes(tmp_parent=self._tmp_parent)
         self._instance_dir.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
-        # Write the AP_PID sentinel so other instances' sweeps can
-        # tell our dir is live. Strict ``"x"`` because the dir is
-        # exclusively ours; a pre-existing sentinel would mean the
-        # uuid collided with a still-running instance — fail loud.
+        # Write the AP_PID sentinel so other instances' sweeps can tell our
+        # dir is live. The pid is qualified by PID namespace and boot so a
+        # sweep from another namespace sharing this root cannot read us as dead.
         sentinel = self._instance_dir / _AP_PID_FILE
-        sentinel.write_text(str(os.getpid()), encoding="utf-8")
+        sentinel.write_text(owner_claim.format_owner_claim(), encoding="utf-8")
         self._reaper_task = asyncio.create_task(
             self._idle_reaper_loop(),
             name="harness-process-manager-idle-reaper",
@@ -1586,20 +1585,25 @@ async def sweep_orphaned_harness_processes(*, tmp_parent: Path | None = None) ->
             )
             continue
         try:
-            pid = int(sentinel.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError) as exc:
+            claim = owner_claim.parse_owner_claim(sentinel.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError) as exc:
             _logger.warning(
                 "could not read AP_PID sentinel at %s: %s; skipping",
                 sentinel,
                 exc,
             )
             continue
-        if _pid_alive(pid):
+        if claim is None:
+            # A legacy bare pid or malformed sentinel cannot be placed in this
+            # process domain, so the dir may still belong to a live instance.
+            _logger.debug("preserving %s: AP_PID sentinel has no resolvable owner", child)
+            continue
+        if not owner_claim.owner_is_gone(claim, process_alive=_pid_alive):
             continue
         _logger.info(
             "sweeping orphaned Omnigent instance dir %s (pid %d not running)",
             child,
-            pid,
+            claim.pid,
         )
         await _kill_orphan_runners(child)
         shutil.rmtree(child, ignore_errors=True)
