@@ -386,7 +386,7 @@ def test_prepare_bridge_dir_excludes_concurrent_orphan_prune(
     assert prepared_paths == [bridge_dir]
     assert bridge_dir.is_dir()
     assert session_data.read_text(encoding="utf-8") == "preserve me"
-    assert owner_marker.read_text(encoding="utf-8").strip() == str(os.getpid())
+    assert owner_marker.read_text(encoding="utf-8").splitlines()[0] == str(os.getpid())
 
 
 def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
