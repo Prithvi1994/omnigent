@@ -3471,7 +3471,24 @@ class McpServerStartup(BaseModel):
 
 
 class SessionMcpStartupEvent(_SSEEventBase):
-    """Transient per-server startup state from native or SDK harnesses."""
+    """
+    Per-MCP-server startup state for a session.
+
+    Native harnesses (codex-native) mirror their MCP startup progress as
+    ``external_mcp_startup`` posts. SDK-harness sessions have no startup
+    sequence, so the failures reported by the runner's per-turn
+    ``tools/list`` are folded into this same event. The web UI renders
+    both on its MCP surfaces.
+
+    :param type: Always ``"session.mcp_startup"``.
+    :param conversation_id: Session identifier, e.g. ``"conv_abc123"``.
+    :param servers: Latest per-server startup map, e.g.
+        ``{"safe": {"status": "starting", "error": None}}``.
+
+    Category: **transient** (SSE + snapshot cache). Not persisted; a
+    client connecting mid-startup seeds from the session snapshot's
+    ``mcp_startup`` field and updates live off this event.
+    """
 
     type: Literal["session.mcp_startup"]
     conversation_id: str
