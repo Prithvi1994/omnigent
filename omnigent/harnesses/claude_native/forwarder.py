@@ -21,6 +21,7 @@ import httpx
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
+    CLAUDE_FRAMEWORK_CONTEXT_FILE,
     OBSERVER_HOOK_STDERR_FILE,
     BtwOverlay,
     ClaudeHookRecord,
@@ -1169,6 +1170,9 @@ _OTHER_PRODUCER_BRIDGE_FILES = (
     # Relay coordinates written at relay startup for the in-terminal shim to
     # source; the poll loop reads tool_relay.json (watched above), never this.
     "tool_relay.env",
+    # Framework context the executor stages for the prompt-submit hook to
+    # inject into Claude's next turn; the poll loop never reads it.
+    CLAUDE_FRAMEWORK_CONTEXT_FILE,
 )
 
 # Sub-agent transcripts grow; their sibling ``agent-*.meta.json`` is read once

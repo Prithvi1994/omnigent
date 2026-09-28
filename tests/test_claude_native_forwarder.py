@@ -12207,6 +12207,7 @@ def _assert_all_classified(candidates: dict[str, str]) -> None:
         ("turn_replay_pending.json", False),
         ("turn_routing.log", False),
         ("subagent_router.json", False),
+        ("pending_framework_context.txt", False),
     ],
 )
 def test_bridge_file_disposition_controls_fingerprint(
@@ -12765,7 +12766,7 @@ def test_forwarder_tick_is_needed_while_a_retry_is_outstanding() -> None:
 
     # A retry that is scheduled but not yet due must NOT hold the gate open —
     # a sustained outage would otherwise pin the loop at full rate forever.
-    tracker.record_failure("item:1", httpx.ConnectError("boom"))
+    tracker.record_failure("item:1", httpx.ConnectError("boom"), session_id="conv_gate")
     assert not forwarder._forwarder_tick_is_needed(
         now=settled["now"],
         last_change_at=settled["last_change_at"],
