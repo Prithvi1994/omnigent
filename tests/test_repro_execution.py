@@ -1357,7 +1357,8 @@ def test_diagnostics_are_sanitized_before_bounding(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "kind", ["collection_error", "collection_incomplete", "truncated", "malformed", "none"]
+    "kind",
+    ["collection_error", "collection_incomplete", "truncated", "malformed", "interrupted", "none"],
 )
 def test_subprocess_capture_completeness_is_separate_from_inventory(tmp_path, monkeypatch, kind):
     from dev.repro_env import execution
@@ -1376,6 +1377,8 @@ if kind == 'malformed':
     journal.path.write_text('{"partial":')
 elif kind == 'truncated':
     journal.emit('large', text='x' * 300000)
+elif kind == 'interrupted':
+    journal.emit('collector_start')
 elif kind != 'none':
     journal.emit(kind, operation='trace_stop', context_id='browser-1', detail='trace unavailable')
 (path / 'useful.png').write_bytes(b'retained')

@@ -536,6 +536,7 @@ def pytest_configure(config):
         return
     collector = Evidence(Path(path))
     config._repro_evidence = collector
+    collector.emit("collector_start")
     collector.install_http()
     collector.capture("playwright_install", collector.install_browser)
 

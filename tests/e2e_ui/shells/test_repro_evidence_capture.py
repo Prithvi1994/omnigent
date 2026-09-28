@@ -243,7 +243,7 @@ def test_raw_trace_never_enters_bundle_when_redaction_fails(tmp_path, browser, m
 
 
 @pytest.mark.parametrize("tracing", ["off", "on", "retain-on-failure"])
-@pytest.mark.parametrize("fails", [False, True])
+@pytest.mark.parametrize("fails", [False, True, "abrupt"])
 def test_pytest_playwright_teardown_retains_trace(tmp_path, tracing, fails):
     import json
     import os
@@ -258,7 +258,7 @@ def test_pytest_playwright_teardown_retains_trace(tmp_path, tracing, fails):
         "def test_browser(page):\n"
         "    page.set_content('<input aria-label=\"Input\">')\n"
         '    page.get_by_label("Input").fill("retained browser action")\n'
-        f"    assert {not fails}\n"
+        + ("    import os; os._exit(7)\n" if fails == "abrupt" else f"    assert {not fails}\n")
     )
     env = {**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "PYTEST_PLUGINS": ""}
     code = run(
@@ -283,9 +283,16 @@ def test_pytest_playwright_teardown_retains_trace(tmp_path, tracing, fails):
         ],
         env,
     )
-    assert code == int(fails)
+    assert code == (7 if fails == "abrupt" else int(fails))
     attempt = next((tmp_path / "execution").glob("*/attempt.json"))
     record = json.loads(attempt.read_text())
+    if fails == "abrupt":
+        assert record["artifacts_complete"] and not record["capture_complete"]
+        assert any(
+            e.get("error_type") == "CollectorInterrupted" for e in record["collection_errors"]
+        )
+        assert list(attempt.parent.glob("source-*.py"))
+        return
     assert record["capture_complete"] and not record["collection_errors"]
     traces = list(attempt.parent.glob("trace-*.zip"))
     assert traces
@@ -340,8 +347,9 @@ def test_unstopped_caller_trace_reports_incomplete_capture(tmp_path, browser):
         collector.patch.undo()
 
 
+@pytest.mark.parametrize("with_path", [False, True])
 def test_caller_stop_exception_is_preserved_with_optional_chunk_capture(
-    tmp_path, browser, monkeypatch
+    tmp_path, browser, monkeypatch, with_path
 ):
     with browser.new_context() as probe:
         tracing_type = type(probe.tracing)
@@ -360,7 +368,7 @@ def test_caller_stop_exception_is_preserved_with_optional_chunk_capture(
         context = browser.new_context()
         context.new_page().set_content("<p>observed</p>")
         with pytest.raises(RuntimeError, match="caller stop failed"):
-            context.tracing.stop()
+            context.tracing.stop(path=tmp_path / "caller.zip" if with_path else None)
         assert collector.contexts[context]["trace_active"]
         fail_stop = False
         context.close()

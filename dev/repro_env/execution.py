@@ -276,6 +276,7 @@ def collector_errors(directory: Path, wrapper: Journal) -> list[dict]:
     for path in sorted(directory.glob("events-*.jsonl")):
         if path == wrapper.path or path.is_symlink():
             continue
+        started = finished = False
         try:
             with path.open("rb") as stream:
                 while line := stream.readline(MAX_EVENT + 1):
@@ -288,12 +289,24 @@ def collector_errors(directory: Path, wrapper: Journal) -> list[dict]:
                         add({k: v for k, v in event.items() if k not in {"kind", "time_ns"}}, path)
                     if event.get("truncated"):
                         add({"operation": "journal_event", "error_type": "TruncatedEvent"}, path)
+                    if event.get("kind") == "collector_start":
+                        started = True
                     if event.get("kind") == "collector_end":
+                        finished = True
                         for error in event.get("collection_errors", []):
                             add(error, path)
         except Exception as exc:  # noqa: BLE001 — retain other journals and the command result.
             error = wrapper.failure("child_journal_read", exc, journal=path.name)
             wrapper.emit("collection_error", **error)
+        if started and not finished:
+            add(
+                {
+                    "operation": "collector_lifecycle",
+                    "error_type": "CollectorInterrupted",
+                    "detail": "Collector started but did not finish",
+                },
+                path,
+            )
     if omitted:
         errors.append(
             {
