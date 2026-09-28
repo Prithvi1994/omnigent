@@ -26,7 +26,8 @@ from urllib.parse import quote, urlencode
 
 import httpx
 import jwt
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request
+from starlette.datastructures import URL
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
@@ -45,7 +46,6 @@ from omnigent.server.oidc import (
 from omnigent.server.oidc_access import OidcAdmissionPolicy, resolve_allowed_domains_path
 from omnigent.server.routes.device_auth import (
     _generate_user_code,
-    _require_browser_origin,
     issue_login_grant,
 )
 from omnigent.stores.permission_store import PermissionStore
@@ -705,12 +705,22 @@ def create_auth_router(
             status_code=200,
         )
 
+    def _require_cli_browser_origin(request: Request) -> None:
+        # These forms are server-rendered; API/WebSocket origin exceptions
+        # must not authorize browser consent. The callback covers proxy origins.
+        allowed = {
+            str(request.url.replace(path="", query="")),
+            str(URL(config.redirect_uri).replace(path="", query="")),
+        }
+        if request.headers.get("origin") not in allowed:
+            raise HTTPException(status_code=403, detail="Untrusted browser Origin")
+
     @router.post("/cli-approve")
     async def cli_approve(request: Request) -> Response:
         """Approve a pending CLI login ticket from the browser."""
         from fastapi.responses import JSONResponse
 
-        _require_browser_origin(request)
+        _require_cli_browser_origin(request)
         user_id = auth_provider.get_user_id(request)
         if user_id is None:
             return JSONResponse(status_code=401, content={"error": "unauthorized"})
@@ -760,7 +770,7 @@ def create_auth_router(
         """Deny a pending CLI login ticket from the browser."""
         from fastapi.responses import JSONResponse
 
-        _require_browser_origin(request)
+        _require_cli_browser_origin(request)
         user_id = auth_provider.get_user_id(request)
         if user_id is None:
             return JSONResponse(status_code=401, content={"error": "unauthorized"})

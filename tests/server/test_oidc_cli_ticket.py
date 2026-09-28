@@ -185,6 +185,49 @@ async def test_cli_approve_requires_origin_and_session() -> None:
         assert no_session.status_code == 401
 
 
+@pytest.mark.parametrize("endpoint", ["cli-approve", "cli-deny"])
+@pytest.mark.parametrize("allowlisted", [False, True])
+@pytest.mark.parametrize(
+    "origin", ["https://evil.example", "http://sub.test", "null", "omnigent://internal"]
+)
+async def test_cli_consent_rejects_foreign_origins(
+    monkeypatch: pytest.MonkeyPatch, endpoint: str, origin: str, allowlisted: bool
+) -> None:
+    if allowlisted:
+        monkeypatch.setenv("OMNIGENT_WS_ALLOWED_ORIGINS", origin)
+    else:
+        monkeypatch.delenv("OMNIGENT_WS_ALLOWED_ORIGINS", raising=False)
+    async with httpx.AsyncClient(
+        transport=_build_app(), base_url="http://test", follow_redirects=False
+    ) as client:
+        ticket, verifier = await _create_ticket(client)
+        await _complete_callback(client, ticket)
+        response = await client.post(
+            f"/auth/{endpoint}", data={"ticket": ticket}, headers={"Origin": origin}
+        )
+        assert response.status_code == 403
+        assert (
+            await client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={verifier}")
+        ).status_code == 202
+
+
+async def test_cli_consent_accepts_configured_public_origin_behind_proxy() -> None:
+    async with httpx.AsyncClient(
+        transport=_build_app(), base_url="http://internal-proxy", follow_redirects=False
+    ) as client:
+        ticket, verifier = await _create_ticket(client)
+        await _complete_callback(client, ticket)
+        response = await client.post(
+            "/auth/cli-approve",
+            data={"ticket": ticket},
+            headers={"Origin": "http://localhost:8000"},
+        )
+        assert response.status_code == 200
+        assert (
+            await client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={verifier}")
+        ).status_code == 200
+
+
 async def test_cli_approve_rejects_stale_session() -> None:
     transport = _build_app()
     async with httpx.AsyncClient(
