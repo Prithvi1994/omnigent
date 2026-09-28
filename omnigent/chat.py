@@ -2754,34 +2754,26 @@ async def _persisted_turn_error(
     client: OmnigentClient,
     session_id: str,
 ) -> str | None:
-    """Read the latest turn's persisted terminal error message, if any.
+    """Read a terminal error after the latest completed assistant message.
 
-    Companion to :func:`_persisted_turn_text`. When a turn produced no
-    ``completed`` assistant text, the runner may still have persisted a
-    terminal ``error`` item — e.g. a harness *start* failure such as the
-    cursor SDK rejecting an unknown model. Without this, the headless ``-p``
-    path renders that as a silent, exit-0 empty success; returning the message
-    lets the caller surface it and exit non-zero.
-
-    Mirrors :func:`_persisted_turn_text`'s walk: newest → oldest, stopping at
-    the current turn's user message, so a prior turn's error is never
-    attributed to this turn.
-
-    :param client: Connected SDK client bound to the session's server.
-    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
-    :returns: The current turn's terminal error message, or ``None``.
+    The relay flushes final assistant text before persisting terminal errors.
+    A newer completed message therefore supersedes an earlier recovered error.
+    Informational banners are not failures. An unreadable transcript cannot
+    establish successful completion.
     """
     try:
         recent: _ResponseOutput = await client.sessions.list_items(
             session_id, limit=_RECONCILE_ITEMS_LIMIT, order="desc"
         )
     except ClientOmnigentError as exc:
-        logger.debug("reconcile error read failed for %s: %r", session_id, exc)
-        return None
+        raise ClientOmnigentError("Could not verify the headless turn's terminal outcome") from exc
     for item in recent:
-        if item.get("type") == "message" and item.get("role") == "user":
-            break  # reached the start of the current turn
-        if item.get("type") == "error":
+        if item.get("type") == "message":
+            if item.get("role") == "user" or (
+                item.get("role") == "assistant" and item.get("status") == "completed"
+            ):
+                break
+        if item.get("type") == "error" and item.get("level") != "info":
             message = item.get("message")
             if isinstance(message, str) and message:
                 return message

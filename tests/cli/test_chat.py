@@ -4214,6 +4214,29 @@ async def test_query_sessions_once_checks_terminal_error_even_with_text(monkeypa
         await _run_one_shot(client, _return_text, monkeypatch)
 
 
+async def test_query_sessions_once_unreadable_terminal_outcome_is_failure(monkeypatch):
+    client = _FakeAPClient([_item_user("hi"), _item_assistant("preamble")])
+
+    async def unreadable(*args, **kwargs):
+        raise ClientOmnigentError("unavailable")
+
+    client.sessions.list_items = unreadable
+    with pytest.raises(ClientOmnigentError, match="Could not verify"):
+        await _run_one_shot(client, _return_text, monkeypatch)
+
+
+async def test_query_sessions_once_recovered_error_and_info_are_not_terminal(monkeypatch):
+    client = _FakeAPClient(
+        [
+            _item_user("hi"),
+            _item_error("transient failure"),
+            _item_assistant("recovered answer"),
+            dict(_item_error("workspace reset"), level="info"),
+        ]
+    )
+    assert await _run_one_shot(client, _return_text, monkeypatch) == "direct answer"
+
+
 async def test_query_sessions_once_returns_text_after_terminal_check(monkeypatch):
     client = _FakeAPClient([_item_user("say hi"), _item_assistant("direct answer")])
     assert await _run_one_shot(client, _return_text, monkeypatch) == "direct answer"
