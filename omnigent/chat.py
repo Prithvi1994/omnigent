@@ -2516,10 +2516,15 @@ async def _query_sessions_once(
         if strict_completion:
             try:
                 turn_error = await _persisted_turn_error(client, bound.id, strict=True)
+                await chat.refresh()
             except ClientOmnigentError as verification_error:
                 raise exc from verification_error
             if turn_error is not None:
                 raise ClientOmnigentError(turn_error) from exc
+            if chat.status != "idle":
+                raise ClientOmnigentError(
+                    f"Headless session did not reach terminal completion (status: {chat.status})"
+                ) from exc
         reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
             return reconciled
@@ -2548,13 +2553,13 @@ async def _query_sessions_once(
                         break
                     await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
         if strict_completion:
-            if chat.status in ("running", "launching"):
-                raise ClientOmnigentError(
-                    "Headless session did not reach terminal completion"
-                ) from None
             turn_error = await _persisted_turn_error(client, bound.id, strict=True)
             if turn_error is not None:
                 raise ClientOmnigentError(turn_error) from None
+            if chat.status != "idle":
+                raise ClientOmnigentError(
+                    f"Headless session did not reach terminal completion (status: {chat.status})"
+                ) from None
         reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
             return reconciled
@@ -2649,13 +2654,13 @@ async def _query_sessions_once(
         )
 
     if strict_completion:
-        if chat.status in ("running", "launching"):
-            raise ClientOmnigentError(
-                "Headless session did not reach terminal completion"
-            ) from None
         turn_error = await _persisted_turn_error(client, bound.id, strict=True)
         if turn_error is not None:
             raise ClientOmnigentError(turn_error) from None
+        if chat.status != "idle":
+            raise ClientOmnigentError(
+                f"Headless session did not reach terminal completion (status: {chat.status})"
+            ) from None
     if all_text_parts:
         return "\n\n".join(p for p in all_text_parts if p)
     # An auto-woken turn can finish between live-stream subscriptions.
