@@ -583,11 +583,13 @@ def run_prompt_result(**kwargs: Any) -> PromptResult:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         raise InterruptedError("Headless invocation terminated")
 
-    if main_thread:
-        signal.signal(signal.SIGTERM, interrupted)
     try:
+        if main_thread and previous is not None:
+            signal.signal(signal.SIGTERM, interrupted)
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
             run_prompt(**kwargs)
+    except InterruptedError as exc:
+        status, error = "failed", str(exc)
     except (Exception, SystemExit) as exc:  # noqa: BLE001 — typed failure boundary
         status = "failed"
         error = errors.getvalue().strip() or str(exc) or type(exc).__name__
