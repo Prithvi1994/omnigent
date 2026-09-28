@@ -5111,6 +5111,8 @@ def create_runner_app(
         if _binding := _session_comment_relays.pop(session_id, None):
             _binding.relay.close()
         _session_histories.pop(session_id, None)
+        # The session is gone; a later forward for it is a new session's message.
+        _started_item_ids.pop(session_id, None)
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
         _session_inboxes.pop(session_id, None)

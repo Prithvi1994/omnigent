@@ -5046,6 +5046,12 @@ async def _persist_native_terminal_failure(
     """
     turn_id = generate_task_id()
     user_item = _build_new_item(body, turn_id, created_by=created_by)
+    # Persisted under the web submission's id and acknowledged by it, so a
+    # re-send after this failure dedupes instead of adding a second copy and
+    # the client settles the bubble that was actually sent.
+    web_stable_id = _web_stable_id(body)
+    if web_stable_id is not None:
+        user_item = user_item.model_copy(update={"stable_id": web_stable_id})
     persisted_items = await asyncio.to_thread(
         conversation_store.append,
         session_id,
@@ -5066,7 +5072,7 @@ async def _persist_native_terminal_failure(
         ),
     )
     consumed = persisted_items[0]
-    _publish_input_consumed(session_id, consumed)
+    _publish_input_consumed(session_id, consumed, stable_id=web_stable_id)
     if error_persist_result == "persisted":
         _publish_error_event(session_id, error)
     _publish_terminal_pending(session_id, False)
@@ -5147,6 +5153,9 @@ async def _persist_host_launch_failure_turn(
     )
     turn_id = generate_task_id()
     user_item = _build_new_item(body, turn_id, created_by=created_by)
+    web_stable_id = _web_stable_id(body)
+    if web_stable_id is not None:
+        user_item = user_item.model_copy(update={"stable_id": web_stable_id})
     persisted_items = await asyncio.to_thread(
         conversation_store.append,
         session_id,
@@ -5159,7 +5168,7 @@ async def _persist_host_launch_failure_turn(
         NewConversationItem(type="error", response_id=turn_id, data=error),
     )
     consumed = persisted_items[0]
-    _publish_input_consumed(session_id, consumed)
+    _publish_input_consumed(session_id, consumed, stable_id=web_stable_id)
     if error_persist_result == "persisted":
         _publish_error_event(session_id, error)
     _publish_terminal_pending(session_id, False)

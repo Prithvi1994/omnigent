@@ -1285,6 +1285,7 @@ describe("chatStore — switchTo", () => {
     await useChatStore.getState().send("hello from bg", "agent_xyz");
     // Optimistic bubble is pending: nothing committed yet.
     expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+    const bgStableId = useChatStore.getState().pendingUserMessages[0]!.stableId;
 
     // The user navigates away; conv_bgsend keeps its stream.
     await useChatStore.getState().switchTo("conv_other");
@@ -1296,6 +1297,7 @@ describe("chatStore — switchTo", () => {
         // Nested envelope, as the server sends it (see `parseEvent`).
         data: {
           item_id: "item_bg_user",
+          stable_id: bgStableId,
           type: "message",
           data: { role: "user", content: [{ type: "input_text", text: "hello from bg" }] },
         },
@@ -5070,10 +5072,13 @@ describe("chatStore — send (file attachments)", () => {
 
     const file = new File(["bytes"], "screenshot.png", { type: "image/png" });
     await useChatStore.getState().send("whats going on", "agent_xyz", [file]);
+    const sent = useChatStore.getState().pendingUserMessages[0]!;
 
+    // The receipt names the submission it drained; the item id is the mirror's.
     handleSessionEvent({
       type: "session_input_consumed",
       itemId: "msg_persisted_1",
+      stableId: sent.stableId,
       itemType: "message",
       data: {
         role: "user",
@@ -5175,6 +5180,7 @@ describe("chatStore — send (file attachments)", () => {
 
     const file = new File(["bytes"], "shot.png", { type: "image/png" });
     await useChatStore.getState().send("", "agent_xyz", [file]);
+    const queued = useChatStore.getState().pendingUserMessages[0]!;
 
     handleSessionEvent({
       type: "session_input_consumed",
@@ -5197,6 +5203,7 @@ describe("chatStore — send (file attachments)", () => {
     handleSessionEvent({
       type: "session_input_consumed",
       itemId: "msg_steer",
+      stableId: queued.stableId,
       itemType: "message",
       data: {
         role: "user",
@@ -5255,11 +5262,13 @@ describe("chatStore — send (file attachments)", () => {
     ]);
 
     // Text-only consume (transcript round-trip). clearedPendingId names
-    // the server id, which the optimistic bubble does not carry, so the
-    // FIFO head path promotes it — and still merges the image.
+    // the server id, which the optimistic bubble does not carry; the receipt's
+    // stable id names the submission, so identity promotes it — and still
+    // merges the image.
     handleSessionEvent({
       type: "session_input_consumed",
       itemId: "msg_native_1",
+      stableId: afterSend.pendingUserMessages[0]!.stableId,
       itemType: "message",
       clearedPendingId: "pending_native_1",
       data: {
@@ -5822,7 +5831,8 @@ describe("chatStore — send (failed send)", () => {
       "d".repeat(32),
     ]);
 
-    // A hidden re-send that fails on the network keeps the record for next time.
+    // A hidden re-send that fails on the network keeps the record and stays in
+    // the recovery set: the browser coming back online retries it, bubble-less.
     persistPendingSend("conv_existing", { stableId: "c".repeat(32), content });
     useChatStore.setState({ pendingUserMessages: [], blocks: [committed("c".repeat(32), "x")] });
     installFlakyPost(Infinity, () => mockResponse({ queued: true }));
@@ -5832,6 +5842,12 @@ describe("chatStore — send (failed send)", () => {
     expect(readPendingSends("conv_existing")).toEqual([
       expect.objectContaining({ stableId: "c".repeat(32) }),
     ]);
+    bodies = installFlakyPost(0, () => mockResponse({ queued: true, item_id: "c".repeat(32) }));
+    window.dispatchEvent(new Event("online"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stableIdsOf(bodies)).toEqual(new Set(["c".repeat(32)]));
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(readPendingSends("conv_existing")).toEqual([]);
   });
 
   it("acknowledges receipts against the live queue first and a failed bubble only by identity", () => {
@@ -5882,6 +5898,64 @@ describe("chatStore — send (failed send)", () => {
     });
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
     expect(committedIds()).toEqual(["msg_b", "msg_lookalike", "a".repeat(32)]);
+  });
+
+  it("a receipt naming another submission never takes a live send's bubble", () => {
+    // A repeated receipt for a message already on screen (another tab's
+    // re-send after the server forgot it) names that message; the send in
+    // flight here keeps its bubble. Only a head without a stable id of its
+    // own is still acknowledged by queue position.
+    useChatStore.setState({
+      blocks: [committed("old_msg", "the old one")],
+      pendingUserMessages: [
+        {
+          tempId: "pend_new",
+          stableId: "b".repeat(32),
+          content: [{ type: "input_text", text: "the new one" }],
+          posted: true,
+        },
+      ],
+    });
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "old_msg",
+      stableId: "9".repeat(32),
+      itemType: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "the old one" }] },
+    });
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_new"]);
+
+    // A message typed in the terminal (no stable id) is not this send's receipt either.
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "typed_in_tui",
+      itemType: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "typed" }] },
+    });
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_new"]);
+
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "new_msg",
+      stableId: "b".repeat(32),
+      itemType: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "the new one" }] },
+    });
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+
+    // Legacy: a head that carries no stable id is acknowledged by position.
+    useChatStore.setState({
+      pendingUserMessages: [
+        { tempId: "pend_legacy", content: [{ type: "input_text", text: "legacy" }], posted: true },
+      ],
+    });
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: "legacy_msg",
+      itemType: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "legacy" }] },
+    });
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
   });
 });
 

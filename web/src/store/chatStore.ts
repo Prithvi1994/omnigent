@@ -1341,6 +1341,9 @@ interface FailedSend {
   /** The send owned the turn latch (`status: "streaming"`), so a successful
    *  re-send re-arms it; a send alongside a live turn never touches it. */
   latchOnSuccess: boolean;
+  /** No bubble of its own: the transcript already shows the stored copy of a
+   *  message whose delivery is unconfirmed. Retried like the others. */
+  hidden?: boolean;
 }
 
 /**
@@ -1460,29 +1463,24 @@ async function deliverRevivedSend(
 
 /**
  * Re-send a remembered message the transcript already shows, without a bubble.
- * Ordered on the conversation's send chain like every other re-send. The record
- * is forgotten once the server accepts the send; a transport failure leaves it
- * for the next reload.
+ * It joins the recovery set like a failed bubble, so it is ordered on the send
+ * chain and retried on reconnect and when the browser comes back online; the
+ * record is forgotten once the server accepts the send.
  */
-async function resendShownRecord(
-  conversationId: string,
-  record: PersistedPendingSend,
-): Promise<void> {
-  const chain = enterSendChain(conversationId);
-  try {
-    await chain.waitForPrior();
-    await deliverRevivedSend(
-      conversationId,
-      `pend_shown_${record.stableId}`,
-      record.content,
-      record.stableId,
-    );
-    forgetPendingSend(conversationId, record.stableId);
-  } catch {
-    // Still remembered; the next cold load tries again.
-  } finally {
-    chain.releaseSend();
-  }
+function resendShownRecord(conversationId: string, record: PersistedPendingSend): Promise<void> {
+  const tempId = `pend_shown_${record.stableId}`;
+  failedSends.set(tempId, {
+    sessionId: conversationId,
+    deliver: async () => {
+      await deliverRevivedSend(conversationId, tempId, record.content, record.stableId);
+      forgetPendingSend(conversationId, record.stableId);
+    },
+    inFlight: false,
+    attempts: 1,
+    latchOnSuccess: false,
+    hidden: true,
+  });
+  return resendFailedSend(tempId);
 }
 
 /**
@@ -1570,8 +1568,9 @@ async function resendFailedSend(tempId: string): Promise<void> {
   const bubble = setterForState(entry.sessionId)?.pendingUserMessages.find(
     (p) => p.tempId === tempId,
   );
-  // Cancelled, consumed, or accepted meanwhile: nothing left to deliver.
-  if (bubble === undefined || bubble.posted === true) {
+  // Cancelled, consumed, or accepted meanwhile: nothing left to deliver. A
+  // hidden re-send never had a bubble.
+  if (!entry.hidden && (bubble === undefined || bubble.posted === true)) {
     failedSends.delete(tempId);
     return;
   }
@@ -6522,14 +6521,15 @@ function committedContentFor(
  *   that had no optimistic predecessor — they mount fresh.
  */
 /**
- * Which optimistic bubble a consumed event acknowledges. In-flight and posted
- * bubbles are matched by queue position: per-session ordering makes the oldest
- * the right one. A failed bubble has left the queue, so it is matched only by
- * identity — the receipt's `stable_id` (the submission it acknowledges), or the
- * committed item id when that is the stable id, as on the SDK path — and only
- * when the queue head does not match that receipt itself. Wording is never
- * evidence. Returns -1 when nothing should be acknowledged (an unsent draft at
- * the head, or nothing waits).
+ * Which optimistic bubble a consumed event acknowledges. Identity first: the
+ * receipt's `stable_id` (the submission it acknowledges), or the committed item
+ * id when that is the stable id, as on the SDK path, names one bubble, failed
+ * or live. A live queue head that carries its own stable id is never consumed
+ * for a receipt naming another submission — a repeated receipt for a message
+ * already on screen, or a message typed in the terminal, must not take the
+ * bubble of a send still in flight. Only a head without a stable id falls back
+ * to queue position. Wording is never evidence. Returns -1 when nothing should
+ * be acknowledged (an unsent draft at the head, or nothing waits).
  */
 function pickPendingForConsumed(
   pending: PendingUserMessage[],
@@ -6537,13 +6537,12 @@ function pickPendingForConsumed(
   stableId: string | undefined,
 ): number {
   const submissionId = stableId ?? itemId;
-  const matches = (p: PendingUserMessage): boolean =>
-    p.stableId !== undefined && p.stableId === submissionId;
+  const named = pending.findIndex((p) => p.stableId !== undefined && p.stableId === submissionId);
+  if (named >= 0) return pending[named]!.initialDraft ? -1 : named;
   const firstLive = pending.findIndex((p) => p.failed === undefined);
-  const head = firstLive >= 0 && !pending[firstLive]!.initialDraft ? firstLive : -1;
-  const failedIdx = pending.findIndex((p) => p.failed !== undefined && matches(p));
-  if (failedIdx >= 0 && (head < 0 || !matches(pending[head]!))) return failedIdx;
-  return head;
+  if (firstLive < 0) return -1;
+  const head = pending[firstLive]!;
+  return head.initialDraft || head.stableId !== undefined ? -1 : firstLive;
 }
 
 function committedUserBlock(
