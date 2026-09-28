@@ -8,6 +8,8 @@ const {
   readDatabricksAuthMode,
   usesDatabricksBrowserAuth,
   isDatabricksLoginUrl,
+  isTransientRenewalError,
+  RENEWAL_RETRY_DELAYS_MS,
   createDatabricksAuth,
 } = require("../src/databricks-auth");
 
@@ -78,6 +80,15 @@ function harness({ mode = "browser", ensureSession, loadRejection } = {}) {
     windows.set(win, ORIGIN);
     return win;
   }
+  // Fire the single armed renewal-retry timer and return its delay.
+  function fireRetry() {
+    const retries = [...timers].filter(([, t]) => RENEWAL_RETRY_DELAYS_MS.includes(t.delay));
+    assert.equal(retries.length, 1);
+    const [id, { fn, delay }] = retries[0];
+    timers.delete(id);
+    fn();
+    return delay;
+  }
   function request(win, url, resourceType = "mainFrame") {
     let result;
     guard({ webContentsId: win.webContents.id, url, resourceType }, (value) => {
@@ -91,6 +102,7 @@ function harness({ mode = "browser", ensureSession, loadRejection } = {}) {
     windows,
     calls,
     timers,
+    fireRetry,
     request,
     session,
     removeCookie(cause = "expired") {
@@ -335,6 +347,7 @@ describe("Databricks browser session lifecycle", () => {
     await drain();
     assert.equal(h.calls.renew.length, 1);
     assert.equal(h.calls.errors.length, 1);
+    assert.equal(h.calls.errors[0].error.errorCode, "SESSION_REJECTED");
   });
   it("does not use an arbitrary foreign navigation as an expiry signal", async (t) => {
     const h = harness();
@@ -410,5 +423,243 @@ describe("Databricks browser session lifecycle", () => {
     assert.equal(h.timers.size, 0);
     assert.deepEqual(h.calls.load, []);
     assert.deepEqual(h.calls.errors, []);
+  });
+});
+
+const offline = () => new TypeError("fetch failed");
+
+describe("Databricks renewal during network outages", () => {
+  it("retries a transient failure on the backoff schedule, then reloads the page", async (t) => {
+    let failures = RENEWAL_RETRY_DELAYS_MS.length;
+    const h = harness({
+      ensureSession: async () => {
+        if (failures-- > 0) throw offline();
+        return ORIGIN;
+      },
+    });
+    t.after(() => h.auth.dispose());
+    const win = h.window();
+    await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
+    h.request(win, `${ORIGIN}/login.html`);
+    await drain();
+    const delays = [];
+    // Each retry must settle before the next timer is armed.
+    /* oxlint-disable no-await-in-loop */
+    for (let i = 0; i < RENEWAL_RETRY_DELAYS_MS.length; i++) {
+      assert.deepEqual(h.calls.load, []);
+      delays.push(h.fireRetry());
+      await drain();
+    }
+    /* oxlint-enable no-await-in-loop */
+    assert.deepEqual(delays, [10_000, 20_000, 40_000, 80_000, 160_000]);
+    assert.equal(h.calls.renew.length, 6);
+    assert.deepEqual(h.calls.errors, []);
+    assert.deepEqual(h.calls.load, [{ win, url: TARGET }]);
+    // Back on the normal expiry schedule.
+    assert.deepEqual(
+      [...h.timers.values()].map((timer) => timer.delay),
+      [3_540_000],
+    );
+  });
+  it("requires sign-in once the retry schedule is exhausted", async (t) => {
+    const h = harness({
+      ensureSession: async () => {
+        throw new Error("net::ERR_INTERNET_DISCONNECTED");
+      },
+    });
+    t.after(() => h.auth.dispose());
+    const win = h.window();
+    await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
+    h.request(win, `${ORIGIN}/login.html`);
+    await drain();
+    /* oxlint-disable no-await-in-loop */
+    for (let i = 0; i < RENEWAL_RETRY_DELAYS_MS.length; i++) {
+      assert.deepEqual(h.calls.errors, []);
+      h.fireRetry();
+      await drain();
+    }
+    /* oxlint-enable no-await-in-loop */
+    assert.equal(h.calls.renew.length, 6);
+    assert.equal(h.calls.errors.length, 1);
+    assert.match(h.calls.errors[0].error.message, /ERR_INTERNET_DISCONNECTED/);
+    assert.equal(h.timers.size, 0);
+    assert.deepEqual(h.calls.load, []);
+  });
+  for (const [label, error] of [
+    [
+      "a dead refresh grant",
+      Object.assign(new Error("token endpoint 400: invalid_grant"), {
+        status: 400,
+        errorCode: "invalid_grant",
+      }),
+    ],
+    [
+      "a missing refresh token",
+      Object.assign(new Error("expired with no refresh token"), { errorCode: "NO_REFRESH_TOKEN" }),
+    ],
+    [
+      "an unexpected redirect",
+      new Error("Databricks session creation redirected to authentication"),
+    ],
+  ]) {
+    it(`requires sign-in immediately for ${label}`, async (t) => {
+      const h = harness({ ensureSession: () => Promise.reject(error) });
+      t.after(() => h.auth.dispose());
+      const win = h.window();
+      await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
+      h.request(win, `${ORIGIN}/login.html`);
+      await drain();
+      assert.equal(h.calls.renew.length, 1);
+      assert.equal(h.calls.errors.length, 1);
+      assert.equal(h.calls.errors[0].error, error);
+      assert.equal(h.timers.size, 0);
+    });
+  }
+  it("joins blocked login requests to the renewal waiting out an outage", async (t) => {
+    let online = false;
+    const h = harness({
+      ensureSession: async () => {
+        if (!online) throw offline();
+        return ORIGIN;
+      },
+    });
+    t.after(() => h.auth.dispose());
+    const win = h.window();
+    await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
+    h.request(win, `${ORIGIN}/login.html`);
+    await drain();
+    /* oxlint-disable no-await-in-loop */
+    for (let i = 0; i < 3; i++) {
+      assert.deepEqual(h.request(win, `${ORIGIN}/login.html`, "xhr"), { cancel: true });
+      await drain();
+    }
+    /* oxlint-enable no-await-in-loop */
+    assert.deepEqual(h.calls.errors, []);
+    assert.equal(h.calls.renew.length, 1);
+    online = true;
+    h.fireRetry();
+    await drain();
+    assert.equal(h.calls.renew.length, 2);
+    assert.deepEqual(h.calls.errors, []);
+    assert.deepEqual(h.calls.load, [{ win, url: TARGET }]);
+  });
+  it("shares each retry attempt across windows on the same workspace", async (t) => {
+    let online = false;
+    const h = harness({
+      ensureSession: async () => {
+        if (!online) throw offline();
+        h.setCookie(cookie());
+        return ORIGIN;
+      },
+    });
+    t.after(() => h.auth.dispose());
+    await h.auth.attach(h.window(), `${ORIGIN}/omnigent`);
+    await h.auth.attach(h.window(), `${ORIGIN}/omnigent`);
+    h.removeCookie();
+    await drain();
+    assert.equal(h.calls.renew.length, 1);
+    const retries = [...h.timers].filter(([, timer]) => timer.delay === 10_000);
+    assert.equal(retries.length, 2);
+    online = true;
+    for (const [id, timer] of retries) {
+      h.timers.delete(id);
+      timer.fn();
+    }
+    await drain();
+    assert.equal(h.calls.renew.length, 2);
+    assert.deepEqual(h.calls.errors, []);
+  });
+  for (const stop of ["detach", "reset"]) {
+    it(`cancels pending retries on ${stop} without requiring sign-in`, async (t) => {
+      const h = harness({
+        ensureSession: async () => {
+          throw offline();
+        },
+      });
+      t.after(() => h.auth.dispose());
+      const win = h.window();
+      await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
+      h.request(win, `${ORIGIN}/login.html`);
+      await drain();
+      assert.equal(h.timers.size, 1);
+      h.auth[stop](win);
+      assert.equal(h.timers.size, 0);
+      await drain();
+      assert.equal(h.calls.renew.length, 1);
+      assert.deepEqual(h.calls.errors, []);
+    });
+  }
+  it("stops retrying silently once the window points at another server", async (t) => {
+    const h = harness({
+      ensureSession: async () => {
+        throw offline();
+      },
+    });
+    t.after(() => h.auth.dispose());
+    const win = h.window();
+    await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
+    h.request(win, `${ORIGIN}/login.html`);
+    await drain();
+    h.windows.set(win, "https://server.example");
+    h.fireRetry();
+    await drain();
+    assert.equal(h.calls.renew.length, 1);
+    assert.equal(h.timers.size, 0);
+    assert.deepEqual(h.calls.errors, []);
+    assert.deepEqual(h.calls.load, []);
+  });
+});
+
+describe("transient renewal error classification", () => {
+  it("retries network, timeout, and server-side failures", async () => {
+    const refused = await fetch("http://127.0.0.1:1/").catch((error) => error);
+    const timedOut = await fetch("http://127.0.0.1:1/", {
+      signal: AbortSignal.timeout(0),
+    }).catch((error) => error);
+    for (const error of [
+      refused,
+      timedOut,
+      new TypeError("fetch failed"),
+      new DOMException("The operation was aborted due to timeout", "TimeoutError"),
+      new Error("net::ERR_NAME_NOT_RESOLVED"),
+      new Error("net::ERR_NETWORK_CHANGED"),
+      new Error("Databricks session creation timed out"),
+      new Error("Databricks session response aborted"),
+      new Error("Databricks session response closed before completion"),
+      Object.assign(new Error("token endpoint 503"), { status: 503 }),
+      Object.assign(new Error("/auth/session/create (no redirect) returned HTTP 502"), {
+        status: 502,
+      }),
+      Object.assign(new Error("token endpoint 429"), { status: 429 }),
+    ]) {
+      assert.equal(isTransientRenewalError(error), true, String(error?.message));
+    }
+  });
+  it("fails credential, client, and protocol errors immediately", () => {
+    for (const error of [
+      Object.assign(new Error("no stored Databricks token"), { errorCode: "NO_STORED_TOKEN" }),
+      Object.assign(new Error("expired with no refresh token"), { errorCode: "NO_REFRESH_TOKEN" }),
+      Object.assign(new Error("token endpoint 400: invalid_grant"), {
+        status: 400,
+        errorCode: "invalid_grant",
+      }),
+      Object.assign(new Error("token endpoint 401"), { status: 401 }),
+      Object.assign(new Error("net::ERR_FAILED"), { status: 403 }),
+      Object.assign(new Error("fetch failed"), { status: 404 }),
+      new Error(
+        "Databricks session creation redirected to authentication or an unexpected destination",
+      ),
+      new Error("/auth/session/create: no new DBAUTH cookie stored"),
+      new Error("Databricks session cookie is missing"),
+      new Error("token endpoint returned a non-JSON response"),
+      new Error("fetch failed"),
+      Object.assign(new Error("Workspace selection cancelled"), { name: "AbortError" }),
+      new TypeError("Invalid URL"),
+      "net::ERR_FAILED",
+      null,
+      undefined,
+    ]) {
+      assert.equal(isTransientRenewalError(error), false, String(error?.message ?? error));
+    }
   });
 });

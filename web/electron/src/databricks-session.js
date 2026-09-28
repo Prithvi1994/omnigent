@@ -29,20 +29,22 @@ const NETWORK_TIMEOUT_MS = 20_000;
  * Ensure ``ses`` holds a live DBAUTH cookie for a workspace, and return that
  * workspace origin. Two entry points with deliberately different behavior:
  *
- * - Explicit connect/login (``interactive: true``): ALWAYS authenticate fresh —
- *   never silently reuse a stored token. So a new window connecting to a SPOG
- *   URL re-runs the account flow + picker (choosing the workspace for THIS
- *   window) instead of dropping into another window's workspace. A workspace URL
- *   re-authenticates directly (usually a silent browser SSO round-trip). The
- *   result is persisted keyed by the resolved workspace origin.
+ * - Explicit connect/login (``interactive: true``): first try the silent path
+ *   below for the entered origin, and on any failure authenticate fresh in the
+ *   browser. Tokens are stored under WORKSPACE origins only, so a SPOG/account
+ *   URL always misses and re-runs the account flow + picker (choosing the
+ *   workspace for THIS window) instead of dropping into another window's
+ *   workspace. A fresh login is persisted keyed by the resolved workspace origin.
+ *   ``useStoredCredentials: false`` skips the silent try (the workspace rejected
+ *   the session those credentials mint).
  * - Restore/renewal (``interactive: false``): reuse the stored token for this
  *   (already-resolved) workspace, refreshing if needed, and re-mint the cookie
- *   against the SAME workspace — no browser, no picker. This is the ONLY path
- *   that reads the cache, including relaunch and additional windows.
+ *   against the SAME workspace — no browser, no picker.
  *
  * @param {Electron.Session} ses The session whose cookie jar to seed.
  * @param {string} origin The entered/pinned origin (account or workspace host).
- * @param {{ interactive?: boolean, nextPath?: string, workspaceId?: string, signal?: AbortSignal,
+ * @param {{ interactive?: boolean, useStoredCredentials?: boolean, nextPath?: string,
+ *   workspaceId?: string, signal?: AbortSignal,
  *   pickWorkspace?: (workspaces: Array<{workspaceId: string, name: string, fqdn: string}>)
  *     => Promise<{fqdn: string, name: string} | null> }} [opts]
  *   ``workspaceId`` (from a ``?o=`` hint) auto-selects that workspace for an
@@ -52,7 +54,14 @@ const NETWORK_TIMEOUT_MS = 20_000;
 async function ensureDatabricksSession(
   ses,
   origin,
-  { interactive = true, nextPath = "/omnigent", pickWorkspace, workspaceId, signal } = {},
+  {
+    interactive = true,
+    useStoredCredentials = true,
+    nextPath = "/omnigent",
+    pickWorkspace,
+    workspaceId,
+    signal,
+  } = {},
 ) {
   signal?.throwIfAborted();
   if (!isDatabricksOAuthServerUrl(origin)) {
@@ -63,6 +72,25 @@ async function ensureDatabricksSession(
     interactive,
     workspaceHint: workspaceId ?? null,
   });
+  if (interactive && useStoredCredentials) {
+    try {
+      const restored = await ensureDatabricksSession(ses, origin, {
+        interactive: false,
+        nextPath,
+        signal,
+      });
+      console.log("[omnigent] databricks session: connected with stored credentials", { origin });
+      return restored;
+    } catch (error) {
+      signal?.throwIfAborted();
+      console.log("[omnigent] databricks session: stored credentials unusable; signing in", {
+        origin,
+        errorCode: error.errorCode,
+        status: error.status,
+      });
+    }
+  }
+
   let bridgeOrigin;
   let accessToken;
 
@@ -72,7 +100,7 @@ async function ensureDatabricksSession(
     accessToken = await getValidStoredToken(origin);
     bridgeOrigin = origin;
   } else {
-    // Explicit login: authenticate fresh, never reusing the cache.
+    // Stored credentials were unusable: authenticate fresh in the browser.
     const { tokens, issuerOrigin } = await runInteractiveLogin(origin, { signal });
     signal?.throwIfAborted();
     const account = parseAccountFromToken(tokens.access_token);

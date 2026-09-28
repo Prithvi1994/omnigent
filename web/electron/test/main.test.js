@@ -392,6 +392,30 @@ describe("Databricks auth mode wiring", () => {
     assert.equal(params.get("url"), workspace);
   });
 
+  it("signs in through the browser on the next Connect after a rejected session", async (t) => {
+    let rejectNext = true;
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      ensureSession: async (_ses, origin) => {
+        if (!rejectNext) return origin;
+        rejectNext = false;
+        throw Object.assign(new Error("rejected"), { errorCode: "SESSION_REJECTED" });
+      },
+    });
+    t.after(h.cleanup);
+    await assert.rejects(
+      h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true }),
+      /rejected/,
+    );
+    await h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true });
+    await h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true });
+    assert.deepEqual(
+      h.calls.auth.map((call) => call[2].useStoredCredentials),
+      [true, false, true],
+    );
+  });
+
   it("prepares stored credentials on saved-server launch and deep-link loads", async (t) => {
     const h = loadNavigationHarness({
       savedServerUrl: workspace,

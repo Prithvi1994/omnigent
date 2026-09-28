@@ -335,6 +335,14 @@ describe("token store round-trip (saveWorkspaceToken / loadTokens)", () => {
     // Not findable under the account origin — the expiry path looks up by workspace.
     assert.equal(oauth.loadTokens(ACCT.origin), null);
   });
+  it("never resolves a stored workspace token for an account-origin connect", async () => {
+    oauth.saveWorkspaceToken(
+      WS,
+      { access_token: "a", refresh_token: "r", expires_at: future() },
+      ACCT,
+    );
+    await assert.rejects(oauth.getValidStoredToken(ACCT.origin), { errorCode: "NO_STORED_TOKEN" });
+  });
   it("omits account context for a workspace-direct token", () => {
     oauth.saveWorkspaceToken(
       WS,

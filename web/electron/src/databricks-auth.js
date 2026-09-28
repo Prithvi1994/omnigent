@@ -52,6 +52,49 @@ function cookieMatchesOrigin(cookie, origin) {
   );
 }
 
+// The workspace rejected a freshly minted session, so stored credentials can't recover it.
+const SESSION_REJECTED = "SESSION_REJECTED";
+// Backoff for renewals that fail while the network is down (e.g. VPN reconnecting after wake).
+const RENEWAL_RETRY_DELAYS_MS = [10_000, 20_000, 40_000, 80_000, 160_000];
+// Session-create transport failures thrown by databricks-session.js.
+const SESSION_TRANSPORT_ERRORS = new Set([
+  "Databricks session creation timed out",
+  "Databricks session response aborted",
+  "Databricks session response closed before completion",
+]);
+
+/**
+ * Whether a silent renewal failure is worth retrying: a network/timeout failure
+ * with no HTTP response, or an HTTP 5xx/429. Credential and protocol failures
+ * (missing/dead tokens, 4xx, unexpected redirects) are not.
+ *
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+function isTransientRenewalError(error) {
+  if (!error || typeof error !== "object") return false;
+  if (error.status != null) {
+    return error.status === 429 || (error.status >= 500 && error.status <= 599);
+  }
+  const message = typeof error.message === "string" ? error.message : "";
+  return (
+    error.name === "TimeoutError" ||
+    (error.name === "TypeError" && (message === "fetch failed" || message === "terminated")) ||
+    message.startsWith("net::ERR_") ||
+    SESSION_TRANSPORT_ERRORS.has(message)
+  );
+}
+
+/** A short, secret-free label for a renewal failure. */
+function renewalErrorKind(error) {
+  if (error?.status != null) return `HTTP ${error.status}`;
+  const message = typeof error?.message === "string" ? error.message : "";
+  if (message.startsWith("net::ERR_")) return message.split(/\s/)[0];
+  if (SESSION_TRANSPORT_ERRORS.has(message)) return message;
+  const code = [error?.cause?.code, error?.code].find((c) => typeof c === "string");
+  return code ?? (error?.name === "TypeError" ? message : (error?.name ?? "Error"));
+}
+
 /** One session owns the request guard; each window owns its renewal lifecycle. */
 function createDatabricksAuth({
   session,
@@ -81,6 +124,7 @@ function createDatabricksAuth({
     if (!ctx) return;
     connections.delete(win);
     clearTimeoutFn(ctx.timer);
+    clearTimeoutFn(ctx.retryTimer);
     ctx.webContents.removeListener("did-navigate", ctx.onNavigate);
     ctx.webContents.removeListener("did-navigate-in-page", ctx.onNavigateInPage);
   }
@@ -146,13 +190,9 @@ function createDatabricksAuth({
       shared: renewals.has(ctx.origin),
       reload,
     });
-    const pending =
-      renewals.get(ctx.origin) ??
-      Promise.resolve().then(() => ensureSession(session, ctx.origin, { interactive: false }));
-    renewals.set(ctx.origin, pending);
-    ctx.pending = pending
-      .then(async () => {
-        if (!current(ctx)) return;
+    ctx.pending = renewWithRetries(ctx)
+      .then(async (renewed) => {
+        if (!renewed || !current(ctx)) return;
         await schedule(ctx);
         if (!current(ctx)) return;
         if (ctx.reloadVersion !== ctx.navigationVersion) return;
@@ -171,11 +211,53 @@ function createDatabricksAuth({
       })
       .catch((error) => fail(ctx, error))
       .finally(() => {
-        if (renewals.get(ctx.origin) === pending) renewals.delete(ctx.origin);
         ctx.pending = null;
         ctx.reloadVersion = null;
       });
     return ctx.pending;
+  }
+
+  /** Windows on one origin share an in-flight renewal; a settled one is never reused. */
+  function sharedRenewal(origin) {
+    let pending = renewals.get(origin);
+    if (!pending) {
+      pending = Promise.resolve().then(() =>
+        ensureSession(session, origin, { interactive: false }),
+      );
+      renewals.set(origin, pending);
+      const release = () => {
+        if (renewals.get(origin) === pending) renewals.delete(origin);
+      };
+      pending.then(release, release);
+    }
+    return pending;
+  }
+
+  /**
+   * Renew, waiting out transient failures on the backoff schedule while the page
+   * stays put. Resolves false when the window stopped being this connection.
+   */
+  async function renewWithRetries(ctx, attempt = 0) {
+    try {
+      await sharedRenewal(ctx.origin);
+      return true;
+    } catch (error) {
+      const delayMs = RENEWAL_RETRY_DELAYS_MS[attempt];
+      if (delayMs === undefined || !isTransientRenewalError(error) || !current(ctx)) throw error;
+      console.log("[omnigent] databricks auth: renewal retry scheduled", {
+        origin: ctx.origin,
+        attempt: attempt + 1,
+        delayMs,
+        error: renewalErrorKind(error),
+      });
+      // detach() clears this timer; the abandoned wait then never settles.
+      await new Promise((resolve) => {
+        ctx.retryTimer = setTimeoutFn(resolve, delayMs);
+        ctx.retryTimer?.unref?.();
+      });
+      ctx.retryTimer = null;
+      return current(ctx) && renewWithRetries(ctx, attempt + 1);
+    }
   }
 
   function recover(win) {
@@ -184,7 +266,10 @@ function createDatabricksAuth({
     if (!ctx.pending && now() - ctx.lastRejectedAt < 15_000) {
       fail(
         ctx,
-        new Error("Databricks rejected the renewed session; sign in again in your browser"),
+        Object.assign(
+          new Error("Databricks rejected the renewed session; sign in again in your browser"),
+          { errorCode: SESSION_REJECTED },
+        ),
       );
       return;
     }
@@ -205,6 +290,7 @@ function createDatabricksAuth({
       serverUrl,
       returnUrl: loadUrl,
       timer: null,
+      retryTimer: null,
       pending: null,
       scheduleGeneration: 0,
       navigationVersion: 0,
@@ -218,7 +304,10 @@ function createDatabricksAuth({
         if (isDatabricksLoginUrl(url, origin)) {
           fail(
             ctx,
-            new Error("Workspace authentication is required; sign in again in your browser"),
+            Object.assign(
+              new Error("Workspace authentication is required; sign in again in your browser"),
+              { errorCode: SESSION_REJECTED },
+            ),
           );
           return;
         }
@@ -314,5 +403,8 @@ module.exports = {
   usesDatabricksBrowserAuth,
   isDatabricksLoginUrl,
   cookieMatchesOrigin,
+  isTransientRenewalError,
+  RENEWAL_RETRY_DELAYS_MS,
+  SESSION_REJECTED,
   createDatabricksAuth,
 };

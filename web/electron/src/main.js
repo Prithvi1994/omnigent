@@ -79,6 +79,7 @@ const {
   usesDatabricksBrowserAuth,
   isDatabricksLoginUrl,
   createDatabricksAuth,
+  SESSION_REJECTED,
 } = require("./databricks-auth");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
 const {
@@ -599,6 +600,9 @@ const EXPIRY_RELOAD_MIN_INTERVAL_MS = 15_000;
 let databricksAuthMode;
 let databricksAuth;
 const connectionAttempts = new WeakMap();
+// Workspaces whose stored credentials minted a session Databricks then rejected;
+// the next Connect signs in through the browser instead of retrying them.
+const databricksBrowserSignInRequired = new Set();
 
 function abortConnectionAttempt(win, message = "Connection superseded") {
   const attempt = connectionAttempts.get(win);
@@ -640,6 +644,8 @@ function showDatabricksAuthRequired(win, serverUrl, error) {
     errorCode: error.errorCode,
     requestId: error.requestId,
   });
+  if (error.errorCode === SESSION_REJECTED)
+    databricksBrowserSignInRequired.add(originOf(serverUrl));
   const expired = error.errorCode === "NO_REFRESH_TOKEN" || error.errorCode === "invalid_grant";
   const params = new URLSearchParams({
     error: expired
@@ -1420,6 +1426,9 @@ async function loadServerUrl(
           entered.origin,
           {
             interactive,
+            useStoredCredentials: !(
+              interactive && databricksBrowserSignInRequired.delete(entered.origin)
+            ),
             signal,
             workspaceId: entered.searchParams.get("o") || undefined,
             pickWorkspace: (workspaces) =>

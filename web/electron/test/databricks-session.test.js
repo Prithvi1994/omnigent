@@ -18,10 +18,10 @@ const COOKIE = {
   value: "new",
 };
 
-function harness({ respond, follow, oldCookie = false } = {}) {
+function harness({ respond, follow, oldCookie = false, stored } = {}) {
   const requests = [];
   const logs = [];
-  const calls = { browser: 0, stored: 0 };
+  const calls = { browser: 0, stored: 0, storedOrigins: [] };
   let jar = oldCookie ? [{ ...COOKIE, value: "old" }] : [];
   const cookies = Object.assign(new EventEmitter(), { get: async () => jar });
   const ses = { cookies };
@@ -98,9 +98,10 @@ function harness({ respond, follow, oldCookie = false } = {}) {
               calls.browser++;
               return { tokens: { access_token: "token" }, issuerOrigin: ORIGIN };
             },
-            getValidStoredToken: async () => {
+            getValidStoredToken: async (origin) => {
               calls.stored++;
-              return "token";
+              calls.storedOrigins.push(origin);
+              return stored ? stored(origin) : "token";
             },
             saveWorkspaceToken() {},
           };
@@ -131,11 +132,115 @@ describe("Databricks session preparation", () => {
     assert.equal(h.calls.stored, 0);
     assert.equal(h.requests.length, 0);
   });
-  it("uses fresh browser auth only for explicit login", async () => {
+  it("connects with stored credentials without opening the browser", async () => {
     const h = harness();
     assert.equal(await h.ensureDatabricksSession(h.ses, ORIGIN), ORIGIN);
-    assert.equal(h.calls.browser, 1);
+    assert.equal(h.calls.browser, 0);
+    assert.equal(h.calls.stored, 1);
+    assert.equal(h.requests.length, 1);
+    const output = JSON.stringify(h.logs);
+    assert.match(output, /connected with stored credentials/);
+    assert.doesNotMatch(output, /"token"/);
+  });
+  it("skips stored credentials when the caller requires a browser sign-in", async () => {
+    const h = harness();
+    assert.equal(
+      await h.ensureDatabricksSession(h.ses, ORIGIN, { useStoredCredentials: false }),
+      ORIGIN,
+    );
     assert.equal(h.calls.stored, 0);
+    assert.equal(h.calls.browser, 1);
+  });
+  for (const [label, stored] of [
+    [
+      "no stored token",
+      () => {
+        throw Object.assign(new Error("no stored Databricks token"), {
+          errorCode: "NO_STORED_TOKEN",
+        });
+      },
+    ],
+    [
+      "a dead refresh grant",
+      () => {
+        throw Object.assign(new Error("token endpoint 400: invalid_grant"), {
+          status: 400,
+          errorCode: "invalid_grant",
+        });
+      },
+    ],
+    [
+      "a network failure",
+      () => {
+        throw new TypeError("fetch failed");
+      },
+    ],
+  ]) {
+    it(`falls back to browser sign-in on connect with ${label}`, async () => {
+      const h = harness({ stored });
+      assert.equal(await h.ensureDatabricksSession(h.ses, ORIGIN), ORIGIN);
+      assert.equal(h.calls.stored, 1);
+      assert.equal(h.calls.browser, 1);
+      assert.match(JSON.stringify(h.logs), /stored credentials unusable; signing in/);
+    });
+  }
+  it("falls back to browser sign-in when minting from stored credentials fails", async () => {
+    let requests = 0;
+    const h = harness({
+      respond(req) {
+        if (++requests === 1) req.emit("error", new Error("net::ERR_NAME_NOT_RESOLVED"));
+        else req.emit("redirect", 302, "GET", `${ORIGIN}/omnigent`, {});
+      },
+    });
+    assert.equal(await h.ensureDatabricksSession(h.ses, ORIGIN), ORIGIN);
+    assert.equal(h.calls.stored, 1);
+    assert.equal(h.calls.browser, 1);
+    assert.equal(h.requests.length, 2);
+  });
+  it("sends an account URL through browser sign-in since tokens are stored per workspace", async () => {
+    const account = "https://accounts.cloud.databricks.com";
+    const h = harness({
+      stored: (origin) => {
+        if (origin !== ORIGIN) {
+          throw Object.assign(new Error("no stored Databricks token"), {
+            errorCode: "NO_STORED_TOKEN",
+          });
+        }
+        return "workspace-token";
+      },
+    });
+    await h.ensureDatabricksSession(h.ses, account);
+    assert.deepEqual(h.calls.storedOrigins, [account]);
+    assert.equal(h.calls.browser, 1);
+  });
+  it("stops at cancellation instead of falling back to browser sign-in", async () => {
+    const controller = new AbortController();
+    const h = harness({
+      stored: () => {
+        controller.abort();
+        return "token";
+      },
+    });
+    await assert.rejects(
+      h.ensureDatabricksSession(h.ses, ORIGIN, { signal: controller.signal }),
+      (error) => error.name === "AbortError",
+    );
+    assert.equal(h.calls.browser, 0);
+    assert.equal(h.requests.length, 0);
+  });
+  it("stops at cancellation during a failed stored lookup", async () => {
+    const controller = new AbortController();
+    const h = harness({
+      stored: () => {
+        controller.abort();
+        throw new TypeError("fetch failed");
+      },
+    });
+    await assert.rejects(
+      h.ensureDatabricksSession(h.ses, ORIGIN, { signal: controller.signal }),
+      (error) => error.name === "AbortError",
+    );
+    assert.equal(h.calls.browser, 0);
   });
   it("uses stored credentials for silent restoration without interactive login", async () => {
     const h = harness();
