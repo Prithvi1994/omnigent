@@ -1392,13 +1392,46 @@ sys.exit(7)
     assert (path.parent / "useful.png").read_bytes() == b"retained"
 
 
-def test_known_session_subresources_keep_test_and_browser_association(tmp_path):
+@pytest.mark.parametrize("status", [200, 403, 404])
+def test_known_session_subresources_keep_test_and_browser_association(tmp_path, status):
     collector = Evidence(tmp_path)
     collector.node = "first-test"
     collector.session("http://localhost/v1/sessions/known", {"id": "known"})
     collector.node = "second-test"
     state = {"sessions": set()}
-    collector.session("http://localhost/v1/sessions/known/items", {"data": []}, state=state)
+    collector.session(
+        "http://localhost/v1/sessions/known/items", {"data": []}, state=state, status=status
+    )
     collector.session("http://localhost/v1/sessions/projects/items", {"data": []}, state=state)
     assert collector.sessions == {("http://localhost", "known"): {"first-test", "second-test"}}
     assert state["sessions"] == {("http://localhost", "known")}
+
+
+def test_failure_details_survive_unserializable_context(tmp_path):
+    journal = Journal(tmp_path)
+    nested = {}
+    nested["cycle"] = nested
+    error = journal.failure("snapshot", ValueError("useful diagnostic"), nested=nested)
+    assert error == {
+        "operation": "snapshot",
+        "error_type": "ValueError",
+        "detail": "useful diagnostic",
+    }
+    error = journal.failure("snapshot", ValueError("diagnostic"), error_type="wrong")
+    assert error["error_type"] == "ValueError"
+
+
+def test_child_journal_error_cap_counts_omitted_records(tmp_path):
+    from dev.repro_env.execution import collector_errors
+
+    wrapper, child = Journal(tmp_path), Journal(tmp_path)
+    for i in range(202):
+        child.emit("collection_error", operation="snapshot", session_id=str(i))
+    child.emit("collection_error", operation="snapshot", session_id="201")
+    errors = collector_errors(tmp_path, wrapper)
+    assert len(errors) == 201
+    assert errors[-1] == {
+        "operation": "collection_errors",
+        "error_type": "OmittedRecords",
+        "omitted_record_count": 3,
+    }

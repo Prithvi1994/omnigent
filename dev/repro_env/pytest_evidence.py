@@ -87,8 +87,9 @@ class Evidence:
             match = re.match(r"^/v1/sessions/([^/]+)/", parts.path)
             key = (origin, unquote(match[1])) if match else None
             # Associate later item/resource reads only with an already observed session.
-            if key not in self.sessions:
-                return
+            with self.sessions_lock:
+                if key not in self.sessions:
+                    return
             identity = None
         elif not parts.path.startswith("/c/") and key[1] != identity:
             return
@@ -104,8 +105,10 @@ class Evidence:
 
     def deleted_session(self, url, status):
         key = self.session_key(url)
-        if key in self.sessions and 200 <= status < 300:
+        if 200 <= status < 300:
             with self.sessions_lock:
+                if key not in self.sessions:
+                    return
                 self.deleted.add(key)
             self.emit("session_deleted", server=safe_url(key[0]), session_id=key[1], status=status)
 
@@ -141,7 +144,9 @@ class Evidence:
         with httpx.Client(trust_env=False, timeout=3) as client:
             for suffix in ("", "/resources"):
                 r = client.get(f"{session_url}{suffix}")
-                if not suffix and r.status_code == 404 and (base, sid) in self.deleted:
+                with self.sessions_lock:
+                    deleted = (base, sid) in self.deleted
+                if not suffix and r.status_code == 404 and deleted:
                     self.emit(
                         "session_absent",
                         session_id=sid,
@@ -206,7 +211,9 @@ class Evidence:
                 return send(client, request, *args, **kwargs)
             path = request.url.path
             key = self.session_key(str(request.url))
-            if request.method == "DELETE" and key in self.sessions:
+            with self.sessions_lock:
+                known_session = key in self.sessions
+            if request.method == "DELETE" and known_session:
                 self.snapshot("before_session_delete", sessions={key})
             if path == "/mock/reset":
                 self.busy = True
@@ -306,13 +313,12 @@ class Evidence:
 
             def caller_stop(*args, **kwargs):
                 # pytest-playwright stops tracing even with --tracing=off.
-                # Retain at that boundary, before it discards our active trace.
+                # Save its discarded chunk, then preserve the caller's stop result.
                 if not state["trace_active"]:
                     return stop(*args, **kwargs)
-                state["tracing"] = False
-                state["trace_active"] = False
                 diagnostic = {"context_id": key, "phase": "caller_stop"}
-                if kwargs.get("path") is not None:
+
+                def requested_stop():
                     try:
                         result = stop(*args, **kwargs)
                     except Exception as exc:
@@ -323,6 +329,12 @@ class Evidence:
                             ),
                         )
                         raise
+                    state["tracing"] = False
+                    state["trace_active"] = False
+                    return result
+
+                if kwargs.get("path") is not None:
+                    result = requested_stop()
                     retain_trace(Path(kwargs["path"]), state)
                     return result
                 temporary = self.capture(
@@ -330,19 +342,19 @@ class Evidence:
                     lambda: tempfile.TemporaryDirectory(prefix="repro-raw-trace-"),
                     **diagnostic,
                 )
-                if temporary is None:
-                    return stop(*args, **kwargs)
                 try:
-                    raw = Path(temporary.name) / "trace.zip"
+                    if temporary is not None:
+                        raw = Path(temporary.name) / "trace.zip"
 
-                    def save():
-                        result = stop(*args, **{**kwargs, "path": str(raw)})
-                        retain_trace(raw, state)
-                        return result
+                        def save_chunk():
+                            context.tracing.stop_chunk(path=str(raw))
+                            retain_trace(raw, state)
 
-                    return self.capture("trace_stop", save, **diagnostic)
+                        self.capture("trace_stop", save_chunk, **diagnostic)
+                    return requested_stop()
                 finally:
-                    self.capture("trace_cleanup", temporary.cleanup, **diagnostic)
+                    if temporary is not None:
+                        self.capture("trace_cleanup", temporary.cleanup, **diagnostic)
 
             def caller_start(*args, **kwargs):
                 if state["tracing"]:

@@ -156,7 +156,8 @@ class Journal:
         error = {"operation": operation, "error_type": type(exc).__name__}
         # Sanitize before truncation so a split credential cannot escape redaction.
         with contextlib.suppress(Exception):
-            error.update(self.clean(context))
+            error = {**self.clean(context), **error}
+        with contextlib.suppress(Exception):
             detail = self.clean(str(exc))
             detail = re.sub(
                 r"""(?i)(\b[\w-]*(?:authorization|cookie|password|secret|token|api[-_]?key)[\w-]*["']?\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)""",
@@ -253,7 +254,10 @@ def inventory(directory: Path) -> list[dict]:
 
 
 def collector_errors(directory: Path, wrapper: Journal) -> list[dict]:
-    """Read bounded records from child collectors after their process has exited."""
+    """Read bounded collector records after the wrapped command exits.
+
+    Background descendants may still be flushing; a partial record is a collection failure.
+    """
     errors = []
     seen = set()
     omitted = 0
@@ -291,7 +295,13 @@ def collector_errors(directory: Path, wrapper: Journal) -> list[dict]:
             error = wrapper.failure("child_journal_read", exc, journal=path.name)
             wrapper.emit("collection_error", **error)
     if omitted:
-        errors.append({"operation": "collection_errors", "omitted_count": omitted})
+        errors.append(
+            {
+                "operation": "collection_errors",
+                "error_type": "OmittedRecords",
+                "omitted_record_count": omitted,
+            }
+        )
     return errors
 
 
@@ -320,6 +330,8 @@ def run(
             "Agent-workspace observations, not an independent verifier.",
             "Only wrapped commands and supported pytest/browser paths are instrumented.",
             "No observed event does not prove an action was absent.",
+            "Background processes may outlive the command; "
+            "their final journal flush is not guaranteed.",
         ],
     }
 

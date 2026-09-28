@@ -338,3 +338,57 @@ def test_unstopped_caller_trace_reports_incomplete_capture(tmp_path, browser):
         assert list(collector.directory.glob("screen-*.png"))
     finally:
         collector.patch.undo()
+
+
+def test_caller_stop_exception_is_preserved_with_optional_chunk_capture(
+    tmp_path, browser, monkeypatch
+):
+    with browser.new_context() as probe:
+        tracing_type = type(probe.tracing)
+    original = tracing_type.stop
+    fail_stop = True
+
+    def stop(tracing, *, path=None):
+        if fail_stop:
+            raise RuntimeError("caller stop failed")
+        return original(tracing, path=path)
+
+    monkeypatch.setattr(tracing_type, "stop", stop)
+    collector = Evidence(tmp_path / "saved")
+    try:
+        collector.install_browser()
+        context = browser.new_context()
+        context.new_page().set_content("<p>observed</p>")
+        with pytest.raises(RuntimeError, match="caller stop failed"):
+            context.tracing.stop()
+        assert collector.contexts[context]["trace_active"]
+        fail_stop = False
+        context.close()
+        assert any(
+            e["operation"] == "trace_stop" and e["detail"] == "caller stop failed"
+            for e in collector.journal.errors
+        )
+    finally:
+        collector.patch.undo()
+
+
+def test_optional_chunk_failure_does_not_change_caller_stop(tmp_path, browser, monkeypatch):
+    collector = Evidence(tmp_path / "saved")
+    try:
+        collector.install_browser()
+        with browser.new_context() as context:
+            context.new_page().set_content("<p>observed</p>")
+
+            def fail(*, path=None):
+                raise OSError("chunk storage unavailable")
+
+            monkeypatch.setattr(context.tracing, "stop_chunk", fail)
+            context.tracing.stop()
+            assert not collector.contexts[context]["trace_active"]
+        assert any(
+            e["operation"] == "trace_stop" and e["detail"] == "chunk storage unavailable"
+            for e in collector.journal.errors
+        )
+        assert list(collector.directory.glob("screen-*.png"))
+    finally:
+        collector.patch.undo()
