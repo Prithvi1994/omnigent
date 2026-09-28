@@ -157,7 +157,13 @@ class Journal:
         # Sanitize before truncation so a split credential cannot escape redaction.
         with contextlib.suppress(Exception):
             error.update(self.clean(context))
-            error["detail"] = self.clean(str(exc))[:2048]
+            detail = self.clean(str(exc))
+            detail = re.sub(
+                r"""(?i)(\b[\w-]*(?:authorization|cookie|password|secret|token|api[-_]?key)[\w-]*["']?\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)""",
+                r"\1[redacted]",
+                detail,
+            )
+            error["detail"] = detail[:2048]
 
         self.errors.append(error)
         with contextlib.suppress(Exception):

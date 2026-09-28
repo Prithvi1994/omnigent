@@ -83,7 +83,14 @@ class Evidence:
         key = self.session_key(url)
         if parts.path.rstrip("/") == "/v1/sessions" and identity:
             key = (origin, identity)
-        elif not key or (not parts.path.startswith("/c/") and key[1] != identity):
+        elif not key:
+            match = re.match(r"^/v1/sessions/([^/]+)/", parts.path)
+            key = (origin, unquote(match[1])) if match else None
+            # Associate later item/resource reads only with an already observed session.
+            if key not in self.sessions:
+                return
+            identity = None
+        elif not parts.path.startswith("/c/") and key[1] != identity:
             return
         if not self.session_identity({"id": key[1]}):
             return

@@ -1342,14 +1342,16 @@ def test_diagnostics_are_sanitized_before_bounding(tmp_path, monkeypatch):
 
     def fail():
         raise RuntimeError(
-            "stop failed secret-value-12345 at http://user:password@localhost/p?token=hidden "
-            + "x" * 4000
+            "stop failed secret-value-12345 password=inline-value api_key='two words' "
+            'payload {"refresh_token": "unknown-secret"} '
+            "at http://user:password@localhost/p?token=hidden " + "x" * 4000
         )
 
     journal.capture("trace_stop", fail, context_id="context-1", phase="before_browser_close")
     event = events(tmp_path)[0]
     assert len(event["detail"]) == 2048
-    assert "secret-value" not in event["detail"] and "password" not in event["detail"]
+    assert "secret-value" not in event["detail"] and "user:password" not in event["detail"]
+    assert all(s not in event["detail"] for s in ("inline-value", "two words", "unknown-secret"))
     assert "token=hidden" not in event["detail"]
     assert event["context_id"] == "context-1" and event["phase"] == "before_browser_close"
 
@@ -1388,3 +1390,15 @@ sys.exit(7)
     assert record["capture_complete"] == (kind == "none")
     assert bool(record["collection_errors"]) == (kind != "none")
     assert (path.parent / "useful.png").read_bytes() == b"retained"
+
+
+def test_known_session_subresources_keep_test_and_browser_association(tmp_path):
+    collector = Evidence(tmp_path)
+    collector.node = "first-test"
+    collector.session("http://localhost/v1/sessions/known", {"id": "known"})
+    collector.node = "second-test"
+    state = {"sessions": set()}
+    collector.session("http://localhost/v1/sessions/known/items", {"data": []}, state=state)
+    collector.session("http://localhost/v1/sessions/projects/items", {"data": []}, state=state)
+    assert collector.sessions == {("http://localhost", "known"): {"first-test", "second-test"}}
+    assert state["sessions"] == {("http://localhost", "known")}
