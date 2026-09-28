@@ -81,12 +81,11 @@ async function ensureDatabricksSession(
       });
       console.log("[omnigent] databricks session: connected with stored credentials", { origin });
       return restored;
-    } catch (error) {
+    } catch {
       signal?.throwIfAborted();
+      // The token and session modules already logged the underlying failure.
       console.log("[omnigent] databricks session: stored credentials unusable; signing in", {
         origin,
-        errorCode: error.errorCode,
-        status: error.status,
       });
     }
   }
