@@ -441,15 +441,12 @@ def _kiro_stack(server_tmp: Path, shim_source: str) -> Iterator[tuple[str, str, 
             try:
                 resp = httpx.get(f"{base_url}/health", timeout=2)
                 if resp.status_code == 200:
-                    status_resp = httpx.get(
-                        f"{base_url}/v1/runners/{runner_id}/status", timeout=2
-                    )
+                    status_resp = httpx.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2)
                     if status_resp.status_code == 200 and status_resp.json()["online"] is True:
                         ready = True
                         break
                     last_error = (
-                        f"runner status HTTP {status_resp.status_code}: "
-                        f"{status_resp.text[:200]}"
+                        f"runner status HTTP {status_resp.status_code}: {status_resp.text[:200]}"
                     )
                 else:
                     last_error = f"health HTTP {resp.status_code}: {resp.text[:200]}"
