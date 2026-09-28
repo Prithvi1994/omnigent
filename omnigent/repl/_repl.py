@@ -2316,14 +2316,8 @@ class _SessionsChatReplAdapter:
                 backoff = min(backoff * 2, max_backoff)
 
     async def _wait_for_stream_subscription(self) -> None:
-        """
-        Hold a turn's POST until the pump's subscribe attempt settles.
-
-        The live stream has no replay, so events published before the
-        subscriber is registered never reach this client. A hung connect
-        gives up after ``_STREAM_SUBSCRIBE_GRACE_S``; the snapshot poll in
-        :meth:`send` surfaces whatever was still missed.
-        """
+        """Hold a turn's POST until the pump's subscribe settles, so events published
+        right after the POST reach this client (the stream has no replay)."""
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(
                 self._stream_subscribe_settled.wait(),
@@ -2331,14 +2325,8 @@ class _SessionsChatReplAdapter:
             )
 
     def _surface_pending_elicitations(self, snapshot: object) -> None:
-        """
-        Route prompts parked in a session snapshot through the live event path.
-
-        ``GET /v1/sessions/{id}`` replays outstanding elicitation requests
-        the no-replay stream may have published before this client
-        subscribed; each unseen one is pushed through ``_on_event`` exactly
-        like a live event. Snapshots without the field are a no-op.
-        """
+        """Push prompts parked in a session snapshot through ``_on_event`` like live
+        events, recovering any the stream published before this client subscribed."""
         if self._on_event is None:
             return
         from omnigent.server.schemas import ElicitationRequestEvent

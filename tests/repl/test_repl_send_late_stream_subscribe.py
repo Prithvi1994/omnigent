@@ -1,10 +1,6 @@
-"""A REPL turn must not lose its approval prompt to a late ``/stream`` subscribe.
-
-``send()`` starts the SSE pump in the background; the stream has no replay, so a
-prompt published before the subscriber registers would never reach the terminal.
-These tests drive ``send()`` against a fake client whose stream attaches late or
-never, checking the POST waits for the ack and snapshot-only prompts surface once.
-"""
+"""``send()`` must not lose an approval prompt to a late ``/stream`` subscribe. The
+stream has no replay, so these tests use a fake client whose stream attaches late or
+never and check that the POST waits for the ack and snapshot prompts surface once."""
 
 from __future__ import annotations
 

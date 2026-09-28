@@ -1,16 +1,6 @@
-"""
-REPL approval prompt must survive a slow ``/stream`` subscribe.
-
-Attach the terminal REPL to a live always-ask session through a TCP proxy that
-holds only the first ``GET /v1/sessions/{id}/stream`` request for a few seconds,
-then send a message. The server parks the turn on the ``always_ask_on_input``
-policy and publishes the approval prompt as a live SSE event; the REPL must
-still render ``approval required`` although its subscription lands late.
-
-Usage::
-
-    python -m pytest tests/e2e/test_repl_approval_prompt_slow_stream_subscribe.py -v --timeout=300
-"""
+"""REPL approval prompt must survive a slow ``/stream`` subscribe: attach through a
+proxy that delays only the first ``GET .../stream``, send a message, and expect the
+``approval required`` banner although the subscription lands after the prompt."""
 
 from __future__ import annotations
 
@@ -47,11 +37,8 @@ def _strip_ansi(text: str) -> str:
 
 
 class _SlowStreamProxy:
-    """Transparent TCP proxy that delays the first SSE subscribe.
-
-    The first client->server chunk carrying ``GET /v1/sessions/{id}/stream``
-    is held for ``delay_s`` before forwarding; everything else passes through.
-    """
+    """TCP proxy that holds the first client chunk carrying ``GET /v1/sessions/{id}/stream``
+    for ``delay_s`` before forwarding; everything else passes straight through."""
 
     def __init__(
         self,
