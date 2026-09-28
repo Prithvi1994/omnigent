@@ -4144,7 +4144,7 @@ async def test_query_sessions_once_reconciles_persisted_text_on_failed_status(
     client = _FakeAPClient([_item_user("say hi"), _item_assistant("hi there")])
     result = await _run_one_shot(client, _raise_turn_failed, monkeypatch)
     assert result == "hi there"  # the persisted assistant text, not an error
-    # Exactly one transcript read — the failure-only reconcile fallback.
+    # Two reads: terminal-error verification, then text reconciliation.
     assert client.sessions.list_items_calls == 2
 
 
@@ -4223,6 +4223,17 @@ async def test_query_sessions_once_unreadable_terminal_outcome_is_failure(monkey
     client.sessions.list_items = unreadable
     with pytest.raises(ClientOmnigentError, match="Could not verify"):
         await _run_one_shot(client, _return_text, monkeypatch)
+
+
+async def test_query_sessions_once_preserves_failure_when_transcript_is_unreadable(monkeypatch):
+    client = _FakeAPClient([])
+
+    async def unreadable(*args, **kwargs):
+        raise ClientOmnigentError("items endpoint unavailable")
+
+    client.sessions.list_items = unreadable
+    with pytest.raises(ClientOmnigentError, match="auth misconfigured"):
+        await _run_one_shot(client, _raise_genuine_failure, monkeypatch)
 
 
 async def test_query_sessions_once_recovered_error_and_info_are_not_terminal(monkeypatch):
@@ -4364,7 +4375,7 @@ async def test_query_sessions_once_deadline_does_not_approve_persisted_preamble(
             return await _never_return("")
 
     monkeypatch.setattr("omnigent_client.SessionsChat", RunningChat)
-    with pytest.raises(TimeoutError, match="terminal completion"):
+    with pytest.raises(ClientOmnigentError, match="terminal completion"):
         await _query_sessions_once(
             client=client,
             agent_name="test",

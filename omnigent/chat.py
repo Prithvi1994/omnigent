@@ -2486,10 +2486,13 @@ async def _query_sessions_once(
     # subscription cleanly.
     try:
         result = await asyncio.wait_for(chat.query(prompt), timeout=_PER_TURN_TIMEOUT_S)
-    except ClientOmnigentError:
-        turn_error = await _persisted_turn_error(client, bound.id)
+    except ClientOmnigentError as exc:
+        try:
+            turn_error = await _persisted_turn_error(client, bound.id)
+        except ClientOmnigentError as verification_error:
+            raise exc from verification_error
         if turn_error is not None:
-            raise ClientOmnigentError(turn_error) from None
+            raise ClientOmnigentError(turn_error) from exc
         reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
             return reconciled
@@ -2518,7 +2521,9 @@ async def _query_sessions_once(
                         break
                     await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
         if chat.status in ("running", "launching"):
-            raise TimeoutError("Headless session did not reach terminal completion") from None
+            raise ClientOmnigentError(
+                "Headless session did not reach terminal completion"
+            ) from None
         turn_error = await _persisted_turn_error(client, bound.id)
         if turn_error is not None:
             raise ClientOmnigentError(turn_error) from None
@@ -2616,7 +2621,7 @@ async def _query_sessions_once(
         )
 
     if chat.status in ("running", "launching"):
-        raise TimeoutError("Headless session did not reach terminal completion") from None
+        raise ClientOmnigentError("Headless session did not reach terminal completion") from None
     turn_error = await _persisted_turn_error(client, bound.id)
     if turn_error is not None:
         raise ClientOmnigentError(turn_error) from None
