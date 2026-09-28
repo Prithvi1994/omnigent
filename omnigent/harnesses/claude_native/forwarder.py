@@ -135,7 +135,7 @@ _FORWARD_LOOP_STALL_DEADLINE_S = 300.0
 _POST_TIMEOUT_S = 10.0
 _MAX_SEEN_SOURCE_IDS = 2000
 _SUBAGENT_FORWARD_CONCURRENCY = 8
-_SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS = 12
+_SUBAGENT_BATCH_MAX_TRANSIENT_ATTEMPTS = 12
 _CURSOR_FINGERPRINT_BYTES = 256
 _FORK_COMMAND_NAMES = frozenset({"/branch", "/fork"})
 _HTTP_POST_MAX_PERMANENT_FAILURES = 3
@@ -936,7 +936,6 @@ class _PostRetryTracker:
         *,
         max_permanent_attempts: int = _HTTP_POST_MAX_PERMANENT_FAILURES,
         max_not_confirmed_attempts: int = _SUBAGENT_DELIVERY_NOT_CONFIRMED_MAX_ATTEMPTS,
-        max_transient_attempts: int | None = None,
         base_delay_s: float = _HTTP_POST_RETRY_BASE_DELAY_S,
         max_delay_s: float = _HTTP_POST_RETRY_MAX_DELAY_S,
     ) -> None:
@@ -947,17 +946,12 @@ class _PostRetryTracker:
             failure is exhausted.
         :param max_not_confirmed_attempts: Attempts before a
             ``subagent_delivery_not_confirmed`` 503 is exhausted.
-        :param max_transient_attempts: Optional attempt budget for transient
-            failures. ``None`` preserves indefinite retries.
         :param base_delay_s: Initial retry delay in seconds.
         :param max_delay_s: Maximum retry delay in seconds.
         :returns: None.
         """
         self._max_permanent_attempts = max(1, max_permanent_attempts)
         self._max_not_confirmed_attempts = max(1, max_not_confirmed_attempts)
-        self._max_transient_attempts = (
-            max(1, max_transient_attempts) if max_transient_attempts is not None else None
-        )
         self._base_delay_s = max(0.0, base_delay_s)
         self._max_delay_s = max(0.0, max_delay_s)
         self._entries: dict[str, _PostRetryEntry] = {}
@@ -995,7 +989,12 @@ class _PostRetryTracker:
         _note_forward_success()
 
     def record_failure(
-        self, key: str, exc: httpx.HTTPError, *, session_id: str
+        self,
+        key: str,
+        exc: httpx.HTTPError,
+        *,
+        session_id: str,
+        max_transient_attempts: int | None = None,
     ) -> _PostRetryDecision:
         """
         Record one failed post and compute the next retry action.
@@ -1003,6 +1002,8 @@ class _PostRetryTracker:
         :param key: Stable retry key, e.g. ``"item:source-1"``.
         :param exc: HTTP exception raised while posting the event.
         :param session_id: Session targeted by the failed post.
+        :param max_transient_attempts: Optional batch budget before splitting
+            into individual requests. Individual transient failures have no limit.
         :returns: Retry decision for this failure.
         """
         # Count every failed post (transient or permanent) so a sustained
@@ -1021,8 +1022,8 @@ class _PostRetryTracker:
             or (
                 not permanent
                 and not not_confirmed
-                and self._max_transient_attempts is not None
-                and entry.attempts >= self._max_transient_attempts
+                and max_transient_attempts is not None
+                and entry.attempts >= max(1, max_transient_attempts)
             )
         )
         if give_up:
@@ -1183,9 +1184,7 @@ async def forward_claude_transcript_to_session(
     item_retries = _PostRetryTracker()
     status_retries = _PostRetryTracker()
     subagent_start_retries = _PostRetryTracker()
-    subagent_item_retries = _PostRetryTracker(
-        max_transient_attempts=_SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS
-    )
+    subagent_item_retries = _PostRetryTracker()
     subagent_status_retries = _PostRetryTracker()
     session_event_batch_capability = _SessionEventBatchCapability()
     subagent_status_capability = _SubagentStatusCapability()
@@ -1291,9 +1290,7 @@ async def forward_claude_transcript_to_session(
                         item_retries = _PostRetryTracker()
                         status_retries = _PostRetryTracker()
                         subagent_start_retries = _PostRetryTracker()
-                        subagent_item_retries = _PostRetryTracker(
-                            max_transient_attempts=_SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS
-                        )
+                        subagent_item_retries = _PostRetryTracker()
                         subagent_status_retries = _PostRetryTracker()
                         external_session_id_mirrored = False
                         task_subjects = {}
@@ -1334,9 +1331,7 @@ async def forward_claude_transcript_to_session(
                         item_retries = _PostRetryTracker()
                         status_retries = _PostRetryTracker()
                         subagent_start_retries = _PostRetryTracker()
-                        subagent_item_retries = _PostRetryTracker(
-                            max_transient_attempts=_SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS
-                        )
+                        subagent_item_retries = _PostRetryTracker()
                         subagent_status_retries = _PostRetryTracker()
                         external_session_id_mirrored = False
                         task_subjects = {}
@@ -2142,7 +2137,10 @@ async def _forward_one_subagent(
                 )
             except httpx.HTTPError as exc:
                 decision = item_retry_tracker.record_failure(
-                    retry_key, exc, session_id=entry.child_conversation_id
+                    retry_key,
+                    exc,
+                    session_id=entry.child_conversation_id,
+                    max_transient_attempts=_SUBAGENT_BATCH_MAX_TRANSIENT_ATTEMPTS,
                 )
                 if not decision.exhausted:
                     _logger.warning(
@@ -2159,65 +2157,16 @@ async def _forward_one_subagent(
                         extra={"session_id": parent_session_id},
                     )
                     break
-                if (
-                    not decision.permanent
-                    and not _is_subagent_delivery_not_confirmed(exc)
-                    and not _batch_response_never_received(exc)
-                ):
-                    _logger.error(
-                        "Dropping claude-native sub-agent transcript batch after "
-                        "transient delivery retries were exhausted; child=%s items=%s "
-                        "attempts=%s http_status=%s",
-                        entry.child_conversation_id,
-                        len(batch),
-                        decision.attempts,
-                        _http_status_for_log(exc),
-                        extra={
-                            "session_id": entry.child_conversation_id,
-                            "event_name": "claude_subagent_transcript_dropped",
-                            "attributes": {
-                                "parent_session_id": parent_session_id,
-                                "drop_reason": "transient_retries_exhausted",
-                                "item_count": len(batch),
-                                "http_status": _http_status_for_log(exc),
-                                "attempts": decision.attempts,
-                                "exception_type": type(exc).__name__,
-                            },
-                        },
-                    )
-                    for pending_item in batch:
-                        item = pending_item.item
-                        append_dead_letter(
-                            bridge_dir,
-                            session_id=entry.child_conversation_id,
-                            event_type="external_conversation_item",
-                            payload={
-                                "source_id": item.source_id,
-                                "item_type": item.item_type,
-                                "item_data": item.data,
-                                "response_id": item.response_id,
-                            },
-                            reason="transient HTTP failure after retries",
-                            delivered_ambiguous=False,
-                            http_status=_http_status_for_log(exc),
-                        )
-                    completed_items.extend(batch)
-                    new_entry = replace(
-                        new_entry,
-                        last_activity_ts=now,
-                        delivery_error=_SUBAGENT_DROPPED_ITEM_REASON,
-                    )
-                else:
-                    _logger.warning(
-                        "Re-driving claude-native sub-agent transcript batch individually "
-                        "after HTTP failures; child=%s items=%s attempts=%s http_status=%s",
-                        entry.child_conversation_id,
-                        len(batch),
-                        decision.attempts,
-                        _http_status_for_log(exc),
-                        extra={"session_id": parent_session_id},
-                    )
-                    retry_individually = True
+                _logger.warning(
+                    "Re-driving claude-native sub-agent transcript batch individually "
+                    "after HTTP failures; child=%s items=%s attempts=%s http_status=%s",
+                    entry.child_conversation_id,
+                    len(batch),
+                    decision.attempts,
+                    _http_status_for_log(exc),
+                    extra={"session_id": parent_session_id},
+                )
+                retry_individually = True
             else:
                 completed_items.extend(batch)
                 delivered = True
@@ -2253,12 +2202,9 @@ async def _forward_one_subagent(
                     if _is_permanent_http_error(item_exc):
                         dead_letter_reason = "permanent HTTP failure after retries"
                         drop_category = "permanent_http_failure"
-                    elif _is_subagent_delivery_not_confirmed(item_exc):
+                    else:
                         dead_letter_reason = "delivery not confirmed after retries"
                         drop_category = "delivery_not_confirmed"
-                    else:
-                        dead_letter_reason = "transient HTTP failure after retries"
-                        drop_category = "transient_retries_exhausted"
                     _logger.error(
                         "Dropping claude-native sub-agent transcript item after "
                         "individual delivery retries; child=%s source_id=%s http_status=%s",
@@ -6071,23 +6017,6 @@ def _http_status_for_log(exc: httpx.HTTPError) -> int | None:
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code
     return None
-
-
-def _batch_response_never_received(exc: httpx.HTTPError) -> bool:
-    """
-    Return whether ``exc`` failed before any response reached the client.
-
-    A transport failure (read/connect/write timeout, read error, protocol
-    error) means the server never rendered a verdict on the batch, so the
-    payload is unproven rather than rejected. Splitting the batch is then
-    strictly better than discarding it: a whole-batch read timeout is usually
-    the batch's own size against the flat post timeout, and single items fit
-    where 100 do not.
-
-    :param exc: HTTP exception raised while posting an Omnigent event.
-    :returns: ``True`` when no HTTP response was received.
-    """
-    return not isinstance(exc, httpx.HTTPStatusError)
 
 
 def _read_hook_state(bridge_dir: Path) -> HookForwardState | None:
