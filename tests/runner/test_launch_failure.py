@@ -118,17 +118,34 @@ def test_classifies_hosting_workspace_auth_as_fatal_with_card() -> None:
 @pytest.mark.parametrize(
     "output",
     [
-        _ROOT_REFUSAL_OUTPUT,
+        "dbcert expired on Arca",
         "Not logged in · Please run /login",
-        "bash: qwen: command not found",
+        "Error: Invalid API key",
     ],
 )
-def test_user_actionable_exits_are_non_fatal(output: str) -> None:
-    # Every recognized user-actionable exit downgrades to WARNING (non-fatal),
-    # so it stays out of the reliability error KPI.
+def test_self_healing_exits_are_non_fatal(output: str) -> None:
+    # Only self-healing, user-refreshable credential/session failures downgrade
+    # to WARNING (non-fatal), so they stay out of the reliability error KPI.
     diagnosis = classify_terminal_failure(command="claude", exit_status=1, output=output)
     assert diagnosis is not None
     assert diagnosis.fatal is False
+
+
+@pytest.mark.parametrize(
+    ("exit_status", "output"),
+    [
+        (1, _ROOT_REFUSAL_OUTPUT),
+        (None, "bash: qwen: command not found"),
+        (127, ""),
+    ],
+)
+def test_host_provisioning_exits_are_fatal(exit_status: int | None, output: str) -> None:
+    # Host/deployment failures (root host, missing CLI) recur until infra is
+    # fixed — not user self-heal — so they keep a card but stay fatal (ERROR).
+    diagnosis = classify_terminal_failure(command="claude", exit_status=exit_status, output=output)
+    assert diagnosis is not None
+    assert diagnosis.fatal is True
+    assert diagnosis.remediation is not None
 
 
 def test_failure_diagnosis_defaults_to_fatal() -> None:

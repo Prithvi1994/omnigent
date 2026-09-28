@@ -44,8 +44,10 @@ class FailureDiagnosis:
         ``ERROR`` and counted in the reliability KPI). ``False`` for a
         user-actionable/environment failure the user can recover from (e.g.
         an expired credential); those are logged at ``WARNING`` and excluded
-        from the error KPI. Recognized user-actionable matchers set this to
-        ``False``; an unrecognized exit has no diagnosis and stays fatal.
+        from the error KPI. Only matchers for self-healing, user-refreshable
+        credential/session state set this to ``False`` (expired cert, not
+        signed in); host-provisioning and platform failures stay fatal even
+        when recognized, and an unrecognized exit has no diagnosis and is fatal.
     """
 
     title: str
@@ -106,9 +108,9 @@ _AUTH_MARKERS = (
 # --- binary missing -----------------------------------------------------------
 # Only unambiguous "the launched executable isn't there" evidence. A bare
 # "no such file or directory" is deliberately excluded: it also appears in an
-# ordinary app crash (e.g. a missing config file in a traceback), so treating
-# it as a missing-binary — and thus a non-fatal, KPI-excluded exit — would hide
-# a genuine crash. Exit code 127 is handled separately in the predicate.
+# ordinary app crash (e.g. a missing config file in a traceback), so it would
+# mislabel a genuine crash as a missing binary. Exit code 127 is handled
+# separately in the predicate.
 _MISSING_MARKERS = (
     "command not found",
     "not recognized as an internal or external command",
@@ -149,8 +151,9 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "The agent terminal exited immediately because Claude Code refuses "
                 "--dangerously-skip-permissions when running as the root user."
             ),
+            # Fatal: a host provisioned as root recurs on every launch until the
+            # host is re-provisioned — not something the user self-heals in-session.
             remediation="Run the host as a non-root user (uid != 0).",
-            fatal=False,
         ),
     ),
     _TerminalMatcher(
@@ -162,8 +165,9 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "The host couldn't find the agent's CLI on its PATH, so the terminal "
                 "exited before the session could start."
             ),
+            # Fatal: a missing CLI recurs until the host is set up — a deployment
+            # gap worth keeping in the error KPI, not a user self-heal.
             remediation=f"Install the harness on the host (e.g. run `{cli_invocation()} setup`).",
-            fatal=False,
         ),
     ),
     _TerminalMatcher(
