@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Awaitable, Callable, Generator
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
@@ -559,6 +560,11 @@ def run_prompt(
     )
 
 
+# Strict terminal verification is opt-in for the typed API only. Async tasks
+# inherit this context without changing legacy CLI callers in other contexts.
+_STRICT_PROMPT_COMPLETION: ContextVar[bool] = ContextVar("strict_prompt_completion", default=False)
+
+
 @dataclass(frozen=True)
 class PromptResult:
     """Terminal outcome of a headless invocation; text alone is not success."""
@@ -576,6 +582,7 @@ def run_prompt_result(**kwargs: Any) -> PromptResult:
     started = time.monotonic()
     output, errors = io.StringIO(), io.StringIO()
     status, error = "completed", None
+    completion_token = _STRICT_PROMPT_COMPLETION.set(True)
     main_thread = threading.current_thread() is threading.main_thread()
     previous = signal.getsignal(signal.SIGTERM) if main_thread else None
 
@@ -594,6 +601,7 @@ def run_prompt_result(**kwargs: Any) -> PromptResult:
         status = "failed"
         error = errors.getvalue().strip() or str(exc) or type(exc).__name__
     finally:
+        _STRICT_PROMPT_COMPLETION.reset(completion_token)
         if main_thread and previous is not None:
             signal.signal(signal.SIGTERM, previous)
     return PromptResult(status, output.getvalue(), error, time.monotonic() - started)
@@ -2413,6 +2421,8 @@ async def _query_sessions_once(
     """
     from omnigent_client import SessionsChat
 
+    strict_completion = _STRICT_PROMPT_COMPLETION.get()
+
     # Remote target: no local bundle means no local runner either, so
     # adopt one the server already has online before the dispatch
     # precondition is checked.
@@ -2503,12 +2513,13 @@ async def _query_sessions_once(
     try:
         result = await asyncio.wait_for(chat.query(prompt), timeout=_PER_TURN_TIMEOUT_S)
     except ClientOmnigentError as exc:
-        try:
-            turn_error = await _persisted_turn_error(client, bound.id)
-        except ClientOmnigentError as verification_error:
-            raise exc from verification_error
-        if turn_error is not None:
-            raise ClientOmnigentError(turn_error) from exc
+        if strict_completion:
+            try:
+                turn_error = await _persisted_turn_error(client, bound.id, strict=True)
+            except ClientOmnigentError as verification_error:
+                raise exc from verification_error
+            if turn_error is not None:
+                raise ClientOmnigentError(turn_error) from exc
         reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
             return reconciled
@@ -2536,13 +2547,14 @@ async def _query_sessions_once(
                     if chat.status not in ("running", "launching"):
                         break
                     await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
-        if chat.status in ("running", "launching"):
-            raise ClientOmnigentError(
-                "Headless session did not reach terminal completion"
-            ) from None
-        turn_error = await _persisted_turn_error(client, bound.id)
-        if turn_error is not None:
-            raise ClientOmnigentError(turn_error) from None
+        if strict_completion:
+            if chat.status in ("running", "launching"):
+                raise ClientOmnigentError(
+                    "Headless session did not reach terminal completion"
+                ) from None
+            turn_error = await _persisted_turn_error(client, bound.id, strict=True)
+            if turn_error is not None:
+                raise ClientOmnigentError(turn_error) from None
         reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
             return reconciled
@@ -2636,11 +2648,14 @@ async def _query_sessions_once(
             bound.id,
         )
 
-    if chat.status in ("running", "launching"):
-        raise ClientOmnigentError("Headless session did not reach terminal completion") from None
-    turn_error = await _persisted_turn_error(client, bound.id)
-    if turn_error is not None:
-        raise ClientOmnigentError(turn_error) from None
+    if strict_completion:
+        if chat.status in ("running", "launching"):
+            raise ClientOmnigentError(
+                "Headless session did not reach terminal completion"
+            ) from None
+        turn_error = await _persisted_turn_error(client, bound.id, strict=True)
+        if turn_error is not None:
+            raise ClientOmnigentError(turn_error) from None
     if all_text_parts:
         return "\n\n".join(p for p in all_text_parts if p)
     # An auto-woken turn can finish between live-stream subscriptions.
@@ -2650,6 +2665,10 @@ async def _query_sessions_once(
         if reconciled is not None:
             logger.info("Recovered headless output from completed session %s", bound.id)
             return reconciled
+    if not strict_completion:
+        turn_error = await _persisted_turn_error(client, bound.id)
+        if turn_error is not None:
+            raise ClientOmnigentError(turn_error)
     return None
 
 
@@ -2774,27 +2793,33 @@ async def _persisted_turn_text(
 async def _persisted_turn_error(
     client: OmnigentClient,
     session_id: str,
+    *,
+    strict: bool = False,
 ) -> str | None:
-    """Read a terminal error after the latest completed assistant message.
+    """Read the latest turn error, with opt-in strict completion semantics.
 
     The relay flushes final assistant text before persisting terminal errors.
     A newer completed message therefore supersedes an earlier recovered error.
     Informational banners are not failures. An unreadable transcript cannot
-    establish successful completion.
+    establish successful completion in strict mode. Legacy callers retain
+    their best-effort lookup through the current turn.
     """
     try:
         recent: _ResponseOutput = await client.sessions.list_items(
             session_id, limit=_RECONCILE_ITEMS_LIMIT, order="desc"
         )
     except ClientOmnigentError as exc:
+        if not strict:
+            logger.debug("reconcile error read failed for %s: %r", session_id, exc)
+            return None
         raise ClientOmnigentError("Could not verify the headless turn's terminal outcome") from exc
     for item in recent:
         if item.get("type") == "message":
             if item.get("role") == "user" or (
-                item.get("role") == "assistant" and item.get("status") == "completed"
+                strict and item.get("role") == "assistant" and item.get("status") == "completed"
             ):
                 break
-        if item.get("type") == "error" and item.get("level") != "info":
+        if item.get("type") == "error" and (not strict or item.get("level") != "info"):
             message = item.get("message")
             if isinstance(message, str) and message:
                 return message
