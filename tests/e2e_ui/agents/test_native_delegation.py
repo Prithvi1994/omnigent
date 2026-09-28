@@ -2,6 +2,8 @@
 
 import json
 import uuid
+from dataclasses import asdict
+from pathlib import Path
 
 import httpx
 import pytest
@@ -25,6 +27,7 @@ from tests.e2e_ui.messages.test_native_claude_render_parity import (
 from tests.e2e_ui.native_driver import (
     navigate_to_child,
     send_composer_message,
+    wait_claude_completion,
     wait_native_delegation,
 )
 from tests.server.integration.mock_llm_server import MockState
@@ -38,6 +41,7 @@ def test_native_claude_delegation(
     native_claude_mock_session: tuple[str, str],
     mock_llm_server_url: str,
     agent_type: str,
+    tmp_path: Path,
 ) -> None:
     base_url, parent_id = native_claude_mock_session
     nonce = uuid.uuid4().hex
@@ -72,6 +76,13 @@ def test_native_claude_delegation(
         tool_name = tool["name"]
         properties = tool["input_schema"]["properties"]
         assert {"subagent_type", "prompt", "description"} <= properties.keys(), tool
+        arguments = {
+            "subagent_type": agent_type,
+            "description": f"Inspect {nonce[:8]}",
+            "prompt": child_marker,
+        }
+        if "run_in_background" in properties:
+            arguments["run_in_background"] = False
         parent_key = configure_mock_llm(
             mock_llm_server_url,
             [
@@ -80,13 +91,7 @@ def test_native_claude_delegation(
                         {
                             "call_id": call_id,
                             "name": tool_name,
-                            "arguments": json.dumps(
-                                {
-                                    "subagent_type": agent_type,
-                                    "description": f"Inspect {nonce[:8]}",
-                                    "prompt": child_marker,
-                                }
-                            ),
+                            "arguments": json.dumps(arguments),
                         }
                     ]
                 },
@@ -123,7 +128,10 @@ def test_native_claude_delegation(
         expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
         with httpx.Client(base_url=base_url, timeout=10) as client:
             proof = wait_native_delegation(client, parent_id, call_id=call_id, tool_name=tool_name)
-        assert child_reply in json.dumps(proof.result)
+        completion = wait_claude_completion(mock, call_id=call_id, expected_text=child_reply)
+        (tmp_path / "native-delegation.json").write_text(
+            json.dumps({"delegation": asdict(proof), "completion": completion}, indent=2)
+        )
         selections = mock.get("/mock/selections").raise_for_status().json()["selections"]
         assert any(
             selection["key"] == parent_key

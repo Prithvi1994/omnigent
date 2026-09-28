@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from xml.etree import ElementTree
 
 import httpx
 from playwright.sync_api import Page, Response, expect
@@ -211,6 +212,79 @@ def wait_native_delegation(
             raise AssertionError(
                 f"Native delegation {parent_id}/{call_id} not observed: {observed}"
             )
+        time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+
+
+def _completion_from_requests(
+    requests: list[dict], call_id: str, expected_text: str
+) -> dict | None:
+    for index, request in enumerate(requests):
+        for message in request.get("messages", []):
+            if message.get("role") != "user":
+                continue
+            blocks = message.get("content", [])
+            if isinstance(blocks, str):
+                blocks = [{"type": "text", "text": blocks}]
+            for block in blocks:
+                tool_result = block.get("type") == "tool_result"
+                if tool_result and block.get("tool_use_id") != call_id:
+                    continue
+                if tool_result and block.get("is_error"):
+                    raise AssertionError(f"Native call {call_id} returned an error")
+                content = block.get("content", "") if tool_result else block.get("text", "")
+                text = (
+                    content
+                    if isinstance(content, str)
+                    else "\n".join(
+                        part.get("text", "") for part in content if isinstance(part, dict)
+                    )
+                )
+                notifications = re.findall(
+                    r"<task-notification>.*?</task-notification>", text, re.S
+                )
+                if notifications:
+                    for notification in notifications:
+                        try:
+                            event = ElementTree.fromstring(notification)
+                        except ElementTree.ParseError:
+                            continue
+                        if event.findtext("tool-use-id") != call_id:
+                            continue
+                        status = event.findtext("status")
+                        if status in {"failed", "cancelled"}:
+                            raise AssertionError(f"Native call {call_id} ended with {status}")
+                        if status == "completed" and expected_text in (
+                            event.findtext("result") or ""
+                        ):
+                            return {
+                                "request_index": index,
+                                "kind": "notification",
+                                "text": notification,
+                            }
+                elif tool_result and expected_text in text:
+                    return {"request_index": index, "kind": "tool_result", "text": text}
+    return None
+
+
+def wait_claude_completion(
+    mock: httpx.Client,
+    *,
+    call_id: str,
+    expected_text: str,
+    timeout: float = 60,
+) -> dict:
+    """Require the native parent to receive its tool's reply or completed notification."""
+    deadline = time.monotonic() + timeout
+    while True:
+        completion = _completion_from_requests(
+            _get(mock, "/mock/requests")["requests"],
+            call_id,
+            expected_text,
+        )
+        if completion is not None:
+            return completion
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"Native parent did not receive completion for {call_id}")
         time.sleep(min(0.2, max(0, deadline - time.monotonic())))
 
 

@@ -11,6 +11,7 @@ from tests.e2e_ui.native_driver import (
     inject_child_start,
     send_message,
     wait_child_task,
+    wait_claude_completion,
     wait_native_delegation,
 )
 
@@ -168,3 +169,96 @@ def test_composer_observation_matches_its_own_submission(event_type, session, te
         ),
     )
     assert _matches_message_response(response, "parent", "prompt") is expected
+
+
+@pytest.mark.parametrize("placement", ["tool_result", "text_block", "text_message"])
+@pytest.mark.parametrize("status", ["completed", "running", "failed", "cancelled"])
+def test_native_notification_requires_completed_exact_call(placement, status):
+    notification = (
+        "<task-notification><tool-use-id>call</tool-use-id>"
+        f"<status>{status}</status><result>worker reply</result></task-notification>"
+    )
+    if placement == "tool_result":
+        content = [{"type": "tool_result", "tool_use_id": "call", "content": notification}]
+    elif placement == "text_block":
+        content = [{"type": "text", "text": notification}]
+    else:
+        content = notification
+    requests = [{"messages": [{"role": "user", "content": content}]}]
+    with httpx.Client(
+        base_url="http://mock",
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"requests": requests})),
+    ) as client:
+        with pytest.raises(AssertionError, match="did not receive completion"):
+            wait_claude_completion(
+                client, call_id="other", expected_text="worker reply", timeout=0
+            )
+        if status == "completed":
+            assert (
+                wait_claude_completion(
+                    client, call_id="call", expected_text="worker reply", timeout=0
+                )["kind"]
+                == "notification"
+            )
+        else:
+            with pytest.raises(AssertionError):
+                wait_claude_completion(
+                    client, call_id="call", expected_text="worker reply", timeout=0
+                )
+
+
+@pytest.mark.parametrize("is_error", [False, True])
+@pytest.mark.parametrize("reply", ["worker reply", [{"type": "text", "text": "worker reply"}]])
+def test_native_synchronous_completion_rejects_errors(is_error, reply):
+    requests = [
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call",
+                            "content": reply,
+                            "is_error": is_error,
+                        }
+                    ],
+                }
+            ]
+        }
+    ]
+    with httpx.Client(
+        base_url="http://mock",
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"requests": requests})),
+    ) as client:
+        if is_error:
+            with pytest.raises(AssertionError, match="returned an error"):
+                wait_claude_completion(
+                    client, call_id="call", expected_text="worker reply", timeout=0
+                )
+        else:
+            assert (
+                wait_claude_completion(
+                    client, call_id="call", expected_text="worker reply", timeout=0
+                )["kind"]
+                == "tool_result"
+            )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "worker reply",
+        "<task-notification><result>worker reply</result></task-notification>",
+        "<task-notification><tool-use-id>call</tool-use-id><status>completed</status>"
+        "<result>worker reply</task-notification>",
+    ],
+)
+def test_plain_or_malformed_notification_is_not_completion(text):
+    requests = [{"messages": [{"role": "user", "content": text}]}]
+    with httpx.Client(
+        base_url="http://mock",
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"requests": requests})),
+    ) as client:
+        with pytest.raises(AssertionError, match="did not receive completion"):
+            wait_claude_completion(client, call_id="call", expected_text="worker reply", timeout=0)
