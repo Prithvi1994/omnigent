@@ -365,15 +365,16 @@ def test_caller_stop_exception_is_preserved_with_optional_chunk_capture(
     collector = Evidence(tmp_path / "saved")
     try:
         collector.install_browser()
-        context = browser.new_context()
-        context.new_page().set_content("<p>observed</p>")
-        with pytest.raises(RuntimeError, match="caller stop failed"):
-            context.tracing.stop(path=tmp_path / "caller.zip" if with_path else None)
-        assert collector.contexts[context]["trace_active"]
-        fail_stop = False
-        context.close()
+        with browser.new_context() as context:
+            try:
+                context.new_page().set_content("<p>observed</p>")
+                with pytest.raises(RuntimeError, match="caller stop failed"):
+                    context.tracing.stop(path=tmp_path / "caller.zip" if with_path else None)
+                assert collector.contexts[context]["trace_active"]
+            finally:
+                fail_stop = False
         assert any(
-            e["operation"] == "trace_stop" and e["detail"] == "caller stop failed"
+            e["operation"] == "trace_stop" and e.get("detail") == "caller stop failed"
             for e in collector.journal.errors
         )
     finally:
@@ -394,7 +395,7 @@ def test_optional_chunk_failure_does_not_change_caller_stop(tmp_path, browser, m
             context.tracing.stop()
             assert not collector.contexts[context]["trace_active"]
         assert any(
-            e["operation"] == "trace_stop" and e["detail"] == "chunk storage unavailable"
+            e["operation"] == "trace_stop" and e.get("detail") == "chunk storage unavailable"
             for e in collector.journal.errors
         )
         assert list(collector.directory.glob("screen-*.png"))

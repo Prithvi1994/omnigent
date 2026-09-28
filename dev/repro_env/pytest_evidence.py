@@ -211,10 +211,11 @@ class Evidence:
                 return send(client, request, *args, **kwargs)
             path = request.url.path
             key = self.session_key(str(request.url))
-            with self.sessions_lock:
-                known_session = key in self.sessions
-            if request.method == "DELETE" and known_session:
-                self.snapshot("before_session_delete", sessions={key})
+            if request.method == "DELETE":
+                with self.sessions_lock:
+                    known_session = key in self.sessions
+                if known_session:
+                    self.snapshot("before_session_delete", sessions={key})
             if path == "/mock/reset":
                 self.busy = True
                 try:

@@ -1438,3 +1438,15 @@ def test_child_journal_error_cap_counts_omitted_records(tmp_path):
         "error_type": "OmittedRecords",
         "omitted_record_count": 3,
     }
+
+
+def test_unreadable_journal_does_not_claim_collector_interruption(tmp_path):
+    from dev.repro_env.execution import collector_errors
+
+    wrapper, child = Journal(tmp_path), Journal(tmp_path)
+    child.emit("collector_start")
+    with child.path.open("a") as stream:
+        stream.write("not-json\n")
+    child.emit("collector_end", collection_errors=[])
+    assert collector_errors(tmp_path, wrapper) == []
+    assert [e["operation"] for e in wrapper.errors] == ["child_journal_read"]

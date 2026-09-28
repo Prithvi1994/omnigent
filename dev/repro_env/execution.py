@@ -298,6 +298,7 @@ def collector_errors(directory: Path, wrapper: Journal) -> list[dict]:
         except Exception as exc:  # noqa: BLE001 — retain other journals and the command result.
             error = wrapper.failure("child_journal_read", exc, journal=path.name)
             wrapper.emit("collection_error", **error)
+            continue  # An unread remainder leaves collector completion unknown.
         if started and not finished:
             add(
                 {
