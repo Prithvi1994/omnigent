@@ -11832,6 +11832,76 @@ async def test_forwarder_gate_settles_when_idle_then_wakes_on_new_output(
 
 
 @pytest.mark.asyncio
+async def test_forwarder_gate_keeps_pane_signal_cadence_while_idle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A footer switch in an idle pane still reaches the wire at the pane cadence.
+
+    The permission mode lives only in the rendered pane, so the fingerprint
+    cannot see it change. A gated tick must keep sampling the pane instead of
+    leaving a shift+tab switch to the periodic resync.
+
+    :param tmp_path: Per-test temp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.harnesses.claude_native.bridge import PaneSignals
+
+    monkeypatch.setattr(forwarder, "_IDLE_SETTLE_SECONDS", 0.05)
+    # High enough that a resync cannot be what delivers the switch.
+    monkeypatch.setattr(forwarder, "_IDLE_RESYNC_SECONDS", 60.0)
+    monkeypatch.setattr(forwarder, "_PANE_POLL_INTERVAL_S", 0.05)
+    pane = {"mode": "default"}
+    monkeypatch.setattr(
+        forwarder,
+        "read_pane_signals",
+        lambda _bridge_dir: PaneSignals(permission_mode=pane["mode"]),
+    )
+    bridge_dir, _transcript_path = _seed_idle_session(tmp_path)
+    full_polls = _count_full_polls(monkeypatch)
+
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_gate_pane",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        await _get_recorded_item_request(server)
+        # Let the gate engage before switching the pane's footer.
+        await asyncio.sleep(0.4)
+        before = full_polls()
+
+        pane["mode"] = "plan"
+        while True:
+            body = (await _get_recorded_request(server, timeout_s=2.0))["body"]
+            if (
+                body.get("type") == "external_permission_mode_change"
+                and body["data"]["permission_mode"] == "plan"
+            ):
+                break
+        assert body["data"]["initial_observation"] is False
+        assert full_polls() - before <= 5, (
+            f"the switch needed the full body: {full_polls() - before} full polls"
+        )
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+
+@pytest.mark.asyncio
 async def test_forwarder_gate_forwards_every_record_of_a_slow_trickle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

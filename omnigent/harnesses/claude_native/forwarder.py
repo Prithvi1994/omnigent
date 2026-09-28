@@ -1586,6 +1586,9 @@ async def forward_claude_transcript_to_session(
     gate_enabled = _idle_gate_enabled()
     fingerprint: _BridgeFingerprint | None = None
     known_transcript_path: Path | None = None
+    # Session the body last resolved from the bridge; a gated tick relays pane
+    # signals to it without re-reading bridge.json.
+    active_session_id = session_id
     bridge_inputs = _BridgeInputPaths(bridge_dir)
     last_input_change_at = time.monotonic()
     last_full_poll_at = 0.0
@@ -1651,6 +1654,18 @@ async def forward_claude_transcript_to_session(
                                 "polls; bridge=%s",
                                 bridge_label,
                             )
+                        # The pane has no on-disk input the fingerprint can see, so
+                        # a footer switch (shift+tab, /btw) keeps its own cadence.
+                        if known_transcript_path is not None and now >= dedupe.pane_next_read:
+                            async with _forward_progress_timeout(
+                                client, _FORWARD_LOOP_STALL_DEADLINE_S
+                            ):
+                                await _forward_pane_signals(
+                                    client=client,
+                                    session_id=active_session_id,
+                                    bridge_dir=bridge_dir,
+                                    dedupe=dedupe,
+                                )
                         await asyncio.sleep(poll_interval_s)
                         continue
                     if gate_engaged:
@@ -1662,6 +1677,7 @@ async def forward_claude_transcript_to_session(
                     last_full_poll_at = now
                 async with _forward_progress_timeout(client, _FORWARD_LOOP_STALL_DEADLINE_S):
                     current_session_id = read_active_session_id(bridge_dir) or session_id
+                    active_session_id = current_session_id
                     observer_stderr_offset = _log_new_observer_hook_stderr(
                         bridge_dir=bridge_dir,
                         session_id=current_session_id,
