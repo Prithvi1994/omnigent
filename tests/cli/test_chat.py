@@ -4281,6 +4281,26 @@ def test_prompt_result_preserves_terminal_outcome(monkeypatch, fails):
     assert result.usage is None and result.cost is None
 
 
+def test_prompt_result_sigterm_unwinds_and_restores_handler(monkeypatch):
+    import signal
+
+    cleaned = []
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def run(**kwargs):
+        try:
+            signal.raise_signal(signal.SIGTERM)
+        finally:
+            cleaned.append(True)
+
+    monkeypatch.setattr(chat_module, "run_prompt", run)
+    result = chat_module.run_prompt_result(target="unused", client_tools=None, prompt="hi")
+    assert result.status == "failed"
+    assert "terminated" in result.error
+    assert cleaned == [True]
+    assert signal.getsignal(signal.SIGTERM) == previous
+
+
 async def test_query_sessions_once_multi_turn_async_orchestrator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

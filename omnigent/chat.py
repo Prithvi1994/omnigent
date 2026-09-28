@@ -15,9 +15,11 @@ import logging
 import os
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass
@@ -574,12 +576,24 @@ def run_prompt_result(**kwargs: Any) -> PromptResult:
     started = time.monotonic()
     output, errors = io.StringIO(), io.StringIO()
     status, error = "completed", None
+    main_thread = threading.current_thread() is threading.main_thread()
+    previous = signal.getsignal(signal.SIGTERM) if main_thread else None
+
+    def interrupted(_signum: int, _frame: Any) -> None:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise InterruptedError("Headless invocation terminated")
+
+    if main_thread:
+        signal.signal(signal.SIGTERM, interrupted)
     try:
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
             run_prompt(**kwargs)
     except (Exception, SystemExit) as exc:  # noqa: BLE001 — typed failure boundary
         status = "failed"
         error = errors.getvalue().strip() or str(exc) or type(exc).__name__
+    finally:
+        if main_thread and previous is not None:
+            signal.signal(signal.SIGTERM, previous)
     return PromptResult(status, output.getvalue(), error, time.monotonic() - started)
 
 
