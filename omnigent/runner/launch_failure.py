@@ -44,10 +44,12 @@ class FailureDiagnosis:
         ``ERROR`` and counted in the reliability KPI). ``False`` for a
         user-actionable/environment failure the user can recover from (e.g.
         an expired credential); those are logged at ``WARNING`` and excluded
-        from the error KPI. Only matchers for self-healing, user-refreshable
-        credential/session state set this to ``False`` (expired cert, not
-        signed in); host-provisioning and platform failures stay fatal even
-        when recognized, and an unrecognized exit has no diagnosis and is fatal.
+        from the error KPI. Only the expired-sandbox-certificate matcher — the
+        one failure confirmed in production to be routinely user-resolved so the
+        next attempt succeeds — sets this to ``False``. Every other recognized
+        exit stays fatal (host provisioning, platform auth, and even a plain
+        not-signed-in, which lacks the volume to confirm recovery), and an
+        unrecognized exit has no diagnosis and is fatal.
     """
 
     title: str
@@ -207,11 +209,13 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "The agent CLI exited because it has no valid credentials for this "
                 "host — it needs to be logged in before it can run a session."
             ),
+            # Fatal for now: `/login` looks user-actionable, but this exit has
+            # too little volume to confirm users recover, so keep it in the KPI
+            # (with a card) until the data says otherwise.
             remediation=(
                 f"Sign the agent in on the host (e.g. run its `/login`, "
                 f"or `{cli_invocation()} login`)."
             ),
-            fatal=False,
         ),
     ),
 )

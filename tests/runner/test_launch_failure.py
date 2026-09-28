@@ -56,6 +56,8 @@ def test_classifies_auth_failure(output: str) -> None:
     assert diagnosis is not None
     assert diagnosis.title == "Agent isn't signed in"
     assert diagnosis.remediation is not None
+    # Fatal until volume confirms users recover from it (see classifier note).
+    assert diagnosis.fatal is True
 
 
 def test_classifies_missing_binary_by_exit_code() -> None:
@@ -115,17 +117,11 @@ def test_classifies_hosting_workspace_auth_as_fatal_with_card() -> None:
     assert diagnosis.remediation is not None
 
 
-@pytest.mark.parametrize(
-    "output",
-    [
-        "dbcert expired on Arca",
-        "Not logged in · Please run /login",
-        "Error: Invalid API key",
-    ],
-)
-def test_self_healing_exits_are_non_fatal(output: str) -> None:
-    # Only self-healing, user-refreshable credential/session failures downgrade
-    # to WARNING (non-fatal), so they stay out of the reliability error KPI.
+@pytest.mark.parametrize("output", ["dbcert expired on Arca", "dbcert refresh failed"])
+def test_expired_cert_is_the_only_non_fatal_exit(output: str) -> None:
+    # Expired dbcert is the one exit confirmed in production to be routinely
+    # user-resolved, so it is the only failure downgraded to WARNING (kept out
+    # of the error KPI). Every other recognized exit stays fatal.
     diagnosis = classify_terminal_failure(command="claude", exit_status=1, output=output)
     assert diagnosis is not None
     assert diagnosis.fatal is False
