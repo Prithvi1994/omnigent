@@ -146,6 +146,16 @@ the leftover raw dir, so the same footage isn't collected twice. If that dir has
 errored before opening a page, or the fixture never came online) — capture the
 reason per the empty-recordings rule; never report a clip you didn't produce.
 
+**Don't poll clipped or element screenshots while filming.** Chromium takes
+`page.screenshot(clip=…)` and `locator.screenshot()` by resizing the view to the
+clip for the capture, and the recorder films that resized view: a pixel probe
+polled during the journey leaves the footage mostly grey with a shrunken or
+magnified strip of the page. The `tests/e2e_ui/` conftest turns a clipped
+`page.screenshot` on a recorded page into a full-viewport capture cropped to the
+clip, so probes there are safe. For element screenshots, or a Playwright script
+outside that suite, read pixels via `page.evaluate` (e.g. a canvas
+`toDataURL()`) or capture from a second, unrecorded context instead.
+
 ## `mobile` facets
 
 The iOS/Android apps are thin native shells that load the *same* server-served SPA

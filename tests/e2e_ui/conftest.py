@@ -2399,6 +2399,80 @@ def _record_video(
     yield
 
 
+# Screenshot kwargs that describe the clipped result rather than the
+# full-viewport capture it is cropped from.
+_CLIP_RESULT_KEYS = frozenset({"clip", "path", "type", "quality"})
+
+
+def _recorded_clip_capture(page: Any, kwargs: dict[str, Any]) -> dict[str, Any] | None:
+    """Full-viewport screenshot kwargs for a clip of a video-recorded page, or
+    ``None`` when Playwright's native clip path is fine (no clip, ``full_page``,
+    or a page whose context is not recording video)."""
+    if kwargs.get("clip") is None or kwargs.get("full_page") or page.video is None:
+        return None
+    return {**{k: v for k, v in kwargs.items() if k not in _CLIP_RESULT_KEYS}, "type": "png"}
+
+
+def _crop_recorded_clip(png: bytes, page: Any, kwargs: dict[str, Any]) -> bytes:
+    """Cut ``kwargs["clip"]`` out of a full-viewport PNG, encoding and saving it
+    the way the clipped screenshot would have been."""
+    from PIL import Image
+
+    clip = kwargs["clip"]
+    image = Image.open(io.BytesIO(png))
+    viewport = page.viewport_size
+    # CSS pixels to image pixels; covers device_scale_factor and scale="css".
+    factor = image.width / viewport["width"] if viewport else 1.0
+    left = max(0, round(clip["x"] * factor))
+    top = max(0, round(clip["y"] * factor))
+    right = min(image.width, round((clip["x"] + clip["width"]) * factor))
+    bottom = min(image.height, round((clip["y"] + clip["height"]) * factor))
+    if right <= left or bottom <= top:
+        raise ValueError("Clipped area is either empty or outside the resulting image")
+    cropped = image.crop((left, top, right, bottom))
+
+    path = kwargs.get("path")
+    kind = kwargs.get("type") or (
+        "jpeg" if str(path or "").lower().endswith((".jpg", ".jpeg")) else "png"
+    )
+    encoded = io.BytesIO()
+    if kind == "jpeg":
+        cropped.convert("RGB").save(encoded, "JPEG", quality=kwargs.get("quality") or 80)
+    else:
+        cropped.save(encoded, "PNG")
+    data = encoded.getvalue()
+    if path:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(data)
+    return data
+
+
+@pytest.fixture(autouse=True)
+def _undistorted_clip_screenshots(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep ``page.screenshot(clip=...)`` from distorting a page's video recording:
+    Chromium resizes the view to the clip for the capture and the screencast films
+    that, so a recorded page gets a full-viewport capture cropped to the clip."""
+    from playwright.async_api import Page as _AsyncPage
+
+    orig_sync = Page.screenshot
+    orig_async = _AsyncPage.screenshot
+
+    def sync_screenshot(self: Page, **kwargs: Any) -> bytes:
+        viewport_kwargs = _recorded_clip_capture(self, kwargs)
+        if viewport_kwargs is None:
+            return orig_sync(self, **kwargs)
+        return _crop_recorded_clip(orig_sync(self, **viewport_kwargs), self, kwargs)
+
+    async def async_screenshot(self: Any, **kwargs: Any) -> bytes:
+        viewport_kwargs = _recorded_clip_capture(self, kwargs)
+        if viewport_kwargs is None:
+            return await orig_async(self, **kwargs)
+        return _crop_recorded_clip(await orig_async(self, **viewport_kwargs), self, kwargs)
+
+    monkeypatch.setattr(Page, "screenshot", sync_screenshot)
+    monkeypatch.setattr(_AsyncPage, "screenshot", async_screenshot)
+
+
 @pytest.fixture
 def runner_id(live_server: str) -> str:
     """Token-bound id of the runner spawned by :func:`live_server`.
