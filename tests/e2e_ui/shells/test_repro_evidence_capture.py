@@ -48,7 +48,11 @@ def test_browser_trace_preserves_actions_mock_boundary_and_video(tmp_path, brows
                 self.send_header("Content-Type", "application/json")
                 import json
 
-                body = json.dumps({"data": final_items, "has_more": False}).encode()
+                body = json.dumps(
+                    {"id": "shared"}
+                    if self.path == "/v1/sessions/shared"
+                    else {"data": final_items, "has_more": False}
+                ).encode()
             self.end_headers()
             self.wfile.write(body)
 
@@ -187,7 +191,7 @@ def test_driver_can_take_over_tracing(tmp_path, browser):
         saved = events(tmp_path / "saved")
         assert not [e for e in saved if e["kind"] == "collection_error"]
         assert any(e["kind"] == "trace_owner" and e["owner"] == "driver" for e in saved)
-        assert len(list((tmp_path / "saved").glob("trace-*.zip"))) == 1
+        assert len(list((tmp_path / "saved").glob("trace-*.zip"))) == 2
     finally:
         collector.patch.undo()
 
@@ -230,6 +234,107 @@ def test_raw_trace_never_enters_bundle_when_redaction_fails(tmp_path, browser, m
         assert any(
             e["kind"] == "collection_error" and e["operation"] == "trace_stop" for e in saved
         )
-        assert not any(e.get("kind_of_artifact") == "playwright_trace" for e in saved)
+        assert not any(
+            e["kind"] == "artifact" and e.get("kind_of_artifact") == "playwright_trace"
+            for e in saved
+        )
+    finally:
+        collector.patch.undo()
+
+
+@pytest.mark.parametrize("tracing", ["off", "on", "retain-on-failure"])
+@pytest.mark.parametrize("fails", [False, True])
+def test_pytest_playwright_teardown_retains_trace(tmp_path, tracing, fails):
+    import json
+    import os
+    import sys
+    import zipfile
+
+    from dev.repro_env.execution import run
+
+    (tmp_path / "execution-context.json").write_text("{}")
+    source = tmp_path / "test_browser.py"
+    source.write_text(
+        "def test_browser(page):\n"
+        "    page.set_content('<input aria-label=\"Input\">')\n"
+        '    page.get_by_label("Input").fill("retained browser action")\n'
+        f"    assert {not fails}\n"
+    )
+    env = {**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "PYTEST_PLUGINS": ""}
+    code = run(
+        tmp_path,
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            str(source),
+            "-p",
+            "pytest_playwright.pytest_playwright",
+            "-p",
+            "pytest_base_url.plugin",
+            "-o",
+            "addopts=",
+            "--confcutdir",
+            str(tmp_path),
+            f"--tracing={tracing}",
+            "--output",
+            str(tmp_path / "plugin-output"),
+            "-q",
+        ],
+        env,
+    )
+    assert code == int(fails)
+    attempt = next((tmp_path / "execution").glob("*/attempt.json"))
+    record = json.loads(attempt.read_text())
+    assert record["capture_complete"] and not record["collection_errors"]
+    traces = list(attempt.parent.glob("trace-*.zip"))
+    assert traces
+    content = b""
+    for trace in traces:
+        with zipfile.ZipFile(trace) as archive:
+            content += b"\n".join(
+                archive.read(n) for n in archive.namelist() if n.endswith(".trace")
+            )
+    assert b"retained browser action" in content
+    assert list(attempt.parent.glob("screen-*.png"))
+    if tracing == "on" or (tracing == "retain-on-failure" and fails):
+        assert list((tmp_path / "plugin-output").glob("**/trace.zip"))
+
+
+def test_discarded_trace_storage_failure_preserves_caller_stop(tmp_path, browser, monkeypatch):
+    from dev.repro_env import pytest_evidence
+
+    collector = Evidence(tmp_path / "saved")
+    try:
+        collector.install_browser()
+        with browser.new_context() as context:
+            context.new_page().set_content("<p>observed</p>")
+
+            def fail(**kwargs):
+                raise OSError("temporary storage unavailable")
+
+            monkeypatch.setattr(pytest_evidence.tempfile, "TemporaryDirectory", fail)
+            context.tracing.stop()
+        saved = events(collector.directory)
+        assert any(
+            e["kind"] == "collection_error" and e["operation"] == "trace_prepare" for e in saved
+        )
+        assert list(collector.directory.glob("screen-*.png"))
+    finally:
+        collector.patch.undo()
+
+
+def test_unstopped_caller_trace_reports_incomplete_capture(tmp_path, browser):
+    collector = Evidence(tmp_path / "saved")
+    try:
+        collector.install_browser()
+        with browser.new_context() as context:
+            context.tracing.start(screenshots=True, snapshots=True)
+            context.new_page().set_content("<p>caller trace</p>")
+        saved = events(collector.directory)
+        assert any(
+            e["kind"] == "collection_incomplete" and e["operation"] == "trace_stop" for e in saved
+        )
+        assert list(collector.directory.glob("screen-*.png"))
     finally:
         collector.patch.undo()

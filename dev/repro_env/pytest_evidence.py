@@ -11,7 +11,7 @@ import threading
 import tokenize
 import uuid
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 import pytest
@@ -26,6 +26,7 @@ class Evidence:
         self.patch = pytest.MonkeyPatch()
         self.sessions: dict[tuple[str, str], set[str | None]] = {}
         self.contexts: dict = {}
+        self.deleted: set[tuple[str, str]] = set()
         self.local = threading.local()
         self.sessions_lock = threading.Lock()
         self.snapshot_lock = threading.Lock()
@@ -42,8 +43,8 @@ class Evidence:
     def emit(self, kind, **data):
         self.journal.emit(kind, test_id=self.node, **data)
 
-    def capture(self, operation, callback):
-        return self.journal.capture(operation, callback, test_id=self.node)
+    def capture(self, operation, callback, **context):
+        return self.journal.capture(operation, callback, test_id=self.node, **context)
 
     def artifact(self, operation, path, callback, **data):
         def save():
@@ -52,32 +53,54 @@ class Evidence:
                 raise FileNotFoundError(path)
             self.emit("artifact", path=path.name, **data)
 
-        self.capture(operation, save)
+        self.capture(operation, save, **data)
 
-    def session(self, url, body=None, state=None):
+    @staticmethod
+    def session_identity(body):
+        # Collections (including future reserved routes) are not session objects.
+        if not isinstance(body, dict) or isinstance(body.get("data"), list):
+            return None
+        sid = body.get("id")
+        if isinstance(sid, str) and sid and not sid.startswith("temp:") and "/" not in sid:
+            return sid
+        return None
+
+    def session_key(self, url):
         parts = urlsplit(url)
-        # Follow only local test servers observed by the driver.
+        if parts.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            return None
+        match = re.fullmatch(r"/(?:v1/sessions|c)/([^/]+)/?", parts.path)
+        if match:
+            return (f"{parts.scheme}://{parts.netloc}", unquote(match[1]))
+        return None
+
+    def session(self, url, body=None, state=None, status=200):
+        parts = urlsplit(url)
         if parts.hostname not in {"127.0.0.1", "localhost", "::1"}:
             return
-        # Keep authentication for snapshot requests; emitted origins always use safe_url.
         origin = f"{parts.scheme}://{parts.netloc}"
-        match = re.match(r"^/v1/sessions/([^/]+)(?:/|$)", parts.path)
-        if match is None:
-            match = re.fullmatch(r"/c/([^/]+)/?", parts.path)
-        sid = (
-            match[1]
-            if match
-            else body.get("id")
-            if isinstance(body, dict) and parts.path == "/v1/sessions"
-            else None
-        )
-        if sid and not sid.startswith("temp:"):
-            key = (origin, sid)
+        identity = self.session_identity(body) if 200 <= status < 300 else None
+        key = self.session_key(url)
+        if parts.path.rstrip("/") == "/v1/sessions" and identity:
+            key = (origin, identity)
+        elif not key or (not parts.path.startswith("/c/") and key[1] != identity):
+            return
+        if not self.session_identity({"id": key[1]}):
+            return
+        with self.sessions_lock:
+            self.sessions.setdefault(key, set()).add(self.node)
+            if identity:
+                self.deleted.discard(key)
+            if state is not None:
+                state["sessions"].add(key)
+        self.emit("product_session", server=safe_url(origin), session_id=key[1])
+
+    def deleted_session(self, url, status):
+        key = self.session_key(url)
+        if key in self.sessions and 200 <= status < 300:
             with self.sessions_lock:
-                self.sessions.setdefault(key, set()).add(self.node)
-                if state is not None:
-                    state["sessions"].add(key)
-            self.emit("product_session", server=safe_url(origin), session_id=sid)
+                self.deleted.add(key)
+            self.emit("session_deleted", server=safe_url(key[0]), session_id=key[1], status=status)
 
     def snapshot(self, reason, sessions=None):
         if self.busy:
@@ -97,6 +120,9 @@ class Evidence:
                     self.capture(
                         "session_snapshot",
                         lambda base=base, sid=sid: self.read_session(base, sid, reason),
+                        session_id=sid,
+                        server=safe_url(base),
+                        phase=reason,
                     )
         finally:
             self.busy = False
@@ -104,9 +130,20 @@ class Evidence:
     def read_session(self, base, sid, reason):
         with self.sessions_lock:
             observed_in_tests = sorted(n for n in self.sessions[base, sid] if n)
+        session_url = f"{base}/v1/sessions/{quote(sid, safe='')}"
         with httpx.Client(trust_env=False, timeout=3) as client:
             for suffix in ("", "/resources"):
-                r = client.get(f"{base}/v1/sessions/{sid}{suffix}")
+                r = client.get(f"{session_url}{suffix}")
+                if not suffix and r.status_code == 404 and (base, sid) in self.deleted:
+                    self.emit(
+                        "session_absent",
+                        session_id=sid,
+                        server=safe_url(base),
+                        phase=reason,
+                        status=404,
+                        expected=True,
+                    )
+                    return
                 self.emit(
                     "session_snapshot",
                     session_id=sid,
@@ -117,12 +154,25 @@ class Evidence:
                     status=r.status_code,
                     body=r.json() if r.is_success else None,
                 )
+                if suffix:
+                    self.capture(
+                        "session_snapshot",
+                        r.raise_for_status,
+                        session_id=sid,
+                        server=safe_url(base),
+                        phase=reason,
+                        surface=suffix,
+                    )
+                else:
+                    r.raise_for_status()
+                if not suffix and self.session_identity(r.json()) != sid:
+                    raise ValueError("Session snapshot identity does not match requested session")
             after = None
             for _ in range(20):
                 params = {"limit": 100, "order": "asc"}
                 if after:
                     params["after"] = after
-                r = client.get(f"{base}/v1/sessions/{sid}/items", params=params)
+                r = client.get(f"{session_url}/items", params=params)
                 r.raise_for_status()
                 body = r.json()
                 self.emit(
@@ -148,9 +198,9 @@ class Evidence:
             if self.busy or request.url.host not in {"localhost", "127.0.0.1", "::1"}:
                 return send(client, request, *args, **kwargs)
             path = request.url.path
-            if request.method == "DELETE" and path.startswith("/v1/sessions/"):
-                self.session(str(request.url))
-                self.snapshot("before_session_delete")
+            key = self.session_key(str(request.url))
+            if request.method == "DELETE" and key in self.sessions:
+                self.snapshot("before_session_delete", sessions={key})
             if path == "/mock/reset":
                 self.busy = True
                 try:
@@ -182,7 +232,10 @@ class Evidence:
                     except httpx.RequestNotRead:
                         request_body = None
                         unavailable["request"] = "streamed"
-                    self.session(str(request.url), body)
+                    if request.method == "DELETE":
+                        self.deleted_session(str(request.url), response.status_code)
+                    else:
+                        self.session(str(request.url), body, status=response.status_code)
                     self.emit(
                         "http",
                         method=request.method,
@@ -203,23 +256,22 @@ class Evidence:
 
         create, close, fulfill = Browser.new_context, BrowserContext.close, Route.fulfill
 
-        def save_trace(context, state):
-            state["tracing"] = False
-            path = self.directory / f"trace-{state['id']}.zip"
+        def retain_trace(raw, state):
+            path = self.directory / f"trace-{state['id']}-{uuid.uuid4().hex}.zip"
 
             def save():
-                # Raw traces never enter the directory retained by the workflow.
                 with tempfile.TemporaryDirectory(prefix="repro-raw-trace-") as temporary:
-                    raw = Path(temporary) / "trace.zip"
-                    context.tracing.stop(path=str(raw))
-                    sanitize_trace(raw, self.journal.secrets)
-                    shutil.copyfile(raw, path)
+                    copied = Path(temporary) / "trace.zip"
+                    shutil.copyfile(raw, copied)
+                    sanitize_trace(copied, self.journal.secrets)
+                    shutil.copyfile(copied, path)
 
             self.artifact(
                 "trace_stop",
                 path,
                 save,
                 context_id=state["id"],
+                phase="trace_stop",
                 created_in_test=state["created_in_test"],
                 kind_of_artifact="playwright_trace",
             )
@@ -230,6 +282,7 @@ class Evidence:
             state = {
                 "id": key,
                 "tracing": False,
+                "trace_active": False,
                 "pages": [],
                 "sessions": set(),
                 "created_in_test": self.node,
@@ -239,22 +292,66 @@ class Evidence:
             def start_trace():
                 context.tracing.start(screenshots=True, snapshots=True, sources=False)
                 state["tracing"] = True
+                state["trace_active"] = True
 
-            self.capture("trace_start", start_trace)
-            start = context.tracing.start
+            self.capture("trace_start", start_trace, context_id=key, phase="context_created")
+            start, stop = context.tracing.start, context.tracing.stop
+
+            def caller_stop(*args, **kwargs):
+                # pytest-playwright stops tracing even with --tracing=off.
+                # Retain at that boundary, before it discards our active trace.
+                if not state["trace_active"]:
+                    return stop(*args, **kwargs)
+                state["tracing"] = False
+                state["trace_active"] = False
+                diagnostic = {"context_id": key, "phase": "caller_stop"}
+                if kwargs.get("path") is not None:
+                    try:
+                        result = stop(*args, **kwargs)
+                    except Exception as exc:
+                        self.journal.emit(
+                            "collection_error",
+                            **self.journal.failure(
+                                "trace_stop", exc, **diagnostic, test_id=self.node
+                            ),
+                        )
+                        raise
+                    retain_trace(Path(kwargs["path"]), state)
+                    return result
+                temporary = self.capture(
+                    "trace_prepare",
+                    lambda: tempfile.TemporaryDirectory(prefix="repro-raw-trace-"),
+                    **diagnostic,
+                )
+                if temporary is None:
+                    return stop(*args, **kwargs)
+                try:
+                    raw = Path(temporary.name) / "trace.zip"
+
+                    def save():
+                        result = stop(*args, **{**kwargs, "path": str(raw)})
+                        retain_trace(raw, state)
+                        return result
+
+                    return self.capture("trace_stop", save, **diagnostic)
+                finally:
+                    self.capture("trace_cleanup", temporary.cleanup, **diagnostic)
 
             def caller_start(*args, **kwargs):
                 if state["tracing"]:
-                    save_trace(context, state)
+                    self.capture("trace_stop", caller_stop, context_id=key, phase="owner_handoff")
                     self.emit(
                         "trace_owner",
                         context_id=state["id"],
                         owner="driver",
-                        limitation="Subsequent tracing is owned and retained by the driver.",
+                        limitation="Caller owns tracing; evidence copies traces at caller stop.",
                     )
-                return start(*args, **kwargs)
+                result = start(*args, **kwargs)
+                state["trace_active"] = True
+                return result
 
             self.patch.setattr(context.tracing, "start", caller_start)
+            self.patch.setattr(context.tracing, "stop", caller_stop)
             context.on(
                 "page", lambda page: self.capture("browser_page", lambda: self.page(page, state))
             )
@@ -288,7 +385,20 @@ class Evidence:
                             url=safe_url(page.url),
                         )
                 if state["tracing"]:
-                    save_trace(context, state)
+                    self.capture(
+                        "trace_stop",
+                        context.tracing.stop,
+                        context_id=state["id"],
+                        phase="before_browser_close",
+                    )
+                elif state["trace_active"]:
+                    self.emit(
+                        "collection_incomplete",
+                        operation="trace_stop",
+                        context_id=state["id"],
+                        phase="before_browser_close",
+                        detail="Caller-owned trace was not stopped before context close",
+                    )
             result = close(context, *args, **kwargs)
             if state:
                 for page in state["pages"]:
@@ -385,7 +495,10 @@ class Evidence:
         ):
             return
         body = response.json() if "json" in response.headers.get("content-type", "") else None
-        self.session(response.url, body, state=state)
+        if request.method == "DELETE":
+            self.deleted_session(response.url, response.status)
+        else:
+            self.session(response.url, body, state=state, status=response.status)
         self.emit(
             "browser_response",
             context_id=context_id,
@@ -461,4 +574,5 @@ def pytest_unconfigure(config):
     if collector:
         for context in list(collector.contexts):
             collector.capture("remaining_context_close", context.close)
+        collector.emit("collector_end", collection_errors=collector.journal.errors)
         collector.patch.undo()

@@ -152,8 +152,13 @@ class Journal:
     def clean(self, value):
         return clean(value, self.secrets)
 
-    def failure(self, operation, exc):
+    def failure(self, operation, exc, **context):
         error = {"operation": operation, "error_type": type(exc).__name__}
+        # Sanitize before truncation so a split credential cannot escape redaction.
+        with contextlib.suppress(Exception):
+            error.update(self.clean(context))
+            error["detail"] = self.clean(str(exc))[:2048]
+
         self.errors.append(error)
         with contextlib.suppress(Exception):
             print(
@@ -165,7 +170,7 @@ class Journal:
         try:
             return callback()
         except Exception as exc:  # noqa: BLE001 — evidence failures cannot replace outcomes.
-            self.emit("collection_error", **self.failure(operation, exc), **context)
+            self.emit("collection_error", **self.failure(operation, exc, **context))
             return None
 
     def emit(self, kind: str, **data) -> None:
@@ -241,6 +246,49 @@ def inventory(directory: Path) -> list[dict]:
     return sorted(result, key=lambda row: row["path"])
 
 
+def collector_errors(directory: Path, wrapper: Journal) -> list[dict]:
+    """Read bounded records from child collectors after their process has exited."""
+    errors = []
+    seen = set()
+    omitted = 0
+
+    def add(error, path):
+        nonlocal omitted
+        error = {**error, "journal": path.name}
+        identity = json.dumps(error, sort_keys=True)
+        if identity not in seen:
+            if len(errors) < 200:
+                seen.add(identity)
+                errors.append(error)
+            else:
+                omitted += 1
+
+    for path in sorted(directory.glob("events-*.jsonl")):
+        if path == wrapper.path or path.is_symlink():
+            continue
+        try:
+            with path.open("rb") as stream:
+                while line := stream.readline(MAX_EVENT + 1):
+                    if len(line) > MAX_EVENT or not line.endswith(b"\n"):
+                        raise ValueError("Journal record is oversized or incomplete")
+                    event = json.loads(line)
+                    if not isinstance(event, dict):
+                        raise ValueError("Journal record must be an object")
+                    if event.get("kind") in {"collection_error", "collection_incomplete"}:
+                        add({k: v for k, v in event.items() if k not in {"kind", "time_ns"}}, path)
+                    if event.get("truncated"):
+                        add({"operation": "journal_event", "error_type": "TruncatedEvent"}, path)
+                    if event.get("kind") == "collector_end":
+                        for error in event.get("collection_errors", []):
+                            add(error, path)
+        except Exception as exc:  # noqa: BLE001 — retain other journals and the command result.
+            error = wrapper.failure("child_journal_read", exc, journal=path.name)
+            wrapper.emit("collection_error", **error)
+    if omitted:
+        errors.append({"operation": "collection_errors", "omitted_count": omitted})
+    return errors
+
+
 def run(
     output: Path, command: list[str], env: dict[str, str] | None = None, *, prepare=None
 ) -> int:
@@ -269,8 +317,10 @@ def run(
         ],
     }
 
+    child_errors = []
+
     def save_record():
-        record["collection_errors"] = list(journal.errors)
+        record["collection_errors"] = [*journal.errors, *child_errors]
         journal.capture(
             "attempt_write", lambda: write_json(directory / "attempt.json", journal.clean(record))
         )
@@ -530,7 +580,17 @@ def run(
         if stable and process is not None:
             for stream in (process.stdout, process.stderr):
                 journal.capture("pipe_close", stream.close)
+        child_errors = (
+            journal.capture("child_journals", lambda: collector_errors(directory, journal)) or []
+        )
         artifacts = journal.capture("inventory", lambda: inventory(directory)) if stable else None
         record["artifacts"] = artifacts or []
         record["artifacts_complete"] = artifacts is not None
+        record["capture_complete"] = (
+            artifacts is not None
+            and record.get("output_complete", False)
+            and record.get("status") == "finished"
+            and not journal.errors
+            and not child_errors
+        )
         save_record()
