@@ -4145,7 +4145,7 @@ async def test_query_sessions_once_reconciles_persisted_text_on_failed_status(
     result = await _run_one_shot(client, _raise_turn_failed, monkeypatch)
     assert result == "hi there"  # the persisted assistant text, not an error
     # Exactly one transcript read — the failure-only reconcile fallback.
-    assert client.sessions.list_items_calls == 1
+    assert client.sessions.list_items_calls == 2
 
 
 async def test_query_sessions_once_reconciles_persisted_text_on_empty_result(
@@ -4206,18 +4206,45 @@ async def test_query_sessions_once_returns_none_when_no_text_and_no_error(
     assert result is None
 
 
-async def test_query_sessions_once_returns_text_without_reconcile_on_success(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The normal completion path returns the live text and skips the transcript.
+async def test_query_sessions_once_checks_terminal_error_even_with_text(monkeypatch):
+    client = _FakeAPClient(
+        [_item_user("say hi"), _item_assistant("preamble"), _item_error("Prompt is too long")]
+    )
+    with pytest.raises(ClientOmnigentError, match="Prompt is too long"):
+        await _run_one_shot(client, _return_text, monkeypatch)
 
-    If this fails (``list_items`` was called), the wrapper is reconciling
-    on every turn, adding a needless round-trip to the happy path.
-    """
-    client = _FakeAPClient([], list_items_must_not_be_called=True)
-    result = await _run_one_shot(client, _return_text, monkeypatch)
-    assert result == "direct answer"
-    assert client.sessions.list_items_calls == 0  # no reconcile on success
+
+async def test_query_sessions_once_returns_text_after_terminal_check(monkeypatch):
+    client = _FakeAPClient([_item_user("say hi"), _item_assistant("direct answer")])
+    assert await _run_one_shot(client, _return_text, monkeypatch) == "direct answer"
+    assert client.sessions.list_items_calls == 1
+
+
+async def test_query_sessions_once_does_not_recover_preamble_after_failure(monkeypatch):
+    client = _FakeAPClient(
+        [_item_user("say hi"), _item_assistant("preamble"), _item_error("Prompt is too long")]
+    )
+    with pytest.raises(ClientOmnigentError, match="Prompt is too long"):
+        await _run_one_shot(client, _raise_turn_failed, monkeypatch)
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_prompt_result_preserves_terminal_outcome(monkeypatch, fails):
+    from omnigent import chat
+
+    def run(**kwargs):
+        print("preamble")
+        if fails:
+            print("Prompt is too long", file=__import__("sys").stderr)
+            raise SystemExit(1)
+
+    monkeypatch.setattr(chat, "run_prompt", run)
+    result = chat.run_prompt_result(target="unused", client_tools=None, prompt="hi")
+    assert result.status == ("failed" if fails else "completed")
+    assert result.text == "preamble\n"
+    assert result.error == ("Prompt is too long" if fails else None)
+    assert result.elapsed_seconds >= 0
+    assert result.usage is None and result.cost is None
 
 
 async def test_query_sessions_once_multi_turn_async_orchestrator(
@@ -4240,7 +4267,7 @@ async def test_query_sessions_once_multi_turn_async_orchestrator(
             extra_turns=["<!-- POLLY_REVIEW_START -->\n## Summary\nLooks good."],
         ),
     )
-    client = _FakeAPClient([], list_items_must_not_be_called=True)
+    client = _FakeAPClient([])
     result = await _query_sessions_once(
         client=client,
         agent_name="polly",
@@ -4291,6 +4318,39 @@ async def test_query_sessions_once_raises_on_lost_terminal_event_without_text(
     client = _FakeAPClient([_item_user("say hi")])
     with pytest.raises(RuntimeError, match=r"no\s+persisted assistant text"):
         await asyncio.wait_for(_run_one_shot(client, _never_return, monkeypatch), timeout=10)
+
+
+async def test_query_sessions_once_deadline_does_not_approve_persisted_preamble(monkeypatch):
+    monkeypatch.setattr(chat_module, "_PER_TURN_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(chat_module, "_LOOP_TIMEOUT_S", 0.02)
+    client = _FakeAPClient([_item_user("hi"), _item_assistant("preamble")])
+
+    class RunningChat:
+        status = "running"
+
+        def __init__(self, **kwargs):
+            pass
+
+        async def query(self, prompt):
+            return await _never_return(prompt)
+
+        async def refresh(self):
+            pass
+
+        async def await_turn(self, **kwargs):
+            return await _never_return("")
+
+    monkeypatch.setattr("omnigent_client.SessionsChat", RunningChat)
+    with pytest.raises(TimeoutError, match="terminal completion"):
+        await _query_sessions_once(
+            client=client,
+            agent_name="test",
+            tool_handler=None,
+            prompt="hi",
+            session_bundle=b"bundle",
+            session_bundle_filename="agent.tar.gz",
+            runner_id="runner_test",
+        )
 
 
 async def test_query_sessions_once_slow_first_turn_not_truncated(

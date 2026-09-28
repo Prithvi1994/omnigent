@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import logging
 import os
 import secrets
@@ -554,6 +555,32 @@ def run_prompt(
         prompt=prompt,
         ephemeral=ephemeral,
     )
+
+
+@dataclass(frozen=True)
+class PromptResult:
+    """Terminal outcome of a headless invocation; text alone is not success."""
+
+    status: str
+    text: str
+    error: str | None
+    elapsed_seconds: float
+    usage: dict[str, Any] | None = None
+    cost: float | None = None
+
+
+def run_prompt_result(**kwargs: Any) -> PromptResult:
+    """Run the same harness as the CLI, retaining its terminal outcome."""
+    started = time.monotonic()
+    output, errors = io.StringIO(), io.StringIO()
+    status, error = "completed", None
+    try:
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            run_prompt(**kwargs)
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 — typed failure boundary
+        status = "failed"
+        error = errors.getvalue().strip() or str(exc) or type(exc).__name__
+    return PromptResult(status, output.getvalue(), error, time.monotonic() - started)
 
 
 def run_attach(
@@ -2460,6 +2487,9 @@ async def _query_sessions_once(
     try:
         result = await asyncio.wait_for(chat.query(prompt), timeout=_PER_TURN_TIMEOUT_S)
     except ClientOmnigentError:
+        turn_error = await _persisted_turn_error(client, bound.id)
+        if turn_error is not None:
+            raise ClientOmnigentError(turn_error) from None
         reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
             return reconciled
@@ -2487,6 +2517,11 @@ async def _query_sessions_once(
                     if chat.status not in ("running", "launching"):
                         break
                     await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
+        if chat.status in ("running", "launching"):
+            raise TimeoutError("Headless session did not reach terminal completion") from None
+        turn_error = await _persisted_turn_error(client, bound.id)
+        if turn_error is not None:
+            raise ClientOmnigentError(turn_error) from None
         reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
             return reconciled
@@ -2580,6 +2615,11 @@ async def _query_sessions_once(
             bound.id,
         )
 
+    if chat.status in ("running", "launching"):
+        raise TimeoutError("Headless session did not reach terminal completion") from None
+    turn_error = await _persisted_turn_error(client, bound.id)
+    if turn_error is not None:
+        raise ClientOmnigentError(turn_error) from None
     if all_text_parts:
         return "\n\n".join(p for p in all_text_parts if p)
     # An auto-woken turn can finish between live-stream subscriptions.
@@ -2589,15 +2629,6 @@ async def _query_sessions_once(
         if reconciled is not None:
             logger.info("Recovered headless output from completed session %s", bound.id)
             return reconciled
-    # No assistant text at all. If the runner persisted a terminal
-    # ``error`` item (e.g. a harness start failure like the cursor SDK's
-    # invalid-model rejection), surface it instead of returning ``None`` —
-    # otherwise the headless caller renders a failed turn as a silent,
-    # exit-0 empty success. The callers wrap this in ``except
-    # ClientOmnigentError`` and print the message to stderr + exit non-zero.
-    turn_error = await _persisted_turn_error(client, bound.id)
-    if turn_error is not None:
-        raise ClientOmnigentError(turn_error)
     return None
 
 
