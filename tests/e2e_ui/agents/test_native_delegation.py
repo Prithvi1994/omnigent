@@ -7,7 +7,12 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import configure_mock_llm, set_fallback_mock_llm
+from tests.e2e_ui.conftest import (
+    _CLAUDE_MOCK_MODEL,
+    configure_mock_llm,
+    reset_mock_llm,
+    set_fallback_mock_llm,
+)
 from tests.e2e_ui.messages.test_message_render_parity import (
     _ASSISTANT,
     _WORKING,
@@ -22,6 +27,7 @@ from tests.e2e_ui.native_driver import (
     send_composer_message,
     wait_native_delegation,
 )
+from tests.server.integration.mock_llm_server import MockState
 
 
 @pytest.mark.nightly
@@ -45,7 +51,9 @@ def test_native_claude_delegation(
     _open_terminal_view(page)
     _wait_terminal_connected(page)
     _ensure_chat_view(page)
+    reset_mock_llm(mock_llm_server_url)
     set_fallback_mock_llm(mock_llm_server_url, "default", probe)
+    set_fallback_mock_llm(mock_llm_server_url, _CLAUDE_MOCK_MODEL, probe)
     send_composer_message(page, parent_id, probe)
     expect(page.locator(_ASSISTANT, has_text=probe).last).to_be_visible(timeout=60_000)
     expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
@@ -55,6 +63,7 @@ def test_native_claude_delegation(
         tools = [
             tool
             for request in requests
+            if probe in MockState._user_input_text(request)
             for tool in request.get("tools", [])
             if tool.get("name") in {"Task", "Agent"}
         ]
@@ -107,7 +116,8 @@ def test_native_claude_delegation(
             },
         )
         title.raise_for_status()
-        assert mock.get("/mock/queues").json()["queues"][parent_key]["remaining"] == 2
+        queues_after_title = mock.get("/mock/queues").raise_for_status().json()["queues"]
+        assert queues_after_title[parent_key]["remaining"] == 2, queues_after_title
         send_composer_message(page, parent_id, parent_marker)
         expect(page.locator(_ASSISTANT, has_text=parent_reply).last).to_be_visible(timeout=90_000)
         expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)

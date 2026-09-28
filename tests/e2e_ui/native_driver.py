@@ -152,7 +152,6 @@ def wait_native_delegation(
 ) -> NativeDelegation:
     """Observe a real Claude invocation, result and child linked to that exact call."""
     deadline = time.monotonic() + timeout
-    observed: dict[str, Any] = {}
     while True:
         items = _list(client, f"/v1/sessions/{parent_id}/items")
         invocation = next(
