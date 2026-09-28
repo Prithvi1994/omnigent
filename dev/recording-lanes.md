@@ -195,6 +195,13 @@ tests skip when the harness CLI isn't installed; if the one your bug needs is
 unavailable here, keep `recordings: []` and name the missing CLI in your evidence
 (a real environment limit, not a `not_reproduced`).
 
+A pane that "hangs" or a prompt that "never appears" is a claim about time, so
+the clip has to outlast a healthy response. Keep the pane on screen past the
+longest healthy latency you observed for that step (your own diagnostic runs, or
+the passing cases the test measured) before the driver stops, and say in the
+caption how long the clip waited. A clip that ends within the normal response
+window shows an ordinary wait, not the bug. See "Finishing a clip" below.
+
 ## `cli` facets
 
 Author/replay a VHS tape (`recordings/<slug>/journey.tape`) that replays the SAME
@@ -225,6 +232,17 @@ tape and note that rendering was skipped.
   message), with only a short trailing `Sleep` after it lands — never a bare
   `Sleep`/short total duration as the stop condition. The clip must show the
   outcome, not the moment before it.
+- **When the claim is that nothing arrives, the wait is the output.** For a tape
+  whose caption says the prompt never appears or the turn hangs, end on an anchor
+  that only elapsed time past the longest healthy latency you observed can
+  satisfy — for a prompt that normally lands in 5–9 s, keep a
+  `Wait+Screen@60s /streaming… 2[0-9]s/` anchor or add `Sleep 25s` after the
+  message is sent — never on a pattern the first in-progress frame already
+  matches (`/streaming… [0-9]+s/` is satisfied at 1 s). Do not weaken a wait
+  anchor while fixing an unrelated recorder problem (a missing shim, a font, a
+  render timeout); after any tape edit, re-check that the stop condition still
+  outlasts the healthy latency the caption claims against, and state that wait
+  in the caption.
 - **A clip of the reproduction TEST running is NOT the journey.** If the tape
   won't render (server boot times out, `ttyd` missing, VHS unavailable), do
   **not** substitute a recording of `pytest … FAILS` / an `AssertionError`. That
@@ -262,6 +280,16 @@ state, bad output, error) for a `before` recording, or the correct end state for
 `fixed`/`after` one. Convert to `.mp4` with `ffmpeg` when available; `.webm`/`.gif`
 are fine otherwise. Recordings are workspace artifacts exactly like the test —
 leave them uncommitted; in CI the artifact bundle collects them.
+
+A caption that says something never appears or the turn hangs claims the product
+stayed stuck longer than a healthy response takes, so the clip must keep
+recording past the longest healthy latency you observed for that step before it
+ends, and the caption must state how long the clip waited (`… → toolbar still on
+'streaming…' after 25 s; the prompt normally appears within 9 s`). A clip that
+stops inside the normal response window shows an ordinary wait, not the bug, and
+must not carry that caption. Never shorten a wait anchor while working around an
+unrelated recorder problem; re-check the stop condition against the caption's
+claim after every tape or driver edit.
 
 For each recording, write a short **`caption`** in its handoff entry describing
 **the actions that clip performs** — the ordered steps a viewer watches, ending in
