@@ -37,6 +37,9 @@ _LAG_TEXT = "sentinel-lag-e2e a slow but healthy send only shows the spinner"
 _LOST_TEXT = "sentinel-lost-e2e the server got this but the reply was dropped"
 _OFFLINE_TEXT = "sentinel-offline-e2e this goes out by itself when the network is back"
 _CANCEL_TEXT = "sentinel-cancel-e2e this one is taken back before it ever goes out"
+_OFFLINE_RELOAD_TEXT = (
+    "sentinel-offline-reload-e2e sent offline, page refreshed as soon as it was back"
+)
 _REFUSED_TEXT = "sentinel-refused-e2e the runner never came up"
 _GATEWAY_TEXT = "sentinel-gateway-e2e a 502 says nothing definitive"
 _REFUSAL_CAUSE = (
@@ -389,6 +392,43 @@ def test_offline_send_recovers_on_reconnect_without_a_click(
     expect(bubble).to_have_count(1)
     expect(page.locator('[data-testid="error-pill"]')).to_have_count(0)
     assert _wait_until(lambda: _user_message_count(base_url, session_id, _OFFLINE_TEXT) == 1, 15)
+
+
+def test_offline_send_survives_a_reload_right_after_the_network_returns(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Offline send, network back, refresh at once: the message is delivered exactly once.
+
+    The tab's memory of the send has to outlive the reload (it is kept per tab
+    and revived on the cold load), and the re-send that fires the moment the
+    network returns may be cut off by the very reload that follows it. That cut
+    request still reaches the server, so the revived send after the reload
+    must be recognised as the same submission: one committed copy, no
+    duplicate, and nothing left reading "Failed".
+    """
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_label(_COMPOSER_LABEL)).to_be_visible(timeout=30_000)
+    page.context.set_offline(True)
+    try:
+        _, bubble = _send(page, _OFFLINE_RELOAD_TEXT)
+        expect(page.locator(_FOOTER)).to_have_attribute("data-state", "sending", timeout=8_000)
+    finally:
+        page.context.set_offline(False)
+    page.reload()
+
+    expect(page.get_by_label(_COMPOSER_LABEL)).to_be_visible(timeout=30_000)
+    expect(bubble).to_be_visible(timeout=15_000)
+    expect(page.locator(_FOOTER)).to_have_count(0, timeout=30_000)
+    expect(page.locator('[data-testid="error-pill"]')).to_have_count(0)
+    assert _wait_until(
+        lambda: _user_message_count(base_url, session_id, _OFFLINE_RELOAD_TEXT) == 1, 15
+    )
+    # Give a second delivery every chance to show up before calling it once.
+    page.wait_for_timeout(3_000)
+    assert _user_message_count(base_url, session_id, _OFFLINE_RELOAD_TEXT) == 1
+    expect(bubble).to_have_count(1)
 
 
 def test_cancel_drops_a_failed_send_without_posting_it(

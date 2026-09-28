@@ -3611,6 +3611,38 @@ describe("chatStore — first message during native model startup", () => {
     expect(useChatStore.getState().failedSendDraft).toBeNull();
   });
 
+  it("re-attempts a first send that failed after the draft was handed to the runner", async () => {
+    // The draft is cleared right before the POST. A failed fetch then must not
+    // make the automatic check read the bubble as cancelled and skip its POST.
+    begin();
+    await settle();
+    const base = fetchMock.getMockImplementation()!;
+    let posts = 0;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/events") && init?.method === "POST") {
+        posts += 1;
+        if (posts === 1) return Promise.reject(new TypeError("Failed to fetch"));
+        return mockResponse({ queued: true, pending_id: "pending_native_1" });
+      }
+      return base(input, init);
+    });
+    reportModel();
+    await settle();
+    expect(posts).toBe(1);
+    // Real timers in this block: wait out the check's one-second pause.
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 1_200);
+    });
+    await settle();
+
+    expect(posts).toBe(2);
+    expect(useChatStore.getState().pendingUserMessages[0]).toMatchObject({
+      posted: true,
+      initialDraft: undefined,
+    });
+    expect(useChatStore.getState().pendingUserMessages[0]?.failed).toBeUndefined();
+  });
+
   it("cancels and restores repeated corrected drafts before native startup finishes", async () => {
     begin();
     await settle();
@@ -5744,7 +5776,10 @@ describe("chatStore — send (failed send)", () => {
     expect(readPendingSends("conv_existing")).toEqual([]);
   });
 
-  it("does not revive a remembered send the server already shows, matching by identity only", () => {
+  it("re-sends a remembered send the server already shows without a second bubble", async () => {
+    // Stored is not delivered: an SDK-path item is persisted before the runner
+    // accepts it, so a record whose copy is already on screen is still re-sent
+    // (the server dedups a delivered one) — just without another bubble.
     const content = [{ type: "input_text" as const, text: "already there" }];
     // The first attempt landed after all: the snapshot replays it as a pending
     // entry carrying the same stable id.
@@ -5752,10 +5787,13 @@ describe("chatStore — send (failed send)", () => {
     useChatStore.setState({
       pendingUserMessages: [{ tempId: "pending_srv_1", content, stableId: "f".repeat(32) }],
     });
+    let bodies = installFlakyPost(0, () => mockResponse({ queued: true, pending_id: "pending_1" }));
     rehydratePersistedSends("conv_existing");
+    await vi.advanceTimersByTimeAsync(0);
     expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual([
       "pending_srv_1",
     ]);
+    expect(stableIdsOf(bodies)).toEqual(new Set(["f".repeat(32)]));
     expect(readPendingSends("conv_existing")).toEqual([]);
 
     // Or it was committed while the tab was away, under its stable id.
@@ -5764,8 +5802,11 @@ describe("chatStore — send (failed send)", () => {
       pendingUserMessages: [],
       blocks: [committed("e".repeat(32), "already there")],
     });
+    bodies = installFlakyPost(0, () => mockResponse({ queued: true, item_id: "e".repeat(32) }));
     rehydratePersistedSends("conv_existing");
+    await vi.advanceTimersByTimeAsync(0);
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(stableIdsOf(bodies)).toEqual(new Set(["e".repeat(32)]));
     expect(readPendingSends("conv_existing")).toEqual([]);
 
     // Same wording under a different id is a different message: it is revived.
@@ -5774,9 +5815,22 @@ describe("chatStore — send (failed send)", () => {
       pendingUserMessages: [],
       blocks: [committed("msg_other", "already there")],
     });
+    installFlakyPost(0, () => mockResponse({ queued: true, pending_id: "pending_2" }));
     rehydratePersistedSends("conv_existing");
+    await vi.advanceTimersByTimeAsync(0);
     expect(useChatStore.getState().pendingUserMessages.map((p) => p.stableId)).toEqual([
       "d".repeat(32),
+    ]);
+
+    // A hidden re-send that fails on the network keeps the record for next time.
+    persistPendingSend("conv_existing", { stableId: "c".repeat(32), content });
+    useChatStore.setState({ pendingUserMessages: [], blocks: [committed("c".repeat(32), "x")] });
+    installFlakyPost(Infinity, () => mockResponse({ queued: true }));
+    rehydratePersistedSends("conv_existing");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(readPendingSends("conv_existing")).toEqual([
+      expect.objectContaining({ stableId: "c".repeat(32) }),
     ]);
   });
 
@@ -11561,6 +11615,68 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, committed.id, reply.id]);
 
     const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("reconnect backfill consumes live bubbles by count and a failed bubble only by identity", async () => {
+    // A failed bubble was never delivered, so a recovered user item cannot be
+    // its receipt unless it carries the bubble's own stable id.
+    const before = userMessage("ack_pre2", "before the gap");
+    seedSession("conv_reconnect_failed", [before]);
+    persistPendingSend("conv_reconnect_failed", {
+      stableId: "f".repeat(32),
+      content: [{ type: "input_text", text: "never went out" }],
+    });
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_reconnect_failed",
+      abortController: controller,
+      blocks: itemsToBlocks([before]),
+      pendingUserMessages: [
+        {
+          tempId: "pend_failed",
+          stableId: "f".repeat(32),
+          content: [{ type: "input_text", text: "never went out" }],
+          failed: { attempts: 2 },
+        },
+        {
+          tempId: "pend_live",
+          content: [{ type: "input_text", text: "only once" }],
+          posted: true,
+        },
+      ],
+    });
+
+    const loop = startStreamPump("conv_reconnect_failed", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    // One recovered user item: it is the live bubble's, not the failed one's.
+    const committed = userMessage("ack_gap2", "only once");
+    seedSessionItems("conv_reconnect_failed", [before, committed]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual([
+      "pend_failed",
+    ]);
+    expect(readPendingSends("conv_reconnect_failed")).toHaveLength(1);
+
+    // A recovered item under the failed bubble's own id is its receipt: the
+    // bubble and its recovery record go.
+    const landed = { ...userMessage("gap_landed", "never went out"), id: "f".repeat(32) };
+    seedSessionItems("conv_reconnect_failed", [before, committed, landed]);
+    sinks[1]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(3);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(readPendingSends("conv_reconnect_failed")).toEqual([]);
+
+    const last = sinks[2]!;
     last.push("data: [DONE]\n\n");
     last.close();
     await drainAsync(2);

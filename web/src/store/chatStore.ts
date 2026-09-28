@@ -84,7 +84,12 @@ import type {
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { randomUUID } from "@/lib/randomUUID";
-import { forgetPendingSend, persistPendingSend, readPendingSends } from "@/lib/pendingSends";
+import {
+  forgetPendingSend,
+  persistPendingSend,
+  readPendingSends,
+  type PersistedPendingSend,
+} from "@/lib/pendingSends";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
@@ -1454,11 +1459,38 @@ async function deliverRevivedSend(
 }
 
 /**
+ * Re-send a remembered message the transcript already shows, without a bubble.
+ * Ordered on the conversation's send chain like every other re-send. The record
+ * is forgotten once the server accepts the send; a transport failure leaves it
+ * for the next reload.
+ */
+async function resendShownRecord(
+  conversationId: string,
+  record: PersistedPendingSend,
+): Promise<void> {
+  const chain = enterSendChain(conversationId);
+  try {
+    await chain.waitForPrior();
+    await deliverRevivedSend(
+      conversationId,
+      `pend_shown_${record.stableId}`,
+      record.content,
+      record.stableId,
+    );
+    forgetPendingSend(conversationId, record.stableId);
+  } catch {
+    // Still remembered; the next cold load tries again.
+  } finally {
+    chain.releaseSend();
+  }
+}
+
+/**
  * Revive sends this tab left failed before a reload. Called on a cold load
  * once the snapshot's pending entries and history are in place: a record whose
  * stable id the server already shows (a replayed pending entry, or a committed
- * item persisted under it) is dropped; the rest come back as failed bubbles
- * and are re-sent once with their original stable id.
+ * item persisted under it) is re-sent without a bubble; the rest come back as
+ * failed bubbles and are re-sent once with their original stable id.
  */
 export function rehydratePersistedSends(conversationId: string): void {
   const records = readPendingSends(conversationId);
@@ -1476,12 +1508,15 @@ export function rehydratePersistedSends(conversationId: string): void {
     }
     // Identity only: a snapshot pending entry or a committed item carrying
     // this stable id means the server has it. Matching wording is not
-    // evidence — two identical messages are two messages.
+    // evidence — two identical messages are two messages. Having it is not
+    // having delivered it, though: an SDK-path item is stored before the
+    // runner accepts it. So the send is repeated without a second bubble; the
+    // server answers a delivered one from its dedup memory and runs the rest.
     const serverHasIt =
       state.pendingUserMessages.some((p) => p.stableId === record.stableId) ||
       hasCommittedItem(state.blocks, record.stableId);
     if (serverHasIt) {
-      forgetPendingSend(conversationId, record.stableId);
+      void resendShownRecord(conversationId, record);
       continue;
     }
     pendingSeq += 1;
@@ -2610,7 +2645,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...fileBlocks,
           ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
         ];
-        if (initialDraft && !initialSendPending()) return;
+        // Only the first pass can still be cancelled through the draft: it
+        // clears the bubble's draft right before posting, so a re-attempt
+        // (the check, Retry, a reconnect) must not read that as cancelled.
+        if (initialDraft && !initialDispatched && !initialSendPending()) return;
 
         // Promote "pending:<filename>" to real file_ids. Claude-native's
         // session.input.consumed is text-only (transcript round-trip
@@ -5295,6 +5333,20 @@ async function reconcileOnReconnect(
 
   const snapshotBlocks = itemsToBlocks(items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
+  // `session.input.consumed` is not replayed, so recovered user blocks are the
+  // durable equivalent of its acknowledgement: live bubbles leave in FIFO
+  // order, one per recovered block. A failed bubble was never delivered, so a
+  // count cannot stand for it; it leaves only when a recovered item carries
+  // its stable id, and then its recovery records go with it.
+  const recoveredUserIds = new Set(
+    snapshotBlocks
+      .filter((b) => b.type === "user_message" && !isSystemUserContent(b.content))
+      .map((b) => b.ctx.itemId)
+      .filter((iid): iid is string => Boolean(iid)),
+  );
+  const ackedFailed = get().pendingUserMessages.filter(
+    (p) => p.failed !== undefined && p.stableId !== undefined && recoveredUserIds.has(p.stableId),
+  );
   set((s) => {
     const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
     const seen = new Set(
@@ -5302,13 +5354,20 @@ async function reconcileOnReconnect(
     );
     const unseen = snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
     const patch: Partial<ChatState> = reconnectStatusPatch(session, s, launchBeforeFetch);
-    // `session.input.consumed` is not replayed, so recovered user blocks are
-    // the durable equivalent of its FIFO acknowledgement.
     const recoveredUserInputs = unseen.filter(
       (b) => b.type === "user_message" && !isSystemUserContent(b.content),
     ).length;
     if (recoveredUserInputs > 0) {
-      patch.pendingUserMessages = s.pendingUserMessages.slice(recoveredUserInputs);
+      const ackedTempIds = new Set(ackedFailed.map((p) => p.tempId));
+      let liveToConsume = recoveredUserInputs - ackedFailed.length;
+      patch.pendingUserMessages = s.pendingUserMessages.filter((p) => {
+        if (p.failed !== undefined) return !ackedTempIds.has(p.tempId);
+        if (liveToConsume > 0) {
+          liveToConsume -= 1;
+          return false;
+        }
+        return true;
+      });
     }
     let nextBlocks = currentBlocks;
     if (unseen.length > 0) {
@@ -5348,6 +5407,10 @@ async function reconcileOnReconnect(
     if (nextBlocks !== s.blocks) patch.blocks = nextBlocks;
     return patch;
   });
+  for (const acked of ackedFailed) {
+    failedSends.delete(acked.tempId);
+    if (acked.stableId !== undefined) forgetPendingSend(id, acked.stableId);
+  }
 }
 
 // ── Presence idle reporting ─────────────────────────────────────────

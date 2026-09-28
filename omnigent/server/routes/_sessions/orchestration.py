@@ -6792,7 +6792,8 @@ class _WebDispatch:
     """
     One web submission's dispatch in flight, with the identity it was posted under.
 
-    :param outcome: Resolves to the first request's result, or its error.
+    :param outcome: The dispatch task; resolves to the first request's result, or
+        its error. It is never cancelled by a requester going away.
     :param content: The content blocks of the first request, e.g.
         ``[{"type": "input_text", "text": "hi"}]``.
     :param created_by: The first request's poster, or ``None`` in single-user mode.
@@ -6866,27 +6867,34 @@ async def _dispatch_session_event_to_runner_impl(
             web_stable_id,
             extra={"session_id": session_id},
         )
-        # Shielded so a waiter that goes away cannot cancel the shared future.
+        # Shielded so a waiter that goes away cannot cancel the shared dispatch.
         return await asyncio.shield(in_flight.outcome)
-    future: asyncio.Future[_SessionEventDispatchResult] = (
-        asyncio.get_running_loop().create_future()
-    )
+
+    async def _dispatch() -> _SessionEventDispatchResult:
+        with _mark_dispatch_in_flight(session_id):
+            return await _dispatch_session_event_to_runner_uncoalesced(
+                session_id, conv, body, conversation_store, runner_client, **kwargs
+            )
+
+    # The dispatch runs as its own task so a client that disconnects mid-flight
+    # (a reload right after the network came back) cannot cancel it once the
+    # message is on its way to the runner: cancellation there would roll back
+    # the pending entry the runner has already taken, and the client's re-send
+    # would paste the prompt a second time. The task runs to completion and
+    # every waiter, including the requester, gets its real outcome.
+    task = asyncio.ensure_future(_dispatch())
     _web_dispatches[key] = _WebDispatch(
-        outcome=future, content=body.data.get("content"), created_by=created_by
+        outcome=task, content=body.data.get("content"), created_by=created_by
     )
-    try:
-        result = await _dispatch_session_event_to_runner_uncoalesced(
-            session_id, conv, body, conversation_store, runner_client, **kwargs
-        )
-    except BaseException as exc:
-        future.set_exception(exc)
-        future.exception()  # marked retrieved: no log noise when nobody was waiting
-        raise
-    else:
-        future.set_result(result)
-        return result
-    finally:
-        _web_dispatches.pop(key, None)
+
+    def _settle(done: asyncio.Future[_SessionEventDispatchResult]) -> None:
+        if _web_dispatches.get(key) is not None and _web_dispatches[key].outcome is done:
+            _web_dispatches.pop(key, None)
+        if not done.cancelled():
+            done.exception()  # marked retrieved: no log noise when nobody was waiting
+
+    task.add_done_callback(_settle)
+    return await asyncio.shield(task)
 
 
 async def _dispatch_session_event_to_runner_uncoalesced(

@@ -12694,6 +12694,95 @@ async def test_overlapping_duplicates_share_the_first_dispatch_outcome(
         pending_inputs.reset_for_tests()
 
 
+async def test_native_dispatch_outlives_a_client_that_disconnects_mid_forward(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A client gone mid-forward cannot roll back a message the runner has taken.
+
+    A reload right after the network returns cuts the re-send's request, and
+    the server cancels that request's handler. Before, the cancellation landed
+    in the forward's rollback and dropped the pending entry although the runner
+    had the message, so the revived send after the reload pasted it again. The
+    dispatch now runs to completion on its own task: the entry stays, and the
+    revived send is answered from it without a second forward.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    forwards: list[httpx.Request] = []
+    gate = asyncio.Event()
+
+    async def runner_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            forwards.append(request)
+            await gate.wait()
+        return httpx.Response(202, json={})
+
+    monkeypatch.setattr(
+        orchestration,
+        "_ensure_native_terminal_ready",
+        AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=None)),
+    )
+    monkeypatch.setattr(
+        sessions_module, "_ensure_runner_session_initialized", AsyncMock(return_value=True)
+    )
+    stable_id = "d" * 32
+    message = {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "cut off mid-flight"}],
+            "stable_id": stable_id,
+        },
+    }
+    pending_inputs.reset_for_tests()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner_handler), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(orchestration, "_get_runner_client", AsyncMock(return_value=runner))
+        agent = await create_test_agent(client, name="claude-native-ui")
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "labels": {"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+            },
+        )
+        assert created.status_code == 201, created.text
+        session_id = created.json()["id"]
+        events_url = f"/v1/sessions/{session_id}/events"
+        try:
+            first = asyncio.create_task(client.post(events_url, json=message))
+            for _ in range(200):
+                if forwards:
+                    break
+                await asyncio.sleep(0.01)
+            assert forwards, "the forward never started"
+            # The client goes away while the runner still holds the request.
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            known = pending_inputs.submission_for(session_id, stable_id)
+            assert known is not None and known.pending_id is not None
+            gate.set()
+            await asyncio.sleep(0.1)
+            assert pending_inputs.submission_for(session_id, stable_id) == known
+
+            revived = await client.post(events_url, json=message)
+            assert revived.status_code == 202, revived.text
+            assert revived.json() == {"queued": True, "pending_id": known.pending_id}
+            assert len(forwards) == 1
+            snapshot = (await client.get(f"/v1/sessions/{session_id}")).json()
+            assert [p["stable_id"] for p in snapshot["pending_inputs"]] == [stable_id]
+        finally:
+            gate.set()
+            pending_inputs.reset_for_tests()
+
+
 async def test_stable_id_naming_a_different_item_is_rejected(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
