@@ -68,6 +68,17 @@ describe("KeyboardShortcutsList composer rows", () => {
   });
 });
 
+describe("KeyboardShortcutsList settings layout", () => {
+  it("groups shortcut rows into settings cards", () => {
+    render(<KeyboardShortcutsList variant="settings" />);
+
+    const heading = screen.getByRole("heading", { name: "General" });
+    const list = heading.closest("section")?.querySelector("ul");
+    expect(heading).toHaveClass("text-ui", "text-foreground");
+    expect(list).toHaveClass("rounded-xl", "border-border", "bg-card");
+  });
+});
+
 describe("KeyboardShortcutsDialog", () => {
   it("advertises the session-search chord without taking the Print shortcut", () => {
     render(<KeyboardShortcutsList />);
@@ -89,6 +100,7 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Open command palette")).toBeTruthy();
     expect(screen.getByText("Show keyboard shortcuts")).toBeTruthy();
     expect(screen.getByText("Send message")).toBeTruthy();
+    expect(keysFor("Open model picker")).toEqual(["Ctrl", "⇧", "M"]);
     expect(screen.getByText("Recall previous prompt")).toBeTruthy();
     expect(screen.getByText("Previous session")).toBeTruthy();
     expect(keysFor("Previous session")).toEqual(["Ctrl", "["]);

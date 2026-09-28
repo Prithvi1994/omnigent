@@ -45,13 +45,32 @@ from omnigent.models.model_metadata import ModelMetadata, ModelWireAPI
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
 
+def _cancel_all_tasks(loop):
+    """Cancel and drain leftover tasks, the way :func:`asyncio.run` does.
+
+    A task still pending when the loop closes has its callbacks invoked
+    against a dead loop and raises "Event loop is closed" from the loop's
+    exception handler. Under pytest-xdist that surfaces as an INTERNALERROR
+    which kills the whole worker instead of failing one test.
+    """
+    pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+    if not pending:
+        return
+    for task in pending:
+        task.cancel()
+    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+
+
 def _run(coro):
     loop = asyncio.new_event_loop()
     try:
         return loop.run_until_complete(coro)
     finally:
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.close()
+        try:
+            _cancel_all_tasks(loop)
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        finally:
+            loop.close()
 
 
 # ---------------------------------------------------------------------------
@@ -3841,9 +3860,11 @@ def test_redact_argv_for_log_hides_equals_joined_system_prompt() -> None:
         assert "/tmp/ext.js" in redacted
 
 
-def test_rpc_start_log_does_not_leak_system_prompt(monkeypatch, caplog) -> None:
-    """``_PiRpcSession.start`` must not write the full ``--append-system-prompt``
-    value to the debug log; it should be redacted to a length placeholder.
+@pytest.mark.parametrize("system_prompt_mode", ["append", "replace"])
+def test_rpc_start_log_does_not_leak_system_prompt(
+    monkeypatch, caplog, system_prompt_mode
+) -> None:
+    """``_PiRpcSession.start`` must redact prompt values to a length placeholder.
 
     Guards F92: the old code logged ``" ".join(args)`` verbatim, leaking the
     entire system prompt into debug logs.
@@ -3867,6 +3888,7 @@ def test_rpc_start_log_does_not_leak_system_prompt(monkeypatch, caplog) -> None:
             env={"PATH": "/usr/bin"},
             model="some-model",
             system_prompt=test_prompt,
+            system_prompt_mode=system_prompt_mode,
             extra_args=["--extension", "/tmp/ext.js"],
         )
         await rpc.close()
@@ -3887,7 +3909,10 @@ def test_rpc_start_log_does_not_leak_system_prompt(monkeypatch, caplog) -> None:
     assert "--extension" in spawn_line
 
 
-def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(monkeypatch, caplog) -> None:
+@pytest.mark.parametrize("system_prompt_mode", ["append", "replace"])
+def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(
+    monkeypatch, caplog, system_prompt_mode
+) -> None:
     """The normal ``PiExecutor.run_turn`` path must pass the system prompt to
     Pi without leaking it into the spawn debug log.
 
@@ -3922,7 +3947,7 @@ def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(monkeypatch, caplog
     monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
 
     async def _test():
-        executor = PiExecutor(pi_path="/usr/bin/pi")
+        executor = PiExecutor(pi_path="/usr/bin/pi", system_prompt_mode=system_prompt_mode)
         try:
             return [
                 e
@@ -3943,8 +3968,14 @@ def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(monkeypatch, caplog
     assert turn_complete[0].response == "hi"
 
     argv = captured["argv"]
-    assert "--append-system-prompt" in argv
-    assert argv[argv.index("--append-system-prompt") + 1] == test_prompt
+    prompt_flag = (
+        "--system-prompt" if system_prompt_mode == "replace" else "--append-system-prompt"
+    )
+    assert argv[argv.index(prompt_flag) + 1] == test_prompt
+    if system_prompt_mode == "replace":
+        assert argv[argv.index("--append-system-prompt") + 1] == ""
+    else:
+        assert "--system-prompt" not in argv
 
     spawn_logs = [
         r.getMessage() for r in caplog.records if "PiExecutor: spawning" in r.getMessage()
@@ -3954,8 +3985,23 @@ def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(monkeypatch, caplog
 
     assert test_prompt not in spawn_line
     assert f"[system prompt {len(test_prompt)} chars]" in spawn_line
-    assert "--append-system-prompt" in spawn_line
+    assert prompt_flag in spawn_line
     assert "--mode" in spawn_line
+
+
+def test_executor_rejects_invalid_system_prompt_mode() -> None:
+    with pytest.raises(ValueError, match="system_prompt_mode must be 'append' or 'replace'"):
+        PiExecutor(pi_path="/fake/pi", system_prompt_mode="invalid")
+
+
+@pytest.mark.parametrize("prompt", [None, "", " \n "])
+def test_rpc_replace_rejects_empty_prompt(prompt: str | None) -> None:
+    async def _test():
+        rpc = _PiRpcSession()
+        with pytest.raises(ValueError, match="requires non-empty instructions"):
+            await rpc.start("/fake/pi", env={}, system_prompt=prompt, system_prompt_mode="replace")
+
+    _run(_test())
 
 
 def test_run_turn_spawn_env_has_no_host_secrets(monkeypatch) -> None:

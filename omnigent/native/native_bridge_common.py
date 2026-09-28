@@ -1,4 +1,4 @@
-"""Shared owner-pid marker + orphan prune for native-harness bridge dirs.
+"""Shared owner marker + orphan prune for native-harness bridge dirs.
 
 Each native coding-agent harness (claude / codex / antigravity / opencode /
 pi) keeps a per-session bridge directory under its own bridge root holding the
@@ -8,16 +8,18 @@ is abandoned, disposable bridge material must be reclaimed without deleting
 state the native runtime needs to resume.
 
 Every bridge dir carries an ``owner.pid`` marker naming the process that
-prepared it. The marker is refreshed on every turn's bridge prep. The sweep
-considers dirs whose owner is provably dead while leaving live and unmarked
-dirs alone; harnesses may apply an additional retention policy.
+prepared it, qualified by its PID namespace and kernel boot. The marker is
+refreshed on every turn's bridge prep. The sweep considers dirs whose owner is
+provably dead in the sweeper's own process domain while leaving live, foreign,
+legacy and unmarked dirs alone; harnesses may apply an additional retention
+policy.
 
 This module factors the marker write and the per-root sweep so all five
 harnesses share one implementation (the per-harness modules only supply their
-own bridge root), plus a dynamic cross-harness reaper for the runner to call at
-startup. It mirrors the terminal orphan sweep
+own bridge root), plus a dynamic cross-harness reaper for host maintenance or
+standalone runner startup. It mirrors the terminal orphan sweep
 (``inner/terminal.py:reap_orphaned_terminals``) and reuses that module's
-canonical process-liveness predicate.
+canonical process-liveness predicate and ``owner_claim`` ownership records.
 """
 
 from __future__ import annotations
@@ -26,25 +28,60 @@ import contextlib
 import importlib
 import logging
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
+
+from filelock import FileLock
+from filelock import Timeout as FileLockTimeout
 
 from omnigent.native import owner_claim
 
 _logger = logging.getLogger(__name__)
 
 OWNER_PID_FILENAME = owner_claim.OWNER_PID_FILENAME
+_LOCK_DIR_NAME = ".locks"
+
+
+def _bridge_dir_lock(bridge_dir: Path) -> FileLock:
+    """Return the stable cross-process lock for one bridge directory."""
+    lock_dir = bridge_dir.parent / _LOCK_DIR_NAME
+    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return FileLock(str(lock_dir / f"{bridge_dir.name}.lock"), mode=0o600)
+
+
+@contextmanager
+def bridge_dir_preparation_lock(bridge_dir: Path) -> Iterator[None]:
+    """Prevent orphan cleanup while a runner prepares a bridge directory."""
+    with _bridge_dir_lock(bridge_dir):
+        yield
+
+
+@contextmanager
+def _try_bridge_dir_cleanup_lock(bridge_dir: Path) -> Iterator[bool]:
+    """Try to exclude bridge preparation without ever blocking cleanup."""
+    lock = _bridge_dir_lock(bridge_dir)
+    try:
+        lock.acquire(timeout=0)
+    except FileLockTimeout:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        lock.release()
 
 
 def write_owner_pid_marker(bridge_dir: Path) -> None:
     """
-    Record the current process pid as the owner of *bridge_dir*.
+    Record the current process as the owner of *bridge_dir*.
 
     Written on every bridge prep so the marker always names the live
-    runner; :func:`prune_orphaned_dirs` reaps only dirs whose marker
-    names a provably-dead process. Best-effort: a failed write (e.g. the
-    dir vanished mid-crash) never raises, matching ``inner/terminal.py``'s
-    owner.pid convention.
+    runner, qualified by its PID namespace and boot id;
+    :func:`prune_orphaned_dirs` reaps only dirs whose marker names a
+    provably-dead process in the sweeper's own process domain. Best-effort:
+    a failed write (e.g. the dir vanished mid-crash) never raises, matching
+    ``inner/terminal.py``'s owner.pid convention.
 
     :param bridge_dir: Per-session bridge directory to mark.
     """
@@ -64,9 +101,17 @@ def prune_orphaned_dirs(
     *bridge_root* and removes each immediate child dir whose ``owner.pid``
     marker names a process that no longer exists. A harness may provide an
     additional eligibility predicate, such as a minimum inactivity period.
-    The PID must belong to the current namespace before a local liveness
-    probe can establish owner death. Unknown, foreign and legacy ownership
-    is left untouched.
+    The owner must belong to the sweeper's PID namespace and boot before a
+    local liveness probe can establish its death: on a bridge root shared
+    across namespaces (a sandboxed runner beside a plain one) a live foreign
+    pid reads as absent. Foreign, unknown and legacy bare-pid ownership is
+    left untouched, as are dirs with no marker or an unparseable one.
+    Cleanup holds the bridge directory's stable lock while checking the owner
+    marker, liveness, and harness-specific eligibility and while removing the
+    directory. A replacement runner holds the same lock throughout bridge
+    preparation, so cleanup either finishes before preparation begins or skips
+    the actively prepared directory. The final marker reread remains as a
+    conservative guard against uncoordinated marker writers.
 
     Reuses ``inner/terminal.py:_process_alive`` as the liveness predicate.
 
@@ -79,31 +124,45 @@ def prune_orphaned_dirs(
     """
     if not bridge_root.exists():
         return 0
+    from omnigent.inner.native_attachments import attachment_cache_dir
     from omnigent.inner.terminal import _process_alive
 
     pruned = 0
     for entry in bridge_root.iterdir():
-        if not entry.is_dir():
+        if not entry.is_dir() or entry.name == _LOCK_DIR_NAME:
             continue
-        claim = owner_claim.read_owner_claim(entry)
-        if claim is None or not owner_claim.owner_is_gone(claim, process_alive=_process_alive):
-            continue
-        if should_prune is not None:
-            try:
-                eligible = should_prune(entry)
-            except Exception:
-                _logger.exception("Error checking orphaned bridge dir %s", entry)
+        with _try_bridge_dir_cleanup_lock(entry) as acquired:
+            if not acquired:
                 continue
-            if not eligible:
+            claim = owner_claim.read_owner_claim(entry)
+            if claim is None or not owner_claim.owner_is_gone(claim, process_alive=_process_alive):
                 continue
-        shutil.rmtree(entry, ignore_errors=True)
-        pruned += 1
+            if should_prune is not None:
+                try:
+                    eligible = should_prune(entry)
+                except Exception:
+                    _logger.exception("Error checking orphaned bridge dir %s", entry)
+                    continue
+                if not eligible:
+                    continue
+            confirmed = owner_claim.read_owner_claim(entry)
+            if (
+                confirmed is None
+                or confirmed != claim
+                or not owner_claim.owner_is_gone(confirmed, process_alive=_process_alive)
+            ):
+                continue
+            cache_dir = attachment_cache_dir(entry)
+            shutil.rmtree(entry, ignore_errors=True)
+            if not entry.exists():
+                shutil.rmtree(cache_dir, ignore_errors=True)
+            pruned += 1
     return pruned
 
 
 def reap_orphaned_native_bridge_dirs() -> int:
     """
-    Sweep orphaned bridge dirs across every native harness at runner startup.
+    Sweep orphaned bridge dirs across every native harness during maintenance.
 
     Iterates the registered native coding agents and invokes each one's
     module-level ``prune_orphaned_bridge_dirs`` (if it defines one), so
@@ -113,9 +172,9 @@ def reap_orphaned_native_bridge_dirs() -> int:
     isolated: an import failure, a missing pruner, or a raising pruner
     never aborts the sweep of the others.
 
-    Mirrors ``inner/terminal.py:reap_orphaned_terminals``; the runner calls
-    this once at startup to reclaim dirs leaked by a prior runner that died
-    without running the explicit delete path.
+    Mirrors ``inner/terminal.py:reap_orphaned_terminals``; host maintenance and
+    standalone runners call this to reclaim dirs leaked by a prior runner that
+    died without running the explicit delete path.
 
     :returns: The total number of orphaned bridge dirs removed.
     """
@@ -128,9 +187,20 @@ def reap_orphaned_native_bridge_dirs() -> int:
         module_name = f"omnigent.harnesses.{agent.key}_native.bridge"
         try:
             module = importlib.import_module(module_name)
+        except ImportError:
+            # The harness is simply not importable here — a stdlib module its
+            # bridge needs was not built into this interpreter, an extra is not
+            # installed. Skipping it is the documented behaviour, so it does not
+            # rank as a session error.
+            _logger.warning(
+                "Skipping native bridge module %s in the orphan sweep: not importable",
+                module_name,
+                exc_info=True,
+            )
+            continue
         except Exception:
-            # A broken transitive import must not crash runner startup;
-            # skip this harness (matches the per-prune guard below).
+            # The module imported and then raised — a defect in the bridge, not
+            # an absent harness. Still skipped, but worth an error.
             _logger.exception(
                 "Error importing native bridge module %s for orphan sweep",
                 module_name,
