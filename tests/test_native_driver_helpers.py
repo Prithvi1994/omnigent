@@ -140,3 +140,31 @@ def test_logs_require_attempt_window_and_all_exact_identifiers(tmp_path):
     path.write_text("")
     with pytest.raises(AssertionError, match="truncated"):
         window.finish(session_id="child")
+
+
+@pytest.mark.parametrize(
+    "event_type,session,text,expected",
+    [
+        ("message", "parent", "prompt", True),
+        ("interrupt", "parent", "prompt", False),
+        ("function_call_output", "parent", "prompt", False),
+        ("message", "other", "prompt", False),
+        ("message", "parent", "different prompt", False),
+    ],
+)
+def test_composer_observation_matches_its_own_submission(event_type, session, text, expected):
+    from types import SimpleNamespace
+
+    from tests.e2e_ui.native_driver import _matches_message_response
+
+    response = SimpleNamespace(
+        url=f"http://server/v1/sessions/{session}/events",
+        request=SimpleNamespace(
+            method="POST",
+            post_data_json={
+                "type": event_type,
+                "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+            },
+        ),
+    )
+    assert _matches_message_response(response, "parent", "prompt") is expected

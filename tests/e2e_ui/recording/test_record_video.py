@@ -30,11 +30,13 @@ def test_sync_recorder_writes_video(
         else:
             page = browser.new_page(**options)
             context = page.context
-        page.set_content("<h1>Recorded sync journey</h1>")
-        page.get_by_role("heading").wait_for()
-        video = page.video
-        assert video is not None
-        context.close()
+        try:
+            page.set_content("<h1>Recorded sync journey</h1>")
+            page.get_by_role("heading").wait_for()
+            video = page.video
+            assert video is not None
+        finally:
+            context.close()
         path = Path(video.path())
         assert path.parent == (custom_dir if explicit_directory else record_dir)
         assert path.stat().st_size > 0

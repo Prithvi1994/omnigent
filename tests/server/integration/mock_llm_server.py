@@ -1450,8 +1450,10 @@ async def configure(request: Request) -> dict[str, object]:
     contamination). Omitting ``match`` keeps the default model/"default"
     routing.
 
-    Without a key, distinct content/tool selectors get independent queues.
-    Reconfiguring the same selector replaces its queue.
+    Without a key, distinct content selectors and their tool guards get
+    independent queues. Reconfiguring the same selector replaces its queue.
+    Without a content match, configuration still targets the default queue;
+    required_tools then guards consumption without changing model routing.
     Explicit keys replace the named queue, including ``"default"``.
     ``required_tools`` restricts consumption to requests advertising all listed
     tool names, isolating turns from title-generation/background requests.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Response, expect
 
 from omnigent.server.schemas import SessionEventInput
 
@@ -61,14 +62,11 @@ def _accepted_input(session_id: str, result: dict) -> AcceptedInput:
 
 def send_composer_message(page: Page, session_id: str, text: str) -> AcceptedInput:
     """Drive the real composer and reject failed HTTP submissions immediately."""
-    composer = page.get_by_placeholder("Message the agent")
+    composer = page.get_by_role("textbox", name="Message the agent")
     expect(composer).to_be_visible(timeout=30_000)
     composer.fill(text)
     with page.expect_response(
-        lambda response: (
-            urlsplit(response.url).path == f"/v1/sessions/{session_id}/events"
-            and response.request.method == "POST"
-        )
+        lambda response: _matches_message_response(response, session_id, text)
     ) as pending:
         page.get_by_role("button", name="Send", exact=True).click()
     response = pending.value
@@ -77,6 +75,28 @@ def send_composer_message(page: Page, session_id: str, text: str) -> AcceptedInp
             f"Message for {session_id} rejected: {response.status}: {response.text()}"
         )
     return _accepted_input(session_id, response.json())
+
+
+def _matches_message_response(response: Response, session_id: str, text: str) -> bool:
+    if (
+        urlsplit(response.url).path != f"/v1/sessions/{session_id}/events"
+        or response.request.method != "POST"
+    ):
+        return False
+    try:
+        body = response.request.post_data_json
+    except (json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(body, dict) or body.get("type") != "message":
+        return False
+    data = body.get("data")
+    if not isinstance(data, dict) or data.get("role", "user") != "user":
+        return False
+    content = data.get("content")
+    return isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") == "input_text" and block.get("text") == text
+        for block in content
+    )
 
 
 def inject_child_start(
