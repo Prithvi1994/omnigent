@@ -182,6 +182,12 @@ class Session:
         returned with ``visibility="archived"`` or with
         ``visibility="all", include_archived=True``. ``False`` for normal
         sessions.
+    :param pending_elicitations: Outstanding approval prompts on this
+        session, each the raw ``response.elicitation_request`` event
+        payload the server published. The live stream has no replay,
+        so a client that subscribed after the prompt was published
+        recovers it from here. Empty when nothing is pending or the
+        server predates the field.
     """
 
     id: str
@@ -203,6 +209,7 @@ class Session:
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     archived: bool = False
+    pending_elicitations: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Session:
@@ -216,6 +223,7 @@ class Session:
         """
         items_raw = raw.get("items", [])
         labels_raw = raw.get("labels", {})
+        pending_raw = raw.get("pending_elicitations", [])
         raw_cw = raw.get("context_window")
         raw_ltt = raw.get("last_total_tokens")
         raw_updated_at = raw.get("updated_at")
@@ -239,6 +247,9 @@ class Session:
             last_task_error=raw.get("last_task_error"),
             external_session_id=raw.get("external_session_id"),
             archived=bool(raw.get("archived", False)),
+            pending_elicitations=[p for p in pending_raw if isinstance(p, dict)]
+            if isinstance(pending_raw, list)
+            else [],
         )
 
 

@@ -465,6 +465,58 @@ async def test_set_archived_unarchive_sends_false() -> None:
     assert session.archived is False
 
 
+@pytest.mark.asyncio
+async def test_get_parses_pending_elicitations() -> None:
+    """``get()`` keeps the snapshot's parked approval prompts as raw payloads;
+    the stream has no replay, so a late subscriber recovers them from here.
+    Non-dict entries are dropped."""
+    prompt = {
+        "type": "response.elicitation_request",
+        "elicitation_id": "elicit_1",
+        "params": {"mode": "form", "message": "Confirm?"},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_session_response_body(status="running")
+            | {"pending_elicitations": [prompt, "not-a-prompt"]},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.get("conv_abc")
+    finally:
+        await client.aclose()
+
+    assert session.pending_elicitations == [prompt]
+
+
+@pytest.mark.asyncio
+async def test_get_defaults_pending_elicitations_when_absent_or_malformed() -> None:
+    bodies = iter(
+        [
+            _session_response_body(status="idle"),
+            _session_response_body(status="idle") | {"pending_elicitations": "nope"},
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=next(bodies))
+
+    ns, client = _make_namespace(handler)
+    try:
+        absent = await ns.get("conv_abc")
+        malformed = await ns.get("conv_abc")
+    finally:
+        await client.aclose()
+
+    # An older server omits the field and a malformed value is ignored;
+    # both read as "nothing pending" instead of raising.
+    assert absent.pending_elicitations == []
+    assert malformed.pending_elicitations == []
+
+
 # ── post_event / interrupt ────────────────────────────────────────────
 
 

@@ -1261,6 +1261,12 @@ def _server_event_to_sdk_event(event: object) -> object | None:
     return None
 
 
+# Upper bound on how long a send waits for the stream pump's subscribe attempt
+# to settle before posting. The server acks a subscriber immediately and a
+# failed connect settles at once, so only a hung connect reaches this cap.
+_STREAM_SUBSCRIBE_GRACE_S = 6.0
+
+
 class _SessionsChatReplAdapter:
     """
     Sessions-API adapter for the REPL.
@@ -1388,6 +1394,12 @@ class _SessionsChatReplAdapter:
         # Set by run_repl() to the rendering callback.
         self._on_event: Callable[[object], None] | None = None
         self._stream_task: asyncio.Task[None] | None = None
+        # Set once the pump's current ``/stream`` subscribe attempt is acked
+        # by the server or has failed; cleared while a (re)connect is in flight.
+        self._stream_subscribe_settled = asyncio.Event()
+        # Elicitation ids already routed to the approval hook, so a prompt
+        # seen both live and in a snapshot poll is surfaced only once.
+        self._handled_elicitation_ids: set[str] = set()
         self._recover_task: asyncio.Task[None] | None = None
         self._recover_lock = asyncio.Lock()
         self._bind_lock = asyncio.Lock()
@@ -2230,6 +2242,7 @@ class _SessionsChatReplAdapter:
         max_backoff = 5.0
         assert self._session_id is not None
         while True:
+            self._stream_subscribe_settled.clear()
             try:
                 if _dbg:
                     print(
@@ -2238,6 +2251,9 @@ class _SessionsChatReplAdapter:
                         flush=True,
                     )
                 async for event in self._client.sessions.stream(self._session_id):
+                    # The server acks a registered subscriber with an
+                    # immediate heartbeat, so any event means we're attached.
+                    self._stream_subscribe_settled.set()
                     if isinstance(event, _StatusEv) and event.status in (
                         "idle",
                         "waiting",
@@ -2249,11 +2265,13 @@ class _SessionsChatReplAdapter:
                     if self._on_event is not None:
                         self._on_event(event)
                 # Clean close (server sent [DONE]). Reopen.
+                self._stream_subscribe_settled.set()
                 await asyncio.sleep(backoff)
                 backoff = 0.5
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 — reconnect on any error
+                self._stream_subscribe_settled.set()
                 # Recoverable transport errors (peer closed mid-chunk,
                 # read timeout, transient network error) are normal
                 # background noise — the session continues server-side
@@ -2296,6 +2314,49 @@ class _SessionsChatReplAdapter:
                     )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
+
+    async def _wait_for_stream_subscription(self) -> None:
+        """
+        Hold a turn's POST until the pump's subscribe attempt settles.
+
+        The live stream has no replay, so events published before the
+        subscriber is registered never reach this client. A hung connect
+        gives up after ``_STREAM_SUBSCRIBE_GRACE_S``; the snapshot poll in
+        :meth:`send` surfaces whatever was still missed.
+        """
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                self._stream_subscribe_settled.wait(),
+                timeout=_STREAM_SUBSCRIBE_GRACE_S,
+            )
+
+    def _surface_pending_elicitations(self, snapshot: object) -> None:
+        """
+        Route prompts parked in a session snapshot through the live event path.
+
+        ``GET /v1/sessions/{id}`` replays outstanding elicitation requests
+        the no-replay stream may have published before this client
+        subscribed; each unseen one is pushed through ``_on_event`` exactly
+        like a live event. Snapshots without the field are a no-op.
+        """
+        if self._on_event is None:
+            return
+        from omnigent.server.schemas import ElicitationRequestEvent
+
+        for payload in getattr(snapshot, "pending_elicitations", None) or []:
+            if not isinstance(payload, dict):
+                continue
+            elicitation_id = payload.get("elicitation_id")
+            if (
+                not isinstance(elicitation_id, str)
+                or elicitation_id in self._handled_elicitation_ids
+            ):
+                continue
+            try:
+                event = ElicitationRequestEvent.model_validate(payload)
+            except ValueError:
+                continue
+            self._on_event(event)
 
     async def send(
         self,
@@ -2375,6 +2436,7 @@ class _SessionsChatReplAdapter:
                     file=sys.stderr,
                     flush=True,
                 )
+            await self._wait_for_stream_subscription()
             await self._client.sessions.post_event(session_id, event_payload)
             if _dbg:
                 print(
@@ -2390,7 +2452,9 @@ class _SessionsChatReplAdapter:
             # flush streaming body chunks eagerly, so the pump's
             # SSE subscription may not be active when the workflow
             # publishes its terminal event (no-replay pub-sub).
-            # We poll the snapshot every second as a backstop.
+            # We poll the snapshot every second as a backstop, and
+            # surface any approval prompt it shows parked but the
+            # stream never delivered.
             while not self._turn_done.is_set():
                 try:
                     # Event.wait() is cancellation-safe (its finally block
@@ -2403,6 +2467,7 @@ class _SessionsChatReplAdapter:
                     )
                 except asyncio.TimeoutError:
                     snap = await self._client.sessions.get(session_id)
+                    self._surface_pending_elicitations(snap)
                     if snap.status in ("idle", "failed"):
                         self._turn_done.set()
             # Yield a terminal event so callers iterating send()
@@ -2474,6 +2539,7 @@ class _SessionsChatReplAdapter:
                     file=sys.stderr,
                     flush=True,
                 )
+            await self._wait_for_stream_subscription()
             await self._client.sessions.post_event(session_id, event_payload)
             while not self._turn_done.is_set():
                 try:
@@ -2483,6 +2549,7 @@ class _SessionsChatReplAdapter:
                     )
                 except asyncio.TimeoutError:
                     snap = await self._client.sessions.get(session_id)
+                    self._surface_pending_elicitations(snap)
                     if snap.status in ("idle", "failed"):
                         self._turn_done.set()
             from omnigent_client._events import ResponseCompleted
@@ -2599,6 +2666,10 @@ class _SessionsChatReplAdapter:
         from omnigent_client._tool_handler import ElicitationRequestCtx
 
         elicitation_id = getattr(event, "elicitation_id", "")
+        if elicitation_id:
+            if elicitation_id in self._handled_elicitation_ids:
+                return
+            self._handled_elicitation_ids.add(elicitation_id)
         hook = self._hooks.on_elicitation_request
         if hook is None:
             action = "decline"
