@@ -12657,7 +12657,11 @@ def login(server_url: str) -> None:
     try:
         resp.raise_for_status()
     except _httpx.HTTPError as exc:
-        raise click.ClickException(f"Could not start CLI login: {exc}") from exc
+        raise click.ClickException(
+            f"Could not start CLI login: {exc}\n"
+            f"Is the server running with OMNIGENT_AUTH_PROVIDER=oidc?"
+            f"{_proxy_interference_hint(server)}"
+        ) from exc
 
     data = resp.json()
     ticket = data["ticket"]
