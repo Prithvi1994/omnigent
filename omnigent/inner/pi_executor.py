@@ -49,15 +49,16 @@ from dataclasses import dataclass, field, replace
 from typing import Any, NotRequired, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
-from omnigent import model_catalog
+from omnigent.harnesses.pi_native.credentials import (
+    _databricks_workspace_url_for_gateway,
+    _is_databricks_ai_gateway_url,
+)
 from omnigent.inner.agent_env import clean_agent_env
 from omnigent.inner.native_attachments import parse_data_uri
-from omnigent.json_types import JsonObject as _JsonObject
-from omnigent.json_types import JsonValue
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.model_metadata import ModelWireAPI
-from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
-from omnigent.pi_model_compatibility import (
+from omnigent.models import model_catalog
+from omnigent.models.model_metadata import ModelWireAPI
+from omnigent.models.pi_model_compatibility import (
     SYSTEM_AI_RESPONSES_KEYWORDS,
     databricks_model_aliases,
     enrich_databricks_model_catalog,
@@ -65,19 +66,18 @@ from omnigent.pi_model_compatibility import (
     pi_model_json_entry,
     unsupported_in_pi,
 )
-from omnigent.pi_native_credentials import (
-    _databricks_workspace_url_for_gateway,
-    _is_databricks_ai_gateway_url,
-)
-from omnigent.reasoning_effort import (
+from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
+from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
+from omnigent.spec.types import RetryPolicy
+from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.json_types import JsonValue
+from omnigent.util.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
     PI_EFFORTS,
     nearest_pi_thinking_level,
     to_pi_thinking_level,
     validate_effort,
 )
-from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
-from omnigent.spec.types import RetryPolicy
 
 from ._subprocess_lifecycle import close_subprocess_transport
 from .async_utils import run_sync_on_thread
@@ -1016,6 +1016,7 @@ class _PiRpcSession:
         cwd: str | None = None,
         model: str | None = None,
         system_prompt: str | None = None,
+        system_prompt_mode: str = "append",
         thinking: str | None = None,
         extra_args: list[str] | None = None,
     ) -> None:
@@ -1034,8 +1035,10 @@ class _PiRpcSession:
         :param model: Pi model selector, e.g.
             ``"databricks-anthropic/gateway-model-id"``.
             ``None`` lets Pi pick its default.
-        :param system_prompt: Text appended to Pi's default system
-            prompt via ``--append-system-prompt``. ``None`` skips it.
+        :param system_prompt: Omnigent's composed instructions. ``None`` skips
+            injection in append mode; replace mode requires non-empty text.
+        :param system_prompt_mode: Append instructions to Pi's base prompt,
+            or replace it using ``--system-prompt``.
         :param thinking: Pi thinking level in Pi's own vocabulary
             (``off``/``minimal``/.../``max``), passed as ``--thinking``.
             ``None`` omits the flag so Pi's model default applies.
@@ -1055,11 +1058,13 @@ class _PiRpcSession:
             )
         if thinking:
             args.extend(["--thinking", thinking])
-        if system_prompt:
-            # Use --append-system-prompt instead of --system-prompt so Pi
-            # keeps its default prompt (which includes tool descriptions from
-            # promptSnippet and guidelines).  Using --system-prompt would
-            # replace the default prompt entirely, stripping tool awareness.
+        if system_prompt_mode == "replace":
+            if not system_prompt or not system_prompt.strip():
+                raise ValueError("system_prompt_mode='replace' requires non-empty instructions")
+            # An explicit empty append input suppresses APPEND_SYSTEM.md discovery.
+            args.extend(["--system-prompt", system_prompt, "--append-system-prompt", ""])
+        elif system_prompt:
+            # Keep Pi's tool snippets and default guidance in append mode.
             args.extend(["--append-system-prompt", system_prompt])
         if extra_args:
             args.extend(extra_args)
@@ -1729,14 +1734,22 @@ class PiExecutor(Executor):
         bundle_dir: pathlib.Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        context_files: bool = True,
+        system_prompt_mode: str = "append",
+        preserve_model_ids: bool = False,
     ) -> None:
         """Create a PiExecutor.
 
         :param cwd: Working directory for the Pi subprocess.
+        :param context_files: Allow Pi to automatically load context files such
+            as AGENTS.md and CLAUDE.md. Explicit agent instructions are unaffected.
+        :param system_prompt_mode: ``append`` retains Pi's base prompt;
+            ``replace`` uses Omnigent's composed instructions as the base.
         :param os_env: Optional OS environment / sandbox spec.  When set, the
             Pi subprocess is wrapped in the same sandbox other
             harnesses use.
         :param model: Override the model name, e.g. ``"gateway-model-id"``.
+        :param preserve_model_ids: Keep exact IDs from a saved inference profile.
         :param pi_path: Absolute path to a ``pi`` CLI binary.  When ``None``
             the executor searches ``PATH``.
         :param gateway: When ``True``, write a ``models.json`` pointing Pi
@@ -1787,6 +1800,9 @@ class PiExecutor(Executor):
             ``--skill`` for each named bundle skill — names not
             present in the bundle are silently skipped.
         """
+        if system_prompt_mode not in ("append", "replace"):
+            raise ValueError("system_prompt_mode must be 'append' or 'replace'")
+        self._system_prompt_mode = system_prompt_mode
         resolved_pi = pi_path or _find_pi_cli()
         if not resolved_pi:
             raise ImportError(
@@ -1797,6 +1813,7 @@ class PiExecutor(Executor):
         self._cwd = cwd
         self._os_env_spec = os_env
         self._model_override = model
+        self._preserve_model_ids = preserve_model_ids
         self._gateway = gateway
         self._databricks_profile = databricks_profile
         self._gateway_host_override = gateway_host.rstrip("/") if gateway_host else None
@@ -1827,9 +1844,11 @@ class PiExecutor(Executor):
         # off (they don't route through Omnigent policies / history and
         # can 400 against the Databricks Responses API), and the bridge
         # extension's tools are explicitly allowlisted.
-        from omnigent.pi_native import pi_supports_approve
+        from omnigent.harnesses.pi_native.main import pi_supports_approve
 
         self._extra_args: list[str] = ["--no-tools"]
+        if not context_files:
+            self._extra_args.append("--no-context-files")
         if pi_supports_approve(self._pi_path):
             # Pre-accept the project-folder trust dialog. Pi 0.79+ shows a
             # blocking TUI prompt on first launch in a directory with .pi/
@@ -2025,7 +2044,7 @@ class PiExecutor(Executor):
             return model_id
         # Strip bracket suffixes (e.g. "[1m]") — context-window hints accepted
         # by the direct Anthropic API but not by the Databricks AI Gateway.
-        if model and self._gateway:
+        if model and self._gateway and not self._preserve_model_ids:
             model = re.sub(r"\[.*?\]$", "", model)
         return model
 
@@ -2385,6 +2404,7 @@ class PiExecutor(Executor):
             cwd=self._cwd,
             model=pi_model or None,
             system_prompt=system_prompt or None,
+            system_prompt_mode=self._system_prompt_mode,
             thinking=thinking,
             extra_args=extra_args or None,
         )
