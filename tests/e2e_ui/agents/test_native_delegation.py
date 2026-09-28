@@ -1,0 +1,127 @@
+"""Real native delegation through Claude's advertised tool and transcript bridge."""
+
+import json
+import uuid
+
+import httpx
+import pytest
+from playwright.sync_api import Page, expect
+
+from tests.e2e_ui.conftest import configure_mock_llm, set_fallback_mock_llm
+from tests.e2e_ui.messages.test_message_render_parity import (
+    _ASSISTANT,
+    _WORKING,
+    _ensure_chat_view,
+)
+from tests.e2e_ui.messages.test_native_claude_render_parity import (
+    _open_terminal_view,
+    _wait_terminal_connected,
+)
+from tests.e2e_ui.native_driver import (
+    navigate_to_child,
+    send_composer_message,
+    wait_native_delegation,
+)
+
+
+@pytest.mark.nightly
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("agent_type", ["general-purpose", "Explore"])
+def test_native_claude_delegation(
+    page: Page,
+    native_claude_mock_session: tuple[str, str],
+    mock_llm_server_url: str,
+    agent_type: str,
+) -> None:
+    base_url, parent_id = native_claude_mock_session
+    nonce = uuid.uuid4().hex
+    probe = f"probe-{nonce}"
+    parent_marker = f"parent-{nonce}"
+    child_marker = f"worker-request-{nonce}"
+    child_reply = f"worker-finished-{nonce}"
+    parent_reply = f"parent-finished-{nonce}"
+    call_id = f"toolu_{nonce}"
+    page.goto(f"{base_url}/c/{parent_id}")
+    _open_terminal_view(page)
+    _wait_terminal_connected(page)
+    _ensure_chat_view(page)
+    set_fallback_mock_llm(mock_llm_server_url, "default", probe)
+    send_composer_message(page, parent_id, probe)
+    expect(page.locator(_ASSISTANT, has_text=probe).last).to_be_visible(timeout=60_000)
+    expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
+
+    with httpx.Client(base_url=mock_llm_server_url, timeout=10) as mock:
+        requests = mock.get("/mock/requests").raise_for_status().json()["requests"]
+        tools = [
+            tool
+            for request in requests
+            for tool in request.get("tools", [])
+            if tool.get("name") in {"Task", "Agent"}
+        ]
+        assert tools, "Native CLI did not advertise a delegation tool"
+        tool = tools[-1]
+        tool_name = tool["name"]
+        properties = tool["input_schema"]["properties"]
+        assert {"subagent_type", "prompt", "description"} <= properties.keys(), tool
+        parent_key = configure_mock_llm(
+            mock_llm_server_url,
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "call_id": call_id,
+                            "name": tool_name,
+                            "arguments": json.dumps(
+                                {
+                                    "subagent_type": agent_type,
+                                    "description": f"Inspect {nonce[:8]}",
+                                    "prompt": child_marker,
+                                }
+                            ),
+                        }
+                    ]
+                },
+                {"text": parent_reply},
+            ],
+            match=parent_marker,
+            required_tools=[tool_name],
+        )
+        child_key = configure_mock_llm(
+            mock_llm_server_url,
+            [{"text": child_reply}],
+            match=child_marker,
+            required_tools=["Read"],
+        )
+        queues = mock.get("/mock/queues").raise_for_status().json()["queues"]
+        assert parent_key != child_key
+        assert queues[parent_key]["remaining"] == 2
+        assert queues[child_key]["remaining"] == 1
+        # Background title requests carry the user's nonce but no native tools.
+        title = mock.post(
+            "/v1/messages",
+            json={
+                "model": "title-model",
+                "messages": [
+                    {"role": "user", "content": parent_marker},
+                ],
+            },
+        )
+        title.raise_for_status()
+        assert mock.get("/mock/queues").json()["queues"][parent_key]["remaining"] == 2
+        send_composer_message(page, parent_id, parent_marker)
+        expect(page.locator(_ASSISTANT, has_text=parent_reply).last).to_be_visible(timeout=90_000)
+        expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
+        with httpx.Client(base_url=base_url, timeout=10) as client:
+            proof = wait_native_delegation(client, parent_id, call_id=call_id, tool_name=tool_name)
+        assert child_reply in json.dumps(proof.result)
+        selections = mock.get("/mock/selections").raise_for_status().json()["selections"]
+        assert any(
+            selection["key"] == parent_key
+            and selection["response"]["tool_calls"]
+            and selection["response"]["tool_calls"][0]["call_id"] == call_id
+            for selection in selections
+        )
+    navigate_to_child(page, proof.child_id)
+    _ensure_chat_view(page)
+    expect(page.locator(_ASSISTANT, has_text=child_reply).last).to_be_visible(timeout=30_000)
+    expect(page.locator(_WORKING)).to_have_count(0, timeout=30_000)

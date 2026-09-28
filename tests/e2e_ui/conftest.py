@@ -652,9 +652,10 @@ def configure_mock_llm(
     mock_url: str,
     responses: list[dict[str, Any]],
     *,
-    key: str = "default",
+    key: str | None = None,
     match: str | None = None,
-) -> None:
+    required_tools: list[str] | None = None,
+) -> str:
     """Configure a keyed response queue on the mock LLM server.
 
     Each dict in *responses* maps to a ``QueuedResponse`` on the mock
@@ -671,12 +672,20 @@ def configure_mock_llm(
         completion event — a mid-stream fault for exercising the SPA's
         stream error/recovery UI).
     :param key: Queue key — typically the model name baked into the
-        agent spec. Defaults to ``"default"`` (matches any model
-        not assigned to a more specific queue).
+        agent spec. Omitting it allocates an independent content queue when
+        ``match`` is supplied, otherwise uses ``"default"``. Explicit keys replace
+        existing queues.
     :param match: Optional substring to match against the user text for
         content-based routing (in addition to model-name routing).
+    :param required_tools: Only consume responses when these tools are advertised.
+        Use this to exclude title-generation requests containing the same nonce.
+    :returns: Installed queue key, for inspection via ``/mock/queues``.
     """
-    body: dict[str, Any] = {"key": key, "responses": responses}
+    body: dict[str, Any] = {"responses": responses}
+    if key is not None:
+        body["key"] = key
+    if required_tools is not None:
+        body["required_tools"] = required_tools
     if match is not None:
         body["match"] = match
     resp = httpx.post(
@@ -685,6 +694,7 @@ def configure_mock_llm(
         timeout=5.0,
     )
     resp.raise_for_status()
+    return resp.json()["key"]
 
 
 def reset_mock_llm(mock_url: str) -> None:
@@ -2367,7 +2377,7 @@ def _record_video(
     Most e2e_ui tests drive Playwright through ``async_playwright()`` directly
     (``browser.new_page()`` / ``browser.new_context()``), not the
     pytest-playwright ``page`` fixture, so ``pytest --video`` records nothing for
-    them. When ``OMNIGENT_E2E_RECORD_DIR`` is set, patch the async ``Browser``
+    them. When ``OMNIGENT_E2E_RECORD_DIR`` is set, patch sync and async ``Browser``
     methods to inject ``record_video_dir`` into every page/context they open, so
     the rendered journey lands as a ``.webm`` regardless of how the test opened
     the browser. A caller that already passes ``record_video_dir`` is left alone.
@@ -2381,6 +2391,7 @@ def _record_video(
         return
 
     from playwright.async_api import Browser as _AsyncBrowser
+    from playwright.sync_api import Browser as _SyncBrowser
 
     Path(record_dir).mkdir(parents=True, exist_ok=True)
     _orig_new_page = _AsyncBrowser.new_page
@@ -2394,6 +2405,19 @@ def _record_video(
         kwargs.setdefault("record_video_dir", record_dir)
         return await _orig_new_context(self, *args, **kwargs)
 
+    _sync_new_page = _SyncBrowser.new_page
+    _sync_new_context = _SyncBrowser.new_context
+
+    def _new_sync_page(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("record_video_dir", record_dir)
+        return _sync_new_page(self, *args, **kwargs)
+
+    def _new_sync_context(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("record_video_dir", record_dir)
+        return _sync_new_context(self, *args, **kwargs)
+
+    monkeypatch.setattr(_SyncBrowser, "new_page", _new_sync_page)
+    monkeypatch.setattr(_SyncBrowser, "new_context", _new_sync_context)
     monkeypatch.setattr(_AsyncBrowser, "new_page", _new_page)
     monkeypatch.setattr(_AsyncBrowser, "new_context", _new_context)
     yield
