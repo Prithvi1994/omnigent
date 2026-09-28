@@ -417,13 +417,25 @@ def pytest_runtest_protocol(item):
         source = Path(str(item.path))
 
         def copy_source():
+            raw = source.read_bytes()
             with tokenize.open(source) as stream:
-                content = collector.journal.clean(stream.read()).encode("utf-8")
+                text = stream.read()
+            cleaned = collector.journal.clean(text)
+            content = cleaned.encode("utf-8")
             target = collector.directory / f"source-{hashlib.sha256(content).hexdigest()}.py"
             if not target.is_file():
                 target.write_bytes(content)
+            identity = {"redacted": cleaned != text}
+            # Token-like test literals are redacted in the copy; keep the committed file's
+            # hash for verifiers unless the file holds a live environment secret.
+            if not any(secret in text for secret in collector.journal.secrets):
+                identity["original_sha256"] = hashlib.sha256(raw).hexdigest()
             collector.emit(
-                "artifact", path=target.name, source=str(source), kind_of_artifact="test_source"
+                "artifact",
+                path=target.name,
+                source=str(source),
+                kind_of_artifact="test_source",
+                **identity,
             )
 
         collector.capture("test_source", copy_source)

@@ -1,5 +1,6 @@
 """Evidence must survive failures, reset, and teardown without changing outcomes."""
 
+import hashlib
 import json
 import os
 import sys
@@ -199,6 +200,54 @@ def test_unrelated():
         "changed_files",
         "tracked_diff",
     }
+
+
+def _record_pytest_file(tmp_path, monkeypatch, body, extra_env=None):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "execution-context.json").write_text("{}")
+    source = tmp_path / "test_fixture_source.py"
+    source.write_text(body)
+    env = {**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", **(extra_env or {})}
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTEST_PLUGINS", None)
+    command = [sys.executable, "-m", "pytest", str(source), "-q", "-o", "addopts="]
+    assert run(tmp_path, [*command, "--confcutdir", str(tmp_path)], env) == 0
+    attempt = next((tmp_path / "execution").glob("*/attempt.json")).parent
+    [artifact] = [e for e in events(attempt) if e.get("kind_of_artifact") == "test_source"]
+    return source, attempt, artifact
+
+
+def test_test_source_keeps_original_hash_when_token_literal_is_redacted(tmp_path, monkeypatch):
+    body = "def test_header():\n    assert 'Bearer workflow-token'.startswith('Bearer')\n"
+    source, attempt, artifact = _record_pytest_file(tmp_path, monkeypatch, body)
+    copy = (attempt / artifact["path"]).read_text()
+    assert "workflow-token" not in copy
+    assert "Bearer [redacted]" in copy
+    assert artifact["redacted"] is True
+    assert artifact["original_sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+
+
+def test_test_source_without_redaction_hashes_match(tmp_path, monkeypatch):
+    source, _, artifact = _record_pytest_file(
+        tmp_path, monkeypatch, "def test_plain():\n    assert True\n"
+    )
+    original = hashlib.sha256(source.read_bytes()).hexdigest()
+    assert artifact["redacted"] is False
+    assert artifact["original_sha256"] == original
+    assert artifact["path"] == f"source-{original}.py"
+
+
+def test_test_source_with_live_secret_withholds_original_hash(tmp_path, monkeypatch):
+    secret = "live-environment-secret-value"
+    body = f"def test_uses_secret():\n    assert '{secret}'\n"
+    _, attempt, artifact = _record_pytest_file(
+        tmp_path, monkeypatch, body, {"EXAMPLE_API_KEY": secret}
+    )
+    assert artifact["redacted"] is True
+    assert "original_sha256" not in artifact
+    for path in attempt.rglob("*"):
+        if path.is_file():
+            assert secret not in path.read_text(errors="replace"), path.name
 
 
 def test_execute_records_readiness_failure_before_command(tmp_path, monkeypatch):

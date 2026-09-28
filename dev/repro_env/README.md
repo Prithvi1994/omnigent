@@ -38,6 +38,14 @@ Raw traces are sanitized in a private temporary directory outside the retained
 evidence tree. Only sanitized copies enter the bundle. If redaction fails, cleanup
 is attempted and the collector records the failure without advertising a saved trace. Other observations remain available.
 
+Each executed test file is retained as a redacted `source-<sha256>.py` copy, named
+by the hash of that copy. Its `test_source` artifact event also records
+`redacted` (whether redaction changed the copy) and `original_sha256`, the hash of
+the file's bytes on disk, so a verifier can match the committed file even when a
+token-like literal such as `Bearer <value>` was redacted. `original_sha256` is
+omitted when the file contains a live environment secret value. Records written
+before these fields existed have neither.
+
 Output is redacted after complete lines are assembled. Lines exceeding the 8 MiB
 redaction buffer are omitted with an explicit incomplete-output record; fragments
 are never saved independently. This protects retained output, not the command's
