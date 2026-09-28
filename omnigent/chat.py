@@ -591,19 +591,29 @@ def run_prompt_result(**kwargs: Any) -> PromptResult:
         raise InterruptedError("Headless invocation terminated")
 
     try:
-        if main_thread and previous is not None:
-            signal.signal(signal.SIGTERM, interrupted)
-        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
-            run_prompt(**kwargs)
+        try:
+            if main_thread and previous is not None:
+                signal.signal(signal.SIGTERM, interrupted)
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                run_prompt(**kwargs)
+        finally:
+            try:
+                if main_thread and previous is not None:
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            finally:
+                _STRICT_PROMPT_COMPLETION.reset(completion_token)
+                if main_thread and previous is not None:
+                    signal.signal(signal.SIGTERM, previous)
     except InterruptedError as exc:
         status, error = "failed", str(exc)
     except (Exception, SystemExit) as exc:  # noqa: BLE001 — typed failure boundary
         status = "failed"
-        error = errors.getvalue().strip() or str(exc) or type(exc).__name__
-    finally:
-        _STRICT_PROMPT_COMPLETION.reset(completion_token)
-        if main_thread and previous is not None:
-            signal.signal(signal.SIGTERM, previous)
+        # Numeric CLI exits carry their useful diagnostic on stderr. Other
+        # exceptions must not be masked by earlier warnings or progress text.
+        if isinstance(exc, SystemExit) and (exc.code is None or isinstance(exc.code, int)):
+            error = errors.getvalue().strip() or str(exc) or type(exc).__name__
+        else:
+            error = str(exc) or errors.getvalue().strip() or type(exc).__name__
     return PromptResult(status, output.getvalue(), error, time.monotonic() - started)
 
 
@@ -2803,8 +2813,8 @@ async def _persisted_turn_error(
 ) -> str | None:
     """Read the latest turn error, with opt-in strict completion semantics.
 
-    The relay flushes final assistant text before persisting terminal errors.
-    A newer completed message therefore supersedes an earlier recovered error.
+    In strict mode, the relay flushes final assistant text before persisting
+    terminal errors. A newer completed message supersedes a recovered error.
     Informational banners are not failures. An unreadable transcript cannot
     establish successful completion in strict mode. Legacy callers retain
     their best-effort lookup through the current turn.

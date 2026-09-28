@@ -4314,6 +4314,12 @@ async def test_legacy_prompt_retains_text_despite_later_error(monkeypatch, query
     assert result == ("direct answer" if query_impl is _return_text else "preamble")
 
 
+async def test_legacy_prompt_success_does_not_read_transcript(monkeypatch):
+    client = _FakeAPClient([], list_items_must_not_be_called=True)
+    assert await _run_one_shot(client, _return_text, monkeypatch) == "direct answer"
+    assert client.sessions.list_items_calls == 0
+
+
 async def test_legacy_prompt_does_not_require_readable_terminal_outcome(monkeypatch):
     client = _FakeAPClient([])
 
@@ -4346,11 +4352,27 @@ def test_prompt_result_preserves_terminal_outcome(monkeypatch, fails):
     assert not chat._STRICT_PROMPT_COMPLETION.get()
 
 
+def test_prompt_result_exception_is_not_masked_by_stderr_warning(monkeypatch):
+    def run(**kwargs):
+        print("unrelated warning", file=__import__("sys").stderr)
+        raise RuntimeError("actual execution failure")
+
+    monkeypatch.setattr(chat_module, "run_prompt", run)
+    result = chat_module.run_prompt_result(target="unused", client_tools=None, prompt="hi")
+    assert result.status == "failed"
+    assert result.error == "actual execution failure"
+
+
 def test_prompt_result_sigterm_unwinds_and_restores_handler(monkeypatch):
     import signal
 
     cleaned = []
     previous = signal.getsignal(signal.SIGTERM)
+
+    def sentinel(signum, frame):
+        raise AssertionError("typed invocation handler not installed")
+
+    signal.signal(signal.SIGTERM, sentinel)
 
     def run(**kwargs):
         print("diagnostic before termination", file=__import__("sys").stderr)
@@ -4365,9 +4387,36 @@ def test_prompt_result_sigterm_unwinds_and_restores_handler(monkeypatch):
         assert result.status == "failed"
         assert "terminated" in result.error
         assert cleaned == [True]
-        assert signal.getsignal(signal.SIGTERM) == previous
+        assert signal.getsignal(signal.SIGTERM) is sentinel
     finally:
         signal.signal(signal.SIGTERM, previous)
+
+
+def test_prompt_result_sigterm_during_handler_cleanup_is_typed(monkeypatch):
+    import signal
+
+    previous = signal.getsignal(signal.SIGTERM)
+    install = signal.signal
+    injected = False
+
+    def during_cleanup(signum, handler):
+        nonlocal injected
+        if handler == signal.SIG_IGN and not injected:
+            injected = True
+            signal.raise_signal(signal.SIGTERM)
+        return install(signum, handler)
+
+    monkeypatch.setattr(signal, "signal", during_cleanup)
+    monkeypatch.setattr(chat_module, "run_prompt", lambda **kwargs: None)
+    try:
+        result = chat_module.run_prompt_result(target="unused", client_tools=None, prompt="hi")
+        assert injected
+        assert result.status == "failed"
+        assert "terminated" in result.error
+        assert signal.getsignal(signal.SIGTERM) == previous
+        assert not chat_module._STRICT_PROMPT_COMPLETION.get()
+    finally:
+        install(signal.SIGTERM, previous)
 
 
 async def test_query_sessions_once_multi_turn_async_orchestrator(
@@ -4390,7 +4439,7 @@ async def test_query_sessions_once_multi_turn_async_orchestrator(
             extra_turns=["<!-- POLLY_REVIEW_START -->\n## Summary\nLooks good."],
         ),
     )
-    client = _FakeAPClient([])
+    client = _FakeAPClient([], list_items_must_not_be_called=True)
     result = await _query_sessions_once(
         client=client,
         agent_name="polly",
