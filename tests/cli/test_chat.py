@@ -4374,8 +4374,15 @@ async def test_strict_recovery_returns_only_verified_snapshot(monkeypatch, query
     assert client.sessions.list_items_calls == 2
 
 
-@pytest.mark.parametrize("outcome", ["completed", "failed", "incomplete", "cancelled", None])
-@pytest.mark.parametrize("auto_wake", [False, True, "missed-start", "missed-response"])
+@pytest.mark.parametrize(
+    ("outcome", "auto_wake"),
+    [
+        (outcome, auto_wake)
+        for outcome in ("completed", "failed", "incomplete", "cancelled", None)
+        for auto_wake in (False, True, "missed-start", "missed-response")
+    ]
+    + [("completed", "tool-only")],
+)
 async def test_strict_prompt_checks_real_sdk_response_events(monkeypatch, outcome, auto_wake):
     from omnigent_client import SessionsChat
 
@@ -4420,14 +4427,15 @@ async def test_strict_prompt_checks_real_sdk_response_events(monkeypatch, outcom
                 )
                 if auto_wake != "missed-start" or self.subscriptions == 1:
                     yield CreatedEvent(type="response.created", response=response)
-                yield OutputTextDeltaEvent(
-                    type="response.output_text.delta",
-                    response_id=response_id,
-                    item_id="msg_test",
-                    output_index=0,
-                    content_index=0,
-                    delta="partial or final text",
-                )
+                if auto_wake != "tool-only" or self.subscriptions == 1:
+                    yield OutputTextDeltaEvent(
+                        type="response.output_text.delta",
+                        response_id=response_id,
+                        item_id="msg_test",
+                        output_index=0,
+                        content_index=0,
+                        delta="partial or final text",
+                    )
                 # Child completion cannot establish parent response completion.
                 yield SessionChildSessionUpdatedEvent(
                     type="session.child_session.updated",
@@ -4457,14 +4465,16 @@ async def test_strict_prompt_checks_real_sdk_response_events(monkeypatch, outcom
             _item_user("hi"),
             _item_assistant(
                 "preamble",
-                response_id="resp_2" if auto_wake and auto_wake != "missed-response" else "resp_1",
+                response_id="resp_2"
+                if auto_wake and auto_wake not in ("missed-response", "tool-only")
+                else "resp_1",
             ),
         ]
     )
     call = _run_one_shot(
         client, _return_text, monkeypatch, strict_completion=True, chat_cls=SessionsChat
     )
-    if outcome == "completed" and auto_wake != "missed-response":
+    if outcome == "completed" and auto_wake not in ("missed-response", "tool-only"):
         expected = "partial or final text"
         assert await call == (f"{expected}\n\n{expected}" if auto_wake else expected)
     else:

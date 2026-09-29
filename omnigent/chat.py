@@ -588,7 +588,8 @@ def run_prompt_result(**kwargs: Any) -> PromptResult:
     """Run the CLI harness and retain its terminal outcome.
 
     Completion requires an observed successful response and an idle session.
-    Lost completion events fail verification, even when saved text exists.
+    Saved text must belong to the latest observed completed response; lost
+    events or a later tool-only response leave earlier text unverified.
     Output capture changes process-global streams; use an isolated process
     when other threads may print or invoke this API concurrently.
     """
