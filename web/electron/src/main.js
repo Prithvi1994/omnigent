@@ -1559,8 +1559,9 @@ async function loadServerUrl(
           const settings = loadSettings();
           const aliases = parseServerAliases(settings.server_aliases);
           if (Object.hasOwn(aliases, resolvedOrigin)) {
-            delete aliases[resolvedOrigin];
-            settings.server_aliases = aliases;
+            settings.server_aliases = Object.fromEntries(
+              Object.entries(aliases).filter(([origin]) => origin !== resolvedOrigin),
+            );
             saveSettings(settings);
           }
         }
