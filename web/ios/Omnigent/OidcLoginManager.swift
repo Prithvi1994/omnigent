@@ -126,9 +126,7 @@ final class OidcLoginManager {
       try await Task.sleep(for: pollInterval)
       var components = URLComponents(
         url: endpoint("/auth/cli-poll", origin: origin), resolvingAgainstBaseURL: false)
-      components?.queryItems = [
-        URLQueryItem(name: "ticket", value: ticket),
-      ]
+      components?.queryItems = [URLQueryItem(name: "ticket", value: ticket)]
       guard let url = components?.url else { throw LoginError.invalidResponse }
       var request = URLRequest(url: url)
       request.setValue(codeVerifier, forHTTPHeaderField: "X-Omnigent-Code-Verifier")
