@@ -6,7 +6,13 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { PullRequestChangedFile, PullRequestInfo } from "@/hooks/usePullRequests";
+import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
+import type {
+  PullRequestAuth,
+  PullRequestChangedFile,
+  PullRequestDiffResponse,
+  PullRequestInfo,
+} from "@/hooks/usePullRequests";
 
 const state = vi.hoisted(() => ({
   info: null as {
@@ -24,14 +30,18 @@ const state = vi.hoisted(() => ({
   // Per-file diffs the stubbed parsePatchFiles yields (name + optional
   // rename fields), so tests can exercise renamed/pure-rename rendering.
   parsedFiles: [] as { name: string; prevName?: string; type?: string }[],
+  // The whole-PR diff response; the panel parses its patch into per-file diffs.
+  diff: null as PullRequestDiffResponse | null,
 }));
 
-vi.mock("@/hooks/usePullRequests", () => ({
+vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
+  // The panel reads every info payload through the real normalizer.
+  normalizePullRequestInfo: (await importOriginal<typeof UsePullRequestsModule>())
+    .normalizePullRequestInfo,
   usePullRequestInfo: vi.fn(() => state.info),
   usePullRequestChangedFiles: vi.fn(() => state.changes),
-  // One whole-PR patch; the panel parses it into per-file diffs.
   usePullRequestDiff: () => ({
-    data: { object: "session.github.pr_diff", patch: "PATCH" },
+    data: state.diff,
     isLoading: false,
     error: null,
     isFetching: false,
@@ -184,6 +194,7 @@ beforeEach(() => {
   };
   // Default parsed diffs mirror the two changed files above.
   state.parsedFiles = [{ name: "hello.py" }, { name: "src/app.ts" }];
+  state.diff = { object: "session.github.pr_diff", patch: "PATCH" };
 });
 
 afterEach(() => {
@@ -457,6 +468,108 @@ describe("PullRequestPanel", () => {
     }
   });
 
+  it("hides the account selector when the provider can't switch accounts", () => {
+    const info = state.info!.data!;
+    info.repo = null;
+    info.accounts = ["personal", "work"].map((login) => ({
+      login,
+      active: login === "personal",
+      state: "success",
+      host: "github.com",
+    }));
+    info.selected_account = "personal";
+    info.capabilities = {
+      account_switching: false,
+      base_remote_selection: true,
+      line_counts: true,
+      linked_pr_diff: true,
+    };
+    renderPanel();
+    expect(screen.getByText("Can’t reach the upstream repo")).toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "GitHub account" })).toBeNull();
+  });
+
+  it("names the remote host when no provider supports the remote", () => {
+    state.info = {
+      data: {
+        object: "session.github.info",
+        available: false,
+        reason: "unsupported_remote",
+        remote_host: "git.example.com",
+      },
+      isLoading: false,
+      error: null,
+      isFetching: false,
+    };
+    renderPanel();
+    expect(screen.getByText("No supported remote")).toBeInTheDocument();
+    expect(screen.getByText("git.example.com")).toBeInTheDocument();
+    expect(screen.queryByTestId("diff")).toBeNull();
+  });
+
+  describe("with a provider the panel has no copy for", () => {
+    const gitlab = (auth: Partial<PullRequestAuth>): PullRequestInfo => ({
+      object: "session.github.info",
+      available: true,
+      provider: "gitlab",
+      auth: {
+        authenticated: true,
+        hint: null,
+        cli: { name: "glab", available: true },
+        accounts: [
+          { login: "personal", active: true, state: "success", host: "gitlab.com" },
+          { login: "work", active: false, state: "success", host: "gitlab.com" },
+        ],
+        selected_account: "personal",
+        ...auth,
+      },
+      capabilities: {
+        account_switching: false,
+        base_remote_selection: false,
+        line_counts: true,
+        linked_pr_diff: false,
+      },
+      branch: "test/pr-view",
+      repo: null,
+      pr: null,
+    });
+
+    it("uses the generic label and names the missing CLI", () => {
+      state.info!.data = gitlab({ cli: { name: "glab", available: false } });
+      renderPanel();
+      expect(screen.getByRole("heading", { name: "gitlab" })).toBeInTheDocument();
+      expect(screen.getByText("gitlab CLI not found")).toBeInTheDocument();
+      expect(screen.getByText("glab")).toHaveClass("font-mono");
+      expect(screen.queryByRole("combobox", { name: "GitHub account" })).toBeNull();
+      expect(screen.queryByText(/GitHub/)).toBeNull();
+    });
+
+    it("shows the host's sign-in hint when the repo can't be reached", () => {
+      state.info!.data = gitlab({
+        authenticated: false,
+        hint: "Run `glab auth login` on the host.",
+      });
+      renderPanel();
+      expect(screen.getByText("Can’t reach the upstream repo")).toBeInTheDocument();
+      expect(screen.getByText("glab auth login")).toHaveClass("font-mono");
+      expect(screen.queryByText(/gh auth status/)).toBeNull();
+      expect(screen.queryByRole("combobox", { name: "GitHub account" })).toBeNull();
+    });
+  });
+
+  it("explains a diff the host can't produce for a PR outside the workspace", async () => {
+    state.diff = {
+      object: "session.github.pr_diff",
+      patch: "",
+      unavailable_reason: "pr_outside_workspace",
+    };
+    renderChanges();
+    expect(
+      await screen.findByText("Diff unavailable for a PR outside this workspace's repository"),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("diff")).toBeNull();
+  });
+
   it("shows a no-open-PR empty state (naming the branch) and hides the diff", () => {
     state.info!.data!.pr = null;
     renderPanel();
@@ -545,9 +658,10 @@ describe("derivePullRequestPanelState", () => {
   });
 
   it("walks the gh layer: cli → auth → repo → pr → ready", () => {
-    expect(derivePullRequestPanelState(q({ data: { ...ready, gh_available: false } })).kind).toBe(
-      "no-gh-cli",
-    );
+    expect(derivePullRequestPanelState(q({ data: { ...ready, gh_available: false } }))).toEqual({
+      kind: "no-cli",
+      cli: "gh",
+    });
     expect(derivePullRequestPanelState(q({ data: { ...ready, authenticated: false } })).kind).toBe(
       "repo-unresolved",
     );
@@ -557,6 +671,37 @@ describe("derivePullRequestPanelState", () => {
     const noPr = derivePullRequestPanelState(q({ data: { ...ready, pr: null } }));
     expect(noPr).toEqual({ kind: "no-pr", branch: "feat/x" });
     expect(derivePullRequestPanelState(q({ data: ready }))).toEqual({ kind: "ready" });
+  });
+
+  it("reads the remote host and the provider's auth from the payload", () => {
+    expect(
+      derivePullRequestPanelState(
+        q({
+          data: {
+            object: "session.github.info",
+            available: false,
+            reason: "unsupported_remote",
+            remote_host: "git.example.com",
+          },
+        }),
+      ),
+    ).toEqual({ kind: "unsupported-remote", remoteHost: "git.example.com" });
+    // `auth` wins over the legacy fields, which still say gh is ready.
+    const auth: PullRequestAuth = {
+      authenticated: true,
+      hint: null,
+      cli: { name: "az", available: true },
+      accounts: null,
+      selected_account: null,
+    };
+    const az = (over: Partial<PullRequestAuth>) => ({ ...ready, auth: { ...auth, ...over } });
+    expect(
+      derivePullRequestPanelState(q({ data: az({ cli: { name: "az", available: false } }) })),
+    ).toEqual({ kind: "no-cli", cli: "az" });
+    expect(derivePullRequestPanelState(q({ data: az({ authenticated: false }) })).kind).toBe(
+      "repo-unresolved",
+    );
+    expect(derivePullRequestPanelState(q({ data: az({}) }))).toEqual({ kind: "ready" });
   });
 });
 

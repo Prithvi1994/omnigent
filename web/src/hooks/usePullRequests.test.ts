@@ -1,11 +1,17 @@
 // Tests for the pure helpers in usePullRequests — the 404 → reason classifier that
-// steers an outdated host to the "update your host" panel state, and the
-// panel's poll-interval decision.
+// steers an outdated host to the "update your host" panel state, the payload
+// normalizer (and that the info fetch applies it), and the panel's
+// poll-interval decision.
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   computePullRequestPollInterval,
+  fetchPullRequestInfo,
+  normalizePullRequestInfo,
   pullRequestNotFoundReason,
+  type PullRequestAccount,
+  type PullRequestAuth,
+  type PullRequestCapabilities,
   type PullRequestChecks,
   type PullRequestInfo,
 } from "@/hooks/usePullRequests";
@@ -25,6 +31,134 @@ describe("pullRequestNotFoundReason", () => {
     expect(pullRequestNotFoundReason("Resource 'terminal' not found")).toBe("no_os_env");
     expect(pullRequestNotFoundReason(undefined)).toBe("no_os_env");
     expect(pullRequestNotFoundReason("")).toBe("no_os_env");
+  });
+});
+
+describe("normalizePullRequestInfo", () => {
+  const accounts: PullRequestAccount[] = [
+    { login: "personal", active: true, state: "success", host: "github.com" },
+    { login: "work", active: false, state: "success", host: "github.com" },
+  ];
+  const githubCapabilities: PullRequestCapabilities = {
+    account_switching: true,
+    base_remote_selection: true,
+    line_counts: true,
+    linked_pr_diff: true,
+  };
+
+  it("fills GitHub defaults from a legacy payload and keeps the legacy fields", () => {
+    const legacy: PullRequestInfo = {
+      object: "session.github.info",
+      available: true,
+      gh_available: false,
+      authenticated: false,
+      accounts,
+      selected_account: "work",
+    };
+    expect(normalizePullRequestInfo(legacy)).toEqual({
+      ...legacy,
+      provider: "github",
+      auth: {
+        authenticated: false,
+        hint: null,
+        cli: { name: "gh", available: false },
+        accounts,
+        selected_account: "work",
+      },
+      capabilities: githubCapabilities,
+    });
+  });
+
+  it("leaves the CLI and accounts empty when the legacy fields are absent", () => {
+    const info = normalizePullRequestInfo({
+      object: "session.github.info",
+      available: false,
+      reason: "no_os_env",
+    });
+    expect(info.auth).toEqual({
+      authenticated: true,
+      hint: null,
+      cli: null,
+      accounts: null,
+      selected_account: null,
+    });
+  });
+
+  it("prefers auth over the legacy fields when a host sends both", () => {
+    const auth: PullRequestAuth = {
+      authenticated: true,
+      hint: null,
+      cli: { name: "gh", available: true },
+      accounts,
+      selected_account: "personal",
+    };
+    const info = normalizePullRequestInfo({
+      object: "session.github.info",
+      available: true,
+      provider: "github",
+      auth,
+      gh_available: false,
+      authenticated: false,
+      accounts: [],
+      selected_account: "work",
+    });
+    expect(info.auth).toEqual(auth);
+    expect(info.gh_available).toBe(false);
+  });
+
+  it("passes a non-GitHub payload through unchanged", () => {
+    const ado: PullRequestInfo = {
+      object: "session.github.info",
+      available: true,
+      provider: "azure_devops",
+      auth: {
+        authenticated: true,
+        hint: "Run az login on the host.",
+        cli: { name: "az", available: true },
+        accounts: null,
+        selected_account: null,
+      },
+      capabilities: {
+        account_switching: false,
+        base_remote_selection: false,
+        line_counts: false,
+        linked_pr_diff: false,
+      },
+      repo: { name_with_owner: "org/project/repo" },
+    };
+    expect(normalizePullRequestInfo(ado)).toEqual(ado);
+  });
+});
+
+describe("fetchPullRequestInfo", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("normalizes the host's payload and the synthesized 404 payload", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({ object: "session.github.info", available: true, gh_available: true }),
+            { status: 200 },
+          ),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ error: { message: "Resource 'github' not found" } }), {
+            status: 404,
+          }),
+        ),
+    );
+    await expect(fetchPullRequestInfo("conv")).resolves.toMatchObject({
+      provider: "github",
+      auth: { cli: { name: "gh", available: true } },
+    });
+    await expect(fetchPullRequestInfo("conv")).resolves.toMatchObject({
+      reason: "host_outdated",
+      provider: "github",
+      auth: { authenticated: true, cli: null },
+    });
   });
 });
 
@@ -89,6 +223,29 @@ describe("computePullRequestPollInterval", () => {
     expect(
       computePullRequestPollInterval(ready({ pr: { ...ready().pr!, checks: checks() } })),
     ).toBe(5_000);
+  });
+
+  it("reads the sign-in state from auth, else from the legacy fields", () => {
+    const auth = (over: Partial<PullRequestAuth> = {}): PullRequestAuth => ({
+      authenticated: true,
+      hint: null,
+      cli: { name: "az", available: true },
+      accounts: null,
+      selected_account: null,
+      ...over,
+    });
+    // A settled PR still polls while the provider CLI is missing or signed out.
+    expect(
+      computePullRequestPollInterval(
+        ready({ auth: auth({ cli: { name: "az", available: false } }) }),
+      ),
+    ).toBe(5_000);
+    expect(computePullRequestPollInterval(ready({ auth: auth({ authenticated: false }) }))).toBe(
+      5_000,
+    );
+    expect(computePullRequestPollInterval(ready({ auth: auth() }))).toBe(false);
+    // A legacy payload without `auth` maps through the normalizer.
+    expect(computePullRequestPollInterval(ready({ gh_available: false }))).toBe(5_000);
   });
 
   it("rests once there is nothing left to watch", () => {

@@ -2,8 +2,9 @@
 // the `github` prefix because they are stable wire ids.
 //
 // PullRequestPanel — the right-rail "GitHub" tab. Read-only view of the session
-// branch's relationship to GitHub: the associated PR (number, title, state, CI
-// summary, link out) and the branch-vs-base diff.
+// branch's relationship to its git provider: the associated PR (number, title,
+// state, CI summary, link out) and the branch-vs-base diff. Provider-visible
+// text comes from lib/gitProviders.ts.
 //
 // Layout is GitHub's "Files changed": every file's diff stacked in one scroll
 // view, with the sidebar as a jump-to-file navigator that also highlights the
@@ -13,12 +14,13 @@
 // fetches a file's full content (/resources/github/diff/{path}) only when the
 // reader expands unchanged context.
 //
-// Data comes from the runner's read-only GitHub resource API (see
-// hooks/usePullRequests.ts), which shells out to `gh` + `git`.
+// Data comes from the runner's read-only PR resource API (see
+// hooks/usePullRequests.ts), which shells out to the provider CLI + `git`.
 // `derivePullRequestPanelState` is the single switch that turns the info query
-// into what the panel shows: an outdated host, a non-git workspace, a missing
-// `gh` CLI, an unresolved upstream repo, or no PR each render their own empty
-// state, and an associated PR falls through to the header + stacked diff.
+// into what the panel shows: an outdated host, a non-git workspace, an
+// unsupported remote, a missing provider CLI, an unresolved upstream repo, or no
+// PR each render their own empty state, and an associated PR falls through to
+// the header + stacked diff.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -47,6 +49,7 @@ import {
   PanelLeftOpenIcon,
   PlusIcon,
   Rows2Icon,
+  ServerOffIcon,
   TerminalIcon,
   Trash2Icon,
 } from "lucide-react";
@@ -72,14 +75,17 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
+import { gitProviderCopy } from "@/lib/gitProviders";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import {
   fetchPullRequestFileContents,
+  normalizePullRequestInfo,
   usePullRequestChangedFiles,
   usePullRequestDiff,
   usePullRequestInfo,
   useSetPullRequestPreference,
   useUpdateSessionPr,
+  type NormalizedPullRequestInfo,
   type PullRequestAssociation,
   type PullRequestChangedFile,
   type PullRequestCheckRun,
@@ -102,7 +108,7 @@ function PanelMessage({ children }: { children: React.ReactNode }) {
 }
 
 /** Full-panel empty state: an icon, a title, an optional hint line, and optional
- *  children below (the account/remote selectors). Used for every "no GitHub
+ *  children below (the account/remote selectors). Used for every "no PR
  *  content to show" reason so they read as one family. */
 function PullRequestEmptyState({
   icon: Icon,
@@ -125,6 +131,21 @@ function PullRequestEmptyState({
   );
 }
 
+/** Provider copy with its `backticked` commands set in the monospace font. */
+function codeSpans(text: string): React.ReactNode {
+  return text.split("`").map((part, i) => {
+    // Static copy, so position keys stay stable across renders.
+    const key = `${i}:${part}`;
+    return i % 2 ? (
+      <span key={key} className="font-mono">
+        {part}
+      </span>
+    ) : (
+      part
+    );
+  });
+}
+
 /**
  * Account switcher — the one PR-resolution lever that can't be inferred: it picks
  * which signed-in identity `gh` runs as, i.e. which account can even see the repo.
@@ -132,20 +153,21 @@ function PullRequestEmptyState({
  * state), since that's an access problem the account can fix. Once the repo
  * resolves, the account is correct — surfacing the knob then would just invite a
  * misconfiguration, so it's absent from the header and the `no-pr` state. Renders
- * nothing with a single account (nothing to choose).
+ * nothing with a single account (nothing to choose) or when the provider can't
+ * switch accounts.
  */
 function GithubAccountSelector({
   conversationId,
   info,
 }: {
   conversationId: string;
-  info: PullRequestInfo;
+  info: NormalizedPullRequestInfo;
 }) {
   const setPref = useSetPullRequestPreference(conversationId);
-  const accounts = info.accounts ?? [];
-  if (accounts.length <= 1) return null;
+  const accounts = info.auth.accounts ?? [];
+  if (!info.capabilities.account_switching || accounts.length <= 1) return null;
 
-  const selectedAccount = info.selected_account ?? undefined;
+  const selectedAccount = info.auth.selected_account ?? undefined;
 
   return (
     <div className="flex w-full max-w-xs flex-col items-center gap-2 pt-2">
@@ -184,16 +206,17 @@ export type PullRequestPanelState =
   | { kind: "host-outdated" }
   | { kind: "unavailable" }
   | { kind: "not-a-git-repo" }
-  | { kind: "no-gh-cli" }
+  | { kind: "unsupported-remote"; remoteHost: string | undefined }
+  | { kind: "no-cli"; cli: string }
   | { kind: "repo-unresolved" }
   | { kind: "no-pr"; branch: string | undefined }
   | { kind: "ready" };
 
-/** Central switch turning the GitHub info query into the panel's state.
+/** Central switch turning the PR info query into the panel's state.
  *
  * Order matters: transient states (loading/offline/error) first, then the
- * git-first availability reasons, then the `gh` enhancement layer (CLI → auth
- * → repo → PR). `ready` is reached only with an associated PR to render. */
+ * git-first availability reasons, then the provider layer (CLI → auth → repo
+ * → PR). `ready` is reached only with an associated PR to render. */
 export function derivePullRequestPanelState(info: {
   isLoading: boolean;
   error: unknown;
@@ -208,15 +231,19 @@ export function derivePullRequestPanelState(info: {
   if (!data || !data.available) {
     if (data?.reason === "not_a_git_repo") return { kind: "not-a-git-repo" };
     if (data?.reason === "host_outdated") return { kind: "host-outdated" };
+    if (data?.reason === "unsupported_remote") {
+      return { kind: "unsupported-remote", remoteHost: data.remote_host };
+    }
     return { kind: "unavailable" };
   }
-  // Git repo present; `gh` layers PR/repo metadata on top of it.
-  if (data.gh_available === false) return { kind: "no-gh-cli" };
+  // Git repo present; the provider CLI layers PR/repo metadata on top of it.
+  const { auth, repo, pr, branch } = normalizePullRequestInfo(data);
+  if (auth.cli?.available === false) return { kind: "no-cli", cli: auth.cli.name };
   // Not signed in, or signed in but the upstream repo can't be resolved —
-  // both point the user at `gh auth status`.
-  if (data.authenticated === false) return { kind: "repo-unresolved" };
-  if (!data.repo?.name_with_owner) return { kind: "repo-unresolved" };
-  if (!data.pr) return { kind: "no-pr", branch: data.branch };
+  // both point the user at the provider's sign-in check.
+  if (!auth.authenticated) return { kind: "repo-unresolved" };
+  if (!repo?.name_with_owner) return { kind: "repo-unresolved" };
+  if (!pr) return { kind: "no-pr", branch };
   return { kind: "ready" };
 }
 
@@ -499,7 +526,13 @@ function CheckPill({
 // rendered as GitHub-flavored markdown via the shared MessageResponse.
 
 /** One comment card: an author + relative-time header over the markdown body. */
-function PullRequestCommentCard({ comment }: { comment: PullRequestComment }) {
+function PullRequestCommentCard({
+  comment,
+  providerLabel,
+}: {
+  comment: PullRequestComment;
+  providerLabel: string;
+}) {
   const ts = comment.created_at ? Date.parse(comment.created_at) : NaN;
   const rel = relativeTime(ts);
   const initial = comment.author?.[0]?.toUpperCase() ?? "?";
@@ -525,7 +558,7 @@ function PullRequestCommentCard({ comment }: { comment: PullRequestComment }) {
             href={comment.url}
             target="_blank"
             rel="noreferrer"
-            aria-label="Open comment on GitHub"
+            aria-label={`Open comment on ${providerLabel}`}
             className="ml-auto shrink-0 text-muted-foreground hover:text-foreground"
           >
             <ExternalLinkIcon className="size-3" />
@@ -544,10 +577,12 @@ function PullRequestSummaryTab({
   checks,
   body,
   comments,
+  providerLabel,
 }: {
   checks: PullRequestChecks;
   body: string | null | undefined;
   comments: PullRequestComment[];
+  providerLabel: string;
 }) {
   return (
     // Extra bottom padding so the last comment can scroll clear of the very
@@ -606,7 +641,11 @@ function PullRequestSummaryTab({
         ) : (
           <ul className="space-y-2">
             {comments.map((c, i) => (
-              <PullRequestCommentCard key={c.url ?? `${c.author}-${i}`} comment={c} />
+              <PullRequestCommentCard
+                key={c.url ?? `${c.author}-${i}`}
+                comment={c}
+                providerLabel={providerLabel}
+              />
             ))}
           </ul>
         )}
@@ -771,10 +810,12 @@ function SidebarNode({
   );
 }
 
-function pullRequestLabel(pr: PullRequestAssociation): string {
-  const host = pr.host === "github.com" ? "" : `${pr.host}/`;
+/** A PR's picker label, in its own provider's copy (else the session's). */
+function pullRequestLabel(pr: PullRequestAssociation, sessionProvider?: string): string {
+  const copy = gitProviderCopy(pr.provider ?? sessionProvider);
+  const host = pr.host === copy.defaultHost ? "" : `${pr.host}/`;
   const inferred = pr.relationship === "inferred" ? " (from branch)" : "";
-  const identity = `${host}${pr.repository} #${pr.number}${inferred}`;
+  const identity = `${host}${pr.repository} ${copy.prNumberPrefix}${pr.number}${inferred}`;
   const title = pr.title?.trim();
   return title ? `${identity} — ${title}` : identity;
 }
@@ -792,14 +833,14 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
   const info = usePullRequestInfo(conversationId, { poll: true, prUrl: selected });
   const [knownAssociations, setKnownAssociations] = useState<{
     sessionId: string;
-    data: Pick<PullRequestInfo, "prs" | "tracking_available" | "selected_pr_url">;
+    data: Pick<PullRequestInfo, "prs" | "tracking_available" | "selected_pr_url" | "provider">;
   }>();
   useEffect(() => {
     if (info.data) {
-      const { prs, tracking_available, selected_pr_url } = info.data;
+      const { prs, tracking_available, selected_pr_url, provider } = info.data;
       setKnownAssociations({
         sessionId: conversationId,
-        data: { prs, tracking_available, selected_pr_url },
+        data: { prs, tracking_available, selected_pr_url, provider },
       });
     }
   }, [conversationId, info.data]);
@@ -807,6 +848,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
   const associations =
     info.data ??
     (knownAssociations?.sessionId === conversationId ? knownAssociations.data : undefined);
+  const copy = gitProviderCopy(associations?.provider);
   const update = useUpdateSessionPr(conversationId);
   useEffect(() => {
     if (!selected && info.data?.selected_pr_url) {
@@ -849,7 +891,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
             required
             value={url}
             onChange={(event) => setUrl(event.target.value)}
-            placeholder="https://github.com/owner/repo/pull/123"
+            placeholder={copy.prUrlPlaceholder}
             className="flex-1 focus-visible:ring-0"
           />
           <Button type="submit" disabled={update.isPending}>
@@ -877,7 +919,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
           rel="noreferrer"
           className="text-foreground underline underline-offset-4"
         >
-          Open the PR on GitHub
+          Open the PR on {copy.label}
         </a>
       </div>
     ) : undefined;
@@ -886,7 +928,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
     <div className="flex h-full min-h-0 flex-col">
       {showTrackingControls ? (
         <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
-          <h2 className="shrink-0 font-medium text-ui">GitHub</h2>
+          <h2 className="shrink-0 font-medium text-ui">{copy.label}</h2>
           <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
             {prs.length > 0 && (
               <TooltipProvider>
@@ -914,7 +956,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
                     </TooltipTrigger>
                     {selectedPr && (
                       <TooltipContent className="wrap-anywhere">
-                        {pullRequestLabel(selectedPr)}
+                        {pullRequestLabel(selectedPr, associations.provider)}
                       </TooltipContent>
                     )}
                   </Tooltip>
@@ -939,7 +981,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
                             }
                             className="*:[span]:last:block *:[span]:last:min-w-0 *:[span]:last:truncate"
                           >
-                            {pullRequestLabel(pr)}
+                            {pullRequestLabel(pr, associations.provider)}
                           </SelectItem>
                         </TooltipTrigger>
                         <TooltipContent
@@ -947,7 +989,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
                           className="wrap-anywhere"
                           style={isMobileViewport ? { pointerEvents: "none" } : undefined}
                         >
-                          {pullRequestLabel(pr)}
+                          {pullRequestLabel(pr, associations.provider)}
                         </TooltipContent>
                       </Tooltip>
                     ))}
@@ -982,7 +1024,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
         </div>
       ) : (
         <div className="flex h-11 shrink-0 items-center border-b border-border px-2">
-          <h2 className="font-medium text-ui">GitHub</h2>
+          <h2 className="font-medium text-ui">{copy.label}</h2>
         </div>
       )}
       {showTrackingControls && (linking || update.isError) && (
@@ -1183,6 +1225,10 @@ function PullRequestPanelDetails({
     sectionEls.current.get(path)?.scrollIntoView({ block: "start" });
   }, []);
 
+  // Mutation responses seed the query cache raw, so normalize before reading.
+  const normalized = info.data && normalizePullRequestInfo(info.data);
+  const copy = gitProviderCopy(normalized?.provider, normalized?.auth.hint);
+
   // ── Whole-panel states (before the header + stacked diff) ───────────────
   // One central switch: every non-`ready` kind returns its own whole-panel
   // state, so the diff below renders only when there's an open PR.
@@ -1233,15 +1279,35 @@ function PullRequestPanelDetails({
           {emptyStateAction}
         </PullRequestEmptyState>
       );
-    case "no-gh-cli":
+    case "unsupported-remote":
+      return (
+        <PullRequestEmptyState
+          icon={ServerOffIcon}
+          title="No supported remote"
+          hint={
+            panelState.remoteHost ? (
+              <>
+                The workspace’s remote is on{" "}
+                <span className="font-mono">{panelState.remoteHost}</span>, which isn’t a supported
+                git provider.
+              </>
+            ) : (
+              "This workspace’s remote isn’t on a supported git provider."
+            )
+          }
+        >
+          {emptyStateAction}
+        </PullRequestEmptyState>
+      );
+    case "no-cli":
       return (
         <PullRequestEmptyState
           icon={TerminalIcon}
-          title="GitHub CLI not found"
+          title={`${copy.cliLabel} not found`}
           hint={
             <>
-              Install the GitHub CLI (<span className="font-mono">gh</span>) on the host to see this
-              branch’s pull request and CI status.
+              Install the {copy.cliLabel} (<span className="font-mono">{panelState.cli}</span>) on
+              the host to see this branch’s pull request and CI status.
             </>
           }
         >
@@ -1253,14 +1319,11 @@ function PullRequestPanelDetails({
         <PullRequestEmptyState
           icon={KeyRoundIcon}
           title="Can’t reach the upstream repo"
-          hint={
-            <>
-              Pick the account to use, or run <span className="font-mono">gh auth status</span> on
-              the host to confirm the GitHub CLI is signed in.
-            </>
-          }
+          hint={codeSpans(copy.repoUnresolvedHint ?? copy.authHint)}
         >
-          {info.data && <GithubAccountSelector conversationId={conversationId} info={info.data} />}
+          {normalized && (
+            <GithubAccountSelector conversationId={conversationId} info={normalized} />
+          )}
           {emptyStateAction}
         </PullRequestEmptyState>
       );
@@ -1285,8 +1348,8 @@ function PullRequestPanelDetails({
       return (
         <PullRequestEmptyState
           icon={AlertCircleIcon}
-          title="GitHub isn’t available"
-          hint="There’s no GitHub information to show for this session."
+          title={`${copy.label} isn’t available`}
+          hint={`There’s no ${copy.label} information to show for this session.`}
         >
           {emptyStateAction}
         </PullRequestEmptyState>
@@ -1294,7 +1357,7 @@ function PullRequestPanelDetails({
   }
 
   // ── Ready: an associated PR to render as its header + stacked diff ───────
-  const data = info.data!;
+  const data = normalized!;
   const pr = data.pr!;
   const checks = pr.checks;
   const comments = pr.comments ?? [];
@@ -1314,7 +1377,7 @@ function PullRequestPanelDetails({
         <div className="shrink-0 border-b border-border pb-0.5">
           <div className="px-3 pt-2">
             <span className="block min-w-0 truncate text-xs text-muted-foreground">
-              {data.repo?.name_with_owner ?? "GitHub"}
+              {data.repo?.name_with_owner ?? copy.label}
               {data.branch && (
                 <>
                   {" · "}
@@ -1331,7 +1394,10 @@ function PullRequestPanelDetails({
                 className="group flex min-w-0 items-center gap-1 text-ui font-medium hover:underline"
               >
                 <span className="truncate">{pr.title}</span>
-                <span className="shrink-0 text-muted-foreground">#{pr.number}</span>
+                <span className="shrink-0 text-muted-foreground">
+                  {copy.prNumberPrefix}
+                  {pr.number}
+                </span>
                 <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground" />
               </a>
               <PullRequestStatus state={pr.state} />
@@ -1353,7 +1419,12 @@ function PullRequestPanelDetails({
 
         {/* Summary: CI checks + the PR description + its conversation comments. */}
         <TabsContent value="summary" className="min-h-0 flex-1 overflow-y-auto">
-          <PullRequestSummaryTab checks={checks} body={pr.body} comments={comments} />
+          <PullRequestSummaryTab
+            checks={checks}
+            body={pr.body}
+            comments={comments}
+            providerLabel={copy.label}
+          />
         </TabsContent>
 
         {/* Changes: a controls row, then the sidebar (jump-to-file) + one scroll
@@ -1438,7 +1509,11 @@ function PullRequestPanelDetails({
               </div>
             )}
             <div ref={scrollRef} onScroll={onScroll} className="min-w-0 flex-1 overflow-y-auto">
-              {files.length === 0 || prDiff.isLoading ? (
+              {prDiff.data?.unavailable_reason ? (
+                <PanelMessage>
+                  {"Diff unavailable for a PR outside this workspace's repository"}
+                </PanelMessage>
+              ) : files.length === 0 || prDiff.isLoading ? (
                 <PanelMessage>
                   {changes.isLoading || prDiff.isLoading ? (
                     <>

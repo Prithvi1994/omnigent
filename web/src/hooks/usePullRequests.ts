@@ -52,6 +52,8 @@ export interface PullRequestChecks {
 export interface PullRequestComment {
   /** Commenter's GitHub login, or null when unknown. */
   author: string | null;
+  /** The author's stable id, for providers whose display names aren't unique. */
+  author_id?: string;
   /** Comment body (GitHub-flavored markdown). */
   body: string;
   /** ISO-8601 creation time, or null. */
@@ -94,12 +96,36 @@ export interface PullRequestAccount {
   host: string | null;
 }
 
-/** Why the panel can't show GitHub content.
+/** Sign-in state for the workspace's git provider. */
+export interface PullRequestAuth {
+  authenticated: boolean;
+  /** Sign-in guidance from the host, or null to use the provider's own. */
+  hint: string | null;
+  /** The provider CLI the host runs (`gh`, `az`), or null when it needs none. */
+  cli: { name: string; available: boolean } | null;
+  /** Accounts the account selector offers, or null when the provider has none. */
+  accounts: PullRequestAccount[] | null;
+  /** The account the host uses for this workspace. */
+  selected_account: string | null;
+}
+
+/** Optional panel features the provider supports. */
+export interface PullRequestCapabilities {
+  account_switching: boolean;
+  base_remote_selection: boolean;
+  line_counts: boolean;
+  linked_pr_diff: boolean;
+}
+
+/** Why the panel can't show pull request content.
  *  - `not_a_git_repo` — the workspace exists but isn't a git checkout.
  *  - `no_os_env` — no workspace/filesystem to read (404 from a current host).
+ *  - `unsupported_remote` — no supported provider serves the workspace's
+ *    remote (see `remote_host`).
  *  - `host_outdated` — the host predates the `/resources/github` route and
  *    404s "Resource 'github' not found"; synthesized in {@link fetchPullRequestInfo}. */
-export type PullRequestUnavailableReason = "not_a_git_repo" | "no_os_env" | "host_outdated";
+export type PullRequestUnavailableReason =
+  "not_a_git_repo" | "no_os_env" | "unsupported_remote" | "host_outdated";
 
 export interface PullRequestAssociation {
   url: string;
@@ -108,6 +134,8 @@ export interface PullRequestAssociation {
   number: number;
   title?: string | null;
   relationship: "created" | "worked_on" | "attached" | "inferred";
+  /** Git provider id; absent from hosts that predate providers (GitHub). */
+  provider?: string;
 }
 
 function prQuery(prUrl?: string): string {
@@ -123,22 +151,70 @@ export interface PullRequestInfo {
   available: boolean;
   /** Why unavailable — see {@link PullRequestUnavailableReason}. */
   reason?: PullRequestUnavailableReason;
-  /** Whether the `gh` CLI is present on the host. When false, PR/repo are null
-   *  (the panel prompts to install `gh`). */
+  /** The remote's host, sent with reason `unsupported_remote`. */
+  remote_host?: string;
+  /** Git provider id ("github", "azure_devops", ...); see {@link normalizePullRequestInfo}. */
+  provider?: string;
+  auth?: PullRequestAuth;
+  capabilities?: PullRequestCapabilities;
+  /** Whether the `gh` CLI is present on the host.
+   *  @deprecated Legacy GitHub field; read `auth.cli`. Removal in 0.19.0. */
   gh_available?: boolean;
-  /** Whether gh has an authenticated host (false → the panel points at
-   *  `gh auth status`). */
+  /** Whether gh has an authenticated host.
+   *  @deprecated Legacy GitHub field; read `auth.authenticated`. Removal in 0.19.0. */
   authenticated?: boolean;
   branch?: string;
   repo?: PullRequestRepo | null;
   /** The PR's base branch; null when there's no PR (the tab is a PR view). */
   base_ref?: string | null;
   pr?: PullRequest | null;
-  /** Configured gh accounts (the account selector's options). */
+  /** Configured gh accounts.
+   *  @deprecated Legacy GitHub field; read `auth.accounts`. Removal in 0.19.0. */
   accounts?: PullRequestAccount[];
-  /** The login gh runs as for this workspace — the per-workspace preference,
-   *  else the active account. */
+  /** The login gh runs as for this workspace.
+   *  @deprecated Legacy GitHub field; read `auth.selected_account`. Removal in 0.19.0. */
   selected_account?: string | null;
+}
+
+/** Info with the provider fields filled in by {@link normalizePullRequestInfo}. */
+export interface NormalizedPullRequestInfo extends PullRequestInfo {
+  provider: string;
+  auth: PullRequestAuth;
+  capabilities: PullRequestCapabilities;
+}
+
+/** GitHub's feature set, assumed for hosts that predate `capabilities`. */
+const GITHUB_CAPABILITIES: PullRequestCapabilities = {
+  account_switching: true,
+  base_remote_selection: true,
+  line_counts: true,
+  linked_pr_diff: true,
+};
+
+/**
+ * Fill `provider`, `auth`, and `capabilities` for a host that predates them
+ * and sends only the legacy GitHub fields, which stay on the result.
+ * Idempotent, so readers can apply it to data of either shape.
+ */
+export function normalizePullRequestInfo(raw: PullRequestInfo): NormalizedPullRequestInfo {
+  return {
+    ...raw,
+    provider: raw.provider ?? "github",
+    auth: raw.auth ?? legacyPullRequestAuth(raw),
+    capabilities: raw.capabilities ?? GITHUB_CAPABILITIES,
+  };
+}
+
+/** @deprecated Maps the legacy GitHub fields; remove with them in 0.19.0. */
+function legacyPullRequestAuth(raw: PullRequestInfo): PullRequestAuth {
+  return {
+    // Only an explicit false means signed out; older payloads may omit it.
+    authenticated: raw.authenticated !== false,
+    hint: null,
+    cli: raw.gh_available === undefined ? null : { name: "gh", available: raw.gh_available },
+    accounts: raw.accounts ?? null,
+    selected_account: raw.selected_account ?? null,
+  };
 }
 
 /** A file changed on the branch relative to its base. Same shape as the
@@ -212,17 +288,17 @@ export async function fetchPullRequestInfo(
     } catch {
       // Non-JSON body — fall back to the generic reason.
     }
-    return {
+    return normalizePullRequestInfo({
       object: "session.github.info",
       available: false,
       reason: pullRequestNotFoundReason(message),
-    };
+    });
   }
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
   }
   if (!res.ok) throw await errorFromResponse(res);
-  return (await res.json()) as PullRequestInfo;
+  return normalizePullRequestInfo((await res.json()) as PullRequestInfo);
 }
 
 /** Poll cadence while the panel is open and the GitHub state can still change.
@@ -237,7 +313,7 @@ const PULL_REQUEST_POLL_MS = 5_000;
  *
  * While the panel is open we keep polling in every state that can still change
  * from something the user does outside the app — the setup/availability states
- * (no repo, `gh` missing, not authenticated, repo unresolved) as well as
+ * (no repo, provider CLI missing, not authenticated, repo unresolved) as well as
  * waiting for a PR and watching an open PR's checks. It rests (returns `false`)
  * only at a stable end state: an open PR whose checks have all settled, or a
  * merged/closed PR. A resting panel still refreshes on the turn-end invalidate
@@ -252,11 +328,13 @@ export function computePullRequestPollInterval(info: PullRequestInfo | undefined
   // No usable info yet — an initial error, or a transient fetch failure with no
   // cached data. Keep trying; runner-offline is gated off by `enabled`.
   if (!info) return PULL_REQUEST_POLL_MS;
+  // The mutations below seed the cache with raw payloads, so normalize here.
+  const { auth } = normalizePullRequestInfo(info);
   // Setup / availability states, all resolved outside the app.
   if (
     !info.available ||
-    info.gh_available === false ||
-    info.authenticated === false ||
+    auth.cli?.available === false ||
+    !auth.authenticated ||
     !info.repo?.name_with_owner
   ) {
     return PULL_REQUEST_POLL_MS;
@@ -441,6 +519,8 @@ export interface PullRequestDiffResponse {
   object: "session.github.pr_diff";
   /** The whole PR as one unified diff patch (every changed file). */
   patch: string;
+  /** Why the host can't diff this PR, e.g. `pr_outside_workspace`. */
+  unavailable_reason?: string;
 }
 
 async function fetchPullRequestDiff(
