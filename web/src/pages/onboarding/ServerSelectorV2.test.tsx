@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ServerSelectorV2, type ServerSelectorV2Setup } from "./ServerSelectorV2";
 
@@ -368,8 +368,15 @@ describe("ServerSelectorV2", () => {
     fireEvent.click(await screen.findByRole("button", { name: /(install|open) omnigent/i }));
   }
 
-  it("a remote runner connects first, then opens the server, with no local install", async () => {
-    const onConnectRunner = vi.fn().mockResolvedValue({ ok: true });
+  it("a remote runner connects first, streaming its output, then opens the server, with no local install", async () => {
+    let finishRunner: (v: { ok: boolean }) => void = () => {};
+    let emit: (line: string) => void = () => {};
+    const onConnectRunner = vi.fn(
+      () =>
+        new Promise<{ ok: boolean }>((resolve) => {
+          finishRunner = resolve;
+        }),
+    );
     const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
     const onConnect = vi.fn().mockResolvedValue({});
     await installFromRunnerStep({
@@ -377,12 +384,42 @@ describe("ServerSelectorV2", () => {
       onInstallCli,
       onConnectRunner,
       onConnect,
+      onRunnerLog: (cb) => {
+        emit = cb;
+        return () => {};
+      },
       getRunnerOptions: vi.fn().mockResolvedValue({ remote: true, bundledCli: true }),
     });
     expect(screen.getByText(/connecting your remote environment/i)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(onConnectRunner).toHaveBeenCalledWith("https://team.example.com/", "remote"),
+    );
+    act(() => emit("$ remote host --server https://team.example.com/"));
+    expect(
+      await screen.findByText("$ remote host --server https://team.example.com/"),
+    ).toBeInTheDocument();
+    expect(onConnect).not.toHaveBeenCalled();
+    finishRunner({ ok: true });
     await waitFor(() => expect(onConnect).toHaveBeenCalledWith("https://team.example.com/"));
-    expect(onConnectRunner).toHaveBeenCalledWith("https://team.example.com/", "remote");
     expect(onInstallCli).not.toHaveBeenCalled();
+  });
+
+  it("tells a laptop runner, and only a laptop runner, what connecting grants", async () => {
+    const grant = "The server will be able to run agents on this laptop.";
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          managedServers: ["https://team.example.com/"],
+          getRunnerOptions: vi.fn().mockResolvedValue({ remote: true }),
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
+    // Arca is the default: no laptop grant to explain.
+    fireEvent.click(await screen.findByRole("combobox", { name: "Runner" }));
+    expect(screen.queryByText(grant)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("option", { name: "My laptop" }));
+    expect(screen.getByText(grant)).toBeInTheDocument();
   });
 
   it("the laptop skips the install when its host CLI is bundled", async () => {
