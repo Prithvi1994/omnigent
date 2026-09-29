@@ -2353,20 +2353,20 @@ async def test_skill_slash_command_non_json_resolve_surfaces_controlled_error(
     assert "malformed skill resolution" in resp.json()["error"]["message"]
 
 
+@pytest.mark.parametrize(
+    "code, message_fragment",
+    [
+        ("session_agent_missing", "no longer available"),
+        ("sub_agent_unresolved", "not declared"),
+    ],
+)
 async def test_skill_slash_command_missing_session_agent_returns_typed_410(
     client: httpx.AsyncClient,
+    code: str,
+    message_fragment: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    A runner ``session_agent_missing`` on ``/skills/resolve`` surfaces as a
-    typed 410, not a 500.
-
-    The session's bound agent was deleted or rebound — a session-lifecycle
-    condition the client resolves by recreating the agent or starting a new
-    session, not a server fault. The proxy re-derives the typed 410 from the
-    runner body's error code with a client-safe message that never leaks the
-    internal resolver text or the raw agent id.
-    """
+    """Missing parent and child specs preserve their typed, sanitized 410 errors."""
     from omnigent.server.routes import sessions as sessions_module
 
     def _handler(request: httpx.Request) -> httpx.Response:
@@ -2376,7 +2376,7 @@ async def test_skill_slash_command_missing_session_agent_returns_typed_410(
                 410,
                 json={
                     "error": {
-                        "code": "session_agent_missing",
+                        "code": code,
                         "message": (
                             "session spec resolver: agent 'ag_gone' for "
                             "session 'conv_test' was not found"
@@ -2422,11 +2422,11 @@ async def test_skill_slash_command_missing_session_agent_returns_typed_410(
 
     assert resp.status_code == 410, resp.text
     body = resp.json()
-    assert body["error"]["code"] == "session_agent_missing"
+    assert body["error"]["code"] == code
     message = body["error"]["message"]
     assert "session spec resolver" not in message
     assert "ag_gone" not in message
-    assert "no longer available" in message
+    assert message_fragment in message
 
 
 async def test_external_meta_user_message_persists_and_publishes_flagged_input_event(

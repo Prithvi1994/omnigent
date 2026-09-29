@@ -251,29 +251,31 @@ _CODEX_POPUP_RENDER_S = 0.7
 _CODEX_PERMISSION_CONFIRM_BUDGET_S = 4.0
 
 
-def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> None:
+def _unresolved_sub_agent_error(session_id: str | None, sub_agent_name: str) -> OmnigentError:
     """
-    Log that a sub-agent name did not resolve to a declared child spec.
+    Build the hard failure for a sub-agent name with no declared child spec.
 
-    Every spec-swap site is guarded by ``if sub_spec is not None`` with no
-    ``else`` and falls back to the already-resolved PARENT spec — so a
-    renamed/removed sub-agent or stale session metadata silently boots the
-    child as a parent clone (parent prompt, tools, harness, workdir). The
-    create route now rejects an undeclared name up front, but stale rows
-    and post-create bundle edits can still reach these sites; a loud log
-    makes the fallback diagnosable instead of invisible.
+    An existing session can outlive a renamed or removed child definition.
+    Its parent's spec is not a substitute for the missing child's spec.
 
     :param session_id: The session whose turn is resolving the spec.
     :param sub_agent_name: The name that failed to resolve in the parent
         spec tree.
+    :returns: A ``SUB_AGENT_UNRESOLVED`` error naming the requested
+        sub-agent, for the caller to raise.
     """
-    _logger.warning(
+    _logger.error(
         "Sub-agent %r for session %s did not resolve in the parent spec; "
-        "falling back to the parent spec (child runs with the parent's "
-        "prompt, tools and harness). Likely a renamed/removed sub-agent or "
-        "stale session metadata.",
+        "failing the dispatch. Likely a renamed/removed sub-agent or stale "
+        "session metadata.",
         sub_agent_name,
         session_id,
+        extra={"session_id": session_id},
+    )
+    return OmnigentError(
+        f"Sub-agent {sub_agent_name!r} is not declared in this session's "
+        "parent agent spec; it was renamed, removed, or never existed.",
+        code=ErrorCode.SUB_AGENT_UNRESOLVED,
     )
 
 
@@ -3040,10 +3042,6 @@ def create_runner_app(
 
     _session_agent_ids = _session_agent_ids_ref  # shared with module-level get_session_agent_id
     _session_sub_agent_names: dict[str, str] = {}
-    # Tracks whether the sub-agent was successfully resolved on session create.
-    # True = child spec is cached; False = parent kept as fallback after miss.
-    # Absent = session has no sub_agent_name or create has not completed.
-    _session_sub_agent_resolved: dict[str, bool] = {}
     # Per-conversation set of (harness, InstructionDelivery) pairs already
     # warned about. Keyed by conversation so a session that switches harnesses
     # warns again for the new pair rather than inheriting the old one's silence.
@@ -4165,12 +4163,9 @@ def create_runner_app(
                     spec_entry, _sa_name_assign
                 )
                 if _sub_entry is None:
-                    _warn_unresolved_sub_agent(session_id, _sa_name_assign)
-                    _session_sub_agent_resolved[session_id] = False
-                else:
-                    spec_entry = _sub_entry
-                    spec = _unwrap_resolved_spec(_sub_entry)
-                    _session_sub_agent_resolved[session_id] = True
+                    raise _unresolved_sub_agent_error(session_id, _sa_name_assign)
+                spec_entry = _sub_entry
+                spec = _unwrap_resolved_spec(_sub_entry)
             # The session's override outranks the spec: resolving from the spec
             # alone made init spawn a harness the turns never ask for, evicting
             # the override's live subprocess (entries are keyed by conversation).
@@ -5096,7 +5091,6 @@ def create_runner_app(
         _session_agent_ids.pop(session_id, None)
         _session_tool_schemas.pop(session_id, None)
         _instruction_delivery_warned.pop(session_id, None)
-        _session_sub_agent_resolved.pop(session_id, None)
         if _binding := _session_comment_relays.pop(session_id, None):
             _binding.relay.close()
         _session_histories.pop(session_id, None)
@@ -8688,6 +8682,11 @@ def create_runner_app(
                 )
                 _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
                 raise
+            except OmnigentError as exc:
+                _logger.warning(
+                    "turn setup failed for %s: %s", conv, exc, extra={"session_id": conv}
+                )
+                _on_proxy_stream_end(conv, error={"code": exc.code, "message": exc.message})
             except Exception as exc:
                 _logger.error(
                     "turn setup failed for %s: %s",
@@ -8757,19 +8756,10 @@ def create_runner_app(
 
         cached_spec_entry = _session_spec_cache.get(conv)
         cached_spec = _unwrap_resolved_spec(cached_spec_entry)
-        cached_spec_workdir = _resolved_spec_workdir(cached_spec_entry)
         if cached_spec is None and spec_resolver is not None:
-            _aid = _dispatched_agent_id
-            if _aid:
+            if _dispatched_agent_id:
                 try:
-                    resolved = await spec_resolver(_aid, conv)
-                    if isinstance(resolved, ResolvedSpec):
-                        cached_spec = _unwrap_resolved_spec(resolved)
-                        cached_spec_workdir = _resolved_spec_workdir(resolved)
-                        _session_spec_cache[conv] = resolved
-                    elif resolved is not None:
-                        cached_spec = resolved
-                        _session_spec_cache[conv] = resolved
+                    cached_spec_entry = await spec_resolver(_dispatched_agent_id, conv)
                 except (httpx.HTTPError, RuntimeError):
                     _logger.warning(
                         "Spec resolution failed for %s",
@@ -8777,37 +8767,34 @@ def create_runner_app(
                         exc_info=True,
                         extra={"session_id": conv},
                     )
+                # Select the child before publishing anything to the session cache.
+                # Cached entries already hold the child and must not be searched again.
+                _sa_name = await _recover_sub_agent_name(conv)
+                if _sa_name and cached_spec_entry is not None:
+                    sub_entry = _native_runtime._resolve_sub_agent_spec_entry(
+                        cached_spec_entry, _sa_name
+                    )
+                    if sub_entry is None:
+                        raise _unresolved_sub_agent_error(conv, _sa_name)
+                    cached_spec_entry = sub_entry
             else:
                 try:
-                    cached_spec = await _resolve_session_agent_spec(conv)
-                    cached_spec_workdir = _resolved_spec_workdir(_session_spec_cache.get(conv))
-                except (OmnigentError, httpx.HTTPError, RuntimeError):
+                    cached_spec_entry = await _resolve_session_spec_entry(conv)
+                except (OmnigentError, httpx.HTTPError, RuntimeError) as exc:
+                    if (
+                        isinstance(exc, OmnigentError)
+                        and exc.code == ErrorCode.SUB_AGENT_UNRESOLVED
+                    ):
+                        raise
                     _logger.warning(
                         "On-demand agent resolution failed for %s",
                         conv,
                         exc_info=True,
                         extra={"session_id": conv},
                     )
+            cached_spec = _unwrap_resolved_spec(cached_spec_entry)
 
-        # The resolver branches above write straight into the cache, so the
-        # entry read at the top of this block can already be stale.
-        cached_spec_entry = _session_spec_cache.get(conv, cached_spec_entry)
-
-        _sa_name = await _recover_sub_agent_name(conv)
-        # The child's workdir is rooted before _spec_with_workdir_paths below,
-        # which joins relative local-tool paths onto whatever workdir is current.
-        if _sa_name and cached_spec is not None:
-            sub_entry = _native_runtime._resolve_sub_agent_spec_entry(cached_spec_entry, _sa_name)
-            if sub_entry is None:
-                # Warn unless the child was confirmed resolved (True = already cached).
-                if _session_sub_agent_resolved.get(conv) is not True:
-                    _warn_unresolved_sub_agent(conv, _sa_name)
-            else:
-                cached_spec_entry = sub_entry
-                cached_spec = _unwrap_resolved_spec(sub_entry)
-                cached_spec_workdir = _resolved_spec_workdir(sub_entry)
-                _session_spec_cache[conv] = sub_entry
-
+        cached_spec_workdir = _resolved_spec_workdir(cached_spec_entry)
         cached_spec = _spec_with_workdir_paths(cached_spec, cached_spec_workdir)
         if cached_spec is not None:
             cached_spec_entry = _rewrap_like(cached_spec_entry, cached_spec, cached_spec_workdir)
@@ -9209,6 +9196,14 @@ def create_runner_app(
             await _invalidate_session_agent_state(conv_id, _ds_agent_id)
         if _ds_agent_id:
             _session_agent_ids[conv_id] = _ds_agent_id
+        direct_spec_entry: _SpecEntry | None = None
+        if dispatch is None:
+            try:
+                direct_spec_entry = await _resolve_session_spec_entry(conv_id)
+            except (OmnigentError, httpx.HTTPError, RuntimeError, ValueError) as exc:
+                # A known harness cannot make an unresolved child safe to run.
+                if isinstance(exc, OmnigentError) and exc.code == ErrorCode.SUB_AGENT_UNRESOLVED:
+                    raise
         startup_envelope = _fresh_session_init_envelope(conv_id)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
         if not harness_name:
@@ -9478,8 +9473,7 @@ def create_runner_app(
             _instr_body = body
             if dispatch is None:
                 with contextlib.suppress(OmnigentError, httpx.HTTPError, RuntimeError, ValueError):
-                    _instr_entry_ds = await _resolve_session_spec_entry(conv_id)
-                    _instr_spec_ds = _unwrap_resolved_spec(_instr_entry_ds)
+                    _instr_spec_ds = _unwrap_resolved_spec(direct_spec_entry)
                     if _instr_spec_ds is not None:
                         _per_req_instr = cast(str | None, body.get("instructions"))
                         _authored_ds = raw_author_instructions(_instr_spec_ds) is not None
@@ -9529,10 +9523,6 @@ def create_runner_app(
                                         _ds_delivery.value,
                                         extra={"session_id": conv_id},
                                     )
-            # Re-warn on every turn when session-create established a miss.
-            _ds_sa = _session_sub_agent_names.get(conv_id)
-            if _ds_sa and _session_sub_agent_resolved.get(conv_id) is False:
-                _warn_unresolved_sub_agent(conv_id, _ds_sa)
             event_body = _wrap_as_message_event(_instr_body)
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _response_id: str | None = None
@@ -10281,7 +10271,13 @@ def create_runner_app(
                 _publish_turn_status(conversation_id, "running")
 
                 if stream:
-                    response = await _stream_message_to_harness(message_body, conversation_id)
+                    try:
+                        response = await _stream_message_to_harness(message_body, conversation_id)
+                    except OmnigentError as exc:
+                        _on_proxy_stream_end(
+                            conversation_id, error={"code": exc.code, "message": exc.message}
+                        )
+                        raise
                     if not isinstance(response, StreamingResponse):
                         _on_proxy_stream_end(
                             conversation_id,
@@ -12145,11 +12141,8 @@ def create_runner_app(
                         spec_entry, sub_agent_name
                     )
                     if sub_entry is None:
-                        _warn_unresolved_sub_agent(session_id, sub_agent_name)
-                        _session_sub_agent_resolved[session_id] = False
-                    else:
-                        spec_entry = sub_entry
-                        _session_sub_agent_resolved[session_id] = True
+                        raise _unresolved_sub_agent_error(session_id, sub_agent_name)
+                    spec_entry = sub_entry
             if _session_cache_generation_is_current(session_id, generation):
                 _session_spec_cache[session_id] = spec_entry
             return spec_entry
@@ -12161,13 +12154,14 @@ def create_runner_app(
     async def _resolve_session_agent_spec_or_none(session_id: str) -> AgentSpec | None:
         """Resolve the session agent spec, tolerating resolution failure.
 
-        The cursor/opencode/kimi launch arms swallow ``OmnigentError`` and
-        continue without a spec; this is their spec resolver for
-        ``_launch_native_terminal``.
+        Optional launch configuration can be unavailable, but a child that
+        no longer exists must fail before starting a native terminal.
         """
         try:
             return await _resolve_session_agent_spec(session_id)
-        except OmnigentError:
+        except OmnigentError as exc:
+            if exc.code == ErrorCode.SUB_AGENT_UNRESOLVED:
+                raise
             return None
 
     async def _resolve_session_skills(session_id: str) -> list[SkillSpec]:
@@ -12795,7 +12789,6 @@ def create_runner_app(
         _session_tool_schemas.pop(session_id, None)
         _session_mcp_spec_hash.pop(session_id, None)
         _instruction_delivery_warned.pop(session_id, None)
-        _session_sub_agent_resolved.pop(session_id, None)
         if agent_id:
             _spec_cache.pop(agent_id, None)
 
@@ -13638,6 +13631,8 @@ async def _resolve_harness_config(
     :raises RuntimeError: When a spec_resolver is configured but the spec
         cannot be resolved. Callers catch this to surface a clean error
         rather than spawning an invalid harness subprocess.
+    :raises OmnigentError: ``SUB_AGENT_UNRESOLVED`` when ``sub_agent_name``
+        is set but names no declared child of the resolved spec.
     """
     if agent_id and spec_resolver:
         spec_entry = await spec_resolver(agent_id, session_id)
@@ -13657,10 +13652,9 @@ async def _resolve_harness_config(
                     spec_entry, sub_agent_name
                 )
                 if sub_entry is None:
-                    _warn_unresolved_sub_agent(session_id, sub_agent_name)
-                else:
-                    spec = _unwrap_resolved_spec(sub_entry)
-                    workdir = _resolved_spec_workdir(sub_entry)
+                    raise _unresolved_sub_agent_error(session_id, sub_agent_name)
+                spec = _unwrap_resolved_spec(sub_entry)
+                workdir = _resolved_spec_workdir(sub_entry)
             raw_harness = (
                 harness_override or spec.executor.config.get("harness") or spec.executor.type
             )
