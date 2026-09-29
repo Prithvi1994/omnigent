@@ -2361,6 +2361,8 @@ export function NewChatLandingScreen() {
   // True when the user picked the sandbox option instead of a connected
   // host — the server provisions a sandbox host at create time
   // (host_type: "managed"), so no host_id or workspace is sent.
+  // Sandbox rows sit behind "See more" in the host menu unless one is picked.
+  const [showSandboxRows, setShowSandboxRows] = useState(false);
   const [sandboxSelected, setSandboxSelected] = useState(
     () => restoredDraft?.sandboxSelected ?? false,
   );
@@ -6533,6 +6535,24 @@ export function NewChatLandingScreen() {
                     /v1/info reports managed_sandboxes_enabled. Pinned
                     first, above the connected-host list. */}
                         {(managedSandboxesEnabled || showDisabledSandboxWithDocs) &&
+                          !showSandboxRows &&
+                          !sandboxSelected && (
+                            <DropdownMenuItem
+                              onSelect={(e) => {
+                                e.preventDefault();
+                                setShowSandboxRows(true);
+                              }}
+                              className="text-sm text-muted-foreground"
+                              data-testid="new-chat-landing-sandbox-see-more"
+                            >
+                              <span className="flex size-4 shrink-0 items-center justify-center">
+                                <ChevronDownIcon className="size-3.5" />
+                              </span>
+                              See more
+                            </DropdownMenuItem>
+                          )}
+                        {(managedSandboxesEnabled || showDisabledSandboxWithDocs) &&
+                          (showSandboxRows || sandboxSelected) &&
                           (managedSandboxesEnabled ? (
                             sandboxProviderRows.map((provider, index) => (
                               <DropdownMenuItem
