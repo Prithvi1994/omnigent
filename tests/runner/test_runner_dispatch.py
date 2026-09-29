@@ -11667,16 +11667,16 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
             },
             id="cache_holds_child-known_harness-shortcut",
         ),
-        # no_harness path resolves a second time even with a cached child.
+        # Harness selection reuses the already selected child on streams too.
         pytest.param(
             "cache_holds_child",
             "no_harness",
             {
                 "status": 200,
                 "instructions": _contract_composed_instructions("Worker instructions."),
-                "resolver_calls": 2,
+                "resolver_calls": 1,
             },
-            id="cache_holds_child-no_harness-resolves-again",
+            id="cache_holds_child-no_harness-shortcut",
         ),
     ],
 )

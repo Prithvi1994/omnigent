@@ -3709,6 +3709,17 @@ def create_runner_app(
                     _session_snapshot_cache[session_id] = snapshot
             return snapshot
 
+    async def _require_session_snapshot(session_id: str) -> _SessionSnapshot:
+        """Require readable metadata before selecting a session's agent identity."""
+        snapshot = await _session_snapshot(session_id)
+        if not snapshot.ok:
+            raise OmnigentError(
+                f"session spec resolver: GET /v1/sessions/{session_id} "
+                f"failed with HTTP {snapshot.status_code}",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        return snapshot
+
     async def _session_workspace_value(session_id: str) -> str | None:
         if session_id not in _session_workspace_cache:
             generation = _session_cache_generation(session_id)
@@ -8777,13 +8788,7 @@ def create_runner_app(
                     )
                 # Select the child before publishing anything to the session cache.
                 # Cached entries already hold the child and must not be searched again.
-                snapshot = await _session_snapshot(conv)
-                if not snapshot.ok:
-                    raise OmnigentError(
-                        f"Cannot resolve session {conv!r}: metadata unavailable "
-                        f"(HTTP {snapshot.status_code})",
-                        code=ErrorCode.INTERNAL_ERROR,
-                    )
+                snapshot = await _require_session_snapshot(conv)
                 _sa_name = snapshot.sub_agent_name
                 if _sa_name:
                     _session_sub_agent_names[conv] = _sa_name
@@ -9215,6 +9220,8 @@ def create_runner_app(
             _session_agent_ids[conv_id] = _ds_agent_id
         direct_spec_entry: _SpecEntry | None = None
         if dispatch is None:
+            if spec_resolver is not None and _session_spec_cache.get(conv_id) is None:
+                await _require_session_snapshot(conv_id)
             try:
                 direct_spec_entry = await _resolve_session_spec_entry(conv_id)
             except (OmnigentError, httpx.HTTPError, RuntimeError, ValueError) as exc:
@@ -9241,6 +9248,7 @@ def create_runner_app(
                         or cast(str | None, body.get("harness_override"))
                     ),
                     sub_agent_name=_sub_agent_name,
+                    selected_spec_entry=direct_spec_entry,
                     cwd=await _session_runtime_cwd(conv_id),
                 )
             except (httpx.HTTPError, RuntimeError) as exc:
@@ -9258,12 +9266,9 @@ def create_runner_app(
             validate_copy_on_write_harness,
         )
 
-        stream_spec = _unwrap_resolved_spec(_session_spec_cache.get(conv_id))
-        if stream_spec is None and _ds_agent_id and spec_resolver is not None:
-            try:
-                stream_spec = _unwrap_resolved_spec(await spec_resolver(_ds_agent_id, conv_id))
-            except (OmnigentError, httpx.HTTPError, RuntimeError):
-                stream_spec = None
+        stream_spec = _unwrap_resolved_spec(
+            direct_spec_entry if dispatch is None else _session_spec_cache.get(conv_id)
+        )
         if has_copy_on_write(
             getattr(stream_spec, "os_env", None)
         ) or resource_registry.uses_copy_on_write(conv_id):
@@ -12121,13 +12126,7 @@ def create_runner_app(
         async with lock:
             if session_id in _session_spec_cache:
                 return _session_spec_cache[session_id]
-            snapshot = await _session_snapshot(session_id)
-            if not snapshot.ok:
-                raise OmnigentError(
-                    f"session spec resolver: GET /v1/sessions/{session_id} "
-                    f"failed with HTTP {snapshot.status_code}",
-                    code=ErrorCode.INTERNAL_ERROR,
-                )
+            snapshot = await _require_session_snapshot(session_id)
             if snapshot.parent_session_id and is_parent_owned_subagent_labels(snapshot.labels):
                 # Native display identities refer to the runtime-owning parent's spec.
                 return await _resolve_session_spec_entry(snapshot.parent_session_id)
@@ -13627,6 +13626,7 @@ async def _resolve_harness_config(
     model_override: str | None = None,
     harness_override: str | None = None,
     sub_agent_name: str | None = None,
+    selected_spec_entry: _SpecEntry | None = None,
     cwd: Path | None = None,
     resource_registry: SessionResourceRegistry | None = None,
 ) -> tuple[str, dict[str, str] | None]:
@@ -13650,6 +13650,7 @@ async def _resolve_harness_config(
         via :func:`_resolve_sub_agent_spec_entry` before harness derivation,
         so the spawn-env advertises the child's bundle rather than the
         parent's. ``None`` for top-level sessions.
+    :param selected_spec_entry: Already selected session spec; avoids resolving its parent again.
     :param cwd: Runtime working directory for harnesses that need it.
     :returns: ``(harness, spawn_env)`` derived from the resolved spec.
     :raises RuntimeError: When a spec_resolver is configured but the spec
@@ -13658,8 +13659,10 @@ async def _resolve_harness_config(
     :raises OmnigentError: ``SUB_AGENT_UNRESOLVED`` when ``sub_agent_name``
         is set but names no declared child of the resolved spec.
     """
-    if agent_id and spec_resolver:
-        spec_entry = await spec_resolver(agent_id, session_id)
+    if selected_spec_entry is not None or (agent_id and spec_resolver):
+        spec_entry = selected_spec_entry
+        if spec_entry is None and spec_resolver is not None:
+            spec_entry = await spec_resolver(cast(str, agent_id), session_id)
         spec = _unwrap_resolved_spec(spec_entry)
         workdir = _resolved_spec_workdir(spec_entry)
         if spec is not None:
@@ -13671,7 +13674,7 @@ async def _resolve_harness_config(
             # The child's bundle dir comes from the same resolution, so the
             # spawn-env below advertises the child's bundle — not the
             # parent's, whose skills and tools the child has no claim to.
-            if sub_agent_name:
+            if sub_agent_name and selected_spec_entry is None:
                 sub_entry = _native_runtime._resolve_sub_agent_spec_entry(
                     spec_entry, sub_agent_name
                 )

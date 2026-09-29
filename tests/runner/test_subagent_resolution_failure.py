@@ -50,8 +50,12 @@ def _statuses(app: Any, session_id: str) -> list[dict[str, Any]]:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("agent_id_in_body", [False, True])
 @pytest.mark.parametrize("snapshot_failure", [None, 503, "timeout"])
+@pytest.mark.parametrize("path", ["background", "known_harness", "no_harness"])
 async def test_cold_child_resolution_survives_multiple_turns(
-    agent_id_in_body: bool, snapshot_failure: int | str | None, monkeypatch: pytest.MonkeyPatch
+    agent_id_in_body: bool,
+    snapshot_failure: int | str | None,
+    path: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A cached child is already selected, including when create was on another runner."""
     conv = "conv_cold_child"
@@ -82,10 +86,15 @@ async def test_cold_child_resolution_survives_multiple_turns(
     body: dict[str, Any] = {"type": "message", "role": "user", "content": "hi"}
     if agent_id_in_body:
         body["agent_id"] = "ag_contract_root"
+    if path == "known_harness":
+        body["harness"] = "hermes"
+    url = f"/v1/sessions/{conv}/events"
+    if path != "background":
+        url += "?stream=true"
     async with _runner_test_client(app) as http:
         if snapshot_failure:
-            response = await http.post(f"/v1/sessions/{conv}/events", json=body)
-            assert response.status_code == 202
+            response = await http.post(url, json=body)
+            assert response.status_code == (202 if path == "background" else 500)
             await _await_bg_turn_task(conv)
             assert _statuses(app, conv)[-1]["status"] == "failed"
             assert not manager.spawns
@@ -93,8 +102,8 @@ async def test_cold_child_resolution_survives_multiple_turns(
             snapshot_failure = None
             calls.clear()
         for _ in range(2):
-            response = await http.post(f"/v1/sessions/{conv}/events", json=body)
-            assert response.status_code == 202
+            response = await http.post(url, json=body)
+            assert response.status_code == (202 if path == "background" else 200)
             await _await_bg_turn_task(conv)
             assert _statuses(app, conv)[-1]["status"] == "idle"
     assert len(calls) == 1
