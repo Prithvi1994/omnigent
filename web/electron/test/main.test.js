@@ -1034,21 +1034,6 @@ describe("managed server preference wiring", () => {
     );
   });
 
-  it("trusts an aliased workspace host for deep links only while its pick is a recent", () => {
-    assert.match(
-      liveCode,
-      /function trustedAliasOrigins\(settings\)[\s\S]{0,300}recents\.has\(normalizeRecentServers\(\[aliases\[origin\]\]\)\[0\]\) &&\s*databricksWorkspaceUiUrl\(origin\) !== null/,
-    );
-    assert.match(
-      liveCode,
-      /function findKnownServerUrl\(origin\)[\s\S]{0,700}trustedAliasOrigins\(settings\)\.includes\(origin\)/,
-    );
-    assert.match(
-      liveCode,
-      /function knownOrigins\(\)[\s\S]{0,700}for \(const o of trustedAliasOrigins\(settings\)\) origins\.add\(o\)/,
-    );
-  });
-
   it("preserves a managed path while still expanding bare workspace roots", () => {
     assert.match(
       liveCode,
@@ -1064,6 +1049,21 @@ describe("managed server preference wiring", () => {
     assert.match(
       liveCode,
       /ipcMain\.handle\("omnigent:get-server-picker"[\s\S]{0,900}managedServers[\s\S]{0,100}recentServers:\s*recents/,
+    );
+  });
+
+  it("trusts an aliased workspace host for deep links only while its pick is a recent", () => {
+    assert.match(
+      liveCode,
+      /function trustedAliasOrigins\(settings\)[\s\S]{0,300}recents\.has\(normalizeRecentServers\(\[aliases\[origin\]\]\)\[0\]\) &&\s*databricksWorkspaceUiUrl\(origin\) !== null/,
+    );
+    assert.match(
+      liveCode,
+      /function findKnownServerUrl\(origin\)[\s\S]{0,700}trustedAliasOrigins\(settings\)\.includes\(origin\)/,
+    );
+    assert.match(
+      liveCode,
+      /function knownOrigins\(\)[\s\S]{0,700}for \(const o of trustedAliasOrigins\(settings\)\) origins\.add\(o\)/,
     );
   });
 
