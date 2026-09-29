@@ -10,6 +10,7 @@ import pytest
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec
+from tests.runner.conftest import _FakeMcpManager
 from tests.runner.test_runner_dispatch import (
     _CONTRACT_ADAPTERS,
     _INSTRUCTION_WARN_CHUNKS,
@@ -85,12 +86,14 @@ async def test_renamed_child_fails_notifies_parent_and_recovers(path: str) -> No
     spec = _contract_root_spec(with_child=True)
     recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
     manager = _RecordingManager(recording)
+    mcp = _FakeMcpManager(tool_name="jira__search_issues")
 
     async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         return spec
 
     app = create_runner_app(
         process_manager=manager,  # type: ignore[arg-type]
+        mcp_manager=mcp,  # type: ignore[arg-type]
         spec_resolver=resolver,
         server_client=_ContractSnapshotClient(conv),  # type: ignore[arg-type]
     )
@@ -129,6 +132,16 @@ async def test_renamed_child_fails_notifies_parent_and_recovers(path: str) -> No
             assert "worker" in completion["output"]
             assert not manager.spawns
             assert not recording.posted_bodies
+            for method in ("tools/list", "tools/call"):
+                response = await http.post(
+                    f"/v1/sessions/{conv}/mcp/execute",
+                    json={"method": method, "params": {"name": "jira__search_issues"}},
+                )
+                assert response.status_code == 200
+                assert response.json()["error"]["code"] == -32000
+                assert "No spec available" in response.json()["error"]["message"]
+            assert not mcp.call_tool_invocations
+
             # Rejected lookups must not leave the parent cached or the turn active.
             resources = await http.get(f"/v1/sessions/{conv}/resources")
             assert resources.status_code == 410

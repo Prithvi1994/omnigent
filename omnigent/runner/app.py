@@ -12964,7 +12964,9 @@ def create_runner_app(
             spec_entry = _session_spec_cache.get(session_id)
             spec = _unwrap_resolved_spec(spec_entry)
             if spec is None and spec_resolver is not None:
-                spec = await _resolve_session_agent_spec_or_none(session_id)
+                # Missing specs use the JSON-RPC error response below.
+                with contextlib.suppress(OmnigentError):
+                    spec = await _resolve_session_agent_spec_or_none(session_id)
             if spec is None:
                 return JSONResponse(
                     status_code=200,
@@ -13031,7 +13033,9 @@ def create_runner_app(
                 spec_entry = _session_spec_cache.get(session_id)
                 spec = _unwrap_resolved_spec(spec_entry)
                 if spec is None and spec_resolver is not None:
-                    spec = await _resolve_session_agent_spec_or_none(session_id)
+                    # Missing specs use the JSON-RPC error response below.
+                    with contextlib.suppress(OmnigentError):
+                        spec = await _resolve_session_agent_spec_or_none(session_id)
                 if spec is None:
                     return JSONResponse(
                         status_code=200,
