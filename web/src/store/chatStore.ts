@@ -4299,15 +4299,11 @@ function nextReconnectDelay(failedOpens: number): number {
  *   streaming `activeResponse` — without one there is no rid to scope
  *   the drop.
  * - Native live previews (`live:<message_id>` provisional blocks): the
- *   replay is one CUMULATIVE delta per in-flight message (the joined
- *   text so far). Appending that replay to a surviving preview would
- *   double the text. A message that committed
- *   during the gap is excluded from the replay entirely; its preview
- *   must vanish too, or it would double-render beside the committed
- *   item the reconnect backfill splices in. So previews are dropped
- *   unconditionally (NOT gated on `activeResponse` — native sessions
- *   stream mid-turn while `session.status`-driven, e.g. parked on a
- *   permission prompt).
+ *   same server replays one cumulative delta, so its old preview must
+ *   be dropped to avoid doubling text. After a server restart, the
+ *   process-local replay buffer has lost the prefix; keep the browser's
+ *   preview and append the new server's deltas. Committed items from
+ *   the gap remove their previews during snapshot reconciliation.
  *
  * Committed blocks are kept in place so they aren't lost (the replay
  * won't resend them) and dedupe by `itemId` against the live tail.
@@ -4317,7 +4313,7 @@ function nextReconnectDelay(failedOpens: number): number {
  * ApprovalCard here would orphan the parked prompt until a full page
  * refresh.
  */
-function dropEphemeralInFlightBlocks(id: string, set: Setter): void {
+function dropEphemeralInFlightBlocks(id: string, set: Setter, preserveNativePreview = false): void {
   set((s) => {
     if (s.conversationId !== id) return {};
     const active = s.activeResponse;
@@ -4326,7 +4322,7 @@ function dropEphemeralInFlightBlocks(id: string, set: Setter): void {
         ? active.responseId
         : null;
     const kept = s.blocks.filter((b) => {
-      if (isLiveProvisionalBlock(b)) return false;
+      if (isLiveProvisionalBlock(b)) return preserveNativePreview;
       if (b.type === "elicitation" || b.type === "error") return true;
       return rid === null || b.ctx.responseId !== rid || Boolean(b.ctx.itemId);
     });
@@ -5014,6 +5010,7 @@ export async function startStreamPump(
   // established stream — failed opens leave it false so a recovered first
   // connect is still treated as initial, not a reconnect.
   let hasConnected = false;
+  let previousStreamEpoch: string | null = null;
   // A reconnect loop is inherently sequential — open → pump → reconnect —
   // so its awaits cannot be parallelized; no-await-in-loop doesn't apply.
   /* eslint-disable no-await-in-loop */
@@ -5122,13 +5119,20 @@ export async function startStreamPump(
         }
 
         const reconnecting = hasConnected;
+        const streamEpoch = streamRes.headers.get("x-omnigent-stream-epoch");
+        const preserveNativePreview =
+          reconnecting &&
+          previousStreamEpoch !== null &&
+          streamEpoch !== null &&
+          previousStreamEpoch !== streamEpoch;
+        previousStreamEpoch = streamEpoch;
         hasConnected = true;
         failedOpens = 0;
         consecutive404s = 0;
         presenceIdle.noteReported(idle);
         streamAttemptActivity.set(attempt, Date.now());
         if (reconnecting) {
-          dropEphemeralInFlightBlocks(id, set);
+          dropEphemeralInFlightBlocks(id, set, preserveNativePreview);
         } else {
           // Fresh connection (not a reconnect) — clear any stale SSE log from
           // a previous stream bind so the debug panel starts clean.
