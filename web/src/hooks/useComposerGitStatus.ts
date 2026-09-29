@@ -3,6 +3,7 @@ import { useCallback } from "react";
 import { usePullRequestInfo } from "@/hooks/usePullRequests";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
+import { gitProviderCopy } from "@/lib/gitProviders";
 
 /** Windows drive-letter absolute path, e.g. ``C:\repo`` / ``C:/repo``. */
 const WINDOWS_ABS_PATH = /^[A-Za-z]:[/\\]/;
@@ -80,6 +81,8 @@ export interface ComposerGitStatus {
   githubState: "loading" | "ready" | "unknown";
   prCount: number;
   prNumber: number | null;
+  /** Precedes `prNumber` in the PR's provider style: "#" for GitHub, "!" for Azure DevOps. */
+  prNumberPrefix: string;
   /** Re-read live worktree + PR state from the host. */
   refresh: () => void;
   refreshing: boolean;
@@ -152,6 +155,8 @@ export function useComposerGitStatus({
   const prs = info?.prs;
   const prNumber = prs?.[0]?.number ?? info?.pr?.number ?? null;
   const prCount = prs?.length ?? (prNumber !== null ? 1 : 0);
+  // The primary PR's own provider first, then the session's.
+  const prNumberPrefix = gitProviderCopy(prs?.[0]?.provider ?? info?.provider).prNumberPrefix;
 
   const worktreeRefetch = worktrees.refetch;
   const githubRefetch = github.refetch;
@@ -170,6 +175,7 @@ export function useComposerGitStatus({
     githubState: github.isLoading ? "loading" : github.isError || !info ? "unknown" : "ready",
     prCount,
     prNumber,
+    prNumberPrefix,
     refresh,
     refreshing: worktrees.isFetching || github.isFetching,
   };

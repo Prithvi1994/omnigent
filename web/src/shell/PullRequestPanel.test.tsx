@@ -8,6 +8,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
 import type {
+  PullRequestAssociation,
   PullRequestAuth,
   PullRequestChangedFile,
   PullRequestDiffResponse,
@@ -404,15 +405,22 @@ describe("PullRequestPanel", () => {
   });
 
   it("prompts to update the host when it predates the GitHub route", () => {
+    // fetchPullRequestInfo synthesizes this payload with no provider.
     state.info = {
-      data: { object: "session.github.info", available: false, reason: "host_outdated" },
+      data: {
+        object: "session.github.info",
+        available: false,
+        reason: "host_outdated",
+        provider: null,
+      },
       isLoading: false,
       error: null,
       isFetching: false,
     };
     renderPanel();
-    expect(screen.getByText("Update your host to use GitHub")).toBeInTheDocument();
+    expect(screen.getByText("Update your host to use the Pull Requests tab")).toBeInTheDocument();
     expect(screen.getByText(/0\.13\.0 or later/)).toBeInTheDocument();
+    expect(screen.queryByText(/GitHub/)).toBeNull();
     expect(screen.queryByTestId("diff")).toBeNull();
   });
 
@@ -496,6 +504,7 @@ describe("PullRequestPanel", () => {
         available: false,
         reason: "unsupported_remote",
         remote_host: "git.example.com",
+        provider: null,
       },
       isLoading: false,
       error: null,
@@ -505,6 +514,206 @@ describe("PullRequestPanel", () => {
     expect(screen.getByText("No supported remote")).toBeInTheDocument();
     expect(screen.getByText("git.example.com")).toBeInTheDocument();
     expect(screen.queryByTestId("diff")).toBeNull();
+    // No provider serves the workspace, so the header names none.
+    const heading = screen.getByRole("heading", { name: "Pull Requests" });
+    expect(heading.previousElementSibling).toHaveClass("lucide-git-pull-request");
+    expect(screen.queryByRole("heading", { name: "GitHub" })).toBeNull();
+  });
+
+  it("tells a GitHub Enterprise user to sign in to the remote's host", () => {
+    state.info = {
+      data: {
+        object: "session.github.info",
+        available: false,
+        reason: "unsupported_remote",
+        remote_host: "git.example.com",
+        provider: null,
+      },
+      isLoading: false,
+      error: null,
+      isFetching: false,
+    };
+    renderPanel();
+    // A second line under the sentence about the host; the command is set as code.
+    const hint = screen.getByText(/which isn’t a supported/);
+    const note = screen.getByText(/For a GitHub Enterprise host, run/);
+    expect(note).not.toBe(hint);
+    expect(hint.compareDocumentPosition(note) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(note).toHaveTextContent(
+      "For a GitHub Enterprise host, run gh auth login --hostname git.example.com on the host.",
+    );
+    expect(screen.getByText("gh auth login --hostname git.example.com")).toHaveClass("font-mono");
+  });
+
+  it("leaves out the sign-in line when the remote's host is unknown", () => {
+    state.info = {
+      data: {
+        object: "session.github.info",
+        available: false,
+        reason: "unsupported_remote",
+        provider: null,
+      },
+      isLoading: false,
+      error: null,
+      isFetching: false,
+    };
+    renderPanel();
+    expect(
+      screen.getByText("This workspace’s remote isn’t on a supported git provider."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/GitHub Enterprise/)).toBeNull();
+    expect(screen.queryByText(/gh auth login/)).toBeNull();
+  });
+
+  describe("header when no provider is known", () => {
+    const neutralHeading = () => {
+      const heading = screen.getByRole("heading", { name: "Pull Requests" });
+      expect(heading.previousElementSibling).toHaveClass("lucide-git-pull-request");
+      expect(heading.previousElementSibling).toHaveAttribute("aria-hidden", "true");
+      expect(screen.queryByText(/GitHub/)).toBeNull();
+    };
+
+    it("is neutral while the first load runs", () => {
+      state.info = { isLoading: true, error: null, isFetching: true };
+      renderPanel();
+      expect(screen.getByText("Loading pull requests…")).toBeInTheDocument();
+      neutralHeading();
+    });
+
+    it("is neutral when the first load fails", () => {
+      state.info = { isLoading: false, error: new Error("boom"), isFetching: false };
+      renderPanel();
+      expect(screen.getByText("Couldn’t load pull request info: boom")).toBeInTheDocument();
+      neutralHeading();
+    });
+
+    it("is neutral while the runner is offline", () => {
+      state.info = { isLoading: false, error: new RunnerOfflineError(), isFetching: false };
+      renderPanel();
+      expect(screen.getByText(/The agent is asleep/)).toBeInTheDocument();
+      neutralHeading();
+    });
+
+    it("is neutral when the host is outdated", () => {
+      state.info = {
+        data: {
+          object: "session.github.info",
+          available: false,
+          reason: "host_outdated",
+          provider: null,
+        },
+        isLoading: false,
+        error: null,
+        isFetching: false,
+      };
+      renderPanel();
+      neutralHeading();
+    });
+
+    it("says pull requests are unavailable without naming a provider", () => {
+      state.info = {
+        data: {
+          object: "session.github.info",
+          available: false,
+          reason: "no_os_env",
+          provider: null,
+        },
+        isLoading: false,
+        error: null,
+        isFetching: false,
+      };
+      renderPanel();
+      expect(screen.getByText("Pull requests aren’t available")).toBeInTheDocument();
+      expect(screen.getByText(/no pull request information/)).toBeInTheDocument();
+      neutralHeading();
+    });
+
+    it.each([undefined, null, "github", "azure_devops"])(
+      "is neutral in a non-git workspace when the host's provider is %j",
+      (provider) => {
+        state.info = {
+          data: {
+            object: "session.github.info",
+            available: false,
+            reason: "not_a_git_repo",
+            provider,
+          },
+          isLoading: false,
+          error: null,
+          isFetching: false,
+        };
+        renderPanel();
+        expect(screen.getByText("Not a git repository")).toBeInTheDocument();
+        neutralHeading();
+      },
+    );
+
+    it("is neutral above the PR picker in a non-git workspace", () => {
+      const url = "https://github.com/acme/app/pull/6000";
+      state.info = {
+        data: {
+          object: "session.github.info",
+          available: false,
+          reason: "not_a_git_repo",
+          tracking_available: true,
+          selected_pr_url: url,
+          prs: [
+            {
+              url,
+              host: "github.com",
+              repository: "acme/app",
+              number: 6000,
+              relationship: "created",
+            },
+          ],
+        },
+        isLoading: false,
+        error: null,
+        isFetching: false,
+      };
+      renderPanel();
+      const heading = screen.getByRole("heading", { name: "Pull Requests" });
+      expect(heading.previousElementSibling).toHaveClass("lucide-git-pull-request");
+      expect(screen.queryByRole("heading", { name: "GitHub" })).toBeNull();
+      // The picker names the PR in its own provider's style; the header does not.
+      expect(screen.getByRole("combobox", { name: "Session pull request" })).toHaveTextContent(
+        "acme/app #6000",
+      );
+    });
+
+    it("keeps naming GitHub for a host that omits the provider", () => {
+      // The default fixture is a ready payload with no `provider`.
+      renderPanel();
+      const heading = screen.getByRole("heading", { name: "GitHub" });
+      expect(heading.previousElementSibling).toHaveAttribute("aria-hidden", "true");
+      expect(screen.queryByRole("heading", { name: "Pull Requests" })).toBeNull();
+    });
+
+    it("keeps the known provider in the header while a PR switch loads", () => {
+      const url = "https://dev.azure.com/contoso/web/_git/app/pullrequest/7";
+      state.info!.data = {
+        ...state.info!.data!,
+        provider: "azure_devops",
+        tracking_available: true,
+        selected_pr_url: url,
+        prs: [
+          {
+            url,
+            host: "dev.azure.com",
+            repository: "contoso/web/app",
+            number: 7,
+            relationship: "created",
+            provider: "azure_devops",
+          },
+        ],
+      };
+      const { rerender } = renderPanel();
+      expect(screen.getByRole("heading", { name: "Azure DevOps" })).toBeInTheDocument();
+      state.info = { isLoading: true, error: null, isFetching: true };
+      rerender(<PullRequestPanel conversationId="conv_1" />);
+      expect(screen.getByText("Loading pull requests…")).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "Azure DevOps" })).toBeInTheDocument();
+    });
   });
 
   describe("with a provider the panel has no copy for", () => {
@@ -535,7 +744,7 @@ describe("PullRequestPanel", () => {
     });
 
     it("uses the generic label and names the missing CLI", () => {
-      state.info!.data = gitlab({ cli: { name: "glab", available: false } });
+      state.info!.data = gitlab({ authenticated: false, cli: { name: "glab", available: false } });
       renderPanel();
       expect(screen.getByRole("heading", { name: "gitlab" })).toBeInTheDocument();
       expect(screen.getByText("gitlab CLI not found")).toBeInTheDocument();
@@ -554,6 +763,144 @@ describe("PullRequestPanel", () => {
       expect(screen.getByText("glab auth login")).toHaveClass("font-mono");
       expect(screen.queryByText(/gh auth status/)).toBeNull();
       expect(screen.queryByRole("combobox", { name: "GitHub account" })).toBeNull();
+    });
+  });
+
+  describe("with Azure DevOps", () => {
+    const prUrl = "https://dev.azure.com/contoso/web/_git/app/pullrequest/7";
+    const auth = (over: Partial<PullRequestAuth> = {}): PullRequestAuth => ({
+      authenticated: true,
+      hint: null,
+      cli: { name: "az", available: true },
+      accounts: null,
+      selected_account: null,
+      ...over,
+    });
+    const ado = (over: Partial<PullRequestInfo> = {}): PullRequestInfo => ({
+      object: "session.github.info",
+      available: true,
+      provider: "azure_devops",
+      auth: auth(),
+      capabilities: {
+        account_switching: false,
+        base_remote_selection: false,
+        line_counts: false,
+        linked_pr_diff: false,
+      },
+      branch: "feat/widget",
+      base_ref: "main",
+      repo: { name_with_owner: "contoso/web/app" },
+      pr: {
+        number: 7,
+        title: "Add the widget",
+        state: "OPEN",
+        url: prUrl,
+        is_draft: false,
+        author: "dev",
+        base_ref: "main",
+        head_ref: "feat/widget",
+        checks: { passing: 0, failing: 0, pending: 0, total: 0, runs: [] },
+      },
+      ...over,
+    });
+    const association = (over: Partial<PullRequestAssociation> = {}): PullRequestAssociation => ({
+      url: prUrl,
+      host: "dev.azure.com",
+      repository: "contoso/web/app",
+      number: 7,
+      relationship: "created",
+      provider: "azure_devops",
+      ...over,
+    });
+
+    it("shows the provider, the repo, and a !-prefixed PR with no account selector", () => {
+      state.info!.data = ado();
+      renderPanel();
+      const heading = screen.getByRole("heading", { name: "Azure DevOps" });
+      expect(heading.previousElementSibling).toHaveAttribute("aria-hidden", "true");
+      expect(screen.getByText(/contoso\/web\/app/)).toBeInTheDocument();
+      expect(screen.getByText("!7")).toBeInTheDocument();
+      expect(screen.getByRole("link", { name: /Add the widget/ })).toHaveAttribute("href", prUrl);
+      expect(screen.queryByRole("combobox", { name: "GitHub account" })).toBeNull();
+      expect(screen.queryByText(/GitHub/)).toBeNull();
+    });
+
+    it("labels linked PRs with a !, leaving out dev.azure.com but not other hosts", async () => {
+      const other = "https://ado.example.com/fabrikam/api/_git/svc/pullrequest/12";
+      state.info!.data = ado({
+        tracking_available: true,
+        selected_pr_url: prUrl,
+        prs: [
+          association({ title: "Add the widget" }),
+          association({
+            url: other,
+            host: "ado.example.com",
+            repository: "fabrikam/api/svc",
+            number: 12,
+            relationship: "inferred",
+          }),
+        ],
+      });
+      renderPanel();
+      fireEvent.click(screen.getByRole("button", { name: "Link a PR" }));
+      expect(screen.getByRole("textbox", { name: "Pull request URL" })).toHaveAttribute(
+        "placeholder",
+        "https://dev.azure.com/org/project/_git/repo/pullrequest/123",
+      );
+      const picker = screen.getByRole("combobox", { name: "Session pull request" });
+      expect(picker).toHaveTextContent("contoso/web/app !7 — Add the widget");
+      fireEvent.click(picker);
+      expect(
+        screen.getByRole("option", { name: "ado.example.com/fabrikam/api/svc !12 (from branch)" }),
+      ).toBeVisible();
+    });
+
+    it("goes straight to the PR when signed in without the Azure CLI", () => {
+      state.info!.data = ado({ auth: auth({ cli: { name: "az", available: false } }) });
+      renderPanel();
+      expect(screen.getByText("Add the widget")).toBeInTheDocument();
+      expect(screen.queryByText("Azure CLI not found")).toBeNull();
+    });
+
+    it("prompts to install the Azure CLI, or set a token, when signed out without it", () => {
+      state.info!.data = ado({
+        auth: auth({ authenticated: false, cli: { name: "az", available: false } }),
+      });
+      renderPanel();
+      expect(screen.getByText("Azure CLI not found")).toBeInTheDocument();
+      expect(screen.getByText("az")).toHaveClass("font-mono");
+      expect(screen.getByText("az login")).toHaveClass("font-mono");
+      expect(screen.getByText("AZURE_DEVOPS_EXT_PAT")).toHaveClass("font-mono");
+      expect(screen.queryByTestId("diff")).toBeNull();
+    });
+
+    it("shows the Azure DevOps sign-in hint when the repo can't be reached", () => {
+      state.info!.data = ado({ auth: auth({ authenticated: false }), repo: null, pr: null });
+      renderPanel();
+      expect(screen.getByText("Can’t reach the upstream repo")).toBeInTheDocument();
+      expect(screen.getByText("az login")).toHaveClass("font-mono");
+      expect(screen.getByText("AZURE_DEVOPS_EXT_PAT")).toHaveClass("font-mono");
+      expect(screen.queryByText(/gh auth status/)).toBeNull();
+      expect(screen.queryByRole("combobox", { name: "GitHub account" })).toBeNull();
+    });
+
+    it("links the stored PR in its own provider's name when no provider serves the remote", () => {
+      state.info!.data = {
+        object: "session.github.info",
+        available: false,
+        reason: "unsupported_remote",
+        remote_host: "gitlab.com",
+        provider: null,
+        tracking_available: true,
+        selected_pr_url: prUrl,
+        prs: [association()],
+      };
+      renderPanel();
+      expect(screen.getByText("No supported remote")).toBeInTheDocument();
+      expect(screen.getByRole("link", { name: "Open the PR on Azure DevOps" })).toHaveAttribute(
+        "href",
+        prUrl,
+      );
     });
   });
 
@@ -695,13 +1042,38 @@ describe("derivePullRequestPanelState", () => {
       selected_account: null,
     };
     const az = (over: Partial<PullRequestAuth>) => ({ ...ready, auth: { ...auth, ...over } });
-    expect(
-      derivePullRequestPanelState(q({ data: az({ cli: { name: "az", available: false } }) })),
-    ).toEqual({ kind: "no-cli", cli: "az" });
     expect(derivePullRequestPanelState(q({ data: az({ authenticated: false }) })).kind).toBe(
       "repo-unresolved",
     );
     expect(derivePullRequestPanelState(q({ data: az({}) }))).toEqual({ kind: "ready" });
+  });
+
+  it("stops at a missing CLI only while signed out", () => {
+    const azNoCli = (authenticated: boolean, over: Partial<PullRequestInfo> = {}) => ({
+      ...ready,
+      provider: "azure_devops",
+      auth: {
+        authenticated,
+        hint: null,
+        cli: { name: "az", available: false },
+        accounts: null,
+        selected_account: null,
+      },
+      ...over,
+    });
+    expect(derivePullRequestPanelState(q({ data: azNoCli(false) }))).toEqual({
+      kind: "no-cli",
+      cli: "az",
+    });
+    // A token signs in without the CLI, so the signed-in flow goes on as usual.
+    expect(derivePullRequestPanelState(q({ data: azNoCli(true) }))).toEqual({ kind: "ready" });
+    expect(derivePullRequestPanelState(q({ data: azNoCli(true, { pr: null }) }))).toEqual({
+      kind: "no-pr",
+      branch: "feat/x",
+    });
+    expect(derivePullRequestPanelState(q({ data: azNoCli(true, { repo: null }) })).kind).toBe(
+      "repo-unresolved",
+    );
   });
 });
 
@@ -783,7 +1155,7 @@ describe("session PR selection", () => {
     rerender(<PullRequestPanel conversationId="conv_1" />);
     expect(screen.getByRole("combobox", { name: "Session pull request" })).toBe(picker);
     expect(picker).toHaveTextContent("example/two #42 — Second repository");
-    expect(screen.getByText("Loading GitHub…")).toBeInTheDocument();
+    expect(screen.getByText("Loading pull requests…")).toBeInTheDocument();
     expect(screen.queryByText("First repository")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Link a PR" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Unlink PR" })).toBeEnabled();

@@ -68,6 +68,7 @@ const { composerGitStatusArgsSpy, composerGitStatusSnapshot } = vi.hoisted(() =>
     githubState: "ready" as "loading" | "ready" | "unknown",
     prCount: 0,
     prNumber: null as number | null,
+    prNumberPrefix: "#",
     refresh: vi.fn(),
     refreshing: false,
   },
@@ -97,6 +98,7 @@ function setComposerGitStatus(overrides: Record<string, unknown> = {}) {
       githubState: "ready",
       prCount: 0,
       prNumber: null,
+      prNumberPrefix: "#",
       refreshing: false,
     },
     overrides,
@@ -2329,6 +2331,13 @@ describe("Composer shared visible controls", () => {
     );
     expect(screen.getByTestId("composer-pr-unknown")).toHaveTextContent("PR unavailable");
     expect(screen.queryByTestId("composer-git-branch")).toBeNull();
+  });
+
+  it("marks the PR number with the prefix of the PR's provider", () => {
+    setComposerGitStatus({ prCount: 1, prNumber: 7, prNumberPrefix: "!" });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    expect(screen.getByTestId("composer-pr-link")).toHaveTextContent("!7");
+    expect(screen.getByTestId("composer-pr-link")).toHaveAccessibleName("!7");
   });
 
   it("keeps the PR to the right of the confirmed worktree status", () => {

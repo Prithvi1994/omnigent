@@ -1,10 +1,10 @@
 // Serves every git provider. Runtime names (query keys, routes, test ids) keep
 // the `github` prefix because they are stable wire ids.
 //
-// PullRequestPanel — the right-rail "GitHub" tab. Read-only view of the session
-// branch's relationship to its git provider: the associated PR (number, title,
-// state, CI summary, link out) and the branch-vs-base diff. Provider-visible
-// text comes from lib/gitProviders.ts.
+// PullRequestPanel — the right-rail "Pull Requests" tab. Read-only view of the
+// session branch's relationship to its git provider: the associated PR (number,
+// title, state, CI summary, link out) and the branch-vs-base diff.
+// Provider-visible text comes from lib/gitProviders.ts.
 //
 // Layout is GitHub's "Files changed": every file's diff stacked in one scroll
 // view, with the sidebar as a jump-to-file navigator that also highlights the
@@ -75,7 +75,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
-import { gitProviderCopy } from "@/lib/gitProviders";
+import { gitProviderCopy, type GitProviderCopy } from "@/lib/gitProviders";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import {
   fetchPullRequestFileContents,
@@ -107,18 +107,21 @@ function PanelMessage({ children }: { children: React.ReactNode }) {
   );
 }
 
-/** Full-panel empty state: an icon, a title, an optional hint line, and optional
- *  children below (the account/remote selectors). Used for every "no PR
+/** Full-panel empty state: an icon, a title, optional hint and note lines, and
+ *  optional children below (the account/remote selectors). Used for every "no PR
  *  content to show" reason so they read as one family. */
 function PullRequestEmptyState({
   icon: Icon,
   title,
   hint,
+  note,
   children,
 }: {
   icon: LucideIcon;
   title: React.ReactNode;
   hint?: React.ReactNode;
+  /** A second line under the hint. */
+  note?: React.ReactNode;
   children?: React.ReactNode;
 }) {
   return (
@@ -126,8 +129,21 @@ function PullRequestEmptyState({
       <Icon className="size-8 text-muted-foreground/50" />
       <p className="text-ui font-medium text-foreground">{title}</p>
       {hint && <p className="max-w-xs text-ui text-muted-foreground">{hint}</p>}
+      {note && <p className="max-w-xs text-ui text-muted-foreground">{note}</p>}
       {children}
     </div>
+  );
+}
+
+/** Header title: the provider's mark beside its name. Renders a fragment so
+ *  both sit directly in the header row. */
+function PanelTitle({ copy }: { copy: GitProviderCopy }) {
+  const Icon = copy.Icon;
+  return (
+    <>
+      <Icon size={14} className="shrink-0" aria-hidden />
+      <h2 className="shrink-0 font-medium text-ui">{copy.label}</h2>
+    </>
   );
 }
 
@@ -238,7 +254,10 @@ export function derivePullRequestPanelState(info: {
   }
   // Git repo present; the provider CLI layers PR/repo metadata on top of it.
   const { auth, repo, pr, branch } = normalizePullRequestInfo(data);
-  if (auth.cli?.available === false) return { kind: "no-cli", cli: auth.cli.name };
+  // A signed-in provider needs no CLI (Azure DevOps can sign in with a token).
+  if (auth.cli?.available === false && !auth.authenticated) {
+    return { kind: "no-cli", cli: auth.cli.name };
+  }
   // Not signed in, or signed in but the upstream repo can't be resolved —
   // both point the user at the provider's sign-in check.
   if (!auth.authenticated) return { kind: "repo-unresolved" };
@@ -811,7 +830,7 @@ function SidebarNode({
 }
 
 /** A PR's picker label, in its own provider's copy (else the session's). */
-function pullRequestLabel(pr: PullRequestAssociation, sessionProvider?: string): string {
+function pullRequestLabel(pr: PullRequestAssociation, sessionProvider?: string | null): string {
   const copy = gitProviderCopy(pr.provider ?? sessionProvider);
   const host = pr.host === copy.defaultHost ? "" : `${pr.host}/`;
   const inferred = pr.relationship === "inferred" ? " (from branch)" : "";
@@ -848,7 +867,11 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
   const associations =
     info.data ??
     (knownAssociations?.sessionId === conversationId ? knownAssociations.data : undefined);
-  const copy = gitProviderCopy(associations?.provider);
+  const panelState = derivePullRequestPanelState(info);
+  // No provider is known without a payload, or in a non-git workspace (older hosts omit it).
+  const copy = gitProviderCopy(
+    associations && panelState.kind !== "not-a-git-repo" ? associations.provider : null,
+  );
   const update = useUpdateSessionPr(conversationId);
   useEffect(() => {
     if (!selected && info.data?.selected_pr_url) {
@@ -858,7 +881,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
   const changeSelection = (next?: string) => setSelection({ sessionId: conversationId, url: next });
   const prs = associations?.prs ?? [];
   const selectedPr = prs.find((pr) => pr.url === (selected ?? associations?.selected_pr_url));
-  const linkInEmptyState = prs.length === 0 && derivePullRequestPanelState(info).kind === "no-pr";
+  const linkInEmptyState = prs.length === 0 && panelState.kind === "no-pr";
   const linkControls = (
     <>
       {linking && (
@@ -909,6 +932,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
       )}
     </>
   );
+  const fallbackCopy = gitProviderCopy(selectedPr?.provider ?? associations?.provider);
   const openPrFallback =
     associations?.tracking_available && selected && !info.isLoading && !info.data?.pr ? (
       <div className="mt-2 flex flex-col items-center gap-2 text-ui">
@@ -919,7 +943,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
           rel="noreferrer"
           className="text-foreground underline underline-offset-4"
         >
-          Open the PR on {copy.label}
+          Open the PR on {fallbackCopy.label}
         </a>
       </div>
     ) : undefined;
@@ -928,7 +952,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
     <div className="flex h-full min-h-0 flex-col">
       {showTrackingControls ? (
         <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
-          <h2 className="shrink-0 font-medium text-ui">{copy.label}</h2>
+          <PanelTitle copy={copy} />
           <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
             {prs.length > 0 && (
               <TooltipProvider>
@@ -1023,8 +1047,8 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
           </div>
         </div>
       ) : (
-        <div className="flex h-11 shrink-0 items-center border-b border-border px-2">
-          <h2 className="font-medium text-ui">{copy.label}</h2>
+        <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
+          <PanelTitle copy={copy} />
         </div>
       )}
       {showTrackingControls && (linking || update.isError) && (
@@ -1227,7 +1251,7 @@ function PullRequestPanelDetails({
 
   // Mutation responses seed the query cache raw, so normalize before reading.
   const normalized = info.data && normalizePullRequestInfo(info.data);
-  const copy = gitProviderCopy(normalized?.provider, normalized?.auth.hint);
+  const copy = gitProviderCopy(normalized?.provider ?? null, normalized?.auth.hint);
 
   // ── Whole-panel states (before the header + stacked diff) ───────────────
   // One central switch: every non-`ready` kind returns its own whole-panel
@@ -1242,7 +1266,7 @@ function PullRequestPanelDetails({
       return (
         <PanelMessage>
           <Loader2Icon className="size-5 animate-spin" />
-          Loading GitHub…
+          Loading pull requests…
         </PanelMessage>
       );
     case "runner-offline":
@@ -1255,7 +1279,7 @@ function PullRequestPanelDetails({
     case "error":
       return (
         <PanelMessage>
-          <p>Couldn’t load GitHub info: {panelState.message}</p>
+          <p>Couldn’t load pull request info: {panelState.message}</p>
           {emptyStateAction}
         </PanelMessage>
       );
@@ -1263,8 +1287,8 @@ function PullRequestPanelDetails({
       return (
         <PullRequestEmptyState
           icon={DownloadIcon}
-          title="Update your host to use GitHub"
-          hint="The GitHub panel needs the host running Omnigent 0.13.0 or later. Update the host, then reconnect the session."
+          title="Update your host to use the Pull Requests tab"
+          hint="The Pull Requests tab needs the host running Omnigent 0.13.0 or later. Update the host, then reconnect the session."
         >
           {emptyStateAction}
         </PullRequestEmptyState>
@@ -1295,6 +1319,16 @@ function PullRequestPanelDetails({
               "This workspace’s remote isn’t on a supported git provider."
             )
           }
+          // A GitHub Enterprise host the user never signed in to lands here.
+          note={
+            panelState.remoteHost && (
+              <>
+                For a GitHub Enterprise host, run{" "}
+                <span className="font-mono">gh auth login --hostname {panelState.remoteHost}</span>{" "}
+                on the host.
+              </>
+            )
+          }
         >
           {emptyStateAction}
         </PullRequestEmptyState>
@@ -1308,6 +1342,7 @@ function PullRequestPanelDetails({
             <>
               Install the {copy.cliLabel} (<span className="font-mono">{panelState.cli}</span>) on
               the host to see this branch’s pull request and CI status.
+              {copy.signInWithoutCli && <> {codeSpans(copy.authHint)}</>}
             </>
           }
         >
@@ -1348,8 +1383,8 @@ function PullRequestPanelDetails({
       return (
         <PullRequestEmptyState
           icon={AlertCircleIcon}
-          title={`${copy.label} isn’t available`}
-          hint={`There’s no ${copy.label} information to show for this session.`}
+          title="Pull requests aren’t available"
+          hint="There’s no pull request information to show for this session."
         >
           {emptyStateAction}
         </PullRequestEmptyState>

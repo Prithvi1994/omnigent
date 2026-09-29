@@ -1,5 +1,5 @@
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
-// The workspace rail's GitHub tab is shown whenever the workspace/Files gate is
+// The workspace rail's Pull Requests tab is shown whenever the workspace/Files gate is
 // open. Non-git workspaces (not_a_git_repo) show an empty state inside the panel
 // rather than hiding the tab entirely.
 
@@ -162,8 +162,8 @@ function renderShell() {
   );
 }
 
-describe("GitHub rail tab visibility", () => {
-  it("shows the GitHub tab even when the workspace isn't a git repository", () => {
+describe("Pull Requests rail tab visibility", () => {
+  it("shows the Pull Requests tab even when the workspace isn't a git repository", () => {
     usePullRequestInfoMock.mockReturnValue({
       data: { object: "session.github.info", available: false, reason: "not_a_git_repo" },
       isLoading: false,
@@ -172,13 +172,13 @@ describe("GitHub rail tab visibility", () => {
     renderShell();
 
     // The workspace gate is on: Files renders, so the strip is up — and the
-    // GitHub tab must also be present (its panel shows an empty state instead).
+    // Pull Requests tab must also be present (its panel shows an empty state instead).
     expect(screen.getByRole("tab", { name: /^Files$/ })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /^Agents/ })).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: "GitHub" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Pull Requests" })).toBeInTheDocument();
   });
 
-  it("shows the GitHub tab for a git workspace", () => {
+  it("shows the Pull Requests tab for a git workspace", () => {
     usePullRequestInfoMock.mockReturnValue({
       data: { object: "session.github.info", available: true },
       isLoading: false,
@@ -186,10 +186,10 @@ describe("GitHub rail tab visibility", () => {
 
     renderShell();
 
-    expect(screen.getByRole("tab", { name: "GitHub" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Pull Requests" })).toBeInTheDocument();
   });
 
-  it("keeps the GitHub tab when the host is outdated", () => {
+  it("keeps the Pull Requests tab when the host is outdated", () => {
     // An outdated host 404s the info endpoint (reason: host_outdated). The
     // panel renders an actionable "update your host" prompt, so the tab must
     // stay reachable rather than being hidden like the non-git dead end.
@@ -200,19 +200,19 @@ describe("GitHub rail tab visibility", () => {
 
     renderShell();
 
-    expect(screen.getByRole("tab", { name: "GitHub" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Pull Requests" })).toBeInTheDocument();
   });
 
-  it("keeps the GitHub tab while the info is still loading (no flash)", () => {
+  it("keeps the Pull Requests tab while the info is still loading (no flash)", () => {
     // Default beforeEach mock: data undefined, isLoading true — matches the
     // Files gate's optimistic default so tabs don't pop in after load.
     renderShell();
 
-    expect(screen.getByRole("tab", { name: "GitHub" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Pull Requests" })).toBeInTheDocument();
   });
 });
 
-describe("opening GitHub from the composer", () => {
+describe("opening Pull Requests from the composer", () => {
   beforeEach(() => {
     writeSessionWorkspaceState("conv_ws", { open: false, rightRailTab: "files" });
   });
@@ -236,13 +236,13 @@ describe("opening GitHub from the composer", () => {
     expect(screen.getByRole("button", { name: "Open PR" })).toBeInTheDocument();
   });
 
-  it("opens the desktop GitHub tab without mounting the mobile panel", () => {
+  it("opens the desktop Pull Requests tab without mounting the mobile panel", () => {
     renderShell();
 
     fireEvent.click(screen.getByRole("button", { name: "Open PR" }));
 
     const workspace = screen.getByRole("complementary", { name: "Workspace" });
-    expect(within(workspace).getByRole("tab", { name: "GitHub" })).toHaveAttribute(
+    expect(within(workspace).getByRole("tab", { name: "Pull Requests" })).toHaveAttribute(
       "aria-selected",
       "true",
     );
@@ -253,7 +253,7 @@ describe("opening GitHub from the composer", () => {
     expect(within(drawer).queryByTestId("github-panel")).not.toBeInTheDocument();
   });
 
-  it("closes the mobile GitHub drawer when navigating to another session", () => {
+  it("closes the mobile Pull Requests drawer when navigating to another session", () => {
     vi.mocked(isMobileViewport).mockReturnValue(true);
     renderShell();
     fireEvent.click(screen.getByRole("button", { name: "Open PR" }));

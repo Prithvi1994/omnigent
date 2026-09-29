@@ -153,8 +153,9 @@ export interface PullRequestInfo {
   reason?: PullRequestUnavailableReason;
   /** The remote's host, sent with reason `unsupported_remote`. */
   remote_host?: string;
-  /** Git provider id ("github", "azure_devops", ...); see {@link normalizePullRequestInfo}. */
-  provider?: string;
+  /** Git provider id ("github", "azure_devops", ...). `null` means no provider is
+   *  known; absent means a host that predates the field, which serves GitHub. */
+  provider?: string | null;
   auth?: PullRequestAuth;
   capabilities?: PullRequestCapabilities;
   /** Whether the `gh` CLI is present on the host.
@@ -178,7 +179,7 @@ export interface PullRequestInfo {
 
 /** Info with the provider fields filled in by {@link normalizePullRequestInfo}. */
 export interface NormalizedPullRequestInfo extends PullRequestInfo {
-  provider: string;
+  provider: string | null;
   auth: PullRequestAuth;
   capabilities: PullRequestCapabilities;
 }
@@ -193,13 +194,14 @@ const GITHUB_CAPABILITIES: PullRequestCapabilities = {
 
 /**
  * Fill `provider`, `auth`, and `capabilities` for a host that predates them
- * and sends only the legacy GitHub fields, which stay on the result.
+ * and sends only the legacy GitHub fields, which stay on the result. An absent
+ * `provider` becomes GitHub; an explicit `null` stays `null`.
  * Idempotent, so readers can apply it to data of either shape.
  */
 export function normalizePullRequestInfo(raw: PullRequestInfo): NormalizedPullRequestInfo {
   return {
     ...raw,
-    provider: raw.provider ?? "github",
+    provider: raw.provider === undefined ? "github" : raw.provider,
     auth: raw.auth ?? legacyPullRequestAuth(raw),
     capabilities: raw.capabilities ?? GITHUB_CAPABILITIES,
   };
@@ -208,8 +210,9 @@ export function normalizePullRequestInfo(raw: PullRequestInfo): NormalizedPullRe
 /** @deprecated Maps the legacy GitHub fields; remove with them in 0.19.0. */
 function legacyPullRequestAuth(raw: PullRequestInfo): PullRequestAuth {
   return {
-    // Only an explicit false means signed out; older payloads may omit it.
-    authenticated: raw.authenticated !== false,
+    // Only an explicit false means signed out; older payloads may omit it. No
+    // `gh` means no session, whatever `authenticated` says.
+    authenticated: raw.authenticated !== false && raw.gh_available !== false,
     hint: null,
     cli: raw.gh_available === undefined ? null : { name: "gh", available: raw.gh_available },
     accounts: raw.accounts ?? null,
@@ -292,6 +295,8 @@ export async function fetchPullRequestInfo(
       object: "session.github.info",
       available: false,
       reason: pullRequestNotFoundReason(message),
+      // The host answered without naming a provider, so none is assumed.
+      provider: null,
     });
   }
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
@@ -313,12 +318,15 @@ const PULL_REQUEST_POLL_MS = 5_000;
  *
  * While the panel is open we keep polling in every state that can still change
  * from something the user does outside the app — the setup/availability states
- * (no repo, provider CLI missing, not authenticated, repo unresolved) as well as
- * waiting for a PR and watching an open PR's checks. It rests (returns `false`)
- * only at a stable end state: an open PR whose checks have all settled, or a
- * merged/closed PR. A resting panel still refreshes on the turn-end invalidate
- * (see {@link usePullRequestInfo}); resting only forgoes the interval poll. Kept pure
+ * (no repo, not signed in, repo unresolved) as well as waiting for a PR and
+ * watching an open PR's checks. It rests (returns `false`) only at a stable end
+ * state: an open PR whose checks have all settled, or a merged/closed PR. A
+ * resting panel still refreshes on the turn-end invalidate (see
+ * {@link usePullRequestInfo}); resting only forgoes the interval poll. Kept pure
  * and exported so each state is unit-testable.
+ *
+ * A signed-in provider needs no CLI (Azure DevOps can sign in with a token), so
+ * a missing CLI counts only while signed out.
  *
  * Note: an open PR on a repo with no CI stays at `total === 0` and so keeps
  * polling while the panel is open+focused — we can't tell "no CI" from "checks
@@ -331,12 +339,7 @@ export function computePullRequestPollInterval(info: PullRequestInfo | undefined
   // The mutations below seed the cache with raw payloads, so normalize here.
   const { auth } = normalizePullRequestInfo(info);
   // Setup / availability states, all resolved outside the app.
-  if (
-    !info.available ||
-    auth.cli?.available === false ||
-    !auth.authenticated ||
-    !info.repo?.name_with_owner
-  ) {
+  if (!info.available || !auth.authenticated || !info.repo?.name_with_owner) {
     return PULL_REQUEST_POLL_MS;
   }
   const pr = info.pr;

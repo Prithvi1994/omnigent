@@ -84,6 +84,36 @@ describe("normalizePullRequestInfo", () => {
     });
   });
 
+  it("treats a legacy payload without gh as signed out, whatever `authenticated` says", () => {
+    const info = (over: Partial<PullRequestInfo>) =>
+      normalizePullRequestInfo({ object: "session.github.info", available: true, ...over }).auth;
+    expect(info({ gh_available: false, authenticated: true })).toMatchObject({
+      authenticated: false,
+      cli: { name: "gh", available: false },
+    });
+    expect(info({ gh_available: false })).toMatchObject({ authenticated: false });
+    expect(info({ gh_available: true, authenticated: true })).toMatchObject({
+      authenticated: true,
+    });
+    expect(info({ gh_available: true })).toMatchObject({ authenticated: true });
+  });
+
+  it("keeps an explicit null provider and turns an absent one into GitHub", () => {
+    const remote: PullRequestInfo = {
+      object: "session.github.info",
+      available: false,
+      reason: "unsupported_remote",
+      remote_host: "gitlab.com",
+      provider: null,
+    };
+    expect(normalizePullRequestInfo(remote).provider).toBeNull();
+    const noProvider: PullRequestInfo = { ...remote };
+    delete noProvider.provider;
+    expect(normalizePullRequestInfo(noProvider).provider).toBe("github");
+    // Idempotent for the null case too, since readers may normalize twice.
+    expect(normalizePullRequestInfo(normalizePullRequestInfo(remote)).provider).toBeNull();
+  });
+
   it("prefers auth over the legacy fields when a host sends both", () => {
     const auth: PullRequestAuth = {
       authenticated: true,
@@ -154,9 +184,10 @@ describe("fetchPullRequestInfo", () => {
       provider: "github",
       auth: { cli: { name: "gh", available: true } },
     });
+    // The 404 says nothing about a provider, so the synthesized payload names none.
     await expect(fetchPullRequestInfo("conv")).resolves.toMatchObject({
       reason: "host_outdated",
-      provider: "github",
+      provider: null,
       auth: { authenticated: true, cli: null },
     });
   });
@@ -234,16 +265,22 @@ describe("computePullRequestPollInterval", () => {
       selected_account: null,
       ...over,
     });
-    // A settled PR still polls while the provider CLI is missing or signed out.
+    // A settled PR still polls while signed out, with or without the provider CLI.
     expect(
       computePullRequestPollInterval(
-        ready({ auth: auth({ cli: { name: "az", available: false } }) }),
+        ready({ auth: auth({ authenticated: false, cli: { name: "az", available: false } }) }),
       ),
     ).toBe(5_000);
     expect(computePullRequestPollInterval(ready({ auth: auth({ authenticated: false }) }))).toBe(
       5_000,
     );
     expect(computePullRequestPollInterval(ready({ auth: auth() }))).toBe(false);
+    // A token signs in without the CLI, so a missing one is not a setup state.
+    expect(
+      computePullRequestPollInterval(
+        ready({ auth: auth({ cli: { name: "az", available: false } }) }),
+      ),
+    ).toBe(false);
     // A legacy payload without `auth` maps through the normalizer.
     expect(computePullRequestPollInterval(ready({ gh_available: false }))).toBe(5_000);
   });
