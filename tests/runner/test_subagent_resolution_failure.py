@@ -78,7 +78,7 @@ async def test_cold_child_resolution_survives_multiple_turns(agent_id_in_body: b
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["background", "known_harness", "no_harness"])
-async def test_renamed_child_fails_and_reports_failure_to_parent(path: str) -> None:
+async def test_renamed_child_fails_notifies_parent_and_recovers(path: str) -> None:
     """A bundle rename invalidates an old child instead of substituting its parent."""
     conv = "conv_renamed_child"
     parent = "conv_renamed_parent"
@@ -129,38 +129,18 @@ async def test_renamed_child_fails_and_reports_failure_to_parent(path: str) -> N
             assert "worker" in completion["output"]
             assert not manager.spawns
             assert not recording.posted_bodies
+            # Rejected lookups must not leave the parent cached or the turn active.
+            resources = await http.get(f"/v1/sessions/{conv}/resources")
+            assert resources.status_code == 410
+            result = await _CONTRACT_ADAPTERS["known_harness"](http, conv, recording)
+            assert result["status"] == 410
+            assert not manager.spawns
+            assert not recording.posted_bodies
+
+            spec.sub_agents[0].name = "worker"
+            await _contract_run_background(http, conv, recording)
+            assert _statuses(app, conv)[-1]["status"] == "idle"
+            assert "Worker instructions." in recording.posted_bodies[-1]["instructions"]
     finally:
         runner_app.unregister_subagent_work(conv)
         runner_app._session_inboxes_ref.pop(parent, None)
-
-
-@pytest.mark.asyncio
-async def test_failed_background_does_not_cache_parent_and_can_recover() -> None:
-    """Resource reads and explicit-harness retries cannot reuse a rejected parent spec."""
-    conv = "conv_retry_missing_child"
-    spec = _contract_root_spec(with_child=False)
-    recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
-    manager = _RecordingManager(recording)
-
-    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        return spec
-
-    app = create_runner_app(
-        process_manager=manager,  # type: ignore[arg-type]
-        spec_resolver=resolver,
-        server_client=_ContractSnapshotClient(conv),  # type: ignore[arg-type]
-    )
-    async with _runner_test_client(app) as http:
-        await _contract_run_background(http, conv, recording)
-        assert _statuses(app, conv)[-1]["status"] == "failed"
-        resources = await http.get(f"/v1/sessions/{conv}/resources")
-        assert resources.status_code == 410
-        result = await _CONTRACT_ADAPTERS["known_harness"](http, conv, recording)
-        assert result["status"] == 410
-        assert not manager.spawns
-        assert not recording.posted_bodies
-
-        spec = _contract_root_spec(with_child=True)
-        await _contract_run_background(http, conv, recording)
-        assert _statuses(app, conv)[-1]["status"] == "idle"
-        assert "Worker instructions." in recording.posted_bodies[-1]["instructions"]

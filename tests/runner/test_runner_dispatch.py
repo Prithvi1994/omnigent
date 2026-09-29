@@ -9007,22 +9007,7 @@ async def test_create_session_reinit_preserves_existing_inbox() -> None:
 async def test_unresolvable_sub_agent_is_rejected_at_session_create(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A root that cannot supply the requested child must fail the create.
-
-    The trap this pins is a root whose OWN name equals the requested
-    sub-agent. ``_find_spec_by_name`` walks ``spec.sub_agents`` only, so a
-    childless root named "worker" does not resolve "worker" — but any later
-    "is the cached spec already the child?" check compares names and would
-    say yes, letting the parent answer as though it were the child for the
-    rest of the session.
-
-    Creation therefore fails outright rather than caching the parent, so
-    there is no session left for a later turn to be silently answered by.
-    Keeping the parent would run the child with the root's instructions and
-    report that substituted work to the orchestrator as a success.
-
-    :param caplog: Pytest log capture, asserted on for the diagnostic.
-    """
+    """A root sharing the requested child's name cannot substitute for that child."""
     conv = "conv_unresolvable_sub_agent_create"
 
     root_spec = AgentSpec(
@@ -9054,19 +9039,10 @@ async def test_unresolvable_sub_agent_is_rejected_at_session_create(
                 },
             )
 
-    assert created.status_code == 410, (
-        "creating a session for a sub-agent the root does not declare should "
-        f"fail with 410; got {created.status_code} with body {created.text!r}."
-    )
-    assert created.json()["error"]["code"] == "sub_agent_unresolved", created.text
-    assert "'worker'" in caplog.text and "did not resolve" in caplog.text, (
-        f"the rejection logged no diagnostic naming the sub-agent: {caplog.text!r}"
-    )
-    assert not recorder.posted_bodies, (
-        "a rejected create still dispatched to a harness: "
-        f"{recorder.posted_bodies!r}. Anything posted here runs on the root's "
-        "spec, which is the parent clone the rejection exists to prevent."
-    )
+    assert created.status_code == 410, created.text
+    assert created.json()["error"]["code"] == "sub_agent_unresolved"
+    assert "'worker'" in caplog.text and "did not resolve" in caplog.text
+    assert not recorder.posted_bodies
 
 
 @pytest.mark.asyncio
@@ -11587,9 +11563,7 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
             },
             id="child_present-background",
         ),
-        # child missing: all paths agree that the parent's spec is not an
-        # answer. No path composes "Root instructions." any more; the three
-        # rows differ only in what their transport can report.
+        # Missing children fail without composing the parent's instructions.
         pytest.param(
             "child_missing",
             "no_harness",
@@ -11619,9 +11593,7 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
         pytest.param(
             "child_missing",
             "background",
-            # The 202 is already out, so the failure lands as terminal status.
-            # "idle" here would be the reported bug: a substituted child
-            # reporting success to the orchestrator that dispatched it.
+            # Background dispatch reports failure after accepting the request.
             {
                 "status": 202,
                 "terminal_status": "failed",
