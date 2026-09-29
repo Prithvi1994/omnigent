@@ -8769,7 +8769,16 @@ def create_runner_app(
                     )
                 # Select the child before publishing anything to the session cache.
                 # Cached entries already hold the child and must not be searched again.
-                _sa_name = await _recover_sub_agent_name(conv)
+                snapshot = await _session_snapshot(conv)
+                if not snapshot.ok:
+                    raise OmnigentError(
+                        f"Cannot resolve session {conv!r}: metadata unavailable "
+                        f"(HTTP {snapshot.status_code})",
+                        code=ErrorCode.INTERNAL_ERROR,
+                    )
+                _sa_name = snapshot.sub_agent_name
+                if _sa_name:
+                    _session_sub_agent_names[conv] = _sa_name
                 if _sa_name and cached_spec_entry is not None:
                     sub_entry = _native_runtime._resolve_sub_agent_spec_entry(
                         cached_spec_entry, _sa_name

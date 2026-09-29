@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import httpx
 import pytest
 
 from omnigent.runner import app as runner_app
@@ -48,7 +49,10 @@ def _statuses(app: Any, session_id: str) -> list[dict[str, Any]]:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("agent_id_in_body", [False, True])
-async def test_cold_child_resolution_survives_multiple_turns(agent_id_in_body: bool) -> None:
+@pytest.mark.parametrize("snapshot_failure", [None, 503, "timeout"])
+async def test_cold_child_resolution_survives_multiple_turns(
+    agent_id_in_body: bool, snapshot_failure: int | str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A cached child is already selected, including when create was on another runner."""
     conv = "conv_cold_child"
     recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
@@ -58,16 +62,37 @@ async def test_cold_child_resolution_survives_multiple_turns(agent_id_in_body: b
         calls.append(agent_id)
         return _contract_root_spec(with_child=True)
 
+    server = _ContractSnapshotClient(conv)
+    original_get = server.get
+
+    async def get(url: str, **kwargs: Any) -> Any:
+        if url.endswith(f"/v1/sessions/{conv}") and snapshot_failure:
+            if snapshot_failure == "timeout":
+                raise httpx.ReadTimeout("metadata unavailable")
+            return httpx.Response(snapshot_failure)
+        return await original_get(url, **kwargs)
+
+    monkeypatch.setattr(server, "get", get)
+    manager = _RecordingManager(recording)
     app = create_runner_app(
-        process_manager=_RecordingManager(recording),  # type: ignore[arg-type]
+        process_manager=manager,  # type: ignore[arg-type]
         spec_resolver=resolver,
-        server_client=_ContractSnapshotClient(conv),  # type: ignore[arg-type]
+        server_client=server,  # type: ignore[arg-type]
     )
+    body: dict[str, Any] = {"type": "message", "role": "user", "content": "hi"}
+    if agent_id_in_body:
+        body["agent_id"] = "ag_contract_root"
     async with _runner_test_client(app) as http:
+        if snapshot_failure:
+            response = await http.post(f"/v1/sessions/{conv}/events", json=body)
+            assert response.status_code == 202
+            await _await_bg_turn_task(conv)
+            assert _statuses(app, conv)[-1]["status"] == "failed"
+            assert not manager.spawns
+            assert not recording.posted_bodies
+            snapshot_failure = None
+            calls.clear()
         for _ in range(2):
-            body: dict[str, Any] = {"type": "message", "role": "user", "content": "hi"}
-            if agent_id_in_body:
-                body["agent_id"] = "ag_contract_root"
             response = await http.post(f"/v1/sessions/{conv}/events", json=body)
             assert response.status_code == 202
             await _await_bg_turn_task(conv)
