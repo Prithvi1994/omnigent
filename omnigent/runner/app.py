@@ -70,6 +70,7 @@ from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
 from omnigent.harness_capabilities import InstructionDelivery
 from omnigent.harness_plugins import (
     harness_capabilities,
+    is_parent_owned_subagent_labels,
     load_object,
     model_env_keys,
     spawn_env_builders,
@@ -1093,7 +1094,6 @@ def _response_body_preview(resp: object, *, limit: int = 500) -> str:
     return ""
 
 
-@dataclasses.dataclass
 @dataclasses.dataclass(frozen=True)
 class _SessionSnapshot:
     """One ``GET /v1/sessions/{id}`` projected for all runner readers.
@@ -1122,6 +1122,7 @@ class _SessionSnapshot:
         top-level sessions. Lets ``_ensure_subagent_work_entry`` rebuild a lost
         work entry when the in-memory map was wiped (reconnect / restart) or
         never populated (a ``sys_session_create`` child).
+    :param labels: Session labels distinguishing native mirrors from dispatched children.
     :param agent_name: Human-readable bound agent name, e.g.
         ``"cursor-native-ui"``. Used as the sub-agent label when rebuilding a
         work entry for a child the server did not record a ``sub_agent_name``
@@ -1136,6 +1137,7 @@ class _SessionSnapshot:
     sub_agent_name: str | None = None
     parent_session_id: str | None = None
     agent_name: str | None = None
+    labels: dict[str, str] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3662,6 +3664,7 @@ def create_runner_app(
             sub_agent_name: str | None = None
             parent_session_id: str | None = None
             agent_name: str | None = None
+            labels: dict[str, str] = {}
             try:
                 resp = await server_client.get(
                     f"/v1/sessions/{session_id}", params=_SESSION_METADATA_PARAMS
@@ -3669,6 +3672,9 @@ def create_runner_app(
                 status_code = resp.status_code
                 if resp.status_code == 200:
                     body = resp.json()
+                    raw_labels = body.get("labels")
+                    if isinstance(raw_labels, dict):
+                        labels = {k: v for k, v in raw_labels.items() if isinstance(v, str)}
                     raw_created = body.get("created_at")
                     if raw_created is not None:
                         created_at = float(raw_created)
@@ -3696,6 +3702,7 @@ def create_runner_app(
                 sub_agent_name=sub_agent_name,
                 parent_session_id=parent_session_id,
                 agent_name=agent_name,
+                labels=labels,
             )
             if snapshot.ok and snapshot.agent_id is not None:
                 if _session_cache_generation_is_current(session_id, generation):
@@ -3781,6 +3788,7 @@ def create_runner_app(
             agent_id=agent_id,
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
+            labels=snapshot.labels,
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
         _session_workspace_cache[session_id] = snapshot.workspace
@@ -12120,6 +12128,9 @@ def create_runner_app(
                     f"failed with HTTP {snapshot.status_code}",
                     code=ErrorCode.INTERNAL_ERROR,
                 )
+            if snapshot.parent_session_id and is_parent_owned_subagent_labels(snapshot.labels):
+                # Native display identities refer to the runtime-owning parent's spec.
+                return await _resolve_session_spec_entry(snapshot.parent_session_id)
             agent_id = snapshot.agent_id
             if not agent_id:
                 raise OmnigentError(

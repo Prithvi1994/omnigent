@@ -176,9 +176,74 @@ async def test_renamed_child_fails_notifies_parent_and_recovers(path: str) -> No
             assert not recording.posted_bodies
 
             spec.sub_agents[0].name = "worker"
-            await _contract_run_background(http, conv, recording)
+            result = await _CONTRACT_ADAPTERS[path](http, conv, recording)
+            assert result["status"] == (202 if path == "background" else 200)
             assert _statuses(app, conv)[-1]["status"] == "idle"
             assert "Worker instructions." in recording.posted_bodies[-1]["instructions"]
     finally:
         runner_app.unregister_subagent_work(conv)
         runner_app._session_inboxes_ref.pop(parent, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wrapper",
+    [
+        "claude-code-native-ui-subagent",
+        "codex-native-ui-subagent",
+        "opencode-native-ui-subagent",
+        "devin-native-ui-subagent",
+        "antigravity-native-ui-subagent",
+        "acp",
+        "claude-code-native-ui",
+    ],
+)
+async def test_native_mirror_resources_use_the_owning_parent(
+    wrapper: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrored display names are not bundle children; dispatched native agents are."""
+    owner, mirror = "conv_owner", "conv_mirror"
+    server = _ContractSnapshotClient(owner)
+    original_get = server.get
+    labels = (
+        {"omnigent.acp.subagent_id": "native_child"}
+        if wrapper == "acp"
+        else {"omnigent.wrapper": wrapper}
+    )
+    calls = []
+
+    async def get(url: str, **kwargs: Any) -> Any:
+        if url.endswith(f"/v1/sessions/{mirror}"):
+            return httpx.Response(
+                200,
+                json={
+                    "agent_id": "ag_contract_root",
+                    "sub_agent_name": "Explore",
+                    "parent_session_id": owner,
+                    "labels": labels,
+                },
+            )
+        return await original_get(url, **kwargs)
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        calls.append(session_id)
+        return _contract_root_spec(with_child=True)
+
+    monkeypatch.setattr(server, "get", get)
+    manager = _RecordingManager(_RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS))
+    app = create_runner_app(
+        process_manager=manager,
+        spec_resolver=resolver,
+        server_client=server,
+    )  # type: ignore[arg-type]
+    async with _runner_test_client(app) as http:
+        for _ in range(2):
+            response = await http.get(f"/v1/sessions/{mirror}/resources")
+            if wrapper == "claude-code-native-ui":
+                assert response.status_code == 410
+                assert response.json()["error"]["code"] == "sub_agent_unresolved"
+                break
+            assert response.status_code == 200, response.text
+            assert calls == [owner]
+            await http.post(f"/v1/sessions/{mirror}/agent-cache/reset", json={})
+    assert not manager.spawns

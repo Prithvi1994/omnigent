@@ -12153,3 +12153,45 @@ async def test_external_info_error_item_publishes_and_persists_level(
     errors = [item for item in items.json()["data"] if item["type"] == "error"]
     assert len(errors) == 1
     assert errors[0]["level"] == "info"
+
+
+@pytest.mark.parametrize("operation", ["retry", "rebind"])
+@pytest.mark.parametrize("code", ["sub_agent_unresolved", "session_agent_missing"])
+async def test_session_initialization_preserves_missing_spec_errors(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
+    operation: str,
+    code: str,
+) -> None:
+    """Retry and rebind preserve typed initialization failures without reporting recovery."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+    SqlAlchemyConversationStore(db_uri).set_runner_id(sid, "runner_previous")
+
+    def reject(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(410, json={"error": {"code": code, "message": "private resolver"}})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(reject), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+        monkeypatch.setattr(sessions_module, "_registered_runner_id", lambda _, rid, **kw: rid)
+        if operation == "retry":
+            response = await client.post(
+                f"/v1/sessions/{sid}/events", json={"type": "retry_session", "data": {}}
+            )
+        else:
+            response = await client.patch(
+                f"/v1/sessions/{sid}", json={"runner_id": "runner_rejected"}
+            )
+    assert response.status_code == 410, response.text
+    assert response.json()["error"]["code"] == code
+    assert "private resolver" not in response.text
+    if operation == "rebind":
+        restored = await client.get(f"/v1/sessions/{sid}")
+        assert restored.json()["runner_id"] == "runner_previous"

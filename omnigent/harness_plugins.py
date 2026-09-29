@@ -1166,6 +1166,19 @@ def native_agents() -> tuple[NativeCodingAgent, ...]:
     return tuple(agents)
 
 
+def is_parent_owned_subagent_labels(labels: Mapping[str, str]) -> bool:
+    """Identify native/ACP mirrors whose runtime and spec belong to their parent."""
+    wrapper = labels.get(WRAPPER_LABEL_KEY)
+    return (
+        bool(labels.get("omnigent.acp.subagent_id"))
+        or wrapper == "antigravity-native-ui-subagent"
+        or (
+            wrapper is not None
+            and any(wrapper == agent.subagent_wrapper_label for agent in native_agents())
+        )
+    )
+
+
 def native_providers() -> tuple[NativeHarnessProvider, ...]:
     """Return native-harness behavior provider rows, merged across contributions."""
     providers: list[NativeHarnessProvider] = []

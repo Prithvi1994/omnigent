@@ -301,6 +301,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_status,
     _publish_terminal_pending,
     _query_host_runner_status,
+    _raise_if_runner_session_spec_unavailable,
     _read_state_entry,
     _record_daily_cost,
     _reject_reserved_cost_control_label_seed,
@@ -4765,6 +4766,7 @@ async def _ensure_runner_session_initialized(
             )
         from omnigent.server.runner_session_init import runner_inference_verified
 
+        _raise_if_runner_session_spec_unavailable(resp)
         if not runner_inference_verified(conv, resp):
             raise OmnigentError(
                 "The runner did not accept this session's saved inference configuration",
