@@ -54,7 +54,7 @@ import time
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
@@ -797,6 +797,8 @@ class ClaudeTranscriptItem:
         :func:`omnigent.harnesses.claude_native.forwarder._forward_available_items`)
         instead of rendering the summary as a user bubble. Defaults to
         ``False`` for every ordinary transcript item.
+    :param api_error_diagnostics: Allowlisted metadata from this CLI-authored API
+        error record, kept out of the conversation payload.
     :param is_compact_noop: ``True`` when this item was parsed from the
         ``<local-command-stdout>`` record Claude writes when it declines a
         ``/compact`` (e.g. "Not enough messages to compact."). No real
@@ -812,6 +814,7 @@ class ClaudeTranscriptItem:
     response_id: str
     is_compact_summary: bool = False
     is_compact_noop: bool = False
+    api_error_diagnostics: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -7725,7 +7728,7 @@ def _transcript_items_from_entry(
             current_response_id=current_response_id,
         )
     if role == "assistant":
-        return _assistant_transcript_items_from_entry(
+        response_id, items = _assistant_transcript_items_from_entry(
             entry,
             line_number=line_number,
             record_offset=record_offset,
@@ -7733,6 +7736,14 @@ def _transcript_items_from_entry(
             current_response_id=current_response_id,
             settled_response_id=settled_response_id,
         )
+        if _is_api_error_entry(entry):
+            for index, item in enumerate(items):
+                if item.item_type == "message" and item.data.get("role") == "assistant":
+                    items[index] = replace(
+                        item, api_error_diagnostics=_api_error_diagnostics(entry)
+                    )
+                    break
+        return response_id, items
     return current_response_id, []
 
 
@@ -8717,6 +8728,33 @@ _LOGIN_GUIDANCE = (
     "`/login` is not available from the Omnigent web chat — run "
     "`omni setup` on the host to sign in again."
 )
+
+
+def _api_error_diagnostics(entry: _JsonObject) -> dict[str, str]:
+    """Keep correlation metadata from this error record, never a preceding response."""
+    message = entry.get("message")
+    message = message if isinstance(message, dict) else {}
+    fields = {
+        "claude_request_id": entry.get("requestId"),
+        "claude_session_id": entry.get("sessionId"),
+        "claude_transcript_uuid": entry.get("uuid"),
+        "claude_version": entry.get("version"),
+        "claude_record_timestamp": entry.get("timestamp"),
+        "claude_message_id": message.get("id"),
+        "claude_reported_model": message.get("model"),
+    }
+    result = {
+        key: value
+        for key, value in fields.items()
+        if isinstance(value, str) and re.fullmatch(r"[\w.:[\]+/-]{1,256}", value, re.ASCII)
+    }
+    # Synthetic CLI errors often have no requestId. The sink drops None values.
+    result["claude_request_id_status"] = (
+        "present_on_error_record" if "claude_request_id" in result else "missing_on_error_record"
+    )
+    result["claude_request_id_source"] = "transcript.requestId"
+    result["gateway_request_id_verified"] = "false"
+    return result
 
 
 def _is_api_error_entry(entry: _JsonObject) -> bool:

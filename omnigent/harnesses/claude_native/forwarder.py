@@ -18,6 +18,7 @@ from pathlib import Path
 
 import httpx
 
+from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -4081,6 +4082,32 @@ async def _forward_available_status_events(
             )
             return durable
         retry_tracker.clear(retry_key)
+        if status == "failed":
+            _logger.warning(
+                "Claude native turn failed",
+                extra=debug_event(
+                    "claude_native_stop_failure",
+                    session_id=session_id,
+                    claude_session_id=record.claude_session_id,
+                    hook_recorded_at=record.recorded_at,
+                    hook_event_cursor=record.event_cursor,
+                    omnigent_response_id=response_id,
+                    failure_category=(
+                        record.failure_category
+                        if record.failure_category
+                        in {
+                            "server_error",
+                            "rate_limit",
+                            "authentication_failed",
+                            "billing_error",
+                            "invalid_request",
+                            "unknown",
+                        }
+                        else "other_or_missing"
+                    ),
+                    claude_request_id_status="not_provided_by_hook",
+                ),
+            )
         if response_id is not None:
             # The turn ended — record its id as a pending settle so a later
             # assistant entry still inheriting it is marked as a scheduled
@@ -4630,6 +4657,16 @@ async def _forward_available_items(
             )
             return updated
         retry_tracker.clear(retry_key)
+        if item.api_error_diagnostics is not None:
+            _logger.warning(
+                "Claude native API error transcript recorded",
+                extra=debug_event(
+                    "claude_native_api_error",
+                    session_id=session_id,
+                    omnigent_response_id=item.response_id,
+                    **item.api_error_diagnostics,
+                ),
+            )
         await _maybe_sync_effort_from_slash_command(client, session_id=session_id, item=item)
         seen.add(item.source_id)
         seen_source_ids.append(item.source_id)

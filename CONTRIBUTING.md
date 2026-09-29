@@ -301,6 +301,27 @@ Notes:
   approval flows, provider-backed sessions, or agent execution. Use the full
   local development flow above when working on those areas.
 
+### Diagnosing native Claude API failures
+
+The standard process logger emits two warning events that the configured debug-log
+sink also ships: `claude_native_stop_failure` after forwarding a failed hook, and
+`claude_native_api_error` after forwarding a CLI-authored API-error transcript item.
+Filter by `session_id` and these event names. The hook event carries its recording
+time and error category; the transcript event carries the original record time,
+CLI version, reported model, message ID, and transcript UUID when supplied.
+`omnigent_response_id` is Omnigent's display grouping, not an inference request ID.
+
+`claude_request_id` comes only from `requestId` on that error's transcript record.
+It is distinct from the log sink's `request_id`, which identifies an Omnigent RPC.
+Its equivalence to a gateway or provider response-header ID is not verified; check
+that before joining service logs. CLI-synthesized errors can omit it, so
+`claude_request_id_status` explicitly reports `missing_on_error_record` or
+`not_provided_by_hook`. We never borrow the preceding successful response's ID.
+Missing IDs still require CLI/provider-side diagnostics or timestamp correlation.
+These events contain allowlisted metadata, not prompts or response/error bodies.
+They follow the existing forwarding cursors; replay can repeat an event, and
+unsuccessful forwarding does not emit it.
+
 ## Tests
 
 A change that alters behaviour under `omnigent/` should ship with a test, and a
