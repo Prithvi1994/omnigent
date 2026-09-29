@@ -4465,12 +4465,66 @@ async def test_strict_prompt_rejects_deadline_even_if_session_becomes_idle(
 
     monkeypatch.setattr(chat_module, "_LOOP_TIMEOUT_S", 0.01)
     client = _FakeAPClient([_item_user("hi"), _item_assistant("completed answer")])
-    diagnostic = "no verified successful response" if query_times_out else "completion deadline"
-    with pytest.raises(ClientOmnigentError, match=diagnostic):
+    with pytest.raises(ClientOmnigentError, match="completion deadline"):
         await asyncio.wait_for(
             _run_one_shot(client, query, monkeypatch, strict_completion=True, chat_cls=Chat),
             timeout=5,
         )
+
+
+async def test_strict_initial_recovery_deadline_cannot_be_overridden_by_completion(monkeypatch):
+    from omnigent_client import SessionsChat
+
+    from omnigent.server.schemas import CompletedEvent, ResponseObject, SessionHeartbeatEvent
+
+    class Namespace(_FakeSessionsNamespace):
+        idle = False
+        subscriptions = 0
+
+        async def bind_runner(self, session_id, *, runner_id):
+            return await self.get(session_id)
+
+        async def get(self, session_id):
+            return SimpleNamespace(
+                id=session_id, agent_id="agent_test", status="idle" if self.idle else "running"
+            )
+
+        async def post_event(self, session_id, event):
+            assert event["type"] == "message"
+
+        async def stream(self, session_id):
+            self.subscriptions += 1
+            subscription = self.subscriptions
+            yield SessionHeartbeatEvent(type="session.heartbeat")
+            if subscription == 1:
+                raise TimeoutError("initial query timed out")
+            if subscription == 2:
+                yield CompletedEvent(
+                    type="response.completed",
+                    response=ResponseObject(
+                        id="resp_test", status="completed", model="test-model", created_at=1
+                    ),
+                )
+                return
+            try:
+                await asyncio.Event().wait()
+            finally:
+                if subscription == 3:
+                    # The parent completed, but its children settle only at the deadline.
+                    self.idle = True
+
+    monkeypatch.setattr(chat_module, "_PER_TURN_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(chat_module, "_LOOP_TIMEOUT_S", 0.03)
+    client = _FakeAPClient([])
+    client.sessions = Namespace([_item_user("hi"), _item_assistant("saved answer")])
+    with pytest.raises(ClientOmnigentError, match="completion deadline"):
+        await asyncio.wait_for(
+            _run_one_shot(
+                client, _return_text, monkeypatch, strict_completion=True, chat_cls=SessionsChat
+            ),
+            timeout=5,
+        )
+    assert client.sessions.idle
 
 
 async def test_strict_prompt_preserves_deadline_when_transcript_unreadable(monkeypatch):
@@ -4580,6 +4634,39 @@ def test_prompt_result_sigterm_unwinds_and_restores_handler(monkeypatch):
         signal.signal(signal.SIGTERM, previous)
 
 
+@pytest.mark.parametrize("swallow_interruption", [False, True])
+def test_prompt_result_sigterm_escapes_asyncio_callback(monkeypatch, swallow_interruption):
+    import signal
+
+    previous = signal.getsignal(signal.SIGTERM)
+    cleaned = []
+    resumed = []
+
+    async def invocation():
+        asyncio.get_running_loop().call_soon(signal.raise_signal, signal.SIGTERM)
+        try:
+            await asyncio.sleep(0.05)
+            resumed.append(True)
+        finally:
+            cleaned.append(True)
+
+    def run(**kwargs):
+        try:
+            asyncio.run(invocation())
+        except KeyboardInterrupt:
+            if not swallow_interruption:
+                raise
+
+    monkeypatch.setattr(chat_module, "run_prompt", run)
+    result = chat_module.run_prompt_result(target="unused", client_tools=None, prompt="hi")
+    assert result.status == "failed"
+    assert result.error == "Headless invocation terminated"
+    assert cleaned == [True]
+    assert resumed == []
+    assert signal.getsignal(signal.SIGTERM) == previous
+    assert not chat_module._STRICT_PROMPT_COMPLETION.get()
+
+
 def test_prompt_result_sigterm_during_handler_cleanup_is_typed(monkeypatch):
     import signal
 
@@ -4594,7 +4681,7 @@ def test_prompt_result_sigterm_during_handler_cleanup_is_typed(monkeypatch):
 
     def during_cleanup(signum, handler):
         nonlocal injected
-        if handler == signal.SIG_IGN and not injected:
+        if handler is sentinel and not injected:
             injected = True
             signal.raise_signal(signal.SIGTERM)
         return install(signum, handler)
@@ -4709,7 +4796,7 @@ async def test_query_sessions_once_deadline_does_not_approve_persisted_preamble(
             return await _never_return("")
 
     monkeypatch.setattr("omnigent_client.SessionsChat", RunningChat)
-    with pytest.raises(ClientOmnigentError, match="terminal completion"):
+    with pytest.raises(ClientOmnigentError, match="completion deadline"):
         await _query_sessions_once(
             client=client,
             agent_name="test",

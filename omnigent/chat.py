@@ -25,7 +25,7 @@ from collections.abc import Awaitable, Callable, Generator
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any, NoReturn, TypeAlias
 
 import click
 import httpx
@@ -580,6 +580,10 @@ class PromptResult:
     cost: float | None = None
 
 
+class _PromptTerminated(KeyboardInterrupt):
+    """Escape asyncio callbacks when a typed invocation receives SIGTERM."""
+
+
 def run_prompt_result(**kwargs: Any) -> PromptResult:
     """Run the CLI harness and retain its terminal outcome.
 
@@ -594,10 +598,15 @@ def run_prompt_result(**kwargs: Any) -> PromptResult:
     completion_token = _STRICT_PROMPT_COMPLETION.set(True)
     main_thread = threading.current_thread() is threading.main_thread()
     previous = signal.getsignal(signal.SIGTERM) if main_thread else None
+    termination_requested = False
 
     def interrupted(_signum: int, _frame: Any) -> None:
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        raise InterruptedError("Headless invocation terminated")
+        nonlocal termination_requested
+        termination_requested = True
+        # A second SIGTERM retains the caller's shutdown behavior during cleanup.
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
+        raise _PromptTerminated("Headless invocation terminated")
 
     try:
         try:
@@ -608,12 +617,10 @@ def run_prompt_result(**kwargs: Any) -> PromptResult:
         finally:
             try:
                 if main_thread and previous is not None:
-                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    signal.signal(signal.SIGTERM, previous)
             finally:
                 _STRICT_PROMPT_COMPLETION.reset(completion_token)
-                if main_thread and previous is not None:
-                    signal.signal(signal.SIGTERM, previous)
-    except InterruptedError as exc:
+    except (_PromptTerminated, InterruptedError) as exc:
         status, error = "failed", str(exc)
     except (Exception, SystemExit) as exc:  # noqa: BLE001 — typed failure boundary
         status = "failed"
@@ -623,6 +630,8 @@ def run_prompt_result(**kwargs: Any) -> PromptResult:
             error = errors.getvalue().strip() or str(exc) or type(exc).__name__
         else:
             error = str(exc) or errors.getvalue().strip() or type(exc).__name__
+    if termination_requested:
+        status, error = "failed", "Headless invocation terminated"
     return PromptResult(status, output.getvalue(), error, time.monotonic() - started)
 
 
@@ -2508,6 +2517,17 @@ async def _query_sessions_once(
                 f"(observed outcome: {response_status or 'unknown'})"
             )
 
+    async def completion_deadline_expired() -> NoReturn:
+        try:
+            turn_error = await _persisted_turn_error(client, bound.id, strict=True)
+        except ClientOmnigentError as verification_error:
+            raise ClientOmnigentError(
+                f"Headless session exceeded its completion deadline: {verification_error}"
+            ) from verification_error
+        raise ClientOmnigentError(
+            turn_error or "Headless session exceeded its completion deadline"
+        ) from None
+
     chat = SessionsChat(
         namespace=client.sessions,
         files_uploader=session_files.upload,
@@ -2599,13 +2619,17 @@ async def _query_sessions_once(
         # the transcript read below returns the whole turn's output.
         # An async orchestrator stays ``running`` until its sub-agents
         # and synthesis finish, so this also follows those to idle.
-        with contextlib.suppress(TimeoutError):
+        try:
             async with asyncio.timeout(_LOOP_TIMEOUT_S):
                 while True:
                     await chat.refresh()
                     if chat.status not in ("running", "launching"):
                         break
+                    response_status = None
                     await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
+        except TimeoutError:
+            if strict_completion:
+                await completion_deadline_expired()
         if strict_completion:
             turn_error = await _persisted_turn_error(client, bound.id, strict=True)
             if turn_error is not None:
@@ -2707,15 +2731,7 @@ async def _query_sessions_once(
             await _drain_extra_turns()
     except asyncio.TimeoutError:
         if strict_completion:
-            try:
-                turn_error = await _persisted_turn_error(client, bound.id, strict=True)
-            except ClientOmnigentError as verification_error:
-                raise ClientOmnigentError(
-                    f"Headless session exceeded its completion deadline: {verification_error}"
-                ) from verification_error
-            raise ClientOmnigentError(
-                turn_error or "Headless session exceeded its completion deadline"
-            ) from None
+            await completion_deadline_expired()
         logger.warning(
             "headless -p timed out after %.0fs waiting for session %s to complete",
             _LOOP_TIMEOUT_S,
