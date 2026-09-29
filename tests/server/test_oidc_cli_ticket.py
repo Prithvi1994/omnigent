@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
@@ -36,9 +37,11 @@ def _authenticated_origin_mode(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _build_app(
-    store: DeviceGrantStore | None = None, *, base_path: str = ""
+    store: DeviceGrantStore | None = None, *, base_path: str = "", redirect_uri: str | None = None
 ) -> httpx.ASGITransport:
     config = make_oidc_config()
+    if redirect_uri is not None:
+        config = replace(config, redirect_uri=redirect_uri)
     provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
     router = create_auth_router(
         auth_provider=provider,
@@ -66,12 +69,13 @@ async def _complete_callback(
     client: httpx.AsyncClient, ticket: str, *, state: str = "state", base_path: str = ""
 ) -> httpx.Response:
     state_cookie = _mint_state_cookie(state, ticket=ticket)
+    cookie_name = "__Host-ap_auth_state" if client.base_url.scheme == "https" else "ap_auth_state"
     mock_cm = _mock_httpx_client_for_github()
     with patch("omnigent.server.routes.auth.httpx.AsyncClient", return_value=mock_cm):
         return await client.get(
             f"{base_path}/auth/callback",
             params={"code": "auth-code", "state": state},
-            cookies={"ap_auth_state": state_cookie},
+            cookies={cookie_name: state_cookie},
         )
 
 
@@ -237,6 +241,69 @@ async def test_cli_consent_accepts_configured_public_origin_behind_proxy() -> No
         assert (
             await client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={verifier}")
         ).status_code == 200
+
+
+@pytest.mark.parametrize("decision", ["approve", "deny"])
+@pytest.mark.parametrize(
+    ("redirect_uri", "origin"),
+    [
+        ("https://example.com:443/auth/callback", "https://example.com"),
+        ("http://example.com:80/auth/callback", "http://example.com"),
+        ("https://example.com:8443/auth/callback", "https://example.com:8443"),
+        ("https://EXAMPLE.com/auth/callback", "https://example.com"),
+    ],
+)
+async def test_cli_consent_canonicalizes_public_origin_behind_proxy(
+    decision: str, redirect_uri: str, origin: str
+) -> None:
+    async with httpx.AsyncClient(
+        transport=_build_app(redirect_uri=redirect_uri),
+        base_url=f"{urlsplit(redirect_uri).scheme}://internal-proxy",
+        follow_redirects=False,
+    ) as client:
+        ticket, verifier = await _create_ticket(client)
+        await _complete_callback(client, ticket)
+        response = await client.post(
+            f"/auth/cli-{decision}", data={"ticket": ticket}, headers={"Origin": origin}
+        )
+        assert response.status_code == 200
+        poll = await client.get(
+            "/auth/cli-poll",
+            params={"ticket": ticket},
+            headers={"X-Omnigent-Code-Verifier": verifier},
+        )
+        assert poll.status_code == (200 if decision == "approve" else 410)
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://evil.example",
+        "http://example.com",
+        "https://example.com:444",
+        "https://example.com/path",
+        "https://user@example.com",
+        "https://example.com:99999",
+    ],
+)
+async def test_cli_consent_origin_normalization_remains_strict(origin: str) -> None:
+    async with httpx.AsyncClient(
+        transport=_build_app(redirect_uri="https://example.com:443/auth/callback"),
+        base_url="https://internal-proxy",
+        follow_redirects=False,
+    ) as client:
+        ticket, verifier = await _create_ticket(client)
+        await _complete_callback(client, ticket)
+        response = await client.post(
+            "/auth/cli-approve", data={"ticket": ticket}, headers={"Origin": origin}
+        )
+        assert response.status_code == 403
+        pending = await client.get(
+            "/auth/cli-poll",
+            params={"ticket": ticket},
+            headers={"X-Omnigent-Code-Verifier": verifier},
+        )
+        assert pending.status_code == 202
 
 
 async def test_cli_approve_rejects_stale_session() -> None:

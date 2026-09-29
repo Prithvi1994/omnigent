@@ -26,6 +26,7 @@ import json
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import jwt
@@ -605,6 +606,47 @@ def test_non_reauth_callback_ignores_auth_time(
 
 
 # ── CLI login tickets + login-issued refresh grants ───────────────
+
+
+def test_cli_ticket_generic_oidc_reauth_round_trip(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    client, keys = callback_client
+    verifier, challenge = _cli_pkce_pair()
+    created = client.post(
+        "/auth/cli-login", json={"code_challenge": challenge, "code_challenge_method": "S256"}
+    ).json()
+    login = client.get(created["login_url"], follow_redirects=False)
+    authorization = parse_qs(urlsplit(login.headers["location"]).query)
+    assert authorization["prompt"] == ["login"]
+    assert authorization["max_age"] == ["0"]
+    state = jwt.decode(
+        client.cookies[_AUTH_STATE_COOKIE_PLAIN], _TEST_SECRET, algorithms=["HS256"]
+    )
+    assert state["ticket"] == created["ticket"]
+    client.app.state.pending_id_token[0] = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "auth_time": state["reauth_at"]}
+    )
+    callback = client.get(
+        "/auth/callback",
+        params={"code": "auth-code", "state": authorization["state"][0]},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 302
+    consent = client.get(callback.headers["location"])
+    assert "Authorize sign-in" in consent.text
+    poll_params = {"ticket": created["ticket"]}
+    poll_headers = {"X-Omnigent-Code-Verifier": verifier}
+    assert (
+        client.get("/auth/cli-poll", params=poll_params, headers=poll_headers).status_code == 202
+    )
+    approval = client.post(
+        "/auth/cli-approve", data=poll_params, headers={"Origin": "http://testserver"}
+    )
+    assert "<h1>Approved</h1>" in approval.text
+    redeemed = client.get("/auth/cli-poll", params=poll_params, headers=poll_headers)
+    assert redeemed.status_code == 200
+    assert redeemed.json()["user_id"] == "alice@example.com"
 
 
 def test_cli_ticket_fulfillment_issues_refresh_grant(

@@ -82,6 +82,23 @@ if TYPE_CHECKING:
     from omnigent.server.oidc import OIDCConfig
 
 
+def _canonical_cli_origin(value: str) -> tuple[str, str, int | None] | None:
+    try:
+        url = httpx.URL(value)
+    except httpx.InvalidURL:
+        return None
+    if (
+        url.scheme not in ("http", "https")
+        or not url.host
+        or url.userinfo
+        or url.path != "/"
+        or url.query
+        or url.fragment
+    ):
+        return None
+    return url.scheme, url.host, url.port
+
+
 @dataclass
 class _CliTicket:
     """A pending CLI login ticket.
@@ -730,10 +747,11 @@ def create_auth_router(
         # These forms are server-rendered; API/WebSocket origin exceptions
         # must not authorize browser consent. The callback covers proxy origins.
         allowed = {
-            str(request.url.replace(path="", query="")),
-            str(URL(config.redirect_uri).replace(path="", query="")),
+            _canonical_cli_origin(str(request.url.replace(path="", query=""))),
+            _canonical_cli_origin(str(URL(config.redirect_uri).replace(path="", query=""))),
         }
-        if request.headers.get("origin") not in allowed:
+        origin = _canonical_cli_origin(request.headers.get("origin", ""))
+        if origin is None or origin not in allowed:
             raise HTTPException(status_code=403, detail="Untrusted browser Origin")
 
     @router.post("/cli-approve")
