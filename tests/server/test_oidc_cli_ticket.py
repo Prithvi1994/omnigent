@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import AsyncIterator
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import jwt
@@ -33,7 +35,9 @@ def _authenticated_origin_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
 
 
-def _build_app(store: DeviceGrantStore | None = None) -> httpx.ASGITransport:
+def _build_app(
+    store: DeviceGrantStore | None = None, *, base_path: str = ""
+) -> httpx.ASGITransport:
     config = make_oidc_config()
     provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
     router = create_auth_router(
@@ -43,14 +47,15 @@ def _build_app(store: DeviceGrantStore | None = None) -> httpx.ASGITransport:
         device_grant_store=store,
     )
     app = FastAPI()
-    app.include_router(router, prefix="/auth")
+    app.state.base_path = base_path
+    app.include_router(router, prefix=f"{base_path}/auth")
     return httpx.ASGITransport(app=app)
 
 
-async def _create_ticket(client: httpx.AsyncClient) -> tuple[str, str]:
+async def _create_ticket(client: httpx.AsyncClient, base_path: str = "") -> tuple[str, str]:
     verifier, challenge = _pkce_pair()
     response = await client.post(
-        "/auth/cli-login",
+        f"{base_path}/auth/cli-login",
         json={"code_challenge": challenge, "code_challenge_method": "S256"},
     )
     assert response.status_code == 200
@@ -58,13 +63,13 @@ async def _create_ticket(client: httpx.AsyncClient) -> tuple[str, str]:
 
 
 async def _complete_callback(
-    client: httpx.AsyncClient, ticket: str, *, state: str = "state"
+    client: httpx.AsyncClient, ticket: str, *, state: str = "state", base_path: str = ""
 ) -> httpx.Response:
     state_cookie = _mint_state_cookie(state, ticket=ticket)
     mock_cm = _mock_httpx_client_for_github()
     with patch("omnigent.server.routes.auth.httpx.AsyncClient", return_value=mock_cm):
         return await client.get(
-            "/auth/callback",
+            f"{base_path}/auth/callback",
             params={"code": "auth-code", "state": state},
             cookies={"ap_auth_state": state_cookie},
         )
@@ -89,7 +94,8 @@ async def test_cli_ticket_requires_browser_consent_and_issues_grant(tmp_path: Pa
         assert consent.status_code == 200
         assert re.search(r"Code: [A-Z2-9]{4}-[A-Z2-9]{4}", consent.text)
         assert "alice@example.com" in consent.text
-        assert "Authorize CLI login" in consent.text
+        assert "Authorize sign-in" in consent.text
+        assert "For CLI or Slack sign-in" in consent.text
 
         approved = await client.post(
             "/auth/cli-approve",
@@ -324,6 +330,7 @@ async def test_legacy_upgrade_notice_cannot_issue_credentials(tmp_path: Path) ->
         b"null",
         b"[]",
         b"{}",
+        b"[" * 1500 + b"]" * 1500,
         b'{"code_challenge": "short"}',
         b'{"code_challenge_method": "plain"}',
     ],
@@ -335,3 +342,77 @@ async def test_malformed_pkce_is_not_treated_as_a_legacy_request(body: bytes) ->
         )
         assert response.status_code == 400
         assert "login_url" not in response.json()
+
+
+@pytest.mark.parametrize("verifier", ["é" * 43, "", "a" * 42, "a" * 129, "!" * 43])
+async def test_cli_poll_rejects_malformed_verifier_without_consuming(verifier: str) -> None:
+    async with httpx.AsyncClient(transport=_build_app(), base_url="http://test") as client:
+        ticket, valid_verifier = await _create_ticket(client)
+        response = await client.get(
+            "/auth/cli-poll", params={"ticket": ticket, "code_verifier": verifier}
+        )
+        assert response.status_code == 400
+        pending = await client.get(
+            "/auth/cli-poll", params={"ticket": ticket, "code_verifier": valid_verifier}
+        )
+        assert pending.status_code == 202
+
+
+@pytest.mark.parametrize("challenge", ["a" * 42, "a" * 44, "a" * 128, "!" * 43])
+async def test_cli_login_rejects_invalid_s256_challenge(challenge: str) -> None:
+    async with httpx.AsyncClient(transport=_build_app(), base_url="http://test") as client:
+        response = await client.post(
+            "/auth/cli-login", json={"code_challenge": challenge, "code_challenge_method": "S256"}
+        )
+        assert response.status_code == 400
+        assert "ticket" not in response.json()
+
+
+async def test_cli_login_rejects_oversized_body() -> None:
+    async with httpx.AsyncClient(transport=_build_app(), base_url="http://test") as client:
+        response = await client.post("/auth/cli-login", content=b"x" * 4097)
+        assert response.status_code == 413
+
+
+async def test_cli_login_stops_reading_oversized_chunked_body() -> None:
+    async def chunks() -> AsyncIterator[bytes]:
+        yield b"x" * 2048
+        yield b"x" * 2049
+        raise AssertionError("Login endpoint read past its body limit")
+
+    async with httpx.AsyncClient(transport=_build_app(), base_url="http://test") as client:
+        response = await client.post("/auth/cli-login", content=chunks())
+        assert response.status_code == 413
+
+
+@pytest.mark.parametrize("decision", ["approve", "deny"])
+async def test_cli_consent_flow_under_base_path(decision: str) -> None:
+    base_path = "/proxy/6767"
+    async with httpx.AsyncClient(
+        transport=_build_app(base_path=base_path), base_url="http://test", follow_redirects=False
+    ) as client:
+        ticket, verifier = await _create_ticket(client, base_path)
+        consent_url = f"{base_path}/auth/cli-consent?ticket={ticket}"
+        unauthenticated = await client.get(consent_url)
+        login_url = unauthenticated.headers["location"]
+        assert urlsplit(login_url).path == f"{base_path}/auth/login"
+        assert parse_qs(urlsplit(login_url).query)["return_to"] == [consent_url]
+
+        callback = await _complete_callback(client, ticket, base_path=base_path)
+        assert callback.headers["location"] == consent_url
+        consent = await client.get(consent_url)
+        action = f"{base_path}/auth/cli-{decision}"
+        assert f'action="{action}"' in consent.text
+        response = await client.post(
+            action, data={"ticket": ticket}, headers={"Origin": "http://test"}
+        )
+        assert response.status_code == 200
+        poll = await client.get(
+            f"{base_path}/auth/cli-poll", params={"ticket": ticket, "code_verifier": verifier}
+        )
+        assert poll.status_code == (200 if decision == "approve" else 410)
+
+        legacy = await client.post(f"{base_path}/auth/cli-login")
+        upgrade = await client.get(base_path + legacy.json()["login_url"])
+        assert upgrade.status_code == 200
+        assert "Update Omnigent to sign in" in upgrade.text

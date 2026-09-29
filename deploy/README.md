@@ -285,6 +285,12 @@ provider. The old client must show the upgrade page without signing in; the
 updated client must complete fresh sign-in and browser approval. Preserve
 PKCE and consent enforcement if rolling back an unrelated deployment issue.
 
+Do not retain query strings for `/auth/cli-poll` in reverse-proxy or access
+logs: the ticket and PKCE verifier together can redeem an approved login.
+CLI and Slack display a comparison code; native mobile apps currently rely
+on explicit browser approval without displaying that code in the app. Include
+the actual native apps in staging checks before publishing a mobile build.
+
 ### Register the host
 
 Then register the machine as a host, so sessions created in the web UI can

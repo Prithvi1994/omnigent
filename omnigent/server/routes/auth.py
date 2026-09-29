@@ -64,8 +64,10 @@ _CLI_UPGRADE_MESSAGE = (
     "For the CLI, run `omni upgrade`, then retry `omnigent login`. "
     "For mobile, update the app. For Slack, ask your administrator to update the integration."
 )
-# RFC 7636 §4.2: base64url(SHA-256) is 43 chars; allow up to the spec max.
-_CODE_CHALLENGE_RE = re.compile(r"[A-Za-z0-9_-]{43,128}")
+# RFC 7636: the verifier is 43–128 unreserved characters; S256 is 43.
+_CODE_CHALLENGE_RE = re.compile(r"[A-Za-z0-9_-]{43}")
+_CODE_VERIFIER_RE = re.compile(r"[A-Za-z0-9._~-]{43,128}")
+_CLI_LOGIN_MAX_BODY_BYTES = 4096
 # How long an OIDC invite URL stays redeemable. Matches the accounts
 # provider's default invite window (72h) — long enough to share
 # out-of-band, short enough to bound exposure of an unused link.
@@ -458,8 +460,9 @@ def create_auth_router(
         if ticket_id and ticket_id in _cli_tickets:
             ticket = _cli_tickets[ticket_id]
             if time.time() - ticket.created_at <= _CLI_TICKET_TTL_SECONDS:
+                base_path = getattr(request.app.state, "base_path", "")
                 resp = RedirectResponse(
-                    url=f"/auth/cli-consent?ticket={quote(str(ticket_id))}",
+                    url=f"{base_path}/auth/cli-consent?ticket={quote(str(ticket_id))}",
                     status_code=302,
                 )
             else:
@@ -593,7 +596,13 @@ def create_auth_router(
         """
         from fastapi.responses import JSONResponse
 
-        if not await request.body():
+        raw_body = bytearray()
+        async for chunk in request.stream():
+            if len(raw_body) + len(chunk) > _CLI_LOGIN_MAX_BODY_BYTES:
+                return JSONResponse(status_code=413, content={"error": "Login request too large"})
+            raw_body.extend(chunk)
+
+        if not raw_body:
             # Old clients hide HTTP error bodies but open login_url on 200.
             # Give them an instruction page without creating a login ticket.
             return JSONResponse(
@@ -607,8 +616,8 @@ def create_auth_router(
             )
 
         try:
-            body = await request.json()
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            body = json.loads(raw_body)
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
             body = {}
         if not isinstance(body, dict):
             body = {}
@@ -650,9 +659,10 @@ def create_auth_router(
             headers={"Cache-Control": "no-store"},
         )
 
-    def _bounce_to_login(ticket_id: str, *, reauth: bool) -> RedirectResponse:
-        return_to = f"/auth/cli-consent?ticket={quote(ticket_id)}"
-        url = f"/auth/login?return_to={quote(return_to, safe='')}"
+    def _bounce_to_login(request: Request, ticket_id: str, *, reauth: bool) -> RedirectResponse:
+        base_path = getattr(request.app.state, "base_path", "")
+        return_to = f"{base_path}/auth/cli-consent?ticket={quote(ticket_id)}"
+        url = f"{base_path}/auth/login?return_to={quote(return_to, safe='')}"
         if reauth:
             url += "&reauth=1"
         return RedirectResponse(url=url, status_code=302)
@@ -683,7 +693,7 @@ def create_auth_router(
         user_id = auth_provider.get_user_id(request)
         ticket_id = (request.query_params.get("ticket") or "").strip()
         if user_id is None:
-            return _bounce_to_login(ticket_id, reauth=True)
+            return _bounce_to_login(request, ticket_id, reauth=True)
 
         ticket = _cli_ticket(ticket_id)
         if ticket is None or ticket.token is not None or ticket.denied:
@@ -694,13 +704,14 @@ def create_auth_router(
 
         session_iat = _session_iat(request)
         if session_iat is None or session_iat < int(ticket.created_at):
-            return _bounce_to_login(ticket_id, reauth=True)
+            return _bounce_to_login(request, ticket_id, reauth=True)
 
         return HTMLResponse(
             _cli_consent_html(
                 ticket_id=ticket_id,
                 user_id=user_id,
                 user_code=ticket.user_code,
+                base_path=getattr(request.app.state, "base_path", ""),
             ),
             status_code=200,
         )
@@ -824,6 +835,8 @@ def create_auth_router(
                 status_code=400,
                 content={"error": f"code_verifier is required. {_CLI_UPGRADE_MESSAGE}"},
             )
+        if _CODE_VERIFIER_RE.fullmatch(code_verifier) is None:
+            return JSONResponse(status_code=400, content={"error": "Invalid code_verifier"})
         if not hmac.compare_digest(derive_code_challenge(code_verifier), ticket.code_challenge):
             return JSONResponse(
                 status_code=403,
@@ -925,6 +938,7 @@ def _cli_consent_html(
     approved_as: str = "",
     denied: bool = False,
     upgrade_required: bool = False,
+    base_path: str = "",
 ) -> str:
     """Render the minimal, dependency-free CLI login consent page."""
 
@@ -952,25 +966,26 @@ def _cli_consent_html(
         body = f'<p class="err">{esc(error)}</p>'
     elif approved_as:
         body = (
-            "<h1>Approved</h1><p>Approved — the terminal is now signed in as "
+            "<h1>Approved</h1><p>Approved — your client is now signed in as "
             f"<b>{esc(approved_as)}</b>. You can close this tab.</p>"
         )
     elif denied:
         body = "<h1>Denied</h1><p>No access was granted. You can close this tab.</p>"
     else:
         body = (
-            "<h1>Authorize CLI login</h1>"
-            f"<p>A terminal (omnigent login) is requesting a session as "
+            "<h1>Authorize sign-in</h1>"
+            f"<p>An Omnigent client is requesting a session as "
             f"<b>{esc(user_id)}</b> on this Omnigent server.</p>"
             f'<p class="muted">Code: {esc(user_code)}</p>'
-            '<p class="warn">⚠️ Only approve if you just ran '
-            "<code>omnigent login</code> and this code matches the one printed "
-            "in your terminal. If you didn't, click Deny — approving gives "
-            "that terminal access as you.</p>"
-            '<form method="post" action="/auth/cli-approve" class="row">'
+            '<p class="warn">⚠️ Only approve if you just started this sign-in '
+            "from Omnigent. For CLI or Slack sign-in, also check that this code "
+            "matches the one shown in your terminal or Slack. If you didn't "
+            "start this sign-in, click Deny — approving gives that client "
+            "access as you.</p>"
+            f'<form method="post" action="{esc(base_path)}/auth/cli-approve" class="row">'
             f'<input type="hidden" name="ticket" value="{esc(ticket_id)}">'
             '<button type="submit" class="primary">Approve</button></form>'
-            '<form method="post" action="/auth/cli-deny" class="row">'
+            f'<form method="post" action="{esc(base_path)}/auth/cli-deny" class="row">'
             f'<input type="hidden" name="ticket" value="{esc(ticket_id)}">'
             '<button type="submit">Deny</button></form>'
         )

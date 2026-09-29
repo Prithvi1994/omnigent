@@ -227,7 +227,7 @@ def test_system_browser_session_is_bridged_to_isolated_webview(
         # until the user explicitly approves the CLI login there.
         system_browser_page.get_by_role("link", name="Continue as test user").click()
         expect(
-            system_browser_page.get_by_role("heading", name="Authorize CLI login")
+            system_browser_page.get_by_role("heading", name="Authorize sign-in")
         ).to_be_visible()
         expect(system_browser_page.get_by_text(user_code)).to_be_visible()
 
