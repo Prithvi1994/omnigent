@@ -44,6 +44,7 @@ function loadNavigationHarness({
   realBrowserRegistry = false,
   arcaPath = null,
   arcaResult = { ok: true, alreadyRunning: false },
+  managedServers = [],
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -229,6 +230,10 @@ function loadNavigationHarness({
         return {};
       },
       PRE_MANIFEST_BASELINE: {},
+    },
+    "./managed_preferences": {
+      ...require("../src/managed_preferences"),
+      getManagedServerUrls: () => managedServers,
     },
     "./deepLink": {
       parseOmnigentDeepLink: () => null,
@@ -721,12 +726,15 @@ describe("Databricks auth mode wiring", () => {
       h.api.registerIpc();
       await h.ipc.get("omnigent:set-server-url")(setupEvent(h), picked);
       chosen = other;
-      await h.ipc.get("omnigent:set-server-url")(setupEvent(h), picked);
-      assert.deepEqual(saved(h).server_aliases, { [other]: picked });
+      // The same pick in its root form, as the recents list shows it.
+      const pickedRoot = "https://accounts.cloud.databricks.com/?o=123";
+      await h.ipc.get("omnigent:set-server-url")(setupEvent(h), pickedRoot);
+      assert.deepEqual(saved(h).server_aliases, { [other]: pickedRoot });
+      assert.deepEqual(saved(h).recent_servers, [pickedRoot]);
       h.setUrl(`${other}/omnigent`);
       await h.ipc.get("omnigent:switch-server")(
         { sender: h.webContents, senderFrame: { url: `${other}/omnigent` } },
-        picked,
+        pickedRoot,
       );
       await tick();
       assert.equal(h.calls.auth.at(-1)[1], other);
@@ -751,10 +759,13 @@ describe("Databricks auth mode wiring", () => {
       const known = () => JSON.parse(JSON.stringify(h.api.knownOrigins()));
       assert.ok(known().includes(workspaceOrigin));
       assert.equal(h.api.findKnownServerUrl(workspaceOrigin), workspace);
-      // Once the saved default moves on and the pick is forgotten, the host needs consent again.
+      // With the saved default moved on, the saved pick alone keeps the host known…
       const settings = saved(h);
       settings.server_url = "https://unrelated.example.com/";
       fs.writeFileSync(h.settingsPath, JSON.stringify(settings));
+      assert.ok(known().includes(workspaceOrigin));
+      assert.equal(h.api.findKnownServerUrl(workspaceOrigin), workspace);
+      // …until it's forgotten, when the host needs consent again.
       const [listed] = await h.ipc.get("omnigent:get-recent-servers")(setupEvent(h));
       await h.ipc.get("omnigent:forget-recent-server")(setupEvent(h), listed);
       assert.ok(!known().includes(workspaceOrigin));
@@ -767,7 +778,7 @@ describe("Databricks auth mode wiring", () => {
           server_aliases: { "https://evil.example": picked },
         }),
       );
-      assert.ok(!known().includes("https://evil.example"));
+      assert.equal(h.api.findKnownServerUrl("https://evil.example"), null);
     });
 
     it("switches back to the pick through its workspace host, without a sign-in", async (t) => {
@@ -779,6 +790,25 @@ describe("Databricks auth mode wiring", () => {
       assert.equal(options.interactive, false);
       assert.equal(saved(h).server_url, workspace);
       assert.deepEqual(saved(h).recent_servers, [picked]);
+    });
+
+    it("still switches back silently after another recent is forgotten", async (t) => {
+      const h = await joinThroughAccount(t);
+      const settings = saved(h);
+      settings.recent_servers.push("https://unrelated.example.com/");
+      fs.writeFileSync(h.settingsPath, JSON.stringify(settings));
+      // Forgetting rewrites the remaining recents in their root form.
+      const [listed] = await h.ipc.get("omnigent:forget-recent-server")(
+        setupEvent(h),
+        "https://unrelated.example.com/",
+      );
+      assert.notEqual(listed, picked);
+      await h.ipc.get("omnigent:switch-server")(pageEvent(h), listed);
+      await tick();
+      const [, origin, options] = h.calls.auth.at(-1);
+      assert.equal(origin, workspaceOrigin);
+      assert.equal(options.interactive, false);
+      assert.equal(saved(h).server_url, workspace);
     });
 
     it("drops the alias when the user picks the workspace host itself", async (t) => {
@@ -1109,10 +1139,32 @@ describe("managed server preference wiring", () => {
   });
 
   it("returns managed choices in the connected-server picker", () => {
-    assert.match(
-      liveCode,
-      /ipcMain\.handle\("omnigent:get-server-picker"[\s\S]{0,900}managedServers[\s\S]{0,100}recentServers:\s*recents/,
-    );
+    const managed = "https://managed.example.com/";
+    const h = loadNavigationHarness({
+      serverUrl: "https://host.example/",
+      managedServers: [managed],
+    });
+    try {
+      h.api.registerIpc();
+      fs.writeFileSync(
+        h.settingsPath,
+        JSON.stringify({ recent_servers: ["https://host.example/", `${managed}omnigent`] }),
+      );
+      // JSON round trip: the handler's arrays come from the harness's VM realm.
+      const picker = JSON.parse(
+        JSON.stringify(
+          h.ipc.get("omnigent:get-server-picker")({
+            sender: h.webContents,
+            senderFrame: { url: "https://host.example/" },
+          }),
+        ),
+      );
+      assert.deepEqual(picker.managedServers, [managed]);
+      // A recent the organization already provides is listed once, as managed.
+      assert.deepEqual(picker.recentServers, ["https://host.example/"]);
+    } finally {
+      h.cleanup();
+    }
   });
 
   it("allows switching only to a recent or currently managed target", () => {

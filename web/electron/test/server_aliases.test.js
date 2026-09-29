@@ -9,7 +9,9 @@ const {
   withConnectAlias,
 } = require("../src/server_aliases");
 
-const PICKED = "https://team.example.com/omnigent?o=123";
+const PICKED = "https://accounts.cloud.databricks.com/omnigent?o=123";
+// PICKED in its root form, as recents list it.
+const PICKED_ROOT = "https://accounts.cloud.databricks.com/?o=123";
 const WORKSPACE = "https://dbc-1234.cloud.databricks.com";
 
 describe("server aliases", () => {
@@ -41,10 +43,16 @@ describe("server aliases", () => {
     assert.equal(aliasedServerUrl({}, "https://constructor"), "https://constructor");
   });
 
-  it("finds the workspace host for an exact pick", () => {
+  it("finds the workspace host for the pick in any equivalent form", () => {
     const aliases = { [WORKSPACE]: PICKED };
     assert.equal(aliasedWorkspaceOrigin(aliases, PICKED), WORKSPACE);
-    assert.equal(aliasedWorkspaceOrigin(aliases, "https://team.example.com/"), null);
+    assert.equal(aliasedWorkspaceOrigin(aliases, PICKED_ROOT), WORKSPACE);
+    // Another workspace selector is another pick.
+    assert.equal(
+      aliasedWorkspaceOrigin(aliases, "https://accounts.cloud.databricks.com/?o=456"),
+      null,
+    );
+    assert.equal(aliasedWorkspaceOrigin(aliases, "not a url"), null);
     assert.equal(aliasedWorkspaceOrigin({}, PICKED), null);
   });
 
@@ -54,6 +62,10 @@ describe("server aliases", () => {
     assert.deepEqual(first, { [WORKSPACE]: PICKED });
     // Same pick, another workspace chosen at sign-in: only the newest stays.
     assert.deepEqual(withConnectAlias(first, PICKED, `${other}/omnigent`), { [other]: PICKED });
+    // The same pick in its root form replaces it too.
+    assert.deepEqual(withConnectAlias(first, PICKED_ROOT, `${other}/omnigent`), {
+      [other]: PICKED_ROOT,
+    });
   });
 
   it("drops a host's alias when it's connected to directly", () => {

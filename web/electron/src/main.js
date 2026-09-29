@@ -43,6 +43,7 @@ const {
   aliasedServerUrl,
   aliasedWorkspaceOrigin,
   parseServerAliases,
+  serverIdentity,
   withConnectAlias,
 } = require("./server_aliases");
 const {
@@ -1310,9 +1311,12 @@ function rememberRecentServer(settings, url) {
   // also drops its earlier raw-host entries.
   const aliases = parseServerAliases(settings.server_aliases);
   const shown = aliasedServerUrl(aliases, url);
+  const identity = serverIdentity(shown);
   settings.recent_servers = [
     shown,
-    ...existing.filter((u) => typeof u === "string" && aliasedServerUrl(aliases, u) !== shown),
+    ...existing.filter(
+      (u) => typeof u === "string" && serverIdentity(aliasedServerUrl(aliases, u)) !== identity,
+    ),
   ].slice(0, MAX_RECENT_SERVERS);
 }
 
@@ -3067,7 +3071,7 @@ function registerIpc() {
     // Recents are compared normalized, as the page lists them.
     const aliases = parseServerAliases(settings.server_aliases);
     settings.server_aliases = Object.fromEntries(
-      Object.entries(aliases).filter(([, picked]) => normalizeRecentServers([picked])[0] !== url),
+      Object.entries(aliases).filter(([, picked]) => serverIdentity(picked) !== url),
     );
     saveSettings(settings);
     return excludingManagedServers(remaining, managed);
@@ -3806,8 +3810,7 @@ function trustedAliasOrigins(settings) {
   const aliases = parseServerAliases(settings.server_aliases);
   return Object.keys(aliases).filter(
     (origin) =>
-      recents.has(normalizeRecentServers([aliases[origin]])[0]) &&
-      databricksWorkspaceUiUrl(origin) !== null,
+      recents.has(serverIdentity(aliases[origin])) && databricksWorkspaceUiUrl(origin) !== null,
   );
 }
 
