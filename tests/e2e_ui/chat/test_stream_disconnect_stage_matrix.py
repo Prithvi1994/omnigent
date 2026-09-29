@@ -174,6 +174,18 @@ def test_numbered_output_recovers_across_stream_stages(
                 resume.set()
                 assert tail_reached.wait(timeout=60), "numbered producer did not reach 900"
                 expect(section).to_contain_text("899 900 ", timeout=_TIMEOUT_MS)
+                # Simulate a half-open browser socket: the visibility wake
+                # recycles a byte-stale stream on the same server process.
+                page.evaluate(
+                    """() => {
+                      const realNow = Date.now;
+                      Date.now = () => realNow() + 36_000;
+                      document.dispatchEvent(new Event('visibilitychange'));
+                      Date.now = realNow;
+                    }"""
+                )
+                assert _wait_for_stream(page, epochs, 3) == epochs[1]
+                expect(section).to_contain_text("899 900 ", timeout=_TIMEOUT_MS)
                 finish.set()
                 future.result(timeout=90)
             finally:

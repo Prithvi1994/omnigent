@@ -10793,6 +10793,49 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("keeps the old server's prefix through another reconnect on the new server", async () => {
+    seedSession("conv_epoch_twice", []);
+    const sinks = routeStreamOpens(["server-a", "server-b", "server-b"]);
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_epoch_twice", abortController: controller });
+
+    const loop = startStreamPump("conv_epoch_twice", controller, setState, getState);
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      sinks[0]!.push(
+        sse("response.output_text.delta", { message_id: "m1", index: 0, delta: "before " }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      sinks[0]!.close();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(sinks).toHaveLength(2);
+      sinks[1]!.push(
+        sse("response.output_text.delta", { message_id: "m1", index: 1, delta: "after " }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      sinks[1]!.close();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(sinks).toHaveLength(3);
+      // The server-b replay knows only the post-restart suffix, not server-a's prefix.
+      sinks[2]!.push(
+        sse("response.output_text.delta", { message_id: "m1", index: 1, delta: "after " }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      expect(useChatStore.getState().blocks.find((b) => b.ctx.itemId === "live:m1")).toMatchObject({
+        fullText: "before after ",
+      });
+    } finally {
+      controller.abort();
+      const last = sinks[sinks.length - 1];
+      if (last) {
+        last.push("data: [DONE]\n\n");
+        last.close();
+      }
+      await vi.advanceTimersByTimeAsync(20);
+      await loop;
+    }
+  });
+
   it("replaces preserved preview when the final item committed during restart", async () => {
     seedSession("conv_epoch_completed", []);
     const sinks = routeStreamOpens(["server-before", "server-after"]);
