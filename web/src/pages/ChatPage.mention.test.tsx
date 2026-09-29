@@ -461,6 +461,15 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     expect(textarea()).toHaveValue("@src/");
   });
 
+  it("Escape with an unmatched @ token still stops the running turn", () => {
+    const onStop = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ isWorking: true, onStop })} />);
+    type("@zzz");
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(onStop).toHaveBeenCalledTimes(1);
+  });
+
   it("Escape closes the mention menu", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@");

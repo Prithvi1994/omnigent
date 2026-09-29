@@ -126,11 +126,6 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
       dismiss();
       return false;
     }
-    if (e.key === "Escape") {
-      e.preventDefault();
-      dismiss();
-      return true;
-    }
     const { dir, filter } = parseMentionToken(mention.query);
     const canNavigate =
       !e.shiftKey &&
@@ -148,6 +143,13 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
       return true;
     }
     if (!mentionOpen) return false;
+    // Escape only acts on a visible listing, so an unmatched token still lets
+    // it reach the composer (cancel the turn, close the side chat).
+    if (e.key === "Escape") {
+      e.preventDefault();
+      dismiss();
+      return true;
+    }
     const active = mentionIndex >= 0 ? mentionEntries[mentionIndex] : undefined;
     if (e.key === "ArrowDown") {
       e.preventDefault();
