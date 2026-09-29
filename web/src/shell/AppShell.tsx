@@ -109,7 +109,7 @@ import {
 } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
-import { GithubPanel } from "./GithubPanel";
+import { PullRequestPanel } from "./PullRequestPanel";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
@@ -2392,7 +2392,7 @@ export function AppShell() {
                   onClose={() => setGithubPanelOpen(false)}
                   testId="github-panel-drawer"
                 >
-                  <GithubPanel conversationId={conversationId} />
+                  <PullRequestPanel conversationId={conversationId} />
                 </MobilePanelDrawer>
               )}
               {/* Mobile-only push panel — on desktop the viewer lives inside the inline aside. */}

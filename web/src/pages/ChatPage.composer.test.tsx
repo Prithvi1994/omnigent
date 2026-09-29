@@ -49,8 +49,8 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 
 // ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
 // (default: no PR) so bare Composer renders don't need a QueryClientProvider.
-vi.mock("@/hooks/useGithub", () => ({
-  useGithubInfo: () => ({ data: undefined }),
+vi.mock("@/hooks/usePullRequests", () => ({
+  usePullRequestInfo: () => ({ data: undefined }),
 }));
 // The workspace bar's git-status hook uses TanStack Query; stub it so the
 // composer renders in isolation (no QueryClient) with a neutral empty status.

@@ -1,14 +1,17 @@
+// Serves every git provider. Runtime names (query keys, routes, test ids) keep
+// the `github` prefix because they are stable wire ids.
+//
 // TanStack Query hooks for session PR resources and local associations.
 //
-//   useGithubInfo        — GET /resources/github
-//                          repo / branch / base ref / associated PR + CI summary.
-//   useGithubChangedFiles — GET /resources/github/changes
-//                          the PR's changed files (sidebar list).
-//   useGithubPrDiff      — GET /resources/github/diff
-//                          the whole PR as one unified-diff patch.
-//   fetchGithubFileContents — GET /resources/github/diff/{path}?base=<ref>
-//                          before/after full content for one file, fetched on
-//                          demand to expand unchanged context (not a hook).
+//   usePullRequestInfo           — GET /resources/github
+//                                  repo / branch / base ref / associated PR + CI summary.
+//   usePullRequestChangedFiles   — GET /resources/github/changes
+//                                  the PR's changed files (sidebar list).
+//   usePullRequestDiff           — GET /resources/github/diff
+//                                  the whole PR as one unified-diff patch.
+//   fetchPullRequestFileContents — GET /resources/github/diff/{path}?base=<ref>
+//                                  before/after full content for one file, fetched on
+//                                  demand to expand unchanged context (not a hook).
 //
 // Runner-offline (503 runner_unavailable) and no-os_env (404) are handled the
 // same way as the workspace filesystem hooks — reusing their helpers.
@@ -28,25 +31,25 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 
 /** One CI check the PR ran, bucketed for the checks summary. */
-export interface GithubCheckRun {
+export interface PullRequestCheckRun {
   name: string;
   bucket: "passing" | "failing" | "pending";
   /** Link to the run on GitHub, or null when unknown. */
   url: string | null;
 }
 
-export interface GithubChecks {
+export interface PullRequestChecks {
   passing: number;
   failing: number;
   pending: number;
   total: number;
   /** Per-check details (job names) for the hover breakdown. */
-  runs: GithubCheckRun[];
+  runs: PullRequestCheckRun[];
 }
 
 /** One top-level PR conversation comment (from `gh pr view --json comments`).
  *  Minimized/collapsed comments are dropped by the runner, matching GitHub. */
-export interface GithubComment {
+export interface PullRequestComment {
   /** Commenter's GitHub login, or null when unknown. */
   author: string | null;
   /** Comment body (GitHub-flavored markdown). */
@@ -57,7 +60,7 @@ export interface GithubComment {
   url: string | null;
 }
 
-export interface GithubPr {
+export interface PullRequest {
   number: number;
   title: string;
   /** "OPEN" | "MERGED" | "CLOSED" (as reported by gh). */
@@ -67,22 +70,22 @@ export interface GithubPr {
   author: string | null;
   base_ref: string | null;
   head_ref: string | null;
-  checks: GithubChecks;
+  checks: PullRequestChecks;
   head_sha?: string;
   base_sha?: string;
   /** PR description (GitHub-flavored markdown); null when empty. Optional: a
    *  host predating the Summary tab omits it, so treat undefined as none. */
   body?: string | null;
   /** Top-level PR comments GitHub shows by default; absent from an older host. */
-  comments?: GithubComment[];
+  comments?: PullRequestComment[];
 }
 
-export interface GithubRepo {
+export interface PullRequestRepo {
   name_with_owner: string | null;
 }
 
 /** A `gh`-configured account — one option in the panel's account selector. */
-export interface GithubAccount {
+export interface PullRequestAccount {
   login: string;
   /** Whether this is gh's currently-active account for the host. */
   active: boolean;
@@ -95,10 +98,10 @@ export interface GithubAccount {
  *  - `not_a_git_repo` — the workspace exists but isn't a git checkout.
  *  - `no_os_env` — no workspace/filesystem to read (404 from a current host).
  *  - `host_outdated` — the host predates the `/resources/github` route and
- *    404s "Resource 'github' not found"; synthesized in {@link fetchGithubInfo}. */
-export type GithubUnavailableReason = "not_a_git_repo" | "no_os_env" | "host_outdated";
+ *    404s "Resource 'github' not found"; synthesized in {@link fetchPullRequestInfo}. */
+export type PullRequestUnavailableReason = "not_a_git_repo" | "no_os_env" | "host_outdated";
 
-export interface GithubPrAssociation {
+export interface PullRequestAssociation {
   url: string;
   host: string;
   repository: string;
@@ -111,15 +114,15 @@ function prQuery(prUrl?: string): string {
   return prUrl ? `?${new URLSearchParams({ pr_url: prUrl })}` : "";
 }
 
-export interface GithubInfo {
+export interface PullRequestInfo {
   object: "session.github.info";
-  prs?: GithubPrAssociation[];
+  prs?: PullRequestAssociation[];
   selected_pr_url?: string;
   tracking_available?: boolean;
   /** False only when this isn't a git repo (see reason); the diff needs one. */
   available: boolean;
-  /** Why unavailable — see {@link GithubUnavailableReason}. */
-  reason?: GithubUnavailableReason;
+  /** Why unavailable — see {@link PullRequestUnavailableReason}. */
+  reason?: PullRequestUnavailableReason;
   /** Whether the `gh` CLI is present on the host. When false, PR/repo are null
    *  (the panel prompts to install `gh`). */
   gh_available?: boolean;
@@ -127,12 +130,12 @@ export interface GithubInfo {
    *  `gh auth status`). */
   authenticated?: boolean;
   branch?: string;
-  repo?: GithubRepo | null;
+  repo?: PullRequestRepo | null;
   /** The PR's base branch; null when there's no PR (the tab is a PR view). */
   base_ref?: string | null;
-  pr?: GithubPr | null;
+  pr?: PullRequest | null;
   /** Configured gh accounts (the account selector's options). */
-  accounts?: GithubAccount[];
+  accounts?: PullRequestAccount[];
   /** The login gh runs as for this workspace — the per-workspace preference,
    *  else the active account. */
   selected_account?: string | null;
@@ -140,16 +143,16 @@ export interface GithubInfo {
 
 /** A file changed on the branch relative to its base. Same shape as the
  *  workspace changed-files list, plus a "renamed" status. */
-export type GithubChangedFile = Omit<WorkspaceChangedFile, "status"> & {
+export type PullRequestChangedFile = Omit<WorkspaceChangedFile, "status"> & {
   status: WorkspaceChangedFile["status"] | "renamed";
 };
 
-export interface GithubChangedFilesResult {
+export interface PullRequestChangedFilesResult {
   available: boolean;
-  data: GithubChangedFile[];
+  data: PullRequestChangedFile[];
 }
 
-export interface GithubFileDiffResponse {
+export interface PullRequestFileDiffResponse {
   object: "session.github.file_diff";
   path: string;
   /** Content at the base merge-base, or null for an added file. */
@@ -184,13 +187,18 @@ async function errorFromResponse(res: Response): Promise<Error> {
  * Temporary: the route ships in 0.13.0, so this shim is only for hosts below
  * it. @deprecated — expected removal ~0.16.0, once <0.13.0 hosts have aged out.
  */
-export function githubNotFoundReason(message: string | undefined): GithubUnavailableReason {
+export function pullRequestNotFoundReason(
+  message: string | undefined,
+): PullRequestUnavailableReason {
   return message && /resource\b.*\bgithub\b.*not found/i.test(message)
     ? "host_outdated"
     : "no_os_env";
 }
 
-export async function fetchGithubInfo(conversationId: string, prUrl?: string): Promise<GithubInfo> {
+export async function fetchPullRequestInfo(
+  conversationId: string,
+  prUrl?: string,
+): Promise<PullRequestInfo> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github${prQuery(prUrl)}`,
   );
@@ -207,14 +215,14 @@ export async function fetchGithubInfo(conversationId: string, prUrl?: string): P
     return {
       object: "session.github.info",
       available: false,
-      reason: githubNotFoundReason(message),
+      reason: pullRequestNotFoundReason(message),
     };
   }
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
   }
   if (!res.ok) throw await errorFromResponse(res);
-  return (await res.json()) as GithubInfo;
+  return (await res.json()) as PullRequestInfo;
 }
 
 /** Poll cadence while the panel is open and the GitHub state can still change.
@@ -222,7 +230,7 @@ export async function fetchGithubInfo(conversationId: string, prUrl?: string): P
  *  (install `gh`, `gh auth login`/`switch`, `cd` into a repo) — cheap local
  *  git/gh checks — and the waiting-for-a-PR / CI-running states, which cost a
  *  `gh` API call but only while the panel is actually focused. */
-const GITHUB_POLL_MS = 5_000;
+const PULL_REQUEST_POLL_MS = 5_000;
 
 /**
  * The panel's poll interval for the current GitHub info, or `false` to stop.
@@ -233,17 +241,17 @@ const GITHUB_POLL_MS = 5_000;
  * waiting for a PR and watching an open PR's checks. It rests (returns `false`)
  * only at a stable end state: an open PR whose checks have all settled, or a
  * merged/closed PR. A resting panel still refreshes on the turn-end invalidate
- * (see {@link useGithubInfo}); resting only forgoes the interval poll. Kept pure
+ * (see {@link usePullRequestInfo}); resting only forgoes the interval poll. Kept pure
  * and exported so each state is unit-testable.
  *
  * Note: an open PR on a repo with no CI stays at `total === 0` and so keeps
  * polling while the panel is open+focused — we can't tell "no CI" from "checks
  * haven't registered yet", and freshness wins for the cost of a focused poll.
  */
-export function computeGithubPollInterval(info: GithubInfo | undefined): number | false {
+export function computePullRequestPollInterval(info: PullRequestInfo | undefined): number | false {
   // No usable info yet — an initial error, or a transient fetch failure with no
   // cached data. Keep trying; runner-offline is gated off by `enabled`.
-  if (!info) return GITHUB_POLL_MS;
+  if (!info) return PULL_REQUEST_POLL_MS;
   // Setup / availability states, all resolved outside the app.
   if (
     !info.available ||
@@ -251,13 +259,13 @@ export function computeGithubPollInterval(info: GithubInfo | undefined): number 
     info.authenticated === false ||
     !info.repo?.name_with_owner
   ) {
-    return GITHUB_POLL_MS;
+    return PULL_REQUEST_POLL_MS;
   }
   const pr = info.pr;
-  if (!pr) return GITHUB_POLL_MS; // set up, waiting for a PR to appear
+  if (!pr) return PULL_REQUEST_POLL_MS; // set up, waiting for a PR to appear
   if (pr.state !== "OPEN") return false; // merged/closed → nothing left to watch
   // Open PR: poll while checks run or haven't registered; stop once settled.
-  return pr.checks.pending > 0 || pr.checks.total === 0 ? GITHUB_POLL_MS : false;
+  return pr.checks.pending > 0 || pr.checks.total === 0 ? PULL_REQUEST_POLL_MS : false;
 }
 
 /**
@@ -272,7 +280,7 @@ export function computeGithubPollInterval(info: GithubInfo | undefined): number 
  *     status-line indicator and the panel) without a manual refresh. This is
  *     the always-on path — the status line uses it even with the tab closed.
  *   - Panel poll: pass `{ poll: true }` (the GitHub panel does) to also poll
- *     while the panel is open — see {@link computeGithubPollInterval} for which
+ *     while the panel is open — see {@link computePullRequestPollInterval} for which
  *     states poll and which rest. It catches changes a turn boundary can't
  *     (setup fixed outside the app, CI progressing after the turn). Backgrounded
  *     tabs pause (`refetchIntervalInBackground: false`).
@@ -280,7 +288,7 @@ export function computeGithubPollInterval(info: GithubInfo | undefined): number 
  * Disabled when the runner is known offline. Retries the runner-offline case
  * with capped backoff so a cold-booting runner resolves before any error UI.
  */
-export function useGithubInfo(
+export function usePullRequestInfo(
   rawConversationId: string | undefined,
   options?: { poll?: boolean; prUrl?: string },
 ) {
@@ -293,7 +301,7 @@ export function useGithubInfo(
   useTrailingInvalidate(conversationId, useSessionActive(conversationId), "github-info");
   return useQuery({
     queryKey: ["github-info", conversationId, ...(options?.prUrl ? [options.prUrl] : [])],
-    queryFn: () => fetchGithubInfo(conversationId!, options?.prUrl),
+    queryFn: () => fetchPullRequestInfo(conversationId!, options?.prUrl),
     enabled: !!conversationId && serveable !== false,
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
@@ -302,7 +310,7 @@ export function useGithubInfo(
       ? (query) =>
           query.state.data?.tracking_available
             ? 10_000
-            : computeGithubPollInterval(query.state.data)
+            : computePullRequestPollInterval(query.state.data)
       : false,
     refetchIntervalInBackground: false,
   });
@@ -311,16 +319,16 @@ export function useGithubInfo(
 /** The account (a gh login) and/or base repo (a git remote name or `owner/repo`)
  *  to pin for this session's workspace. Either may be omitted to leave it as-is;
  *  an empty `account` clears the per-repo preference. */
-export interface GithubPreferenceInput {
+export interface PullRequestPreferenceInput {
   pr_url?: string;
   account?: string;
   remote?: string;
 }
 
-async function postGithubPreference(
+async function postPullRequestPreference(
   conversationId: string,
-  body: GithubPreferenceInput,
-): Promise<GithubInfo> {
+  body: PullRequestPreferenceInput,
+): Promise<PullRequestInfo> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/preferences`,
     {
@@ -333,7 +341,7 @@ async function postGithubPreference(
     throw new RunnerOfflineError();
   }
   if (!res.ok) throw await errorFromResponse(res);
-  return (await res.json()) as GithubInfo;
+  return (await res.json()) as PullRequestInfo;
 }
 
 /**
@@ -345,10 +353,11 @@ async function postGithubPreference(
  * account/base can resolve a different PR, the PR-derived queries (changed files,
  * whole-PR diff) are invalidated so they refetch. Requires the runner online.
  */
-export function useSetGithubPreference(conversationId: string | undefined) {
+export function useSetPullRequestPreference(conversationId: string | undefined) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (body: GithubPreferenceInput) => postGithubPreference(conversationId!, body),
+    mutationFn: (body: PullRequestPreferenceInput) =>
+      postPullRequestPreference(conversationId!, body),
     onSuccess: (info) => {
       queryClient.setQueryData(["github-info", conversationId], info);
       queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] });
@@ -358,10 +367,10 @@ export function useSetGithubPreference(conversationId: string | undefined) {
   });
 }
 
-async function fetchGithubChangedFiles(
+async function fetchPullRequestChangedFiles(
   conversationId: string,
   prUrl?: string,
-): Promise<GithubChangedFilesResult> {
+): Promise<PullRequestChangedFilesResult> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/changes${prQuery(prUrl)}`,
   );
@@ -370,16 +379,16 @@ async function fetchGithubChangedFiles(
     throw new RunnerOfflineError();
   }
   if (!res.ok) throw await errorFromResponse(res);
-  const json = (await res.json()) as { data: GithubChangedFile[] };
+  const json = (await res.json()) as { data: PullRequestChangedFile[] };
   return { available: true, data: json.data };
 }
 
 /**
  * Fetch the PR's changed files (the "Files changed" list). Enabled only when a
- * PR exists (pass `hasPr` from {@link useGithubInfo}); the runner returns an
+ * PR exists (pass `hasPr` from {@link usePullRequestInfo}); the runner returns an
  * empty list otherwise.
  */
-export function useGithubChangedFiles(
+export function usePullRequestChangedFiles(
   conversationId: string | undefined,
   hasPr: boolean,
   prUrl?: string,
@@ -388,7 +397,7 @@ export function useGithubChangedFiles(
   const serveable = useWorkspaceServeable(conversationId);
   return useQuery({
     queryKey: ["github-changed-files", conversationId, ...(prUrl ? [prUrl, revision] : [])],
-    queryFn: () => fetchGithubChangedFiles(conversationId!, prUrl),
+    queryFn: () => fetchPullRequestChangedFiles(conversationId!, prUrl),
     // Only a PR has files to show — skip the call in every no-PR / unavailable
     // / unauthenticated state (the panel shows an empty state instead).
     enabled: !!conversationId && hasPr && serveable !== false,
@@ -403,12 +412,12 @@ export function useGithubChangedFiles(
  * expand unchanged context in the diff view (the `loadDiffFiles` loader), not
  * as a hook. Returns `""` sides normalized by the caller.
  */
-export async function fetchGithubFileContents(
+export async function fetchPullRequestFileContents(
   conversationId: string,
   path: string,
   base: string | undefined,
   selected?: { pr_url: string; previous_path?: string; head_sha?: string; base_sha?: string },
-): Promise<GithubFileDiffResponse> {
+): Promise<PullRequestFileDiffResponse> {
   // Encode each path segment individually so slashes remain structural.
   const encodedPath = path.split("/").map(encodeURIComponent).join("/");
   const query = new URLSearchParams();
@@ -425,19 +434,19 @@ export async function fetchGithubFileContents(
     throw new RunnerOfflineError();
   }
   if (!res.ok) throw await errorFromResponse(res);
-  return (await res.json()) as GithubFileDiffResponse;
+  return (await res.json()) as PullRequestFileDiffResponse;
 }
 
-export interface GithubPrDiffResponse {
+export interface PullRequestDiffResponse {
   object: "session.github.pr_diff";
   /** The whole PR as one unified diff patch (every changed file). */
   patch: string;
 }
 
-async function fetchGithubPrDiff(
+async function fetchPullRequestDiff(
   conversationId: string,
   prUrl?: string,
-): Promise<GithubPrDiffResponse> {
+): Promise<PullRequestDiffResponse> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff${prQuery(prUrl)}`,
   );
@@ -445,16 +454,16 @@ async function fetchGithubPrDiff(
     throw new RunnerOfflineError();
   }
   if (!res.ok) throw await errorFromResponse(res);
-  return (await res.json()) as GithubPrDiffResponse;
+  return (await res.json()) as PullRequestDiffResponse;
 }
 
 /**
  * Fetch the whole PR as one unified diff patch. The panel parses it
  * client-side into per-file diffs, so the entire PR renders from a single
- * call. Enabled only when a PR exists (pass `hasPr` from {@link useGithubInfo});
+ * call. Enabled only when a PR exists (pass `hasPr` from {@link usePullRequestInfo});
  * disabled when the runner is known offline.
  */
-export function useGithubPrDiff(
+export function usePullRequestDiff(
   conversationId: string | undefined,
   hasPr: boolean,
   prUrl?: string,
@@ -463,7 +472,7 @@ export function useGithubPrDiff(
   const serveable = useWorkspaceServeable(conversationId);
   return useQuery({
     queryKey: ["github-pr-diff", conversationId, ...(prUrl ? [prUrl, revision] : [])],
-    queryFn: () => fetchGithubPrDiff(conversationId!, prUrl),
+    queryFn: () => fetchPullRequestDiff(conversationId!, prUrl),
     enabled: !!conversationId && hasPr && serveable !== false,
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
@@ -484,7 +493,7 @@ export function useUpdateSessionPr(conversationId: string) {
         },
       );
       if (!response.ok) throw await errorFromResponse(response);
-      return (await response.json()) as GithubInfo;
+      return (await response.json()) as PullRequestInfo;
     },
     onSuccess: async (info, body) => {
       await queryClient.cancelQueries({ queryKey: ["github-info", conversationId] });

@@ -1,4 +1,4 @@
-// Tests for GithubPanel — the stacked "Files changed" view. The GitHub data
+// Tests for PullRequestPanel — the stacked "Files changed" view. The GitHub data
 // hooks and the heavy MonacoDiffViewer are mocked; IntersectionObserver (absent
 // in jsdom) is stubbed to fire immediately so lazy sections mount.
 
@@ -6,17 +6,17 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { GithubChangedFile, GithubInfo } from "@/hooks/useGithub";
+import type { PullRequestChangedFile, PullRequestInfo } from "@/hooks/usePullRequests";
 
 const state = vi.hoisted(() => ({
   info: null as {
-    data?: GithubInfo;
+    data?: PullRequestInfo;
     isLoading: boolean;
     error: unknown;
     isFetching: boolean;
   } | null,
   changes: null as {
-    data?: { available: boolean; data: GithubChangedFile[] };
+    data?: { available: boolean; data: PullRequestChangedFile[] };
     isLoading: boolean;
     error: unknown;
     isFetching: boolean;
@@ -26,21 +26,21 @@ const state = vi.hoisted(() => ({
   parsedFiles: [] as { name: string; prevName?: string; type?: string }[],
 }));
 
-vi.mock("@/hooks/useGithub", () => ({
-  useGithubInfo: vi.fn(() => state.info),
-  useGithubChangedFiles: vi.fn(() => state.changes),
+vi.mock("@/hooks/usePullRequests", () => ({
+  usePullRequestInfo: vi.fn(() => state.info),
+  usePullRequestChangedFiles: vi.fn(() => state.changes),
   // One whole-PR patch; the panel parses it into per-file diffs.
-  useGithubPrDiff: () => ({
+  usePullRequestDiff: () => ({
     data: { object: "session.github.pr_diff", patch: "PATCH" },
     isLoading: false,
     error: null,
     isFetching: false,
   }),
-  fetchGithubFileContents: async () => ({ before: "old", after: "new" }),
+  fetchPullRequestFileContents: async () => ({ before: "old", after: "new" }),
   // The account selector (shown in the repo-unresolved empty state) calls this;
   // stub the mutation shape it reads.
   useUpdateSessionPr: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useSetGithubPreference: () => ({
+  useSetPullRequestPreference: () => ({
     mutate: () => {},
     isPending: false,
     isError: false,
@@ -72,17 +72,17 @@ vi.mock("@/components/ai-elements/message", () => ({
   ),
 }));
 
-import { useGithubInfo, useGithubChangedFiles } from "@/hooks/useGithub";
+import { usePullRequestInfo, usePullRequestChangedFiles } from "@/hooks/usePullRequests";
 
-import { GithubPanel, deriveGithubPanelState } from "./GithubPanel";
+import { PullRequestPanel, derivePullRequestPanelState } from "./PullRequestPanel";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 
 function file(
   path: string,
-  status: GithubChangedFile["status"],
+  status: PullRequestChangedFile["status"],
   adds = 1,
   dels = 0,
-): GithubChangedFile {
+): PullRequestChangedFile {
   return {
     path,
     name: path.split("/").pop() ?? path,
@@ -96,7 +96,7 @@ function file(
 
 function renderPanel() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(<GithubPanel conversationId="conv_1" />, {
+  return render(<PullRequestPanel conversationId="conv_1" />, {
     wrapper: ({ children }) => (
       <QueryClientProvider client={client}>{children}</QueryClientProvider>
     ),
@@ -191,7 +191,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe("GithubPanel", () => {
+describe("PullRequestPanel", () => {
   it("shows the PR title in the header and CI check pills on the Summary tab", async () => {
     renderPanel();
     const heading = screen.getByRole("heading", { name: "GitHub" });
@@ -489,8 +489,8 @@ describe("GithubPanel", () => {
   });
 });
 
-describe("deriveGithubPanelState", () => {
-  const ready: GithubInfo = {
+describe("derivePullRequestPanelState", () => {
+  const ready: PullRequestInfo = {
     object: "session.github.info",
     available: true,
     gh_available: true,
@@ -510,53 +510,53 @@ describe("deriveGithubPanelState", () => {
       checks: { passing: 0, failing: 0, pending: 0, total: 0, runs: [] },
     },
   };
-  const q = (over: Partial<{ isLoading: boolean; error: unknown; data: GithubInfo }>) => ({
+  const q = (over: Partial<{ isLoading: boolean; error: unknown; data: PullRequestInfo }>) => ({
     isLoading: false,
     error: null as unknown,
-    data: undefined as GithubInfo | undefined,
+    data: undefined as PullRequestInfo | undefined,
     ...over,
   });
 
   it("orders transient states ahead of data", () => {
-    expect(deriveGithubPanelState(q({ isLoading: true })).kind).toBe("loading");
-    expect(deriveGithubPanelState(q({ error: new RunnerOfflineError() })).kind).toBe(
+    expect(derivePullRequestPanelState(q({ isLoading: true })).kind).toBe("loading");
+    expect(derivePullRequestPanelState(q({ error: new RunnerOfflineError() })).kind).toBe(
       "runner-offline",
     );
-    expect(deriveGithubPanelState(q({ error: new Error("boom") })).kind).toBe("error");
+    expect(derivePullRequestPanelState(q({ error: new Error("boom") })).kind).toBe("error");
   });
 
   it("maps each unavailable reason to its own state", () => {
-    expect(deriveGithubPanelState(q({ data: undefined })).kind).toBe("unavailable");
+    expect(derivePullRequestPanelState(q({ data: undefined })).kind).toBe("unavailable");
     expect(
-      deriveGithubPanelState(
+      derivePullRequestPanelState(
         q({ data: { object: "session.github.info", available: false, reason: "no_os_env" } }),
       ).kind,
     ).toBe("unavailable");
     expect(
-      deriveGithubPanelState(
+      derivePullRequestPanelState(
         q({ data: { object: "session.github.info", available: false, reason: "not_a_git_repo" } }),
       ).kind,
     ).toBe("not-a-git-repo");
     expect(
-      deriveGithubPanelState(
+      derivePullRequestPanelState(
         q({ data: { object: "session.github.info", available: false, reason: "host_outdated" } }),
       ).kind,
     ).toBe("host-outdated");
   });
 
   it("walks the gh layer: cli → auth → repo → pr → ready", () => {
-    expect(deriveGithubPanelState(q({ data: { ...ready, gh_available: false } })).kind).toBe(
+    expect(derivePullRequestPanelState(q({ data: { ...ready, gh_available: false } })).kind).toBe(
       "no-gh-cli",
     );
-    expect(deriveGithubPanelState(q({ data: { ...ready, authenticated: false } })).kind).toBe(
+    expect(derivePullRequestPanelState(q({ data: { ...ready, authenticated: false } })).kind).toBe(
       "repo-unresolved",
     );
-    expect(deriveGithubPanelState(q({ data: { ...ready, repo: null } })).kind).toBe(
+    expect(derivePullRequestPanelState(q({ data: { ...ready, repo: null } })).kind).toBe(
       "repo-unresolved",
     );
-    const noPr = deriveGithubPanelState(q({ data: { ...ready, pr: null } }));
+    const noPr = derivePullRequestPanelState(q({ data: { ...ready, pr: null } }));
     expect(noPr).toEqual({ kind: "no-pr", branch: "feat/x" });
-    expect(deriveGithubPanelState(q({ data: ready }))).toEqual({ kind: "ready" });
+    expect(derivePullRequestPanelState(q({ data: ready }))).toEqual({ kind: "ready" });
   });
 });
 
@@ -627,7 +627,7 @@ describe("session PR selection", () => {
     expect(picker).toHaveTextContent("example/two #42 — Second repository");
     expect(picker).not.toHaveAttribute("title");
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
-    expect(useGithubInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: two });
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: two });
     await user.hover(picker);
     expect(await screen.findByRole("tooltip")).toHaveTextContent(
       "example/two #42 — Second repository",
@@ -635,7 +635,7 @@ describe("session PR selection", () => {
     await user.unhover(picker);
 
     state.info = { isLoading: true, error: null, isFetching: true };
-    rerender(<GithubPanel conversationId="conv_1" />);
+    rerender(<PullRequestPanel conversationId="conv_1" />);
     expect(screen.getByRole("combobox", { name: "Session pull request" })).toBe(picker);
     expect(picker).toHaveTextContent("example/two #42 — Second repository");
     expect(screen.getByText("Loading GitHub…")).toBeInTheDocument();
@@ -645,7 +645,7 @@ describe("session PR selection", () => {
     expect(screen.queryByRole("link", { name: "Open the PR on GitHub" })).toBeNull();
 
     state.info = { isLoading: false, error: new Error("Metadata unavailable"), isFetching: false };
-    rerender(<GithubPanel conversationId="conv_1" />);
+    rerender(<PullRequestPanel conversationId="conv_1" />);
     expect(screen.getByRole("combobox", { name: "Session pull request" })).toBe(picker);
     expect(picker).toHaveTextContent("example/two #42 — Second repository");
     const errorMessage = screen.getByText(/Metadata unavailable/);
@@ -654,10 +654,10 @@ describe("session PR selection", () => {
     expect(fallback).toHaveAttribute("href", two);
     await user.click(picker);
     await user.click(screen.getByRole("option", { name: "example/one #42 — First repository" }));
-    expect(useGithubInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: one });
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: one });
 
     state.info = { isLoading: true, error: null, isFetching: true };
-    rerender(<GithubPanel conversationId="conv_other" />);
+    rerender(<PullRequestPanel conversationId="conv_other" />);
     expect(screen.queryByRole("combobox", { name: "Session pull request" })).toBeNull();
   });
 
@@ -741,6 +741,6 @@ describe("session PR selection", () => {
       },
     };
     renderPanel();
-    expect(useGithubChangedFiles).toHaveBeenLastCalledWith("conv_1", true, url, "base:head");
+    expect(usePullRequestChangedFiles).toHaveBeenLastCalledWith("conv_1", true, url, "base:head");
   });
 });

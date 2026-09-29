@@ -56,7 +56,7 @@ import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
-import { GithubPanel } from "./GithubPanel";
+import { PullRequestPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
@@ -1332,7 +1332,7 @@ function WorkspacePanelImpl({
               className="min-h-0 flex-1"
             />
           ) : rightRailTab === "github" && showGithubTab ? (
-            <GithubPanel conversationId={conversationId} />
+            <PullRequestPanel conversationId={conversationId} />
           ) : rightRailTab === "subagents" && rootSessionId ? (
             <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
           ) : (

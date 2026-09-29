@@ -7,7 +7,7 @@ import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseConversationsModule from "@/hooks/useConversations";
-import type * as UseGithubModule from "@/hooks/useGithub";
+import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
@@ -39,11 +39,11 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
     isLoading: false,
   })),
 }));
-vi.mock("@/hooks/useGithub", async (importOriginal) => ({
+vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
   // Keep the real module (types, the panel's sibling hooks) — only the
   // info hook AppShell reads is replaced, per-test below.
-  ...(await importOriginal<typeof UseGithubModule>()),
-  useGithubInfo: vi.fn(() => ({ data: undefined, isLoading: true })),
+  ...(await importOriginal<typeof UsePullRequestsModule>()),
+  usePullRequestInfo: vi.fn(() => ({ data: undefined, isLoading: true })),
 }));
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
@@ -63,8 +63,8 @@ vi.mock("./Sidebar", () => ({
   Sidebar: () => <div data-testid="sidebar" />,
   isMobileViewport: vi.fn(() => false),
 }));
-vi.mock("./GithubPanel", () => ({
-  GithubPanel: () => <div data-testid="github-panel">Pull request details</div>,
+vi.mock("./PullRequestPanel", () => ({
+  PullRequestPanel: () => <div data-testid="github-panel">Pull request details</div>,
 }));
 vi.mock("./FilesPanel", () => ({
   FilesPanel: () => <div data-testid="files-panel" />,
@@ -85,10 +85,10 @@ vi.mock("./TerminalsPanel", () => ({
 import { AppShell } from "./AppShell";
 import { useOpenGithubTab } from "./FileViewerContext";
 import { isMobileViewport } from "./Sidebar";
-import { useGithubInfo } from "@/hooks/useGithub";
+import { usePullRequestInfo } from "@/hooks/usePullRequests";
 import { useConversations } from "@/hooks/useConversations";
 
-const useGithubInfoMock = vi.mocked(useGithubInfo);
+const usePullRequestInfoMock = vi.mocked(usePullRequestInfo);
 
 afterEach(cleanup);
 
@@ -99,9 +99,9 @@ beforeEach(() => {
   writeWorkspacePanelDefault("open");
   sessionStorage.clear();
   vi.mocked(isMobileViewport).mockReturnValue(false);
-  useGithubInfoMock.mockReset();
-  useGithubInfoMock.mockReturnValue({ data: undefined, isLoading: true } as ReturnType<
-    typeof useGithubInfo
+  usePullRequestInfoMock.mockReset();
+  usePullRequestInfoMock.mockReturnValue({ data: undefined, isLoading: true } as ReturnType<
+    typeof usePullRequestInfo
   >);
   vi.mocked(useConversations).mockReset();
   vi.mocked(useConversations).mockReturnValue({
@@ -164,10 +164,10 @@ function renderShell() {
 
 describe("GitHub rail tab visibility", () => {
   it("shows the GitHub tab even when the workspace isn't a git repository", () => {
-    useGithubInfoMock.mockReturnValue({
+    usePullRequestInfoMock.mockReturnValue({
       data: { object: "session.github.info", available: false, reason: "not_a_git_repo" },
       isLoading: false,
-    } as ReturnType<typeof useGithubInfo>);
+    } as ReturnType<typeof usePullRequestInfo>);
 
     renderShell();
 
@@ -179,10 +179,10 @@ describe("GitHub rail tab visibility", () => {
   });
 
   it("shows the GitHub tab for a git workspace", () => {
-    useGithubInfoMock.mockReturnValue({
+    usePullRequestInfoMock.mockReturnValue({
       data: { object: "session.github.info", available: true },
       isLoading: false,
-    } as ReturnType<typeof useGithubInfo>);
+    } as ReturnType<typeof usePullRequestInfo>);
 
     renderShell();
 
@@ -193,10 +193,10 @@ describe("GitHub rail tab visibility", () => {
     // An outdated host 404s the info endpoint (reason: host_outdated). The
     // panel renders an actionable "update your host" prompt, so the tab must
     // stay reachable rather than being hidden like the non-git dead end.
-    useGithubInfoMock.mockReturnValue({
+    usePullRequestInfoMock.mockReturnValue({
       data: { object: "session.github.info", available: false, reason: "host_outdated" },
       isLoading: false,
-    } as ReturnType<typeof useGithubInfo>);
+    } as ReturnType<typeof usePullRequestInfo>);
 
     renderShell();
 

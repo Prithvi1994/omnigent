@@ -1,4 +1,7 @@
-// GithubPanel — the right-rail "GitHub" tab. Read-only view of the session
+// Serves every git provider. Runtime names (query keys, routes, test ids) keep
+// the `github` prefix because they are stable wire ids.
+//
+// PullRequestPanel — the right-rail "GitHub" tab. Read-only view of the session
 // branch's relationship to GitHub: the associated PR (number, title, state, CI
 // summary, link out) and the branch-vs-base diff.
 //
@@ -11,11 +14,11 @@
 // reader expands unchanged context.
 //
 // Data comes from the runner's read-only GitHub resource API (see
-// hooks/useGithub.ts), which shells out to `gh` + `git`. `deriveGithubPanelState`
-// is the single switch that turns the info query into what the panel shows: an
-// outdated host, a non-git workspace, a missing `gh` CLI, an unresolved
-// upstream repo, or no PR each render their own empty state, and an associated
-// PR falls through to the header + stacked diff.
+// hooks/usePullRequests.ts), which shells out to `gh` + `git`.
+// `derivePullRequestPanelState` is the single switch that turns the info query
+// into what the panel shows: an outdated host, a non-git workspace, a missing
+// `gh` CLI, an unresolved upstream repo, or no PR each render their own empty
+// state, and an associated PR falls through to the header + stacked diff.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -71,19 +74,19 @@ import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import {
-  fetchGithubFileContents,
-  useGithubChangedFiles,
-  useGithubInfo,
-  useGithubPrDiff,
-  useSetGithubPreference,
+  fetchPullRequestFileContents,
+  usePullRequestChangedFiles,
+  usePullRequestDiff,
+  usePullRequestInfo,
+  useSetPullRequestPreference,
   useUpdateSessionPr,
-  type GithubChangedFile,
-  type GithubCheckRun,
-  type GithubChecks,
-  type GithubComment,
-  type GithubInfo,
-  type GithubPrAssociation,
-} from "@/hooks/useGithub";
+  type PullRequestAssociation,
+  type PullRequestChangedFile,
+  type PullRequestCheckRun,
+  type PullRequestChecks,
+  type PullRequestComment,
+  type PullRequestInfo,
+} from "@/hooks/usePullRequests";
 
 // Shiki bundled themes matching the app's editor look; the concrete side is
 // chosen by `themeType` from the app's resolved light/dark mode.
@@ -101,7 +104,7 @@ function PanelMessage({ children }: { children: React.ReactNode }) {
 /** Full-panel empty state: an icon, a title, an optional hint line, and optional
  *  children below (the account/remote selectors). Used for every "no GitHub
  *  content to show" reason so they read as one family. */
-function GithubEmptyState({
+function PullRequestEmptyState({
   icon: Icon,
   title,
   hint,
@@ -136,9 +139,9 @@ function GithubAccountSelector({
   info,
 }: {
   conversationId: string;
-  info: GithubInfo;
+  info: PullRequestInfo;
 }) {
-  const setPref = useSetGithubPreference(conversationId);
+  const setPref = useSetPullRequestPreference(conversationId);
   const accounts = info.accounts ?? [];
   if (accounts.length <= 1) return null;
 
@@ -174,7 +177,7 @@ function GithubAccountSelector({
 
 /** The one thing the panel should show, derived from the info query. Every
  *  non-`ready` kind is a whole-panel state; `ready` renders the PR + diff. */
-export type GithubPanelState =
+export type PullRequestPanelState =
   | { kind: "loading" }
   | { kind: "runner-offline" }
   | { kind: "error"; message: string }
@@ -191,11 +194,11 @@ export type GithubPanelState =
  * Order matters: transient states (loading/offline/error) first, then the
  * git-first availability reasons, then the `gh` enhancement layer (CLI → auth
  * → repo → PR). `ready` is reached only with an associated PR to render. */
-export function deriveGithubPanelState(info: {
+export function derivePullRequestPanelState(info: {
   isLoading: boolean;
   error: unknown;
-  data: GithubInfo | undefined;
-}): GithubPanelState {
+  data: PullRequestInfo | undefined;
+}): PullRequestPanelState {
   if (info.isLoading) return { kind: "loading" };
   if (info.error) {
     if (info.error instanceof RunnerOfflineError) return { kind: "runner-offline" };
@@ -285,7 +288,7 @@ function PullRequestStatus({ state }: { state: string }) {
 // GitHub-style status icons (a file glyph carrying the change kind) instead of
 // bare A/M/D/R letters — quicker to recognize at a glance.
 const STATUS_META: Record<
-  GithubChangedFile["status"],
+  PullRequestChangedFile["status"],
   { label: string; className: string; Icon: LucideIcon }
 > = {
   created: { label: "Added", className: "text-green-600 dark:text-green-400", Icon: FilePlusIcon },
@@ -303,7 +306,7 @@ const STATUS_META: Record<
 };
 
 /** Diffstat (+adds −removes) shared by the sidebar row and the section header. */
-function DiffStat({ file }: { file: GithubChangedFile }) {
+function DiffStat({ file }: { file: PullRequestChangedFile }) {
   if (file.lines_added === null && file.lines_removed === null) return null;
   return (
     <span className="shrink-0 font-mono text-xs tabular-nums">
@@ -334,7 +337,7 @@ type DiffOptions = React.ComponentProps<typeof FileDiff>["options"];
  * the diff open/closed. The diff mounts lazily once the section nears the
  * viewport (a big PR doesn't build every diff at once).
  */
-function GithubFileSection({
+function PullRequestFileSection({
   file,
   fileDiff,
   options,
@@ -342,7 +345,7 @@ function GithubFileSection({
   collapsed,
   onToggleCollapsed,
 }: {
-  file: GithubChangedFile;
+  file: PullRequestChangedFile;
   /** Parsed per-file diff from the whole-PR patch; absent for binary/unparsed. */
   fileDiff: FileDiffMetadata | undefined;
   options: DiffOptions;
@@ -446,7 +449,7 @@ function CheckPill({
   label: string;
   count: number;
   /** All checks; filtered to this pill's bucket for the hover list. */
-  runs: GithubCheckRun[];
+  runs: PullRequestCheckRun[];
   icon: React.ReactNode;
   /** Tint for the pill + icon. */
   className: string;
@@ -496,7 +499,7 @@ function CheckPill({
 // rendered as GitHub-flavored markdown via the shared MessageResponse.
 
 /** One comment card: an author + relative-time header over the markdown body. */
-function GithubCommentCard({ comment }: { comment: GithubComment }) {
+function PullRequestCommentCard({ comment }: { comment: PullRequestComment }) {
   const ts = comment.created_at ? Date.parse(comment.created_at) : NaN;
   const rel = relativeTime(ts);
   const initial = comment.author?.[0]?.toUpperCase() ?? "?";
@@ -537,14 +540,14 @@ function GithubCommentCard({ comment }: { comment: GithubComment }) {
 }
 
 /** The Summary tab body: CI checks, the PR description, then its comments. */
-function GithubSummaryTab({
+function PullRequestSummaryTab({
   checks,
   body,
   comments,
 }: {
-  checks: GithubChecks;
+  checks: PullRequestChecks;
   body: string | null | undefined;
-  comments: GithubComment[];
+  comments: PullRequestComment[];
 }) {
   return (
     // Extra bottom padding so the last comment can scroll clear of the very
@@ -603,7 +606,7 @@ function GithubSummaryTab({
         ) : (
           <ul className="space-y-2">
             {comments.map((c, i) => (
-              <GithubCommentCard key={c.url ?? `${c.author}-${i}`} comment={c} />
+              <PullRequestCommentCard key={c.url ?? `${c.author}-${i}`} comment={c} />
             ))}
           </ul>
         )}
@@ -621,7 +624,7 @@ function GithubSummaryTab({
 interface TreeFileNode {
   type: "file";
   name: string;
-  file: GithubChangedFile;
+  file: PullRequestChangedFile;
 }
 interface TreeDirNode {
   type: "dir";
@@ -656,7 +659,7 @@ function compactNode(node: SidebarTree): SidebarTree {
 }
 
 /** Build the compacted folder tree for the changed-files sidebar. */
-function buildSidebarTree(files: GithubChangedFile[]): SidebarTree[] {
+function buildSidebarTree(files: PullRequestChangedFile[]): SidebarTree[] {
   const root: TreeDirNode = { type: "dir", name: "", path: "", children: [] };
   for (const file of files) {
     const parts = file.path.split("/");
@@ -768,7 +771,7 @@ function SidebarNode({
   );
 }
 
-function pullRequestLabel(pr: GithubPrAssociation): string {
+function pullRequestLabel(pr: PullRequestAssociation): string {
   const host = pr.host === "github.com" ? "" : `${pr.host}/`;
   const inferred = pr.relationship === "inferred" ? " (from branch)" : "";
   const identity = `${host}${pr.repository} #${pr.number}${inferred}`;
@@ -776,7 +779,7 @@ function pullRequestLabel(pr: GithubPrAssociation): string {
   return title ? `${identity} — ${title}` : identity;
 }
 
-export function GithubPanel({ conversationId }: { conversationId: string }) {
+export function PullRequestPanel({ conversationId }: { conversationId: string }) {
   const isMobileViewport = useIsMobileViewport();
   const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
   const [prPickerOpen, setPrPickerOpen] = useState(false);
@@ -786,10 +789,10 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
   const [linking, setLinking] = useState(false);
   const [url, setUrl] = useState("");
   const selected = selection?.sessionId === conversationId ? selection.url : undefined;
-  const info = useGithubInfo(conversationId, { poll: true, prUrl: selected });
+  const info = usePullRequestInfo(conversationId, { poll: true, prUrl: selected });
   const [knownAssociations, setKnownAssociations] = useState<{
     sessionId: string;
-    data: Pick<GithubInfo, "prs" | "tracking_available" | "selected_pr_url">;
+    data: Pick<PullRequestInfo, "prs" | "tracking_available" | "selected_pr_url">;
   }>();
   useEffect(() => {
     if (info.data) {
@@ -813,7 +816,7 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
   const changeSelection = (next?: string) => setSelection({ sessionId: conversationId, url: next });
   const prs = associations?.prs ?? [];
   const selectedPr = prs.find((pr) => pr.url === (selected ?? associations?.selected_pr_url));
-  const linkInEmptyState = prs.length === 0 && deriveGithubPanelState(info).kind === "no-pr";
+  const linkInEmptyState = prs.length === 0 && derivePullRequestPanelState(info).kind === "no-pr";
   const linkControls = (
     <>
       {linking && (
@@ -986,7 +989,7 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
         <div className="shrink-0 border-b border-border p-2">{linkControls}</div>
       )}
       <div className="min-h-0 flex-1">
-        <GithubPanelDetails
+        <PullRequestPanelDetails
           key={`${conversationId}:${selected ?? ""}`}
           conversationId={conversationId}
           info={info}
@@ -1006,13 +1009,13 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
   );
 }
 
-function GithubPanelDetails({
+function PullRequestPanelDetails({
   conversationId,
   info,
   emptyStateAction,
 }: {
   conversationId: string;
-  info: ReturnType<typeof useGithubInfo>;
+  info: ReturnType<typeof usePullRequestInfo>;
   emptyStateAction?: React.ReactNode;
 }) {
   const baseRef = info.data?.base_ref ?? undefined;
@@ -1021,8 +1024,8 @@ function GithubPanelDetails({
   const baseSha = info.data?.pr?.base_sha;
   const revision = `${baseSha ?? ""}:${headSha ?? ""}`;
   const hasPr = !!info.data?.pr;
-  const changes = useGithubChangedFiles(conversationId, hasPr, prUrl, revision);
-  const prDiff = useGithubPrDiff(conversationId, hasPr, prUrl, revision);
+  const changes = usePullRequestChangedFiles(conversationId, hasPr, prUrl, revision);
+  const prDiff = usePullRequestDiff(conversationId, hasPr, prUrl, revision);
 
   // Summary (PR body + comments) vs Changes (the stacked diff). Summary is the
   // landing tab — like GitHub's PR page opening on the Conversation view.
@@ -1042,7 +1045,7 @@ function GithubPanelDetails({
     });
   }, []);
 
-  const files = useMemo<GithubChangedFile[]>(() => changes.data?.data ?? [], [changes.data]);
+  const files = useMemo<PullRequestChangedFile[]>(() => changes.data?.data ?? [], [changes.data]);
   // The sidebar groups the flat file list into a compacted folder tree (the
   // diff scroll below stays linear, in file order).
   const fileTree = useMemo(() => buildSidebarTree(files), [files]);
@@ -1108,13 +1111,13 @@ function GithubPanelDetails({
   const loadDiffFiles = useCallback(
     async (fd: FileDiffMetadata) => {
       const { before, after } = prUrl
-        ? await fetchGithubFileContents(conversationId, fd.name, baseRef, {
+        ? await fetchPullRequestFileContents(conversationId, fd.name, baseRef, {
             pr_url: prUrl,
             previous_path: fd.prevName,
             head_sha: headSha,
             base_sha: baseSha,
           })
-        : await fetchGithubFileContents(conversationId, fd.name, baseRef);
+        : await fetchPullRequestFileContents(conversationId, fd.name, baseRef);
       return {
         oldFile: { name: fd.prevName ?? fd.name, contents: before ?? "" },
         newFile: { name: fd.name, contents: after ?? "" },
@@ -1183,7 +1186,7 @@ function GithubPanelDetails({
   // ── Whole-panel states (before the header + stacked diff) ───────────────
   // One central switch: every non-`ready` kind returns its own whole-panel
   // state, so the diff below renders only when there's an open PR.
-  const panelState = deriveGithubPanelState({
+  const panelState = derivePullRequestPanelState({
     isLoading: info.isLoading,
     error: info.error,
     data: info.data,
@@ -1212,27 +1215,27 @@ function GithubPanelDetails({
       );
     case "host-outdated":
       return (
-        <GithubEmptyState
+        <PullRequestEmptyState
           icon={DownloadIcon}
           title="Update your host to use GitHub"
           hint="The GitHub panel needs the host running Omnigent 0.13.0 or later. Update the host, then reconnect the session."
         >
           {emptyStateAction}
-        </GithubEmptyState>
+        </PullRequestEmptyState>
       );
     case "not-a-git-repo":
       return (
-        <GithubEmptyState
+        <PullRequestEmptyState
           icon={GitBranchIcon}
           title="Not a git repository"
           hint="This workspace isn’t a git checkout, so there’s no branch or PR to show."
         >
           {emptyStateAction}
-        </GithubEmptyState>
+        </PullRequestEmptyState>
       );
     case "no-gh-cli":
       return (
-        <GithubEmptyState
+        <PullRequestEmptyState
           icon={TerminalIcon}
           title="GitHub CLI not found"
           hint={
@@ -1243,11 +1246,11 @@ function GithubPanelDetails({
           }
         >
           {emptyStateAction}
-        </GithubEmptyState>
+        </PullRequestEmptyState>
       );
     case "repo-unresolved":
       return (
-        <GithubEmptyState
+        <PullRequestEmptyState
           icon={KeyRoundIcon}
           title="Can’t reach the upstream repo"
           hint={
@@ -1259,14 +1262,14 @@ function GithubPanelDetails({
         >
           {info.data && <GithubAccountSelector conversationId={conversationId} info={info.data} />}
           {emptyStateAction}
-        </GithubEmptyState>
+        </PullRequestEmptyState>
       );
     case "no-pr":
       // TODO: offer a "Create PR" action here once the panel can open PRs.
       // No account selector here: the repo resolved, so the account is correct —
       // this is a genuine "no PR yet", not a misconfiguration to fix.
       return (
-        <GithubEmptyState
+        <PullRequestEmptyState
           icon={GitPullRequestIcon}
           title={
             <>
@@ -1276,17 +1279,17 @@ function GithubPanelDetails({
           hint="Pull requests created in this session appear here. You can also link an existing PR."
         >
           {emptyStateAction}
-        </GithubEmptyState>
+        </PullRequestEmptyState>
       );
     case "unavailable":
       return (
-        <GithubEmptyState
+        <PullRequestEmptyState
           icon={AlertCircleIcon}
           title="GitHub isn’t available"
           hint="There’s no GitHub information to show for this session."
         >
           {emptyStateAction}
-        </GithubEmptyState>
+        </PullRequestEmptyState>
       );
   }
 
@@ -1350,7 +1353,7 @@ function GithubPanelDetails({
 
         {/* Summary: CI checks + the PR description + its conversation comments. */}
         <TabsContent value="summary" className="min-h-0 flex-1 overflow-y-auto">
-          <GithubSummaryTab checks={checks} body={pr.body} comments={comments} />
+          <PullRequestSummaryTab checks={checks} body={pr.body} comments={comments} />
         </TabsContent>
 
         {/* Changes: a controls row, then the sidebar (jump-to-file) + one scroll
@@ -1448,7 +1451,7 @@ function GithubPanelDetails({
                 </PanelMessage>
               ) : (
                 files.map((file) => (
-                  <GithubFileSection
+                  <PullRequestFileSection
                     key={file.path}
                     file={file}
                     fileDiff={filesByPath.get(file.path)}

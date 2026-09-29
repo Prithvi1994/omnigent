@@ -5,7 +5,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
-import { fetchGithubInfo } from "@/hooks/useGithub";
+import { fetchPullRequestInfo } from "@/hooks/usePullRequests";
 
 export const PULL_REQUEST_REFRESH_MS = 300_000;
 /** A failed lookup is retried this soon instead of waiting the full refresh window. */
@@ -128,7 +128,7 @@ export function usePullRequests(sessions: readonly Conversation[]): CanvasPullRe
           try {
             info = await queryClient.fetchQuery({
               queryKey: ["github-info", session.id],
-              queryFn: () => fetchGithubInfo(session.id),
+              queryFn: () => fetchPullRequestInfo(session.id),
               staleTime: GITHUB_INFO_STALE_MS,
             });
           } catch (error) {

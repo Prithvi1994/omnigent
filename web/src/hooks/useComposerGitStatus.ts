@@ -1,6 +1,6 @@
 import { useCallback } from "react";
 
-import { useGithubInfo } from "@/hooks/useGithub";
+import { usePullRequestInfo } from "@/hooks/usePullRequests";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
 
@@ -90,7 +90,7 @@ export interface ComposerGitStatus {
  *
  * The branch comes from the host's `git worktree list` (via
  * {@link useSessionWorktrees}), matched to the session's workspace — the real
- * checked-out branch, distinct from a PR head. {@link useGithubInfo} supplies
+ * checked-out branch, distinct from a PR head. {@link usePullRequestInfo} supplies
  * only PR/repo metadata: its `branch` field can be a PR head ref, so it is not
  * trusted for the live branch. `not-git` is set only on explicit evidence;
  * offline / ambiguous / an empty list stay `unknown` rather than claiming the
@@ -113,7 +113,7 @@ export function useComposerGitStatus({
   creationBranch?: string | null;
 }): ComposerGitStatus {
   const worktrees = useSessionWorktrees(sessionId, hostId, workspace);
-  const github = useGithubInfo(sessionId ?? undefined);
+  const github = usePullRequestInfo(sessionId ?? undefined);
   const info = github.data;
   const result = worktrees.data;
 

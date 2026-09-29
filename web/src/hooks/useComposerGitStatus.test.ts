@@ -6,7 +6,7 @@ import type { SessionWorktreesResult } from "@/hooks/useSessionWorktrees";
 import { useComposerGitStatus } from "./useComposerGitStatus";
 
 const useSessionWorktreesMock = vi.fn();
-const useGithubInfoMock = vi.fn();
+const usePullRequestInfoMock = vi.fn();
 
 vi.mock("@/hooks/useSessionWorktrees", () => ({
   useSessionWorktrees: (
@@ -15,8 +15,8 @@ vi.mock("@/hooks/useSessionWorktrees", () => ({
     workspace: string | null,
   ) => useSessionWorktreesMock(sessionId, hostId, workspace),
 }));
-vi.mock("@/hooks/useGithub", () => ({
-  useGithubInfo: (id: string | undefined) => useGithubInfoMock(id),
+vi.mock("@/hooks/usePullRequests", () => ({
+  usePullRequestInfo: (id: string | undefined) => usePullRequestInfoMock(id),
 }));
 
 function wt(overrides: Partial<HostWorktree>): HostWorktree {
@@ -43,7 +43,7 @@ function setWorktrees(
   });
 }
 function setGithub(data: Record<string, unknown> | undefined) {
-  useGithubInfoMock.mockReturnValue({ data, isFetching: false, refetch: vi.fn() });
+  usePullRequestInfoMock.mockReturnValue({ data, isFetching: false, refetch: vi.fn() });
 }
 
 function run(args: Partial<Parameters<typeof useComposerGitStatus>[0]> = {}) {
@@ -60,7 +60,7 @@ function run(args: Partial<Parameters<typeof useComposerGitStatus>[0]> = {}) {
 
 afterEach(() => {
   useSessionWorktreesMock.mockReset();
-  useGithubInfoMock.mockReset();
+  usePullRequestInfoMock.mockReset();
 });
 
 describe("useComposerGitStatus", () => {
@@ -212,7 +212,11 @@ describe("useComposerGitStatus", () => {
       { status: "ok", worktrees: [wt({ branch: "main" })] },
       { isFetching: true, refetch: wtRefetch },
     );
-    useGithubInfoMock.mockReturnValue({ data: undefined, isFetching: false, refetch: ghRefetch });
+    usePullRequestInfoMock.mockReturnValue({
+      data: undefined,
+      isFetching: false,
+      refetch: ghRefetch,
+    });
     const { result } = run();
     expect(result.current.refreshing).toBe(true);
     result.current.refresh();
