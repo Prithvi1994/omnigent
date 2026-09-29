@@ -28,7 +28,10 @@ from urllib.parse import urlsplit
 _logger = logging.getLogger(__name__)
 
 # Built-in provider modules, in registration order. Each exposes ``PROVIDER``.
-PROVIDER_MODULES: tuple[str, ...] = ("omnigent.git_providers.github",)
+PROVIDER_MODULES: tuple[str, ...] = (
+    "omnigent.git_providers.github",
+    "omnigent.git_providers.azure_devops",
+)
 # Comma-separated extra provider modules, registered after the built-ins.
 PROVIDER_MODULES_ENV = "OMNIGENT_GIT_PROVIDER_MODULES"
 

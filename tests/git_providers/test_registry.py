@@ -33,6 +33,7 @@ from omnigent.runner.session_prs import PullRequestRef
 
 GITHUB_SHAPED_PR = "https://git.example.test/owner/repo/pull/7"
 GITLAB_MR = "https://git.example.test/g/s/p/-/merge_requests/7"
+BUILTIN_IDS = ["github", "azure_devops"]
 
 
 @pytest.fixture(autouse=True)
@@ -142,7 +143,7 @@ def test_providers_load_on_first_use_and_stay_cached(monkeypatch: pytest.MonkeyP
 
     loaded = providers()
 
-    assert [descriptor.id for descriptor in loaded] == ["github", "lazy"]
+    assert [descriptor.id for descriptor in loaded] == [*BUILTIN_IDS, "lazy"]
     assert loaded[0] is GITHUB
     assert providers() is loaded
     assert lookups == ["PROVIDER"]
@@ -162,7 +163,7 @@ def test_env_modules_follow_builtins_and_broken_modules_are_skipped(
     )
 
     with caplog.at_level(logging.WARNING, logger="omnigent.git_providers"):
-        assert _ids() == ["github", "forge_a", "forge_b"]
+        assert _ids() == [*BUILTIN_IDS, "forge_a", "forge_b"]
 
     warnings = [record.getMessage() for record in caplog.records]
     assert any("gp_test_missing_module" in message for message in warnings)
@@ -174,7 +175,7 @@ def test_registered_providers_follow_env_modules(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_MODULES", "gp_test_forge_env")
     register_provider(FakeProvider("registered"))
 
-    assert _ids() == ["github", "forge_env", "registered"]
+    assert _ids() == [*BUILTIN_IDS, "forge_env", "registered"]
 
 
 @pytest.mark.parametrize("loaded_first", [False, True])
@@ -187,7 +188,7 @@ def test_register_provider_replaces_an_existing_id_in_place(loaded_first: bool) 
     newer_gitlab = FakeProvider("gitlab", display_name="Newer")
     register_provider(newer_gitlab)
 
-    assert _ids() == ["github", "gitlab"]
+    assert _ids() == [*BUILTIN_IDS, "gitlab"]
     assert provider("github") is replacement
     assert provider("gitlab") is newer_gitlab
 
@@ -198,7 +199,7 @@ def test_reset_for_tests_forgets_registered_providers() -> None:
 
     reset_for_tests()
 
-    assert _ids() == ["github"]
+    assert _ids() == BUILTIN_IDS
     assert provider("github") is GITHUB
     assert provider("gitlab") is None
 
