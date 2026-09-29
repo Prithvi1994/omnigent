@@ -36,6 +36,16 @@ function originOf(url: string): string | null {
   }
 }
 
+/** Origin plus workspace selector, so two workspaces on one host stay apart. */
+function serverKey(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}?o=${parsed.searchParams.get("o") ?? ""}`;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Server picker for the native shells (Electron desktop and iOS), pinned to
  * the sidebar's bottom.
@@ -78,14 +88,20 @@ export function SidebarServerPicker() {
 
   const managed = Array.isArray(info.managedServers) ? info.managedServers : [];
   const managedOrigins = new Set(managed.map(originOf).filter((origin) => origin !== null));
-  const currentIsManaged = managedOrigins.has(info.currentOrigin);
+  // When sign-in moved hosts, the shell names the server the user picked; match
+  // it by origin + workspace, since several workspaces can share that host.
+  const currentServer = info.currentServer ?? null;
+  const currentKey = currentServer === null ? null : serverKey(currentServer);
+  const isCurrent = (url: string) =>
+    currentKey === null ? originOf(url) === info.currentOrigin : serverKey(url) === currentKey;
+  const currentIsManaged = managed.some(isCurrent);
   // The current server leads its section even when settings were edited out
   // from under us. Managed origins are not repeated under Recents.
   const recentOthers = info.recentServers.filter((url) => {
     const origin = originOf(url);
-    return origin !== info.currentOrigin && (origin === null || !managedOrigins.has(origin));
+    return !isCurrent(url) && (origin === null || !managedOrigins.has(origin));
   });
-  const currentHost = hostOf(info.currentOrigin);
+  const currentHost = hostOf(currentServer ?? info.currentOrigin);
 
   return (
     // shrink-0 keeps the row at its natural height so the scrolling session
@@ -136,20 +152,20 @@ export function SidebarServerPicker() {
                 Provided by your organization
               </DropdownMenuLabel>
               {managed.map((url) => {
-                const isCurrent = originOf(url) === info.currentOrigin;
+                const current = isCurrent(url);
                 return (
                   <DropdownMenuItem
                     key={url}
-                    disabled={isCurrent}
-                    className={cn("gap-2", isCurrent && "opacity-100")}
-                    onSelect={isCurrent ? undefined : () => void switchServer(url)}
+                    disabled={current}
+                    className={cn("gap-2", current && "opacity-100")}
+                    onSelect={current ? undefined : () => void switchServer(url)}
                   >
-                    {isCurrent ? (
+                    {current ? (
                       <CheckIcon className="size-4 shrink-0" />
                     ) : (
                       <span className="size-4 shrink-0" aria-hidden="true" />
                     )}
-                    <span className={cn("min-w-0 truncate", isCurrent && "font-medium")}>
+                    <span className={cn("min-w-0 truncate", current && "font-medium")}>
                       {hostOf(url)}
                     </span>
                   </DropdownMenuItem>

@@ -59,4 +59,27 @@ function aliasedWorkspaceOrigin(aliases, url) {
   return Object.keys(aliases).find((origin) => aliases[origin] === url) ?? null;
 }
 
-module.exports = { aliasedServerUrl, aliasedWorkspaceOrigin, parseServerAliases };
+/**
+ * Aliases after an explicit connect to `picked` landed on `connected`. When
+ * sign-in moved hosts, the connected host maps to the pick, replacing any older
+ * host for the same pick so the latest choice wins. A direct connect to a host
+ * drops that host's alias.
+ *
+ * @param {Record<string, string>} aliases From parseServerAliases.
+ * @param {string} picked
+ * @param {string} connected
+ * @returns {Record<string, string>}
+ */
+function withConnectAlias(aliases, picked, connected) {
+  const connectedOrigin = originOf(connected);
+  if (connectedOrigin === null) return aliases;
+  const next = Object.fromEntries(
+    Object.entries(aliases).filter(
+      ([origin, pick]) => origin !== connectedOrigin && pick !== picked,
+    ),
+  );
+  if (originOf(picked) !== connectedOrigin) next[connectedOrigin] = picked;
+  return next;
+}
+
+module.exports = { aliasedServerUrl, aliasedWorkspaceOrigin, parseServerAliases, withConnectAlias };

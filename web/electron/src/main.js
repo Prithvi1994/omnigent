@@ -43,6 +43,7 @@ const {
   aliasedServerUrl,
   aliasedWorkspaceOrigin,
   parseServerAliases,
+  withConnectAlias,
 } = require("./server_aliases");
 const {
   registerBrowserPermissions,
@@ -1547,21 +1548,6 @@ async function loadServerUrl(
           if (interactive && !windows.get(win)?.ephemeral) {
             const settings = loadSettings();
             settings.server_url = serverUrl;
-            // Keep showing the URL the user picked for this workspace host.
-            settings.server_aliases = {
-              ...parseServerAliases(settings.server_aliases),
-              [resolvedOrigin]: requestedServerUrl,
-            };
-            saveSettings(settings);
-          }
-        } else if (interactive && !windows.get(win)?.ephemeral) {
-          // Picking the workspace host itself wins over an earlier alias for it.
-          const settings = loadSettings();
-          const aliases = parseServerAliases(settings.server_aliases);
-          if (Object.hasOwn(aliases, resolvedOrigin)) {
-            settings.server_aliases = Object.fromEntries(
-              Object.entries(aliases).filter(([origin]) => origin !== resolvedOrigin),
-            );
             saveSettings(settings);
           }
         }
@@ -3028,9 +3014,15 @@ function registerIpc() {
         interactive: true,
         attempt,
       });
-      // Only a server that actually responded earns a recents slot.
+      // Only a server that actually responded earns a recents slot. Sign-in that
+      // moved to another host maps it back to the pick, for recents and the picker.
       if (!ephemeral) {
         const settings = loadSettings();
+        settings.server_aliases = withConnectAlias(
+          parseServerAliases(settings.server_aliases),
+          target,
+          resolvedServerUrl,
+        );
         rememberRecentServer(settings, resolvedServerUrl);
         saveSettings(settings);
       }
@@ -3232,10 +3224,12 @@ function registerIpc() {
     const recents = excludingManagedServers(settings.recent_servers, managedServers);
     // isPinnedOriginSender guarantees the sender window is tracked.
     const { origin } = windows.get(win);
+    const picked = aliasedServerUrl(parseServerAliases(settings.server_aliases), origin);
     return {
-      // An aliased workspace host reads as the server the user picked.
-      currentOrigin:
-        originOf(aliasedServerUrl(parseServerAliases(settings.server_aliases), origin)) ?? origin,
+      currentOrigin: origin,
+      // The URL the user picked when sign-in moved to this host (it can carry
+      // a workspace selector the origin lacks), else null.
+      currentServer: picked === origin ? null : picked,
       managedServers,
       recentServers: recents,
       // The connected server's manifest, forwarded so the SPA branches on the

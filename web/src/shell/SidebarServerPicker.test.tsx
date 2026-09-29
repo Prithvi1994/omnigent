@@ -168,4 +168,27 @@ describe("SidebarServerPicker", () => {
     // hand-edited settings file stays switchable instead of invisible.
     expect(await screen.findByText("also-not-a-url")).toBeInTheDocument();
   });
+
+  it("tells apart two workspaces behind one account host", async () => {
+    // Sign-in moved this window to workspace 1's own host; the shell names the pick.
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://dbc-1.cloud.databricks.com",
+      currentServer: "https://accounts.example.com/omnigent?o=1",
+      recentServers: ["https://accounts.example.com/?o=1", "https://accounts.example.com/?o=2"],
+    });
+    renderPicker();
+    // The row names the picked host, not the workspace host sign-in moved to.
+    expect(await screen.findByText("accounts.example.com")).toBeInTheDocument();
+    await openMenu();
+    // Workspace 2 stays a switch target even though it shares the account origin.
+    const items = screen.getAllByRole("menuitem");
+    const other = items.find(
+      (item) =>
+        !item.hasAttribute("data-disabled") &&
+        /accounts\.example\.com/.test(item.textContent ?? ""),
+    );
+    expect(other).toBeDefined();
+    fireEvent.click(other!);
+    expect(switchServer).toHaveBeenCalledWith("https://accounts.example.com/?o=2");
+  });
 });

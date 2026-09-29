@@ -314,7 +314,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { createWindow, createBrowserRegistryForWindow, loadServerUrl, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; } };";
+    "\nmodule.exports.testApi = { createWindow, createBrowserRegistryForWindow, loadServerUrl, pinWindow, knownOrigins, findKnownServerUrl, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; } };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -704,7 +704,70 @@ describe("Databricks auth mode wiring", () => {
       assert.equal(saved(h).server_url, workspace);
       assert.deepEqual(saved(h).recent_servers, [picked]);
       const picker = await h.ipc.get("omnigent:get-server-picker")(pageEvent(h));
-      assert.equal(picker.currentOrigin, new URL(picked).origin);
+      // The origin stays the real host; the pick (with its ?o=) rides alongside.
+      assert.equal(picker.currentOrigin, workspaceOrigin);
+      assert.equal(picker.currentServer, picked);
+    });
+
+    it("switches to the workspace chosen last for the same pick", async (t) => {
+      const other = "https://other.cloud.databricks.com";
+      let chosen = workspaceOrigin;
+      const h = loadNavigationHarness({
+        serverUrl: picked,
+        databricksMode: "browser",
+        ensureSession: async () => chosen,
+      });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      await h.ipc.get("omnigent:set-server-url")(setupEvent(h), picked);
+      chosen = other;
+      await h.ipc.get("omnigent:set-server-url")(setupEvent(h), picked);
+      assert.deepEqual(saved(h).server_aliases, { [other]: picked });
+      h.setUrl(`${other}/omnigent`);
+      await h.ipc.get("omnigent:switch-server")(
+        { sender: h.webContents, senderFrame: { url: `${other}/omnigent` } },
+        picked,
+      );
+      await tick();
+      assert.equal(h.calls.auth.at(-1)[1], other);
+    });
+
+    it("records no alias when the connect fails", async (t) => {
+      const h = loadNavigationHarness({
+        serverUrl: picked,
+        databricksMode: "browser",
+        ensureSession: async () => {
+          throw new Error("sign-in failed");
+        },
+      });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      await assert.rejects(h.ipc.get("omnigent:set-server-url")(setupEvent(h), picked));
+      assert.equal(saved(h).server_aliases, undefined);
+    });
+
+    it("trusts the workspace host for deep links only while its pick is saved", async (t) => {
+      const h = await joinThroughAccount(t);
+      const known = () => JSON.parse(JSON.stringify(h.api.knownOrigins()));
+      assert.ok(known().includes(workspaceOrigin));
+      assert.equal(h.api.findKnownServerUrl(workspaceOrigin), workspace);
+      // Once the saved default moves on and the pick is forgotten, the host needs consent again.
+      const settings = saved(h);
+      settings.server_url = "https://unrelated.example.com/";
+      fs.writeFileSync(h.settingsPath, JSON.stringify(settings));
+      const [listed] = await h.ipc.get("omnigent:get-recent-servers")(setupEvent(h));
+      await h.ipc.get("omnigent:forget-recent-server")(setupEvent(h), listed);
+      assert.ok(!known().includes(workspaceOrigin));
+      assert.equal(h.api.findKnownServerUrl(workspaceOrigin), null);
+      // A hand-edited alias for a non-workspace host is never trusted.
+      fs.writeFileSync(
+        h.settingsPath,
+        JSON.stringify({
+          recent_servers: [picked],
+          server_aliases: { "https://evil.example": picked },
+        }),
+      );
+      assert.ok(!known().includes("https://evil.example"));
     });
 
     it("switches back to the pick through its workspace host, without a sign-in", async (t) => {
@@ -1049,21 +1112,6 @@ describe("managed server preference wiring", () => {
     assert.match(
       liveCode,
       /ipcMain\.handle\("omnigent:get-server-picker"[\s\S]{0,900}managedServers[\s\S]{0,100}recentServers:\s*recents/,
-    );
-  });
-
-  it("trusts an aliased workspace host for deep links only while its pick is a recent", () => {
-    assert.match(
-      liveCode,
-      /function trustedAliasOrigins\(settings\)[\s\S]{0,300}recents\.has\(normalizeRecentServers\(\[aliases\[origin\]\]\)\[0\]\) &&\s*databricksWorkspaceUiUrl\(origin\) !== null/,
-    );
-    assert.match(
-      liveCode,
-      /function findKnownServerUrl\(origin\)[\s\S]{0,700}trustedAliasOrigins\(settings\)\.includes\(origin\)/,
-    );
-    assert.match(
-      liveCode,
-      /function knownOrigins\(\)[\s\S]{0,700}for \(const o of trustedAliasOrigins\(settings\)\) origins\.add\(o\)/,
     );
   });
 
