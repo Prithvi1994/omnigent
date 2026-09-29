@@ -470,16 +470,22 @@ def create_auth_router(
             promote_if_listed(admin_list, permission_store, email)
 
         # Mint session cookie.
+        ticket_id = state_payload.get("ticket")
+        authenticated_ticket = (
+            ticket_id
+            if isinstance(ticket_id, str)
+            and (config.provider_type == "github" or isinstance(reauth_at, int))
+            else None
+        )
         session_jwt = mint_session_cookie(
             user_id=email,
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
             provider=config.provider_type,
-            interactive_login=True,
+            cli_login_ticket=authenticated_ticket,
         )
 
         # Check if this callback fulfills a CLI login ticket.
-        ticket_id = state_payload.get("ticket")
         if ticket_id and ticket_id in _cli_tickets:
             ticket = _cli_tickets[ticket_id]
             if time.time() - ticket.created_at <= _CLI_TICKET_TTL_SECONDS:
@@ -686,11 +692,12 @@ def create_auth_router(
         base_path = getattr(request.app.state, "base_path", "")
         return_to = f"{base_path}/auth/cli-consent?ticket={quote(ticket_id)}"
         url = f"{base_path}/auth/login?return_to={quote(return_to, safe='')}"
+        url += f"&ticket={quote(ticket_id)}"
         if reauth:
             url += "&reauth=1"
         return RedirectResponse(url=url, status_code=302, headers=_CLI_BROWSER_HEADERS)
 
-    def _session_iat(request: Request) -> int | None:
+    def _session_iat(request: Request, ticket_id: str) -> int | None:
         token = request.cookies.get(_session_cookie)
         if not token:
             return None
@@ -698,7 +705,7 @@ def create_auth_router(
             payload = jwt.decode(token, config.cookie_secret, algorithms=["HS256"])
         except jwt.InvalidTokenError:
             return None
-        if payload.get("interactive_login") is not True:
+        if payload.get("cli_login_ticket") != ticket_id:
             return None
         iat = payload.get("iat")
         return iat if isinstance(iat, int) else None
@@ -728,7 +735,7 @@ def create_auth_router(
                 headers=_CLI_BROWSER_HEADERS,
             )
 
-        session_iat = _session_iat(request)
+        session_iat = _session_iat(request, ticket_id)
         if session_iat is None or session_iat < int(ticket.created_at):
             return _bounce_to_login(request, ticket_id, reauth=True)
 
@@ -773,11 +780,11 @@ def create_auth_router(
                 headers=_CLI_BROWSER_HEADERS,
             )
 
-        session_iat = _session_iat(request)
+        session_iat = _session_iat(request, ticket_id)
         if session_iat is None or session_iat < int(ticket.created_at):
             return HTMLResponse(
                 _cli_consent_html(
-                    error="Your session is too old to approve this login. "
+                    error="Sign in again to approve this login. "
                     "Run `omnigent login` again and sign in when prompted."
                 ),
                 status_code=200,

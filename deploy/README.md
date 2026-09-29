@@ -288,10 +288,14 @@ PKCE and consent enforcement if rolling back an unrelated deployment issue.
 Updated clients send proof in `X-Omnigent-Code-Verifier`; proxies must forward
 this header without logging it. Query-based proof remains supported for API
 compatibility, so do not retain `/auth/cli-poll` query strings either: a ticket
-and verifier together can redeem an approved login. Approval requires a fresh
-browser login, not a runner or refresh-issued token. Existing browser sessions
-remain valid elsewhere. Generic OIDC ticket flows require fresh IdP authentication;
-GitHub OAuth may reuse its provider session, but still requires browser approval.
+and verifier together can redeem an approved login. Approval requires a browser
+session authenticated for that specific ticket; ordinary browser sessions,
+runner tokens, and refresh-issued tokens cannot approve it. Existing sessions
+remain valid elsewhere. Generic OIDC ticket flows require fresh IdP authentication
+and a signed ID token with `auth_time` at or after the reauthentication request.
+Verify that your IdP honors `prompt=login` and `max_age=0` and supplies `auth_time`;
+missing or stale claims fail closed. GitHub OAuth may reuse its provider session,
+but still requires ticket-specific browser sign-in and approval.
 Polling responses forbid caching, including successful credential responses.
 CLI and Slack display a comparison code; native mobile apps currently rely
 on explicit browser approval without displaying that code in the app. Include

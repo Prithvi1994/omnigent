@@ -93,7 +93,7 @@ async def test_cli_ticket_requires_browser_consent_and_issues_grant(tmp_path: Pa
         browser_claims = jwt.decode(
             callback.cookies["ap_session"], TEST_SIGNING_KEY, algorithms=["HS256"]
         )
-        assert browser_claims["interactive_login"] is True
+        assert browser_claims["cli_login_ticket"] == ticket
 
         pending = await client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={verifier}")
         assert pending.status_code == 202
@@ -118,7 +118,7 @@ async def test_cli_ticket_requires_browser_consent_and_issues_grant(tmp_path: Pa
         body = fulfilled.json()
         payload = jwt.decode(body["token"], TEST_SIGNING_KEY, algorithms=["HS256"])
         assert payload["sub"] == "alice@example.com"
-        assert "interactive_login" not in payload
+        assert "cli_login_ticket" not in payload
         assert body["user_id"] == "alice@example.com"
         assert body["refresh_token"]
 
@@ -399,7 +399,7 @@ async def test_cli_approve_rejects_stale_session() -> None:
         await _complete_callback(client, ticket)
         with patch("omnigent.server.oidc.time.time", return_value=time.time() - 10):
             stale = mint_session_cookie(
-                "alice@example.com", TEST_SIGNING_KEY, 8, "github", interactive_login=True
+                "alice@example.com", TEST_SIGNING_KEY, 8, "github", cli_login_ticket=ticket
             )
         client.cookies.set("ap_session", stale)
         approved = await client.post(
@@ -408,14 +408,14 @@ async def test_cli_approve_rejects_stale_session() -> None:
             headers={"Origin": "http://test"},
         )
         assert approved.status_code == 200
-        assert "session is too old" in approved.text
+        assert "Sign in again to approve this login" in approved.text
         assert (
             await client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={verifier}")
         ).status_code == 202
 
 
 @pytest.mark.parametrize("credential_kind", ["runner", "session"])
-async def test_cli_approve_requires_interactive_login_provenance(
+async def test_cli_approve_requires_ticket_login_provenance(
     credential_kind: str, tmp_path: Path
 ) -> None:
     config = make_oidc_config()
