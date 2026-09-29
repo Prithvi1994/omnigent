@@ -2503,15 +2503,16 @@ async def _query_sessions_once(
     completed_response_id: str | None = None
 
     def response_started(_ctx: object) -> None:
-        nonlocal response_status
+        nonlocal response_status, completed_response_id
         response_status = None
+        completed_response_id = None
 
     def response_ended(ctx: ResponseEndCtx) -> None:
         nonlocal response_status, completed_response_id
         response_status = ctx.status
         completed_response_id = ctx.response.id if ctx.status == "completed" else None
 
-    async def require_completed_response() -> None:
+    async def require_completed_response() -> str | None:
         # Runner reconnects can report idle while unfinished work still exists.
         if response_status != "completed":
             raise ClientOmnigentError(
@@ -2534,6 +2535,7 @@ async def _query_sessions_once(
                         "Headless turn has no verified successful response for its latest output"
                     )
                 break
+        return _completed_turn_text(recent)
 
     async def completion_deadline_expired() -> NoReturn:
         try:
@@ -2614,10 +2616,11 @@ async def _query_sessions_once(
                     f"(status: {chat.status}): {exc}"
                 ) from exc
             try:
-                await require_completed_response()
+                reconciled = await require_completed_response()
             except ClientOmnigentError as verification_error:
                 raise ClientOmnigentError(f"{verification_error}: {exc}") from exc
-        reconciled = await _persisted_turn_text(client, bound.id)
+        else:
+            reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
             return reconciled
         raise
@@ -2643,7 +2646,7 @@ async def _query_sessions_once(
                     await chat.refresh()
                     if chat.status not in ("running", "launching"):
                         break
-                    response_status = None
+                    response_started(None)
                     await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
         except TimeoutError:
             if strict_completion:
@@ -2657,8 +2660,9 @@ async def _query_sessions_once(
                 raise ClientOmnigentError(
                     f"Headless session did not reach terminal completion (status: {chat.status})"
                 ) from None
-            await require_completed_response()
-        reconciled = await _persisted_turn_text(client, bound.id)
+            reconciled = await require_completed_response()
+        else:
+            reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
             return reconciled
         raise RuntimeError(
@@ -2716,7 +2720,6 @@ async def _query_sessions_once(
     # they also guard the first-turn query above.
 
     async def _drain_extra_turns() -> None:
-        nonlocal response_status
         # Probe: collect synthesis text or status events that arrive quickly.
         probe = await chat.await_turn(timeout=_STATUS_PROBE_TIMEOUT_S)
         if probe.text:
@@ -2730,7 +2733,7 @@ async def _query_sessions_once(
         # Async orchestrator confirmed. Loop, refreshing after each turn.
         for _ in range(_MAX_EXTRA_TURNS):
             # A prior completed response cannot prove this auto-woken turn ended.
-            response_status = None
+            response_started(None)
             extra = await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
             if extra.text:
                 all_text_parts.append(extra.text)
@@ -2765,7 +2768,9 @@ async def _query_sessions_once(
             raise ClientOmnigentError(
                 f"Headless session did not reach terminal completion (status: {chat.status})"
             ) from None
-        await require_completed_response()
+        verified_text = await require_completed_response()
+        if not all_text_parts:
+            return verified_text
     if all_text_parts:
         return "\n\n".join(p for p in all_text_parts if p)
     # An auto-woken turn can finish between live-stream subscriptions.
@@ -2882,6 +2887,10 @@ async def _persisted_turn_text(
         # for observability rather than swallowing silently.
         logger.debug("reconcile transcript read failed for %s: %r", session_id, exc)
         return None
+    return _completed_turn_text(recent)
+
+
+def _completed_turn_text(recent: _ResponseOutput) -> str | None:
     # Walk newest → oldest, collecting ``completed`` assistant messages
     # until the current turn's user message is reached. This isolates
     # THIS turn's output: a prior turn's assistant text sits on the far

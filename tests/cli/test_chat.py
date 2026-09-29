@@ -4346,6 +4346,34 @@ async def test_strict_prompt_reconciles_transport_failure_after_observed_complet
     )
 
 
+@pytest.mark.parametrize("query_failure", [ClientOmnigentError("disconnected"), TimeoutError()])
+async def test_strict_recovery_returns_only_verified_snapshot(monkeypatch, query_failure):
+    class Chat(_fake_sessions_chat_cls(_return_empty)):
+        async def query(self, prompt):
+            self.hooks.on_response_end(
+                SimpleNamespace(status="completed", response=SimpleNamespace(id="resp_x"))
+            )
+            raise query_failure
+
+    class Namespace(_FakeSessionsNamespace):
+        async def list_items(self, *args, **kwargs):
+            snapshot = await super().list_items(*args, **kwargs)
+            if self.list_items_calls == 2:
+                # Later output appears after the verified snapshot has been read.
+                self._items.append(_item_assistant("UNVERIFIED", response_id="resp_next"))
+            return snapshot
+
+    client = _FakeAPClient([])
+    client.sessions = Namespace([_item_user("hi"), _item_assistant("verified answer")])
+    assert (
+        await _run_one_shot(
+            client, _return_empty, monkeypatch, strict_completion=True, chat_cls=Chat
+        )
+        == "verified answer"
+    )
+    assert client.sessions.list_items_calls == 2
+
+
 @pytest.mark.parametrize("outcome", ["completed", "failed", "incomplete", "cancelled", None])
 @pytest.mark.parametrize("auto_wake", [False, True, "missed-start", "missed-response"])
 async def test_strict_prompt_checks_real_sdk_response_events(monkeypatch, outcome, auto_wake):
