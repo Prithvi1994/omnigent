@@ -303,7 +303,8 @@ class AzureDevOpsClient:
     Every request goes to ``https://dev.azure.com/{org}``. An Entra token is sent as
     ``Authorization: Bearer`` and a personal access token as ``Authorization: Basic``.
     Methods return parsed JSON. A non-2xx response raises :class:`AzureDevOpsError`.
-    Transport failures raise :class:`httpx.HTTPError` unchanged.
+    Transport failures raise :class:`httpx.HTTPError` unchanged. ``timeout`` replaces
+    the configured request timeout, in seconds.
     """
 
     def __init__(
@@ -311,13 +312,14 @@ class AzureDevOpsClient:
         org: str,
         token: AzureToken,
         *,
+        timeout: float | None = None,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._client = httpx.Client(
             base_url=f"https://{_ADO_HOST}/{quote(org, safe='')}",
             headers={"Authorization": _authorization(token), "Accept": "application/json"},
             verify=client_ssl_context(),
-            timeout=_timeout_seconds(),
+            timeout=_timeout_seconds() if timeout is None else timeout,
             follow_redirects=False,
             # Injectable transport for tests (httpx.MockTransport); None uses
             # the real network.
