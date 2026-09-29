@@ -5305,7 +5305,7 @@ async def _forward_native_terminal_message(
     file_store: FileStore | None = None,
     artifact_store: ArtifactStore | None = None,
     model_override: str | None = None,
-) -> None:
+) -> bool:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
 
@@ -5328,7 +5328,9 @@ async def _forward_native_terminal_message(
         in-band on the message so the executor applies ``/model`` and the
         inject under one lock (no separate racing ``model_change``).
         ``None`` when routing did not pick a model.
-    :returns: None.
+    :returns: ``True`` when the runner reports it had already accepted this
+        message (a re-forward after the server lost its memory), ``False`` when
+        it took the message now.
     :raises HTTPException: 502 when the runner or harness rejects
         the injection request.
     """
@@ -5438,6 +5440,22 @@ async def _forward_native_terminal_message(
             harness=harness,
         ),
     )
+    return _runner_answered_duplicate(resp)
+
+
+def _runner_answered_duplicate(resp: httpx.Response) -> bool:
+    """
+    Whether a runner's 202 says the forwarded message had already started a turn.
+
+    :param resp: The runner's response to the forward.
+    :returns: ``True`` for ``{"status": "duplicate"}``; ``False`` for any other
+        body, including one that is not JSON.
+    """
+    try:
+        payload = resp.json()
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("status") == "duplicate"
 
 
 async def _persist_session_event(
@@ -7221,7 +7239,7 @@ async def _dispatch_session_event_to_runner_uncoalesced(
         # already-running pane.
         forwarded = False
         try:
-            await _forward_native_terminal_message(
+            already_accepted = await _forward_native_terminal_message(
                 runner_client,
                 session_id,
                 conv,
@@ -7238,6 +7256,12 @@ async def _dispatch_session_event_to_runner_uncoalesced(
         finally:
             if not forwarded and pending_id is not None:
                 pending_inputs.resolve(session_id, pending_id)
+        if already_accepted and pending_id is not None:
+            # The runner ran this message before this server's memory of it was
+            # lost. Its mirror may already be persisted, so if a later mirror
+            # jumps over this entry it is released quietly rather than recorded
+            # as undelivered; if the mirror is still to come, it drains it.
+            pending_inputs.mark_entry_uncertain(session_id, pending_id)
         # Emit the routing chip AFTER forwarding the message to the
         # terminal so the live SSE stream delivers the user bubble
         # (echoed back by the CLI) before the chip.

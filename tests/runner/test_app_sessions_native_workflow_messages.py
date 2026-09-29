@@ -2340,6 +2340,51 @@ async def test_forwarded_message_with_a_known_persisted_item_id_does_not_run_twi
         assert len(_hc.posted_bodies) == 1
 
 
+async def test_forwarded_message_with_a_known_stable_id_does_not_run_twice() -> None:
+    """A native forward carries no persisted item; its web stable id is the delivery identity.
+
+    After a server restart the retry of a native message whose response was
+    lost arrives as a fresh forward with the same ``stable_id``. The runner
+    already ran it, so it answers "duplicate" instead of starting a second turn.
+    """
+    import asyncio as _aio
+
+    gate = _aio.Event()
+    app, _pm, _hc = _build_blocking_app(gate)
+    conv = "4fa2b0c1d4e5f60718293a4b5c6d7e90"
+    body = {
+        "type": "message",
+        "role": "user",
+        "model": "test-agent",
+        "content": [{"type": "input_text", "text": "paste me once"}],
+        "harness": "openai-agents",
+        "stable_id": "b" * 32,
+    }
+
+    async with _runner_client(app) as client:
+        await client.post(
+            "/v1/sessions",
+            json={"session_id": conv, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+
+        async def _run_first_turn() -> None:
+            resp = await client.post(f"/v1/sessions/{conv}/events", json=body)
+            async for _ in resp.aiter_text():
+                pass
+
+        turn_task = _aio.create_task(_run_first_turn())
+        await _aio.sleep(0.05)
+
+        duplicate = await client.post(f"/v1/sessions/{conv}/events", json=body)
+        assert duplicate.status_code == 202, duplicate.text
+        assert duplicate.json()["status"] == "duplicate"
+
+        gate.set()
+        await _aio.wait_for(turn_task, timeout=10)
+        await _aio.sleep(0.2)
+        assert len(_hc.posted_bodies) == 1
+
+
 async def test_forwarded_message_that_failed_before_acceptance_is_not_treated_as_a_duplicate() -> (
     None
 ):

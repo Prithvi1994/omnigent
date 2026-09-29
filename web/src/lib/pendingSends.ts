@@ -14,13 +14,6 @@ export interface PersistedPendingSend {
 }
 
 const STORAGE_KEY = "omnigent.pendingSends";
-/**
- * Failed sends kept per conversation. Older ones fall off the reload record
- * (their text is still in the transcript until the tab closes); a user with
- * more than this many undelivered messages in one chat has a bigger problem
- * than the record.
- */
-const MAX_PER_CONVERSATION = 20;
 
 type Stored = Record<string, PersistedPendingSend[]>;
 
@@ -67,11 +60,16 @@ export function readPendingSends(conversationId: string): PersistedPendingSend[]
   return load()[conversationId] ?? [];
 }
 
-/** Remember a send; a record with the same stable id is replaced in place. */
+/**
+ * Remember a send; a record with the same stable id is replaced in place. Every
+ * failed send is kept: a record is dropped only when its send is confirmed,
+ * cancelled, or older than the retry window on the next cold load, so the
+ * reload record never silently loses a message the transcript still shows.
+ */
 export function persistPendingSend(conversationId: string, record: PersistedPendingSend): void {
   const stored = load();
   const kept = (stored[conversationId] ?? []).filter((r) => r.stableId !== record.stableId);
-  stored[conversationId] = [...kept, record].slice(-MAX_PER_CONVERSATION);
+  stored[conversationId] = [...kept, record];
   save(stored);
 }
 

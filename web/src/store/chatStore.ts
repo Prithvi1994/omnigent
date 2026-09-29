@@ -5353,12 +5353,19 @@ async function reconcileOnReconnect(
     );
     const unseen = snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
     const patch: Partial<ChatState> = reconnectStatusPatch(session, s, launchBeforeFetch);
-    const recoveredUserInputs = unseen.filter(
+    const unseenUsers = unseen.filter(
       (b) => b.type === "user_message" && !isSystemUserContent(b.content),
-    ).length;
-    if (recoveredUserInputs > 0) {
-      const ackedTempIds = new Set(ackedFailed.map((p) => p.tempId));
-      let liveToConsume = recoveredUserInputs - ackedFailed.length;
+    );
+    const unseenUserIds = new Set(unseenUsers.map((b) => b.ctx.itemId));
+    // An acknowledged failed bubble leaves whether or not its item is new to
+    // this tab: the receipt may have been lost while the item itself arrived.
+    // Live bubbles are consumed one per recovered item not already accounted
+    // for by an acknowledged failed bubble.
+    const ackedTempIds = new Set(ackedFailed.map((p) => p.tempId));
+    let liveToConsume =
+      unseenUsers.length -
+      ackedFailed.filter((p) => p.stableId !== undefined && unseenUserIds.has(p.stableId)).length;
+    if (ackedFailed.length > 0 || liveToConsume > 0) {
       patch.pendingUserMessages = s.pendingUserMessages.filter((p) => {
         if (p.failed !== undefined) return !ackedTempIds.has(p.tempId);
         if (liveToConsume > 0) {

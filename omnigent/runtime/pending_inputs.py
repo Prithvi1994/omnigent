@@ -526,6 +526,7 @@ def remember_committed(conversation_id: str, drained: DrainedInput, item_id: str
             remembered_at=now,
         )
         _evict_stale_committed_locked(conversation_id, now)
+        _sweep_inactive_locked(now)
 
 
 def mark_dispatched(conversation_id: str, stable_id: str) -> None:
@@ -541,6 +542,7 @@ def mark_dispatched(conversation_id: str, stable_id: str) -> None:
         entries.pop(stable_id, None)
         entries[stable_id] = now
         _evict_stale_dispatched_locked(conversation_id, now)
+        _sweep_inactive_locked(now)
 
 
 def _evict_stale_dispatched_locked(conversation_id: str, now: float) -> None:
@@ -589,6 +591,32 @@ def dispatch_done(conversation_id: str, stable_id: str) -> bool:
                 _dispatched.pop(conversation_id, None)
             return False
         return True
+
+
+def _sweep_inactive_locked(now: float) -> None:
+    """
+    Drop the committed and dispatched memories of conversations gone quiet.
+
+    Per-conversation eviction runs only when that conversation is written or
+    read again, so a conversation nobody returns to would keep its entries past
+    their expiry. Runs on every write; a conversation whose newest entry is
+    older than :data:`_COMMITTED_TTL_S` has nothing left worth keeping. Caller
+    must hold :data:`_lock`.
+
+    :param now: Current ``time.monotonic()`` value to compare against.
+    """
+    for conversation_id in [
+        cid
+        for cid, entries in _committed.items()
+        if all(now - c.remembered_at > _COMMITTED_TTL_S for c in entries.values())
+    ]:
+        _committed.pop(conversation_id, None)
+    for conversation_id in [
+        cid
+        for cid, entries in _dispatched.items()
+        if all(now - at > _COMMITTED_TTL_S for at in entries.values())
+    ]:
+        _dispatched.pop(conversation_id, None)
 
 
 def _evict_stale_committed_locked(conversation_id: str, now: float) -> None:
@@ -673,6 +701,25 @@ def mark_uncertain(conversation_id: str) -> None:
         for entry in _pending.get(conversation_id, {}).values():
             if not entry.held:
                 entry.uncertain = True
+
+
+def mark_entry_uncertain(conversation_id: str, pending_id: str) -> None:
+    """
+    Flag one queued entry as possibly already mirrored.
+
+    Called when the runner answers a forward with "duplicate": it ran this
+    message before the server's memory of it was lost, so the entry's mirror
+    may already be persisted. A later match that jumps over it then drains it
+    quietly instead of recording it as undelivered; if the mirror is still to
+    come, it drains the entry as usual. No-op for an unknown id.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param pending_id: The entry's id, e.g. ``"pending_a1b2c3"``.
+    """
+    with _lock:
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        if entry is not None:
+            entry.uncertain = True
 
 
 def restore(conversation_id: str, drained: DrainedInput) -> None:

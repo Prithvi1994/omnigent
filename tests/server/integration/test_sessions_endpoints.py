@@ -12783,6 +12783,121 @@ async def test_native_dispatch_outlives_a_client_that_disconnects_mid_forward(
             pending_inputs.reset_for_tests()
 
 
+async def test_native_resend_after_server_restart_is_settled_by_the_runner(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A native re-send the server no longer remembers is not pasted again.
+
+    After a server restart the re-send of a message whose response was lost
+    finds no memory of it and forwards again. The runner, which outlives the
+    server, recognises the web stable id it already ran and answers
+    "duplicate". The server keeps the re-recorded entry so the mirror can still
+    drain it if it is on its way, but marks it uncertain: a later mirror that
+    jumps over it releases it quietly instead of recording the delivered
+    message as undelivered.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    forwards: list[httpx.Request] = []
+
+    def runner_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            forwards.append(request)
+            if len(forwards) >= 2:
+                return httpx.Response(202, json={"status": "duplicate"})
+        return httpx.Response(202, json={})
+
+    monkeypatch.setattr(
+        orchestration,
+        "_ensure_native_terminal_ready",
+        AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=None)),
+    )
+    monkeypatch.setattr(
+        sessions_module, "_ensure_runner_session_initialized", AsyncMock(return_value=True)
+    )
+    stable_id = "e" * 32
+    message = {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "ran before the restart"}],
+            "stable_id": stable_id,
+        },
+    }
+    pending_inputs.reset_for_tests()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner_handler), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(orchestration, "_get_runner_client", AsyncMock(return_value=runner))
+        agent = await create_test_agent(client, name="claude-native-ui")
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "labels": {"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+            },
+        )
+        assert created.status_code == 201, created.text
+        session_id = created.json()["id"]
+        events_url = f"/v1/sessions/{session_id}/events"
+        try:
+            first = await client.post(events_url, json=message)
+            assert first.status_code == 202, first.text
+            assert forwards[-1].url.path.endswith("/events")
+            assert json.loads(forwards[-1].content)["stable_id"] == stable_id
+
+            # The server restarts: its memory of the submission is gone.
+            pending_inputs.reset_for_tests()
+
+            resent = await client.post(events_url, json=message)
+            assert resent.status_code == 202, resent.text
+            pending_id = resent.json()["pending_id"]
+            assert len(forwards) == 2
+            entry = pending_inputs._pending[session_id][pending_id]
+            assert entry.uncertain is True
+
+            # The mirror of that message had already landed before the restart;
+            # the next message's mirror (with the forwarder's source id, as the
+            # Claude and Codex forwarders send) jumps over the re-recorded entry.
+            other = {
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "source_id": "src_next_message",
+                    "item_data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "the next message"}],
+                    },
+                },
+            }
+            pending_inputs.record(
+                session_id,
+                [{"type": "input_text", "text": "the next message"}],
+                stable_id="f" * 32,
+            )
+            mirrored = await client.post(events_url, json=other)
+            assert mirrored.status_code == 202, mirrored.text
+            assert pending_inputs.snapshot_for(session_id) == []
+            items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+            assert [it["type"] for it in items if it["type"] == "error"] == []
+            texts = [
+                block["text"]
+                for it in items
+                if it["type"] == "message"
+                for block in it.get("content", [])
+                if "text" in block
+            ]
+            assert texts.count("ran before the restart") == 0
+            assert texts.count("the next message") == 1
+        finally:
+            pending_inputs.reset_for_tests()
+
+
 async def test_stable_id_naming_a_different_item_is_rejected(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

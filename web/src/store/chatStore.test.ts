@@ -5773,6 +5773,21 @@ describe("chatStore — send (failed send)", () => {
     expect(readPendingSends("conv_existing")).toEqual([]);
   });
 
+  it("keeps every failed send for reload, not only the newest twenty", () => {
+    for (let i = 0; i < 21; i += 1) {
+      persistPendingSend("conv_existing", {
+        stableId: i.toString(16).padStart(32, "0"),
+        content: [{ type: "input_text", text: `message ${i}` }],
+      });
+    }
+    expect(readPendingSends("conv_existing")).toHaveLength(21);
+    installFlakyPost(Infinity, () => mockResponse({ queued: true }));
+    rehydratePersistedSends("conv_existing");
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.content[0])).toEqual(
+      Array.from({ length: 21 }, (_, i) => ({ type: "input_text", text: `message ${i}` })),
+    );
+  });
+
   it("does not revive a remembered send older than the retry window", () => {
     const content = [{ type: "input_text" as const, text: "from yesterday" }];
     persistPendingSend("conv_existing", {
@@ -11751,6 +11766,54 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(readPendingSends("conv_reconnect_failed")).toEqual([]);
 
     const last = sinks[2]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("reconnect settles a failed bubble whose committed item was already on screen", async () => {
+    // The item arrived (a history merge, another tab's re-send) but its receipt
+    // was lost: nothing is new to the transcript on reconnect, yet the snapshot
+    // names the bubble's stable id, so the bubble and its records must go.
+    const before = userMessage("ack_pre3", "before the gap");
+    const landed = { ...userMessage("gap_seen", "was sent after all"), id: "a".repeat(32) };
+    seedSession("conv_reconnect_seen", [before, landed]);
+    persistPendingSend("conv_reconnect_seen", {
+      stableId: "a".repeat(32),
+      content: [{ type: "input_text", text: "was sent after all" }],
+    });
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_reconnect_seen",
+      abortController: controller,
+      blocks: itemsToBlocks([before, landed]),
+      pendingUserMessages: [
+        {
+          tempId: "pend_seen",
+          stableId: "a".repeat(32),
+          content: [{ type: "input_text", text: "was sent after all" }],
+          failed: { attempts: 2 },
+        },
+      ],
+    });
+
+    const loop = startStreamPump("conv_reconnect_seen", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(readPendingSends("conv_reconnect_seen")).toEqual([]);
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
+      before.id,
+      "a".repeat(32),
+    ]);
+
+    const last = sinks[1]!;
     last.push("data: [DONE]\n\n");
     last.close();
     await drainAsync(2);

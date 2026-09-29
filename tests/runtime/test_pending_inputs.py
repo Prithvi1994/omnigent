@@ -513,6 +513,55 @@ def test_held_submission_resolves_to_its_pending_id_until_settled() -> None:
     assert pending_inputs.snapshot_for("conv_a") == []
 
 
+def test_mark_entry_uncertain_flags_one_entry_for_a_quiet_release() -> None:
+    """
+    A re-recorded entry the runner already ran is released quietly, not as undelivered.
+
+    After a server restart the re-send is recorded again and forwarded; the
+    runner answers "duplicate". Its mirror may already be persisted, so a later
+    text-matched mirror that jumps over the entry reports it as uncertain (no
+    undelivered record) while entries the runner never confirmed stay skipped.
+    """
+    ran = pending_inputs.record(
+        "conv_a", [_text_block("ran before the restart")], stable_id="e" * 32
+    )
+    lost = pending_inputs.record("conv_a", [_text_block("really lost")], stable_id="d" * 32)
+    pending_inputs.record("conv_a", [_text_block("the next message")], stable_id="f" * 32)
+    pending_inputs.mark_entry_uncertain("conv_a", ran)
+    pending_inputs.mark_entry_uncertain("conv_a", "pending_unknown")  # no-op
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "the next message")
+    assert drained.matched is not None and drained.matched.stable_id == "f" * 32
+    assert [entry.pending_id for entry in drained.uncertain] == [ran]
+    assert [entry.pending_id for entry in drained.skipped] == [lost]
+    assert pending_inputs.snapshot_for("conv_a") == []
+
+
+def test_inactive_conversations_drop_their_dedup_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A conversation nobody returns to does not keep its expired entries forever.
+
+    Per-conversation eviction only runs on that conversation's own accesses, so
+    a write for any conversation also sweeps others whose entries are all past
+    the TTL.
+    """
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    quiet = pending_inputs.DrainedInput(pending_id="p", content=[], stable_id="a" * 32)
+    pending_inputs.remember_committed("conv_quiet", quiet, "item_a")
+    pending_inputs.mark_dispatched("conv_quiet_sdk", "b" * 32)
+    assert "conv_quiet" in pending_inputs._committed
+    assert "conv_quiet_sdk" in pending_inputs._dispatched
+
+    clock["t"] = 1000.0 + pending_inputs._COMMITTED_TTL_S + 1
+    busy = pending_inputs.DrainedInput(pending_id="q", content=[], stable_id="c" * 32)
+    pending_inputs.remember_committed("conv_busy", busy, "item_c")
+    assert "conv_quiet" not in pending_inputs._committed
+    assert "conv_busy" in pending_inputs._committed
+    pending_inputs.mark_dispatched("conv_busy", "d" * 32)
+    assert "conv_quiet_sdk" not in pending_inputs._dispatched
+
+
 def test_committed_memory_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Committed submissions are swept on write: by age and by a per-conversation cap.

@@ -3144,11 +3144,12 @@ def create_runner_app(
 
     _session_histories = _session_histories_ref
     _last_server_item_id: dict[str, str] = {}
-    # Persisted item ids whose forwarded message already started (or
-    # buffered) a turn, per conversation. The server dedupes web re-sends,
-    # but its memory is process-local: after a server restart a re-send of a
-    # message this runner already ran arrives as a fresh forward. The runner
-    # outlives the server, so this is the durable half of that guarantee.
+    # Delivery ids (persisted item id, or a native forward's web stable id)
+    # whose message already started (or buffered) a turn, per conversation.
+    # The server dedupes web re-sends, but its memory is process-local: after
+    # a server restart a re-send of a message this runner already ran arrives
+    # as a fresh forward. The runner outlives the server, so this is the
+    # durable half of that guarantee.
     _started_item_ids: dict[str, deque[str]] = {}
     _session_event_queues = _session_event_queues_ref
     app.state.session_event_queues = _session_event_queues
@@ -10172,7 +10173,12 @@ def create_runner_app(
                 # written only where the message is actually taken (buffered or
                 # started): a request cancelled before that leaves nothing behind,
                 # and its retry is a fresh delivery.
+                # The delivery identity: the persisted item on the SDK path, the
+                # web submission's stable id on a native forward (nothing is
+                # persisted before the terminal echoes it).
                 persisted_item_id = message_body.get("persisted_item_id")
+                if not isinstance(persisted_item_id, str) or not persisted_item_id:
+                    persisted_item_id = message_body.get("stable_id")
                 if not isinstance(persisted_item_id, str) or not persisted_item_id:
                     persisted_item_id = None
                 started_ids = _started_item_ids.setdefault(
@@ -10310,10 +10316,12 @@ def create_runner_app(
                 if conversation_id in _session_histories:
                     _session_histories[conversation_id].append(new_item)
                 else:
-                    persisted_item_id = message_body.get("persisted_item_id")
+                    # Only a persisted item can already sit in history; a
+                    # native forward's stable id names nothing there.
+                    drop_item_id = message_body.get("persisted_item_id")
                     loaded = await _load_history_as_input(
                         conversation_id,
-                        drop_item_id=persisted_item_id,
+                        drop_item_id=drop_item_id if isinstance(drop_item_id, str) else None,
                     )
                     loaded.append(new_item)
                     _session_histories[conversation_id] = loaded
