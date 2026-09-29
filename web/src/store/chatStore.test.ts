@@ -12198,18 +12198,21 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     /**
      * `routeStreamOpens` plus per-open routing headers and abort wiring (a real
      * fetch fails on abort). `snapshotExtras` adds host/parent fields to a GET
-     * snapshot; `pendingFirstOpenFor` parks that session's first open pre-headers.
+     * snapshot; `pendingFirstOpenFor` parks that session's first open pre-headers,
+     * and `failFirstOpenFor` answers it with a 503.
      */
     function routeKeyedStreamOpens(
       opts: {
         snapshotExtras?: Map<string, Record<string, unknown>>;
         pendingFirstOpenFor?: string;
+        failFirstOpenFor?: string;
       } = {},
     ): KeyedStreamRoute {
       const sinks: StreamSink[] = [];
       const opens: StreamOpen[] = [];
       const log: string[] = [];
       let firstOpenParked = false;
+      let firstOpenFailed = false;
       fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input.toString();
         const path = url.split("?")[0]!;
@@ -12218,6 +12221,10 @@ describe("chatStore — startStreamPump reconnect loop", () => {
           const open: StreamOpen = { headers: new Headers(init?.headers), aborted: false };
           opens.push(open);
           log.push(`open:${open.headers.get(SLICE_KEY) ?? "none"}`);
+          if (opts.failFirstOpenFor === streamMatch[1] && !firstOpenFailed) {
+            firstOpenFailed = true;
+            return mockResponse({}, { ok: false, status: 503 });
+          }
           if (opts.pendingFirstOpenFor === streamMatch[1] && !firstOpenParked) {
             firstOpenParked = true;
             return new Promise<Response>((_resolve, reject) => {
@@ -12411,6 +12418,51 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       // Never having connected is no reason to skip the gap: the snapshot that
       // hydrated `before` predates the keyed subscription, so anything committed
       // in between must be backfilled on this first keyed connection.
+      const reopenedAt = route.log.indexOf("open:host_b");
+      expect(route.log.indexOf(`snapshot:${id}`)).toBeGreaterThan(reopenedAt);
+      expect(route.log.indexOf(`items:${id}`)).toBeGreaterThan(reopenedAt);
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toEqual([]);
+      expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, committed.id, reply.id]);
+
+      await teardown(controller, loop);
+      setSessionHost(id, null);
+    });
+
+    it("forces gap reconciliation when the host is learned during a failed open's backoff", async () => {
+      workspaceMode();
+      const id = "conv_rekey_backoff";
+      const before = userMessage("backoff_pre", "before the gap");
+      seedSession(id, [before]);
+      const extras = new Map<string, Record<string, unknown>>([[id, { host_id: null }]]);
+      const route = routeKeyedStreamOpens({ snapshotExtras: extras, failFirstOpenFor: id });
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        blocks: itemsToBlocks([before]),
+        pendingUserMessages: [postedBubble("pend_backoff", "only once")],
+      });
+
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      // The keyless open failed; the first backoff (125-250 ms) is pending.
+      expect(route.log).toEqual(["open:none"]);
+
+      const committed = userMessage("backoff_gap", "only once");
+      const reply = assistantMessage("backoff_gap", "the reply");
+      seedSessionItems(id, [before, committed, reply]);
+      extras.set(id, { host_id: "host_b" });
+      setSessionHost(id, "host_b");
+      await vi.advanceTimersByTimeAsync(250);
+      await drainAsync(50);
+
+      expect(route.log.filter((entry) => entry.startsWith("open:"))).toEqual([
+        "open:none",
+        "open:host_b",
+      ]);
+      // No attempt was live to recycle, but the host still changed after the
+      // bind snapshot, so the first keyed connection must backfill the gap.
       const reopenedAt = route.log.indexOf("open:host_b");
       expect(route.log.indexOf(`snapshot:${id}`)).toBeGreaterThan(reopenedAt);
       expect(route.log.indexOf(`items:${id}`)).toBeGreaterThan(reopenedAt);

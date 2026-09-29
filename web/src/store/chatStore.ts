@@ -5012,9 +5012,21 @@ export async function startStreamPump(
   // Ordinary failed opens still use bindStream's initial snapshot; successful
   // connections and host readdresses need reconnect reconciliation.
   let hasConnected = false;
-  // A host can be learned while the initial keyless open is still pending;
-  // the bind snapshot may predate that gap even without a successful open.
+  // A host can be learned while an open is pending or backing off; the bind
+  // snapshot may predate that gap even without a successful open.
   let hostReaddressed = false;
+  // The host the latest open was addressed to, and that open while it is live.
+  let openedHost = getSessionHost(id);
+  let liveAttempt: AbortController | null = null;
+  const unsubscribeHost = isDatabricksWorkspace()
+    ? subscribeSessionHostChanges(() => {
+        const host = getSessionHost(id);
+        if (host !== null && host !== openedHost) {
+          hostReaddressed = true;
+          liveAttempt?.abort();
+        }
+      })
+    : undefined;
   // A reconnect loop is inherently sequential — open → pump → reconnect —
   // so its awaits cannot be parallelized; no-await-in-loop doesn't apply.
   /* eslint-disable no-await-in-loop */
@@ -5045,16 +5057,8 @@ export async function startStreamPump(
       // Stamped from attempt start so the wake fast-path can also recycle
       // an open that has hung past the stale window, not just a dead body.
       streamAttemptActivity.set(attempt, Date.now());
-      const openedHost = getSessionHost(id);
-      const unsubscribeHost = isDatabricksWorkspace()
-        ? subscribeSessionHostChanges(() => {
-            const host = getSessionHost(id);
-            if (host !== null && host !== openedHost) {
-              hostReaddressed = true;
-              attempt.abort();
-            }
-          })
-        : undefined;
+      openedHost = getSessionHost(id);
+      liveAttempt = attempt;
       try {
         const idle = presenceIdle.idleNow();
         let streamRes: Response;
@@ -5181,13 +5185,14 @@ export async function startStreamPump(
         // Only a transport drop is reconnectable; everything else ends the loop.
         if (reason !== "dropped") break;
       } finally {
-        unsubscribeHost?.();
+        liveAttempt = null;
         controller.signal.removeEventListener("abort", onOuterAbort);
         presenceAttemptControllers.delete(attempt);
         streamAttemptActivity.delete(attempt);
       }
     }
   } finally {
+    unsubscribeHost?.();
     if (statusReconcileTimer !== null) window.clearInterval(statusReconcileTimer);
     if (get().abortController === controller) {
       set({ abortController: null });
