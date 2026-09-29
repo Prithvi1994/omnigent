@@ -1,4 +1,4 @@
-"""A git provider defined outside omnigent drives the pull request panel end to end.
+"""A git provider defined outside omnigent drives the pull request panel and observer end to end.
 
 The fake ``gitlab`` descriptor is registered at run time and its facet module is
 injected into ``sys.modules``, so nothing in omnigent names it.
@@ -6,6 +6,7 @@ injected into ``sys.modules``, so nothing in omnigent names it.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -27,7 +28,7 @@ from omnigent.git_providers import (
     register_provider,
     reset_for_tests,
 )
-from omnigent.runner import pr_resource
+from omnigent.runner import pr_observer, pr_resource
 from omnigent.runner.git_providers import (
     FILE_DIFF_OBJECT,
     INFO_OBJECT,
@@ -38,6 +39,8 @@ from omnigent.runner.git_providers import (
     ShellPrOp,
     ShellSegment,
 )
+from omnigent.runner.git_providers.tool_output import pr_reference, result_objects
+from omnigent.runner.pr_observer import extract_prs
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 
 HOST = "git.example.test"
@@ -46,6 +49,10 @@ MR = f"https://{HOST}/g/s/p/-/merge_requests/7"
 OTHER_MR = f"https://{HOST}/g/s/p/-/merge_requests/8"
 INACCESSIBLE_MR = f"https://{HOST}/g/s/p/-/merge_requests/9"
 _FACET_MODULE = "tests_git_providers_fake_gitlab_facet"
+# The shell commands the fake recognizes: one write and one read.
+_GLAB_CREATE = ("glab", "mr", "create")
+_GLAB_VIEW = ("glab", "mr", "view")
+_MCP_CREATE = "mcp__gitlab__create_merge_request"
 
 
 class FakeGitLab:
@@ -174,15 +181,26 @@ class FakeGitLabFacet:
         self.calls.append("set_preference")
 
     def shell_pr_operations(self, segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
-        return []
+        ops = []
+        for segment in segments:
+            command = segment.invocation_tokens[:3]
+            if command in {_GLAB_CREATE, _GLAB_VIEW}:
+                creates = command == _GLAB_CREATE
+                ops.append(
+                    ShellPrOp(tracks=creates, creates=creates, target=None, content_only=False)
+                )
+        return ops
 
     def pr_from_object(self, obj: Mapping[str, object]) -> PullRequestRef | None:
-        return None
+        # glab prints a merge request's URL as ``web_url``, not a generic URL field.
+        return pr_reference(obj.get("web_url"))
 
     def mcp_prs(
         self, tool_name: str, arguments: dict[str, object], result: object
     ) -> tuple[list[PullRequestRef], bool] | None:
-        return None
+        if tool_name != _MCP_CREATE:
+            return None
+        return [ref for obj in result_objects(result) if (ref := self.pr_from_object(obj))], True
 
 
 @pytest.fixture
@@ -309,3 +327,44 @@ def test_the_dispatcher_names_no_provider() -> None:
     source = Path(pr_resource.__file__).read_text(encoding="utf-8")
 
     assert '"github"' not in source
+
+
+def test_a_shell_create_records_the_mr_that_its_json_output_names(
+    facet: FakeGitLabFacet,
+) -> None:
+    refs, created = extract_prs(
+        "Bash",
+        {"command": "cd /repo && glab mr create --fill --yes"},
+        {"stdout": json.dumps({"iid": 7, "web_url": MR}), "exit_code": 0},
+    )
+
+    assert [(ref.provider, ref.url) for ref in refs] == [("gitlab", MR)]
+    assert created
+
+
+@pytest.mark.parametrize(
+    "command,created",
+    [("glab mr view 8", False), ("glab mr view 8; glab mr create --fill", True)],
+)
+def test_a_read_keeps_shared_output_from_naming_the_mr(
+    facet: FakeGitLabFacet, command: str, created: bool
+) -> None:
+    result = {"stdout": json.dumps({"iid": 8, "web_url": OTHER_MR})}
+
+    assert extract_prs("Bash", {"command": command}, result) == ([], created)
+
+
+def test_the_fake_answers_only_for_its_mcp_tool(facet: FakeGitLabFacet) -> None:
+    result = {"structuredContent": {"iid": 7, "web_url": MR}}
+
+    refs, created = extract_prs(_MCP_CREATE, {"project": "g/s/p"}, result)
+
+    assert ([ref.url for ref in refs], created) == ([MR], True)
+    assert extract_prs("mcp__gitlab__list_merge_requests", {}, result) == ([], False)
+
+
+def test_the_observer_names_no_provider() -> None:
+    source = Path(pr_observer.__file__).read_text(encoding="utf-8")
+
+    assert '"github"' not in source
+    assert "mcp__github" not in source

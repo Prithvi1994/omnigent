@@ -3,6 +3,7 @@
 The panel steps live in :mod:`omnigent.runner.github_resource`. Each method
 imports that module when it runs and calls through it, so patches on the module
 apply, and the tool-call observer, which loads every facet, skips the panel code.
+The observer steps live in :mod:`omnigent.runner.git_providers.github_observer`.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from omnigent.runner.git_providers import (
     PullRequestFacet,
     ShellPrOp,
     ShellSegment,
+    github_observer,
 )
 from omnigent.runner.session_prs import PullRequestRef
 
@@ -145,12 +147,9 @@ class GitHubPullRequests:
 
         github_resource._set_preference(root, reference, account=account, remote=remote)
 
-    def shell_pr_operations(
-        self,
-        segments: Sequence[ShellSegment],  # noqa: ARG002
-    ) -> list[ShellPrOp]:
-        """Return no ops: ``pr_observer`` parses ``gh`` commands itself."""
-        return []
+    def shell_pr_operations(self, segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
+        """Return one op per ``gh pr`` or ``gh api`` segment."""
+        return github_observer.shell_pr_operations(segments)
 
     def pr_from_object(
         self,
@@ -160,13 +159,10 @@ class GitHubPullRequests:
         return None
 
     def mcp_prs(
-        self,
-        tool_name: str,  # noqa: ARG002
-        arguments: dict[str, object],  # noqa: ARG002
-        result: object,  # noqa: ARG002
+        self, tool_name: str, arguments: dict[str, object], result: object
     ) -> tuple[list[PullRequestRef], bool] | None:
-        """Claim no MCP tool: ``pr_observer`` reads GitHub's MCP tools itself."""
-        return None
+        """Read GitHub's pull request MCP tools and the ``write_api_call`` proxy."""
+        return github_observer.mcp_prs(tool_name, arguments, result)
 
 
 PULL_REQUESTS: PullRequestFacet = GitHubPullRequests()
