@@ -3908,7 +3908,9 @@ def _item_user(text: str) -> dict[str, object]:
     }
 
 
-def _item_assistant(text: str, *, status: str = "completed") -> dict[str, object]:
+def _item_assistant(
+    text: str, *, status: str = "completed", response_id: str = "resp_x"
+) -> dict[str, object]:
     """
     Build a persisted assistant-message item in the flat API shape.
 
@@ -3920,7 +3922,7 @@ def _item_assistant(text: str, *, status: str = "completed") -> dict[str, object
     """
     return {
         "id": "msg_assistant",
-        "response_id": "resp_x",
+        "response_id": response_id,
         "type": "message",
         "status": status,
         "role": "assistant",
@@ -4077,14 +4079,18 @@ def _fake_sessions_chat_cls(
         async def query(self, prompt: str) -> QueryResult:
             result = await query_impl(prompt)
             if self.hooks:
-                self.hooks.on_response_end(SimpleNamespace(status="completed"))
+                self.hooks.on_response_end(
+                    SimpleNamespace(status="completed", response=SimpleNamespace(id="resp_x"))
+                )
             return result  # type: ignore[return-value]
 
         async def await_turn(self, *, timeout: float | None = None) -> QueryResult:
             if self._pending:
                 text = self._pending.pop(0)
                 if self.hooks:
-                    self.hooks.on_response_end(SimpleNamespace(status="completed"))
+                    self.hooks.on_response_end(
+                        SimpleNamespace(status="completed", response=SimpleNamespace(id="resp_x"))
+                    )
                 return QueryResult(text=text, files=[])
             return QueryResult(text="", files=[])
 
@@ -4277,7 +4283,16 @@ async def test_query_sessions_once_returns_text_after_terminal_check(monkeypatch
         await _run_one_shot(client, _return_text, monkeypatch, strict_completion=True)
         == "direct answer"
     )
-    assert client.sessions.list_items_calls == 1
+    assert client.sessions.list_items_calls == 2
+
+
+@pytest.mark.parametrize("response_id", [None, "", "unobserved_response"])
+async def test_strict_prompt_rejects_uncorrelated_persisted_output(monkeypatch, response_id):
+    item = _item_assistant("saved text")
+    item["response_id"] = response_id
+    client = _FakeAPClient([_item_user("hi"), item])
+    with pytest.raises(ClientOmnigentError, match="latest output"):
+        await _run_one_shot(client, _return_text, monkeypatch, strict_completion=True)
 
 
 async def test_query_sessions_once_does_not_recover_preamble_after_failure(monkeypatch):
@@ -4317,7 +4332,9 @@ async def test_strict_prompt_rejects_recovered_idle_without_completion(monkeypat
 async def test_strict_prompt_reconciles_transport_failure_after_observed_completion(monkeypatch):
     class Chat(_fake_sessions_chat_cls(_raise_turn_failed)):
         async def query(self, prompt):
-            self.hooks.on_response_end(SimpleNamespace(status="completed"))
+            self.hooks.on_response_end(
+                SimpleNamespace(status="completed", response=SimpleNamespace(id="resp_x"))
+            )
             raise ClientOmnigentError("disconnected after completion")
 
     client = _FakeAPClient([_item_user("hi"), _item_assistant("completed answer")])
@@ -4330,7 +4347,7 @@ async def test_strict_prompt_reconciles_transport_failure_after_observed_complet
 
 
 @pytest.mark.parametrize("outcome", ["completed", "failed", "incomplete", "cancelled", None])
-@pytest.mark.parametrize("auto_wake", [False, True, "missed-start"])
+@pytest.mark.parametrize("auto_wake", [False, True, "missed-start", "missed-response"])
 async def test_strict_prompt_checks_real_sdk_response_events(monkeypatch, outcome, auto_wake):
     from omnigent_client import SessionsChat
 
@@ -4362,7 +4379,13 @@ async def test_strict_prompt_checks_real_sdk_response_events(monkeypatch, outcom
         async def stream(self, session_id):
             self.subscriptions += 1
             yield SessionHeartbeatEvent(type="session.heartbeat")
-            if self.subscriptions == 1 or auto_wake:
+            if self.subscriptions == 2 and auto_wake == "missed-response":
+                # The whole later response (including its outcome) was missed.
+                # Cancelled/incomplete responses can still persist completed text.
+                self._items.append(
+                    _item_assistant("unobserved later output", response_id="resp_2")
+                )
+            if self.subscriptions == 1 or (auto_wake and auto_wake != "missed-response"):
                 response_id = f"resp_{self.subscriptions}"
                 response = ResponseObject(
                     id=response_id, status="in_progress", model="test-model", created_at=1
@@ -4401,11 +4424,19 @@ async def test_strict_prompt_checks_real_sdk_response_events(monkeypatch, outcom
             )
 
     client = _FakeAPClient([])
-    client.sessions = Namespace([_item_user("hi"), _item_assistant("preamble")])
+    client.sessions = Namespace(
+        [
+            _item_user("hi"),
+            _item_assistant(
+                "preamble",
+                response_id="resp_2" if auto_wake and auto_wake != "missed-response" else "resp_1",
+            ),
+        ]
+    )
     call = _run_one_shot(
         client, _return_text, monkeypatch, strict_completion=True, chat_cls=SessionsChat
     )
-    if outcome == "completed":
+    if outcome == "completed" and auto_wake != "missed-response":
         expected = "partial or final text"
         assert await call == (f"{expected}\n\n{expected}" if auto_wake else expected)
     else:

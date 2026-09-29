@@ -2500,22 +2500,40 @@ async def _query_sessions_once(
         on_session_ready(bound.id)
     session_files = client.files.for_session(bound.id)
     response_status: str | None = None
+    completed_response_id: str | None = None
 
     def response_started(_ctx: object) -> None:
         nonlocal response_status
         response_status = None
 
     def response_ended(ctx: ResponseEndCtx) -> None:
-        nonlocal response_status
+        nonlocal response_status, completed_response_id
         response_status = ctx.status
+        completed_response_id = ctx.response.id if ctx.status == "completed" else None
 
-    def require_completed_response() -> None:
+    async def require_completed_response() -> None:
         # Runner reconnects can report idle while unfinished work still exists.
         if response_status != "completed":
             raise ClientOmnigentError(
                 "Headless turn has no verified successful response "
                 f"(observed outcome: {response_status or 'unknown'})"
             )
+
+        recent = await client.sessions.list_items(
+            bound.id, limit=_RECONCILE_ITEMS_LIMIT, order="desc"
+        )
+        for item in recent:
+            if item.get("type") != "message":
+                continue
+            if item.get("role") == "user":
+                break
+            if item.get("role") == "assistant":
+                # An entire auto-woken response can occur between subscriptions.
+                if not completed_response_id or item.get("response_id") != completed_response_id:
+                    raise ClientOmnigentError(
+                        "Headless turn has no verified successful response for its latest output"
+                    )
+                break
 
     async def completion_deadline_expired() -> NoReturn:
         try:
@@ -2596,7 +2614,7 @@ async def _query_sessions_once(
                     f"(status: {chat.status}): {exc}"
                 ) from exc
             try:
-                require_completed_response()
+                await require_completed_response()
             except ClientOmnigentError as verification_error:
                 raise ClientOmnigentError(f"{verification_error}: {exc}") from exc
         reconciled = await _persisted_turn_text(client, bound.id)
@@ -2639,7 +2657,7 @@ async def _query_sessions_once(
                 raise ClientOmnigentError(
                     f"Headless session did not reach terminal completion (status: {chat.status})"
                 ) from None
-            require_completed_response()
+            await require_completed_response()
         reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
             return reconciled
@@ -2747,7 +2765,7 @@ async def _query_sessions_once(
             raise ClientOmnigentError(
                 f"Headless session did not reach terminal completion (status: {chat.status})"
             ) from None
-        require_completed_response()
+        await require_completed_response()
     if all_text_parts:
         return "\n\n".join(p for p in all_text_parts if p)
     # An auto-woken turn can finish between live-stream subscriptions.
