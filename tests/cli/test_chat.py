@@ -4062,6 +4062,7 @@ def _fake_sessions_chat_cls(
     class _FakeSessionsChat:
         def __init__(self, **_kwargs: object) -> None:
             self._pending = list(_extra)
+            self.hooks = _kwargs.get("hooks")
 
         @property
         def status(self) -> str:
@@ -4074,11 +4075,16 @@ def _fake_sessions_chat_cls(
             pass  # status is derived from _pending; no fetch needed.
 
         async def query(self, prompt: str) -> QueryResult:
-            return await query_impl(prompt)  # type: ignore[return-value]
+            result = await query_impl(prompt)
+            if self.hooks:
+                self.hooks.on_response_end(SimpleNamespace(status="completed"))
+            return result  # type: ignore[return-value]
 
         async def await_turn(self, *, timeout: float | None = None) -> QueryResult:
             if self._pending:
                 text = self._pending.pop(0)
+                if self.hooks:
+                    self.hooks.on_response_end(SimpleNamespace(status="completed"))
                 return QueryResult(text=text, files=[])
             return QueryResult(text="", files=[])
 
@@ -4298,12 +4304,113 @@ async def test_strict_prompt_rejects_unsuccessful_status_without_error_item(
         )
 
 
-async def test_strict_prompt_reconciles_transport_failure_only_after_idle(monkeypatch):
+@pytest.mark.parametrize("query_failure", [ClientOmnigentError("disconnected"), TimeoutError()])
+async def test_strict_prompt_rejects_recovered_idle_without_completion(monkeypatch, query_failure):
+    async def query(prompt):
+        raise query_failure
+
+    client = _FakeAPClient([_item_user("hi"), _item_assistant("preamble")])
+    with pytest.raises(ClientOmnigentError, match="no verified successful response"):
+        await _run_one_shot(client, query, monkeypatch, strict_completion=True)
+
+
+async def test_strict_prompt_reconciles_transport_failure_after_observed_completion(monkeypatch):
+    class Chat(_fake_sessions_chat_cls(_raise_turn_failed)):
+        async def query(self, prompt):
+            self.hooks.on_response_end(SimpleNamespace(status="completed"))
+            raise ClientOmnigentError("disconnected after completion")
+
     client = _FakeAPClient([_item_user("hi"), _item_assistant("completed answer")])
     assert (
-        await _run_one_shot(client, _raise_turn_failed, monkeypatch, strict_completion=True)
+        await _run_one_shot(
+            client, _raise_turn_failed, monkeypatch, strict_completion=True, chat_cls=Chat
+        )
         == "completed answer"
     )
+
+
+@pytest.mark.parametrize("outcome", ["completed", "failed", "incomplete", "cancelled", None])
+@pytest.mark.parametrize("auto_wake", [False, True, "missed-start"])
+async def test_strict_prompt_checks_real_sdk_response_events(monkeypatch, outcome, auto_wake):
+    from omnigent_client import SessionsChat
+
+    from omnigent.server.schemas import (
+        CancelledEvent,
+        CompletedEvent,
+        CreatedEvent,
+        FailedEvent,
+        IncompleteEvent,
+        OutputTextDeltaEvent,
+        ResponseObject,
+        SessionChildSessionUpdatedEvent,
+        SessionHeartbeatEvent,
+        SessionStatusEvent,
+    )
+
+    class Namespace(_FakeSessionsNamespace):
+        subscriptions = 0
+
+        async def bind_runner(self, session_id, *, runner_id):
+            return await self.get(session_id)
+
+        async def get(self, session_id):
+            return SimpleNamespace(id=session_id, status="idle", agent_id="agent_test")
+
+        async def post_event(self, session_id, event):
+            assert event["type"] == "message"
+
+        async def stream(self, session_id):
+            self.subscriptions += 1
+            yield SessionHeartbeatEvent(type="session.heartbeat")
+            if self.subscriptions == 1 or auto_wake:
+                response_id = f"resp_{self.subscriptions}"
+                response = ResponseObject(
+                    id=response_id, status="in_progress", model="test-model", created_at=1
+                )
+                if auto_wake != "missed-start" or self.subscriptions == 1:
+                    yield CreatedEvent(type="response.created", response=response)
+                yield OutputTextDeltaEvent(
+                    type="response.output_text.delta",
+                    response_id=response_id,
+                    item_id="msg_test",
+                    output_index=0,
+                    content_index=0,
+                    delta="partial or final text",
+                )
+                # Child completion cannot establish parent response completion.
+                yield SessionChildSessionUpdatedEvent(
+                    type="session.child_session.updated",
+                    conversation_id=session_id,
+                    child_session_id="child_test",
+                    child={"current_task_status": "completed", "is_busy": False},
+                )
+                current_outcome = "completed" if auto_wake and self.subscriptions == 1 else outcome
+                if current_outcome:
+                    event_type = {
+                        "completed": CompletedEvent,
+                        "failed": FailedEvent,
+                        "incomplete": IncompleteEvent,
+                        "cancelled": CancelledEvent,
+                    }[current_outcome]
+                    yield event_type(
+                        type=f"response.{current_outcome}",
+                        response=response.model_copy(update={"status": current_outcome}),
+                    )
+            yield SessionStatusEvent(
+                type="session.status", conversation_id=session_id, status="idle"
+            )
+
+    client = _FakeAPClient([])
+    client.sessions = Namespace([_item_user("hi"), _item_assistant("preamble")])
+    call = _run_one_shot(
+        client, _return_text, monkeypatch, strict_completion=True, chat_cls=SessionsChat
+    )
+    if outcome == "completed":
+        expected = "partial or final text"
+        assert await call == (f"{expected}\n\n{expected}" if auto_wake else expected)
+    else:
+        with pytest.raises(ClientOmnigentError, match="no verified successful response"):
+            await call
 
 
 async def test_strict_prompt_retains_query_error_when_failed_status_has_no_error_item(monkeypatch):
@@ -4330,7 +4437,7 @@ async def test_strict_prompt_preserves_persisted_error_when_refresh_is_unavailab
 
 
 @pytest.mark.parametrize("query_times_out", [False, True])
-async def test_strict_prompt_refreshes_status_after_wait_budget_expires(
+async def test_strict_prompt_rejects_deadline_even_if_session_becomes_idle(
     monkeypatch, query_times_out
 ):
     async def query(prompt):
@@ -4353,13 +4460,37 @@ async def test_strict_prompt_refreshes_status_after_wait_budget_expires(
             try:
                 await asyncio.Event().wait()
             finally:
-                # The server completes while the client's wait is cancelled.
+                # Reconnect recovery reports idle without proving completion.
                 self.server_idle = True
 
     monkeypatch.setattr(chat_module, "_LOOP_TIMEOUT_S", 0.01)
     client = _FakeAPClient([_item_user("hi"), _item_assistant("completed answer")])
-    result = await _run_one_shot(client, query, monkeypatch, strict_completion=True, chat_cls=Chat)
-    assert result == ("completed answer" if query_times_out else "direct answer")
+    diagnostic = "no verified successful response" if query_times_out else "completion deadline"
+    with pytest.raises(ClientOmnigentError, match=diagnostic):
+        await asyncio.wait_for(
+            _run_one_shot(client, query, monkeypatch, strict_completion=True, chat_cls=Chat),
+            timeout=5,
+        )
+
+
+async def test_strict_prompt_preserves_deadline_when_transcript_unreadable(monkeypatch):
+    class Chat(_fake_sessions_chat_cls(_return_text)):
+        async def await_turn(self, *, timeout=None):
+            await asyncio.Event().wait()
+
+    async def unreadable(*args, **kwargs):
+        raise ClientOmnigentError("items endpoint unavailable")
+
+    client = _FakeAPClient([])
+    client.sessions.list_items = unreadable
+    monkeypatch.setattr(chat_module, "_LOOP_TIMEOUT_S", 0.01)
+    with pytest.raises(ClientOmnigentError, match="completion deadline: Could not verify"):
+        await asyncio.wait_for(
+            _run_one_shot(
+                client, _return_text, monkeypatch, strict_completion=True, chat_cls=Chat
+            ),
+            timeout=5,
+        )
 
 
 @pytest.mark.parametrize("query_impl", [_return_text, _raise_turn_failed])

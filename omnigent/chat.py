@@ -34,6 +34,7 @@ from omnigent_client import (
     OmnigentClient,
     RegisteredAgent,
     SessionToolCallInfo,
+    StreamHooks,
     ToolCallable,
     ToolCallInfo,
     ToolHandler,
@@ -79,6 +80,8 @@ from omnigent.spec.parser import discover_host_skills
 from omnigent.spec.types import AgentSpec, SkillSpec
 
 if TYPE_CHECKING:
+    from omnigent_client._tool_handler import ResponseEndCtx
+
     from omnigent._runner_startup import RunnerStartupProgress
 
 console = Console()
@@ -580,6 +583,8 @@ class PromptResult:
 def run_prompt_result(**kwargs: Any) -> PromptResult:
     """Run the CLI harness and retain its terminal outcome.
 
+    Completion requires an observed successful response and an idle session.
+    Lost completion events fail verification, even when saved text exists.
     Output capture changes process-global streams; use an isolated process
     when other threads may print or invoke this API concurrently.
     """
@@ -2485,6 +2490,24 @@ async def _query_sessions_once(
     if on_session_ready is not None:
         on_session_ready(bound.id)
     session_files = client.files.for_session(bound.id)
+    response_status: str | None = None
+
+    def response_started(_ctx: object) -> None:
+        nonlocal response_status
+        response_status = None
+
+    def response_ended(ctx: ResponseEndCtx) -> None:
+        nonlocal response_status
+        response_status = ctx.status
+
+    def require_completed_response() -> None:
+        # Runner reconnects can report idle while unfinished work still exists.
+        if response_status != "completed":
+            raise ClientOmnigentError(
+                "Headless turn has no verified successful response "
+                f"(observed outcome: {response_status or 'unknown'})"
+            )
+
     chat = SessionsChat(
         namespace=client.sessions,
         files_uploader=session_files.upload,
@@ -2492,6 +2515,15 @@ async def _query_sessions_once(
         session=bound,
         tool_callables=tool_callables,
         agent_tools_getter=client._fetch_agent_tools,
+        hooks=StreamHooks(
+            on_response_start=response_started,
+            on_message_start=response_started,
+            on_reasoning_start=response_started,
+            on_tool_call_start=response_started,
+            on_response_end=response_ended,
+        )
+        if strict_completion
+        else None,
     )
     del agent_name
     # A transport-level runner disconnect publishes ``session.status:
@@ -2543,6 +2575,10 @@ async def _query_sessions_once(
                     f"Headless session did not reach terminal completion "
                     f"(status: {chat.status}): {exc}"
                 ) from exc
+            try:
+                require_completed_response()
+            except ClientOmnigentError as verification_error:
+                raise ClientOmnigentError(f"{verification_error}: {exc}") from exc
         reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
             return reconciled
@@ -2579,6 +2615,7 @@ async def _query_sessions_once(
                 raise ClientOmnigentError(
                     f"Headless session did not reach terminal completion (status: {chat.status})"
                 ) from None
+            require_completed_response()
         reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
             return reconciled
@@ -2637,6 +2674,7 @@ async def _query_sessions_once(
     # they also guard the first-turn query above.
 
     async def _drain_extra_turns() -> None:
+        nonlocal response_status
         # Probe: collect synthesis text or status events that arrive quickly.
         probe = await chat.await_turn(timeout=_STATUS_PROBE_TIMEOUT_S)
         if probe.text:
@@ -2649,6 +2687,8 @@ async def _query_sessions_once(
             return
         # Async orchestrator confirmed. Loop, refreshing after each turn.
         for _ in range(_MAX_EXTRA_TURNS):
+            # A prior completed response cannot prove this auto-woken turn ended.
+            response_status = None
             extra = await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
             if extra.text:
                 all_text_parts.append(extra.text)
@@ -2666,6 +2706,16 @@ async def _query_sessions_once(
         async with asyncio.timeout(_LOOP_TIMEOUT_S):
             await _drain_extra_turns()
     except asyncio.TimeoutError:
+        if strict_completion:
+            try:
+                turn_error = await _persisted_turn_error(client, bound.id, strict=True)
+            except ClientOmnigentError as verification_error:
+                raise ClientOmnigentError(
+                    f"Headless session exceeded its completion deadline: {verification_error}"
+                ) from verification_error
+            raise ClientOmnigentError(
+                turn_error or "Headless session exceeded its completion deadline"
+            ) from None
         logger.warning(
             "headless -p timed out after %.0fs waiting for session %s to complete",
             _LOOP_TIMEOUT_S,
@@ -2681,6 +2731,7 @@ async def _query_sessions_once(
             raise ClientOmnigentError(
                 f"Headless session did not reach terminal completion (status: {chat.status})"
             ) from None
+        require_completed_response()
     if all_text_parts:
         return "\n\n".join(p for p in all_text_parts if p)
     # An auto-woken turn can finish between live-stream subscriptions.
