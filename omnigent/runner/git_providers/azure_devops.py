@@ -35,6 +35,7 @@ from omnigent.runner.git_providers import (
     PullRequestFacet,
     ShellPrOp,
     ShellSegment,
+    azure_devops_observer,
 )
 from omnigent.runner.session_prs import PullRequestRef
 
@@ -924,28 +925,19 @@ class AzureDevOpsPullRequests:
         if account is not None or remote is not None:
             raise ValueError("Azure DevOps pull requests have no account or base remote choice")
 
-    def shell_pr_operations(
-        self,
-        segments: Sequence[ShellSegment],  # noqa: ARG002 - no az repos pr command is tracked
-    ) -> list[ShellPrOp]:
-        """Return no operations: Azure DevOps PR shell commands are not tracked."""
-        return []
+    def shell_pr_operations(self, segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
+        """Return one op per ``az repos pr`` command, in order."""
+        return azure_devops_observer.shell_pr_operations(segments)
 
-    def pr_from_object(
-        self,
-        obj: Mapping[str, object],  # noqa: ARG002 - no Azure DevOps-specific fields are read
-    ) -> PullRequestRef | None:
-        """Return ``None``: only the generic ``url`` fields name Azure DevOps PRs."""
-        return None
+    def pr_from_object(self, obj: Mapping[str, object]) -> PullRequestRef | None:
+        """Return the PR that ``pullRequestId`` and the ``repository`` field name."""
+        return azure_devops_observer.pr_from_object(obj)
 
     def mcp_prs(
-        self,
-        tool_name: str,  # noqa: ARG002 - no Azure DevOps MCP tool is tracked
-        arguments: dict[str, object],  # noqa: ARG002 - no Azure DevOps MCP tool is tracked
-        result: object,  # noqa: ARG002 - no Azure DevOps MCP tool is tracked
+        self, tool_name: str, arguments: dict[str, object], result: object
     ) -> tuple[list[PullRequestRef], bool] | None:
         """Return ``None``: no Azure DevOps MCP tool is tracked."""
-        return None
+        return azure_devops_observer.mcp_prs(tool_name, arguments, result)
 
 
 PULL_REQUESTS: PullRequestFacet = AzureDevOpsPullRequests()

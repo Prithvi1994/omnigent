@@ -67,3 +67,14 @@ or `az repos`.
   counts for changed files.
 - **Azure DevOps Services only.** Azure DevOps Server (on premises) is not
   supported.
+
+## Observer limits
+
+The session also records the pull requests that its agent creates or changes.
+For Azure DevOps, it finds them in two places:
+
+- the JSON that `az repos pr create` and `az repos pr update` print
+- pull request web URLs printed in tool output
+
+`az repos pr set-vote` and the `reviewer`, `work-item`, and `policy` commands
+print no pull request, so they do not record one.
