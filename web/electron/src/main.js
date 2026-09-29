@@ -39,6 +39,7 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
+const { aliasedServerUrl, parseServerAliases } = require("./server_aliases");
 const {
   registerBrowserPermissions,
   createBrowserPermissionStore,
@@ -1300,9 +1301,13 @@ function rememberRecentServer(settings, url) {
   // Tolerate a hand-edited/corrupt settings.json (non-array, junk entries)
   // by rebuilding the list from whatever string entries survive.
   const existing = Array.isArray(settings.recent_servers) ? settings.recent_servers : [];
+  // An aliased workspace host is recorded as the URL the user picked, which
+  // also drops its earlier raw-host entries.
+  const aliases = parseServerAliases(settings.server_aliases);
+  const shown = aliasedServerUrl(aliases, url);
   settings.recent_servers = [
-    url,
-    ...existing.filter((u) => typeof u === "string" && u !== url),
+    shown,
+    ...existing.filter((u) => typeof u === "string" && aliasedServerUrl(aliases, u) !== shown),
   ].slice(0, MAX_RECENT_SERVERS);
 }
 
@@ -1538,6 +1543,11 @@ async function loadServerUrl(
           if (interactive && !windows.get(win)?.ephemeral) {
             const settings = loadSettings();
             settings.server_url = serverUrl;
+            // Keep showing the URL the user picked for this workspace host.
+            settings.server_aliases = {
+              ...parseServerAliases(settings.server_aliases),
+              [resolvedOrigin]: requestedServerUrl,
+            };
             saveSettings(settings);
           }
         }
@@ -3199,10 +3209,14 @@ function registerIpc() {
     }
     const win = BrowserWindow.fromWebContents(event.sender);
     const managedServers = managedServerUrls();
-    const recents = excludingManagedServers(loadSettings().recent_servers, managedServers);
+    const settings = loadSettings();
+    const recents = excludingManagedServers(settings.recent_servers, managedServers);
+    // isPinnedOriginSender guarantees the sender window is tracked.
+    const { origin } = windows.get(win);
     return {
-      // isPinnedOriginSender guarantees the sender window is tracked.
-      currentOrigin: windows.get(win).origin,
+      // An aliased workspace host reads as the server the user picked.
+      currentOrigin:
+        originOf(aliasedServerUrl(parseServerAliases(settings.server_aliases), origin)) ?? origin,
       managedServers,
       recentServers: recents,
       // The connected server's manifest, forwarded so the SPA branches on the
@@ -3762,6 +3776,10 @@ function findKnownServerUrl(origin) {
   for (const u of candidates) {
     if (originOf(u) === origin) return u;
   }
+  // A workspace host the user reached through an alias was connected to too.
+  if (Object.hasOwn(parseServerAliases(settings.server_aliases), origin)) {
+    return databricksWorkspaceUiUrl(origin);
+  }
   return null;
 }
 
@@ -3788,6 +3806,7 @@ function knownOrigins() {
       }
     }
   }
+  for (const o of Object.keys(parseServerAliases(settings.server_aliases))) origins.add(o);
   return [...origins];
 }
 

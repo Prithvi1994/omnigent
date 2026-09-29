@@ -973,6 +973,33 @@ describe("managed server preference wiring", () => {
     );
   });
 
+  it("shows the picked URL for a workspace host that sign-in moved to", () => {
+    // Recorded when sign-in bridges the entered URL to its workspace's own host.
+    assert.match(
+      liveCode,
+      /settings\.server_url = serverUrl;[\s\S]{0,120}settings\.server_aliases = \{\s*\.\.\.parseServerAliases\(settings\.server_aliases\),\s*\[resolvedOrigin\]: requestedServerUrl,/,
+    );
+    // Recents store (and dedupe by) the picked URL.
+    assert.match(
+      liveCode,
+      /function rememberRecentServer\(settings, url\)[\s\S]{0,500}const shown = aliasedServerUrl\(aliases, url\);[\s\S]{0,120}aliasedServerUrl\(aliases, u\) !== shown/,
+    );
+    // The server picker marks the picked server as current.
+    assert.match(
+      liveCode,
+      /currentOrigin:\s*originOf\(aliasedServerUrl\(parseServerAliases\(settings\.server_aliases\), origin\)\) \?\? origin/,
+    );
+    // Deep links to the workspace host stay "known".
+    assert.match(
+      liveCode,
+      /function findKnownServerUrl\(origin\)[\s\S]{0,700}Object\.hasOwn\(parseServerAliases\(settings\.server_aliases\), origin\)/,
+    );
+    assert.match(
+      liveCode,
+      /function knownOrigins\(\)[\s\S]{0,700}Object\.keys\(parseServerAliases\(settings\.server_aliases\)\)\) origins\.add\(o\)/,
+    );
+  });
+
   it("preserves a managed path while still expanding bare workspace roots", () => {
     assert.match(
       liveCode,
@@ -987,7 +1014,7 @@ describe("managed server preference wiring", () => {
   it("returns managed choices in the connected-server picker", () => {
     assert.match(
       liveCode,
-      /ipcMain\.handle\("omnigent:get-server-picker"[\s\S]{0,500}managedServers[\s\S]{0,100}recentServers:\s*recents/,
+      /ipcMain\.handle\("omnigent:get-server-picker"[\s\S]{0,900}managedServers[\s\S]{0,100}recentServers:\s*recents/,
     );
   });
 
