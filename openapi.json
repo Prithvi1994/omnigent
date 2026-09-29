@@ -102,7 +102,7 @@
           },
           "mcp_servers_editable": {
             "default": false,
-            "description": "Whether the MCP list can be edited through the session UI. Built-in template agents are read-only; session-scoped uploaded agents are editable.",
+            "description": "Whether the MCP list can be edited through the session UI by the authenticated caller. This requires ownership of both the effective session and its session-scoped agent; built-in template and native agents are read-only.",
             "title": "Mcp Servers Editable",
             "type": "boolean"
           },
@@ -3230,6 +3230,85 @@
           "status"
         ],
         "title": "McpServerStartup",
+        "type": "object"
+      },
+      "McpServerSummary": {
+        "description": "An MCP server a harness loads on the host, without secrets.",
+        "properties": {
+          "harness": {
+            "description": "Harness family that loads it: `claude`, `codex`, or `cursor`.",
+            "title": "Harness",
+            "type": "string"
+          },
+          "name": {
+            "description": "Server name as configured, e.g. `\"github\"`.",
+            "title": "Name",
+            "type": "string"
+          },
+          "plugin": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Plugin that bundles the server, e.g. `\"figma\"`.",
+            "title": "Plugin"
+          },
+          "scope": {
+            "const": "user",
+            "description": "Config scope; always `user` today.",
+            "title": "Scope",
+            "type": "string"
+          },
+          "transport": {
+            "description": "`stdio` for a local process, `http` for a remote server.",
+            "enum": [
+              "stdio",
+              "http"
+            ],
+            "title": "Transport",
+            "type": "string"
+          },
+          "url_host": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Hostname of a remote server, e.g. `\"mcp.linear.app\"`.",
+            "title": "Url Host"
+          }
+        },
+        "required": [
+          "name",
+          "harness",
+          "transport",
+          "scope"
+        ],
+        "title": "McpServerSummary",
+        "type": "object"
+      },
+      "McpServersResponse": {
+        "description": "User-level MCP servers discovered on a host.",
+        "properties": {
+          "mcp_servers": {
+            "items": {
+              "$ref": "#/components/schemas/McpServerSummary"
+            },
+            "title": "Mcp Servers",
+            "type": "array"
+          }
+        },
+        "required": [
+          "mcp_servers"
+        ],
+        "title": "McpServersResponse",
         "type": "object"
       },
       "MessageData": {
@@ -9992,6 +10071,49 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/mcp-servers": {
+      "get": {
+        "description": "List the user-level MCP servers configured for each harness on a host.\n\nReturns names and non-secret metadata only; the caller must own the host.",
+        "operationId": "get_mcp_servers_v1_hosts__host_id__mcp_servers_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpServersResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Mcp Servers",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/runners": {
       "post": {
         "description": "Launch a runner on a host for a session.\n\nGenerates a binding token, writes the expected runner_id\nto the session row, sends the launch command to the host,\nand waits for the host's acknowledgement.\n\n**Parameters**\n\n- `body` \u2014 Launch request with `session_id` and `workspace`.\n\n**Returns:** `{\"runner_id\": ..., \"status\": \"launching\"}`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 409 if host offline, 403 if caller doesn't own the host, 400 if session already has a runner.",
@@ -11506,7 +11628,7 @@
         ]
       },
       "put": {
-        "description": "Replace the session's agent bundle with a new upload.\n\nValidates the new bundle, checks that the spec name matches\nthe existing agent, stores the bundle under a\ncontent-addressed key, updates the agent row, and warm-swaps\nthe cache. Idempotent when the bundle content is unchanged.\n\n**Parameters**\n\n- `bundle` \u2014 Uploaded `.tar.gz` agent bundle file.\n\n**Returns:** The updated `AgentObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session or agent is not found, the bundle is invalid, or the spec name doesn't match.",
+        "description": "Replace the session's agent bundle with a new upload.\n\nValidates the new bundle, checks that the spec name matches\nthe existing agent, stores the bundle under a\ncontent-addressed key, updates the agent row, and warm-swaps\nthe cache. Idempotent when the bundle content is unchanged.\nRequires session-owner permission because a bundle can replace MCP servers.\n\n**Parameters**\n\n- `bundle` \u2014 Uploaded `.tar.gz` agent bundle file.\n\n**Returns:** The updated `AgentObject`.\n\n**Raises**\n\n- `OmnigentError` \u2014 If the session or agent is not found, the bundle is invalid, or the spec name doesn't match.",
         "operationId": "update_session_agent_v1_sessions__session_id__agent_put",
         "parameters": [
           {
