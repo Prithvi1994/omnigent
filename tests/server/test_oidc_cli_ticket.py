@@ -158,6 +158,90 @@ async def test_cli_ticket_poll_requires_matching_verifier() -> None:
         ).status_code == 202
 
 
+@pytest.mark.parametrize(
+    ("outcome", "status"),
+    [
+        ("missing_ticket", 410),
+        ("unknown_ticket", 410),
+        ("upgrade", 410),
+        ("expired", 410),
+        ("missing_verifier", 400),
+        ("malformed_verifier", 400),
+        ("wrong_verifier", 403),
+        ("pending", 202),
+        ("approve", 200),
+        ("deny", 410),
+    ],
+)
+async def test_cli_poll_responses_cannot_be_cached(outcome: str, status: int) -> None:
+    async with httpx.AsyncClient(
+        transport=_build_app(), base_url="http://test", follow_redirects=False
+    ) as client:
+        ticket, verifier = await _create_ticket(client)
+        params = {"ticket": ticket}
+        headers = {"X-Omnigent-Code-Verifier": verifier}
+        if outcome == "missing_ticket":
+            params = {}
+        elif outcome == "unknown_ticket":
+            params["ticket"] = "unknown"
+        elif outcome == "upgrade":
+            params["ticket"] = (await client.post("/auth/cli-login")).json()["ticket"]
+        elif outcome == "missing_verifier":
+            headers = {}
+        elif outcome == "malformed_verifier":
+            headers["X-Omnigent-Code-Verifier"] = "invalid"
+        elif outcome == "wrong_verifier":
+            headers["X-Omnigent-Code-Verifier"] = "b" * 64
+        elif outcome in ("approve", "deny"):
+            await _complete_callback(client, ticket)
+            await client.post(
+                f"/auth/cli-{outcome}", data=params, headers={"Origin": "http://test"}
+            )
+        now = time.time() + (301 if outcome == "expired" else 0)
+        with patch("omnigent.server.routes.auth.time.time", return_value=now):
+            response = await client.get("/auth/cli-poll", params=params, headers=headers)
+        assert response.status_code == status
+        assert response.headers.get("Cache-Control") == "no-store"
+        assert response.headers.get("Pragma") == "no-cache"
+
+
+async def test_cli_poll_shared_cache_cannot_replay_credentials(tmp_path: Path) -> None:
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/grants.db")
+    async with httpx.AsyncClient(
+        transport=_build_app(store), base_url="http://test", follow_redirects=False
+    ) as upstream:
+        ticket, verifier = await _create_ticket(upstream)
+        await _complete_callback(upstream, ticket)
+        await upstream.post(
+            "/auth/cli-approve", data={"ticket": ticket}, headers={"Origin": "http://test"}
+        )
+        cache: dict[str, httpx.Response] = {}
+
+        async def caching_proxy(request: httpx.Request) -> httpx.Response:
+            key = str(request.url)
+            if key in cache:
+                return cache[key]
+            response = await upstream.send(request)
+            if response.status_code == 200 and "no-store" not in response.headers.get(
+                "Cache-Control", ""
+            ):
+                cache[key] = response
+            return response
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(caching_proxy), base_url="http://test"
+        ) as proxy:
+            url = f"/auth/cli-poll?ticket={ticket}"
+            redeemed = await proxy.get(url, headers={"X-Omnigent-Code-Verifier": verifier})
+            assert redeemed.status_code == 200
+            assert redeemed.json()["token"]
+            assert redeemed.json()["refresh_token"]
+            replay = await proxy.get(url)
+            assert replay.status_code == 410
+            assert "token" not in replay.json()
+            assert "refresh_token" not in replay.json()
+
+
 async def test_cli_ticket_deny_is_terminal() -> None:
     transport = _build_app()
     async with httpx.AsyncClient(

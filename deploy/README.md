@@ -290,7 +290,9 @@ this header without logging it. Query-based proof remains supported for API
 compatibility, so do not retain `/auth/cli-poll` query strings either: a ticket
 and verifier together can redeem an approved login. Approval requires a fresh
 browser login, not a runner or refresh-issued token. Existing browser sessions
-remain valid elsewhere and are asked to sign in again when approving a login.
+remain valid elsewhere. Generic OIDC ticket flows require fresh IdP authentication;
+GitHub OAuth may reuse its provider session, but still requires browser approval.
+Polling responses forbid caching, including successful credential responses.
 CLI and Slack display a comparison code; native mobile apps currently rely
 on explicit browser approval without displaying that code in the app. Include
 the actual native apps in staging checks before publishing a mobile build.

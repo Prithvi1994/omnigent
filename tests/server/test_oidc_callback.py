@@ -608,15 +608,20 @@ def test_non_reauth_callback_ignores_auth_time(
 # ── CLI login tickets + login-issued refresh grants ───────────────
 
 
+@pytest.mark.parametrize("reauth", ["1", "0", None])
 def test_cli_ticket_generic_oidc_reauth_round_trip(
     callback_client: tuple[TestClient, _IdpKeys],
+    reauth: str | None,
 ) -> None:
     client, keys = callback_client
     verifier, challenge = _cli_pkce_pair()
     created = client.post(
         "/auth/cli-login", json={"code_challenge": challenge, "code_challenge_method": "S256"}
     ).json()
-    login = client.get(created["login_url"], follow_redirects=False)
+    login_url = httpx.URL(created["login_url"]).copy_remove_param("reauth")
+    if reauth is not None:
+        login_url = login_url.copy_set_param("reauth", reauth)
+    login = client.get(str(login_url), follow_redirects=False)
     authorization = parse_qs(urlsplit(login.headers["location"]).query)
     assert authorization["prompt"] == ["login"]
     assert authorization["max_age"] == ["0"]

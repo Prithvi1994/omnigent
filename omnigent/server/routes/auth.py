@@ -44,6 +44,7 @@ from omnigent.server.oidc import (
     mint_session_cookie,
 )
 from omnigent.server.oidc_access import OidcAdmissionPolicy, resolve_allowed_domains_path
+from omnigent.server.routes._oauth import NO_STORE_HEADERS
 from omnigent.server.routes.device_auth import (
     _generate_user_code,
     issue_login_grant,
@@ -232,12 +233,11 @@ def create_auth_router(
         # before the callback redeems it. Only meaningful when invites
         # are enabled; ignored otherwise.
         invite = request.query_params.get("invite") if _invites_enabled else None
-        # Forced re-authentication for the device-consent anti-phishing
-        # gate: reauth=1 tells the IdP to require the user to
-        # re-authenticate rather than reusing an existing session
-        # (OIDC Core 3.1.2.1 `prompt=login`, `max_age=0`).
-        # Not applicable to GitHub OAuth, which has no prompt parameter.
-        reauth = request.query_params.get("reauth") == "1" and config.provider_type != "github"
+        # CLI tickets require fresh IdP authentication; device consent can
+        # also request it. GitHub OAuth has no reauthentication parameter.
+        reauth = config.provider_type != "github" and (
+            bool(ticket) or request.query_params.get("reauth") == "1"
+        )
 
         # Store state + code_verifier in a short-lived signed cookie.
         state_payload: dict[str, str | int] = {
@@ -844,12 +844,13 @@ def create_auth_router(
             return JSONResponse(
                 status_code=410,
                 content={"error": _CLI_UPGRADE_MESSAGE},
-                headers={"Cache-Control": "no-store"},
+                headers=NO_STORE_HEADERS,
             )
         if not ticket_id or ticket_id not in _cli_tickets:
             return JSONResponse(
                 status_code=410,
                 content={"error": "Ticket not found or expired"},
+                headers=NO_STORE_HEADERS,
             )
 
         ticket = _cli_tickets[ticket_id]
@@ -860,6 +861,7 @@ def create_auth_router(
             return JSONResponse(
                 status_code=410,
                 content={"error": "Ticket expired"},
+                headers=NO_STORE_HEADERS,
             )
 
         code_verifier = request.headers.get("X-Omnigent-Code-Verifier")
@@ -871,19 +873,26 @@ def create_auth_router(
             return JSONResponse(
                 status_code=400,
                 content={"error": f"code_verifier is required. {_CLI_UPGRADE_MESSAGE}"},
+                headers=NO_STORE_HEADERS,
             )
         if _CODE_VERIFIER_RE.fullmatch(code_verifier) is None:
-            return JSONResponse(status_code=400, content={"error": "Invalid code_verifier"})
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Invalid code_verifier"},
+                headers=NO_STORE_HEADERS,
+            )
         if not hmac.compare_digest(derive_code_challenge(code_verifier), ticket.code_challenge):
             return JSONResponse(
                 status_code=403,
                 content={"error": "code_verifier does not match this login ticket"},
+                headers=NO_STORE_HEADERS,
             )
         if ticket.denied:
             del _cli_tickets[ticket_id]
             return JSONResponse(
                 status_code=410,
                 content={"error": "Login request was denied in the browser"},
+                headers=NO_STORE_HEADERS,
             )
 
         # Still pending — browser hasn't completed the flow yet.
@@ -891,6 +900,7 @@ def create_auth_router(
             return JSONResponse(
                 status_code=202,
                 content={"status": "pending"},
+                headers=NO_STORE_HEADERS,
             )
 
         # Fulfilled — return the token and clean up.
@@ -907,7 +917,7 @@ def create_auth_router(
         # extra key, new CLIs against old servers see it absent.
         if refresh_token is not None:
             content["refresh_token"] = refresh_token
-        return JSONResponse(status_code=200, content=content)
+        return JSONResponse(status_code=200, content=content, headers=NO_STORE_HEADERS)
 
     # ── Admin: read-only user list ────────────────────────────────
 
