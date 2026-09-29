@@ -128,10 +128,10 @@ final class OidcLoginManager {
         url: endpoint("/auth/cli-poll", origin: origin), resolvingAgainstBaseURL: false)
       components?.queryItems = [
         URLQueryItem(name: "ticket", value: ticket),
-        URLQueryItem(name: "code_verifier", value: codeVerifier),
       ]
       guard let url = components?.url else { throw LoginError.invalidResponse }
       var request = URLRequest(url: url)
+      request.setValue(codeVerifier, forHTTPHeaderField: "X-Omnigent-Code-Verifier")
       request.timeoutInterval = requestTimeout
       do {
         let (data, response) = try await URLSession.shared.data(for: request)

@@ -359,7 +359,8 @@ async def _poll_cli_ticket(
         try:
             resp = await client.get(
                 "/auth/cli-poll",
-                params={"ticket": ticket, "code_verifier": code_verifier},
+                params={"ticket": ticket},
+                headers={"X-Omnigent-Code-Verifier": code_verifier},
             )
         except httpx.HTTPError:
             continue  # transient — keep polling until the deadline

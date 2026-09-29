@@ -86,6 +86,10 @@ async def test_cli_ticket_requires_browser_consent_and_issues_grant(tmp_path: Pa
         assert callback.status_code == 302
         assert callback.headers["location"] == f"/auth/cli-consent?ticket={ticket}"
         assert "ap_session" in callback.cookies
+        browser_claims = jwt.decode(
+            callback.cookies["ap_session"], TEST_SIGNING_KEY, algorithms=["HS256"]
+        )
+        assert browser_claims["interactive_login"] is True
 
         pending = await client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={verifier}")
         assert pending.status_code == 202
@@ -110,6 +114,7 @@ async def test_cli_ticket_requires_browser_consent_and_issues_grant(tmp_path: Pa
         body = fulfilled.json()
         payload = jwt.decode(body["token"], TEST_SIGNING_KEY, algorithms=["HS256"])
         assert payload["sub"] == "alice@example.com"
+        assert "interactive_login" not in payload
         assert body["user_id"] == "alice@example.com"
         assert body["refresh_token"]
 
@@ -242,7 +247,9 @@ async def test_cli_approve_rejects_stale_session() -> None:
         ticket, verifier = await _create_ticket(client)
         await _complete_callback(client, ticket)
         with patch("omnigent.server.oidc.time.time", return_value=time.time() - 10):
-            stale = mint_session_cookie("alice@example.com", TEST_SIGNING_KEY, 8, "github")
+            stale = mint_session_cookie(
+                "alice@example.com", TEST_SIGNING_KEY, 8, "github", interactive_login=True
+            )
         client.cookies.set("ap_session", stale)
         approved = await client.post(
             "/auth/cli-approve",
@@ -254,6 +261,79 @@ async def test_cli_approve_rejects_stale_session() -> None:
         assert (
             await client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={verifier}")
         ).status_code == 202
+
+
+@pytest.mark.parametrize("credential_kind", ["runner", "session"])
+async def test_cli_approve_requires_interactive_login_provenance(
+    credential_kind: str, tmp_path: Path
+) -> None:
+    config = make_oidc_config()
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
+    store = DeviceGrantStore(f"sqlite:///{tmp_path}/grants.db")
+    async with httpx.AsyncClient(
+        transport=_build_app(store), base_url="http://test", follow_redirects=False
+    ) as client:
+        ticket, verifier = await _create_ticket(client)
+        if credential_kind == "runner":
+            token = provider.mint_runner_token("alice@example.com", ttl_seconds=1800)
+            assert token is not None
+        else:
+            token = mint_session_cookie("alice@example.com", TEST_SIGNING_KEY, 8, "github")
+        client.cookies.set("ap_session", token)
+        with patch("omnigent.server.routes.auth.issue_login_grant") as issue_grant:
+            approval = await client.post(
+                "/auth/cli-approve", data={"ticket": ticket}, headers={"Origin": "http://test"}
+            )
+            assert "<h1>Approved</h1>" not in approval.text
+            pending = await client.get(
+                "/auth/cli-poll", params={"ticket": ticket, "code_verifier": verifier}
+            )
+            assert pending.status_code == 202
+            issue_grant.assert_not_called()
+        consent = await client.get("/auth/cli-consent", params={"ticket": ticket})
+        assert consent.status_code == 302
+        assert "reauth=1" in consent.headers["location"]
+
+
+@pytest.mark.parametrize("decision", ["approve", "deny"])
+async def test_cli_consent_and_decisions_disallow_framing(decision: str) -> None:
+    async with httpx.AsyncClient(
+        transport=_build_app(), base_url="http://test", follow_redirects=False
+    ) as client:
+        ticket, _ = await _create_ticket(client)
+        await _complete_callback(client, ticket)
+        consent = await client.get("/auth/cli-consent", params={"ticket": ticket})
+        response = await client.post(
+            f"/auth/cli-{decision}", data={"ticket": ticket}, headers={"Origin": "http://test"}
+        )
+        invalid = await client.get("/auth/cli-consent", params={"ticket": "missing"})
+        for page in (consent, response, invalid):
+            assert page.headers.get("content-security-policy") == "frame-ancestors 'none'"
+            assert page.headers.get("x-frame-options") == "DENY"
+            assert page.headers.get("cache-control") == "no-store"
+
+
+async def test_cli_poll_accepts_header_proof_and_rejects_conflicting_query_proof() -> None:
+    async with httpx.AsyncClient(
+        transport=_build_app(), base_url="http://test", follow_redirects=False
+    ) as client:
+        ticket, verifier = await _create_ticket(client)
+        await _complete_callback(client, ticket)
+        await client.post(
+            "/auth/cli-approve", data={"ticket": ticket}, headers={"Origin": "http://test"}
+        )
+        rejected = await client.get(
+            "/auth/cli-poll",
+            params={"ticket": ticket, "code_verifier": verifier},
+            headers={"X-Omnigent-Code-Verifier": "b" * 64},
+        )
+        assert rejected.status_code == 403
+        approved = await client.get(
+            "/auth/cli-poll",
+            params={"ticket": ticket},
+            headers={"X-Omnigent-Code-Verifier": verifier},
+        )
+        assert approved.status_code == 200
 
 
 async def test_cli_consent_unauthenticated_bounces_to_login() -> None:

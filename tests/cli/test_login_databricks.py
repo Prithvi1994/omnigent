@@ -57,7 +57,15 @@ class _FakeHttpx:
         """
         headers = kwargs.get("headers")
         auth = headers.get("Authorization") if isinstance(headers, dict) else None
-        self.requests.append({"url": url, "authorization": auth, "params": kwargs.get("params")})
+        verifier = headers.get("X-Omnigent-Code-Verifier") if isinstance(headers, dict) else None
+        self.requests.append(
+            {
+                "url": url,
+                "authorization": auth,
+                "params": kwargs.get("params"),
+                "verifier": verifier,
+            }
+        )
         return self.responses.pop(0)
 
 
@@ -816,8 +824,8 @@ def test_login_oidc_ticket_uses_pkce(monkeypatch: pytest.MonkeyPatch, token_dir:
     challenge = body["code_challenge"]
     assert body["code_challenge_method"] == "S256"
     params = fake.requests[-1]["params"]
-    assert isinstance(params, dict)
-    verifier = params["code_verifier"]
+    assert params == {"ticket": "t"}
+    verifier = fake.requests[-1]["verifier"]
     assert isinstance(verifier, str)
     expected = (
         base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())

@@ -28,8 +28,8 @@ import java.util.concurrent.atomic.AtomicInteger
  *   1. `POST /auth/cli-login` with a PKCE S256 challenge -> `{ticket, login_url}`
  *   2. open `login_url` in the browser; the user authenticates and approves
  *      the consent page; that fulfills the ticket server-side
- *   3. `GET /auth/cli-poll?ticket=...&code_verifier=...` -> `{token}` once
- *      fulfilled (the verifier proves this client created the ticket)
+ *   3. `GET /auth/cli-poll?ticket=...` with `X-Omnigent-Code-Verifier` -> `{token}`
+ *      once fulfilled (the verifier proves this client created the ticket)
  *
  * That `token` is exactly the session-cookie JWT (the server validates the same
  * HS256 JWT as either the session cookie or a `Bearer`), so [MainActivity]
@@ -206,15 +206,15 @@ class OidcLoginManager {
     ): String? {
         val deadline = System.currentTimeMillis() + POLL_TIMEOUT_MS
         val encoded = Uri.encode(ticket)
-        val encodedVerifier = Uri.encode(codeVerifier)
         while (System.currentTimeMillis() < deadline) {
             Thread.sleep(POLL_INTERVAL_MS) // throws InterruptedException on shutdownNow()
             val conn = (
                 URL(
-                    "$origin/auth/cli-poll?ticket=$encoded&code_verifier=$encodedVerifier",
+                    "$origin/auth/cli-poll?ticket=$encoded",
                 ).openConnection() as HttpURLConnection
             )
             conn.requestMethod = "GET"
+            conn.setRequestProperty("X-Omnigent-Code-Verifier", codeVerifier)
             conn.connectTimeout = HTTP_TIMEOUT_MS
             conn.readTimeout = HTTP_TIMEOUT_MS
             try {

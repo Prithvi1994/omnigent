@@ -212,7 +212,8 @@ def test_system_browser_session_is_bridged_to_isolated_webview(
 
         pending_response = native_request_context.get(
             "/auth/cli-poll",
-            params={"ticket": ticket, "code_verifier": code_verifier},
+            params={"ticket": ticket},
+            headers={"X-Omnigent-Code-Verifier": code_verifier},
         )
         assert pending_response.status == 202
         assert pending_response.json() == {"status": "pending"}
@@ -231,9 +232,25 @@ def test_system_browser_session_is_bridged_to_isolated_webview(
         ).to_be_visible()
         expect(system_browser_page.get_by_text(user_code)).to_be_visible()
 
+        # Even a same-origin frame must not expose a clickable consent form.
+        framed_page = system_browser_context.new_page()
+        framed_page.route(
+            "**/framing-test",
+            lambda route: route.fulfill(
+                content_type="text/html",
+                body=f'<iframe src="/auth/cli-consent?ticket={ticket}"></iframe>',
+            ),
+        )
+        framed_page.goto(f"{base_url}/framing-test")
+        expect(
+            framed_page.frame_locator("iframe").get_by_role("button", name="Approve")
+        ).to_have_count(0)
+        framed_page.close()
+
         still_pending = native_request_context.get(
             "/auth/cli-poll",
-            params={"ticket": ticket, "code_verifier": code_verifier},
+            params={"ticket": ticket},
+            headers={"X-Omnigent-Code-Verifier": code_verifier},
         )
         assert still_pending.status == 202
 
@@ -243,7 +260,8 @@ def test_system_browser_session_is_bridged_to_isolated_webview(
 
         poll_response = native_request_context.get(
             "/auth/cli-poll",
-            params={"ticket": ticket, "code_verifier": code_verifier},
+            params={"ticket": ticket},
+            headers={"X-Omnigent-Code-Verifier": code_verifier},
         )
         assert poll_response.ok, poll_response.text()
         session_token = poll_response.json()["token"]
@@ -263,7 +281,8 @@ def test_system_browser_session_is_bridged_to_isolated_webview(
 
         consumed_response = native_request_context.get(
             "/auth/cli-poll",
-            params={"ticket": ticket, "code_verifier": code_verifier},
+            params={"ticket": ticket},
+            headers={"X-Omnigent-Code-Verifier": code_verifier},
         )
         assert consumed_response.status == 410
     finally:

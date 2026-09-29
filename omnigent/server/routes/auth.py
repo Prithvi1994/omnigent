@@ -68,6 +68,11 @@ _CLI_UPGRADE_MESSAGE = (
 _CODE_CHALLENGE_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 _CODE_VERIFIER_RE = re.compile(r"[A-Za-z0-9._~-]{43,128}")
 _CLI_LOGIN_MAX_BODY_BYTES = 4096
+_CLI_BROWSER_HEADERS = {
+    "Content-Security-Policy": "frame-ancestors 'none'",
+    "X-Frame-Options": "DENY",
+    "Cache-Control": "no-store",
+}
 # How long an OIDC invite URL stays redeemable. Matches the accounts
 # provider's default invite window (72h) — long enough to share
 # out-of-band, short enough to bound exposure of an unused link.
@@ -453,6 +458,7 @@ def create_auth_router(
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
             provider=config.provider_type,
+            interactive_login=True,
         )
 
         # Check if this callback fulfills a CLI login ticket.
@@ -656,7 +662,7 @@ def create_auth_router(
         """Explain how to update an unsupported login client before signing in."""
         return HTMLResponse(
             _cli_consent_html(upgrade_required=True),
-            headers={"Cache-Control": "no-store"},
+            headers=_CLI_BROWSER_HEADERS,
         )
 
     def _bounce_to_login(request: Request, ticket_id: str, *, reauth: bool) -> RedirectResponse:
@@ -665,7 +671,7 @@ def create_auth_router(
         url = f"{base_path}/auth/login?return_to={quote(return_to, safe='')}"
         if reauth:
             url += "&reauth=1"
-        return RedirectResponse(url=url, status_code=302)
+        return RedirectResponse(url=url, status_code=302, headers=_CLI_BROWSER_HEADERS)
 
     def _session_iat(request: Request) -> int | None:
         token = request.cookies.get(_session_cookie)
@@ -674,6 +680,8 @@ def create_auth_router(
         try:
             payload = jwt.decode(token, config.cookie_secret, algorithms=["HS256"])
         except jwt.InvalidTokenError:
+            return None
+        if payload.get("interactive_login") is not True:
             return None
         iat = payload.get("iat")
         return iat if isinstance(iat, int) else None
@@ -700,6 +708,7 @@ def create_auth_router(
             return HTMLResponse(
                 _cli_consent_html(error="This login request is invalid or has expired."),
                 status_code=200,
+                headers=_CLI_BROWSER_HEADERS,
             )
 
         session_iat = _session_iat(request)
@@ -714,6 +723,7 @@ def create_auth_router(
                 base_path=getattr(request.app.state, "base_path", ""),
             ),
             status_code=200,
+            headers=_CLI_BROWSER_HEADERS,
         )
 
     def _require_cli_browser_origin(request: Request) -> None:
@@ -742,6 +752,7 @@ def create_auth_router(
             return HTMLResponse(
                 _cli_consent_html(error="This login request is invalid or has expired."),
                 status_code=200,
+                headers=_CLI_BROWSER_HEADERS,
             )
 
         session_iat = _session_iat(request)
@@ -752,6 +763,7 @@ def create_auth_router(
                     "Run `omnigent login` again and sign in when prompted."
                 ),
                 status_code=200,
+                headers=_CLI_BROWSER_HEADERS,
             )
 
         ticket.token = mint_session_cookie(
@@ -774,6 +786,7 @@ def create_auth_router(
         return HTMLResponse(
             _cli_consent_html(approved_as=user_id),
             status_code=200,
+            headers=_CLI_BROWSER_HEADERS,
         )
 
     @router.post("/cli-deny")
@@ -790,7 +803,9 @@ def create_auth_router(
         ticket = _cli_tickets.get(ticket_id)
         if ticket is not None:
             ticket.denied = True
-        return HTMLResponse(_cli_consent_html(denied=True), status_code=200)
+        return HTMLResponse(
+            _cli_consent_html(denied=True), status_code=200, headers=_CLI_BROWSER_HEADERS
+        )
 
     @router.get("/cli-poll")
     async def cli_poll(request: Request) -> Response:
@@ -829,7 +844,11 @@ def create_auth_router(
                 content={"error": "Ticket expired"},
             )
 
-        code_verifier = request.query_params.get("code_verifier")
+        code_verifier = request.headers.get("X-Omnigent-Code-Verifier")
+        if code_verifier is None:
+            # Retain query transport for API compatibility; clients use the
+            # header so the proof does not appear in default access logs.
+            code_verifier = request.query_params.get("code_verifier")
         if not code_verifier:
             return JSONResponse(
                 status_code=400,

@@ -285,8 +285,12 @@ provider. The old client must show the upgrade page without signing in; the
 updated client must complete fresh sign-in and browser approval. Preserve
 PKCE and consent enforcement if rolling back an unrelated deployment issue.
 
-Do not retain query strings for `/auth/cli-poll` in reverse-proxy or access
-logs: the ticket and PKCE verifier together can redeem an approved login.
+Updated clients send proof in `X-Omnigent-Code-Verifier`; proxies must forward
+this header without logging it. Query-based proof remains supported for API
+compatibility, so do not retain `/auth/cli-poll` query strings either: a ticket
+and verifier together can redeem an approved login. Approval requires a fresh
+browser login, not a runner or refresh-issued token. Existing browser sessions
+remain valid elsewhere and are asked to sign in again when approving a login.
 CLI and Slack display a comparison code; native mobile apps currently rely
 on explicit browser approval without displaying that code in the app. Include
 the actual native apps in staging checks before publishing a mobile build.

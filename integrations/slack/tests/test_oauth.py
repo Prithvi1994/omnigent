@@ -213,7 +213,8 @@ async def test_oidc_poll_pending_then_session_jwt() -> None:
     assert result.access_token == "sess-jwt"
     assert result.refresh_token == ""  # OIDC session JWT has no refresh token
     assert result.expires_in == 28800
-    assert poll.calls.last.request.url.params["code_verifier"] == "v" * 64
+    assert "code_verifier" not in poll.calls.last.request.url.params
+    assert poll.calls.last.request.headers["X-Omnigent-Code-Verifier"] == "v" * 64
 
 
 @respx.mock

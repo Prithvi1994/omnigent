@@ -12684,7 +12684,8 @@ def login(server_url: str) -> None:
         try:
             poll_resp = _httpx.get(
                 poll_url,
-                params={"ticket": ticket, "code_verifier": code_verifier},
+                params={"ticket": ticket},
+                headers={"X-Omnigent-Code-Verifier": code_verifier},
                 timeout=10.0,
                 trust_env=_trust_env_for(server),
             )
