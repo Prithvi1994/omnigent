@@ -2,7 +2,11 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
-const { aliasedServerUrl, parseServerAliases } = require("../src/server_aliases");
+const {
+  aliasedServerUrl,
+  aliasedWorkspaceOrigin,
+  parseServerAliases,
+} = require("../src/server_aliases");
 
 const PICKED = "https://team.example.com/omnigent?o=123";
 const WORKSPACE = "https://dbc-1234.cloud.databricks.com";
@@ -34,5 +38,12 @@ describe("server aliases", () => {
     assert.equal(aliasedServerUrl(aliases, "not a url"), "not a url");
     // Inherited keys never count as aliases.
     assert.equal(aliasedServerUrl({}, "https://constructor"), "https://constructor");
+  });
+
+  it("finds the workspace host for an exact pick", () => {
+    const aliases = { [WORKSPACE]: PICKED };
+    assert.equal(aliasedWorkspaceOrigin(aliases, PICKED), WORKSPACE);
+    assert.equal(aliasedWorkspaceOrigin(aliases, "https://team.example.com/"), null);
+    assert.equal(aliasedWorkspaceOrigin({}, PICKED), null);
   });
 });

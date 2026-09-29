@@ -47,4 +47,16 @@ function aliasedServerUrl(aliases, url) {
   return origin !== null && Object.hasOwn(aliases, origin) ? aliases[origin] : url;
 }
 
-module.exports = { aliasedServerUrl, parseServerAliases };
+/**
+ * The workspace origin whose alias is exactly `url` (the URL the user picked),
+ * else null. Stored sign-in tokens are keyed by that workspace host.
+ *
+ * @param {Record<string, string>} aliases From parseServerAliases.
+ * @param {string} url
+ * @returns {string | null}
+ */
+function aliasedWorkspaceOrigin(aliases, url) {
+  return Object.keys(aliases).find((origin) => aliases[origin] === url) ?? null;
+}
+
+module.exports = { aliasedServerUrl, aliasedWorkspaceOrigin, parseServerAliases };

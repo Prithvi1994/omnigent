@@ -39,7 +39,11 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
-const { aliasedServerUrl, parseServerAliases } = require("./server_aliases");
+const {
+  aliasedServerUrl,
+  aliasedWorkspaceOrigin,
+  parseServerAliases,
+} = require("./server_aliases");
 const {
   registerBrowserPermissions,
   createBrowserPermissionStore,
@@ -1550,6 +1554,15 @@ async function loadServerUrl(
             };
             saveSettings(settings);
           }
+        } else if (interactive && !windows.get(win)?.ephemeral) {
+          // Picking the workspace host itself wins over an earlier alias for it.
+          const settings = loadSettings();
+          const aliases = parseServerAliases(settings.server_aliases);
+          if (Object.hasOwn(aliases, resolvedOrigin)) {
+            delete aliases[resolvedOrigin];
+            settings.server_aliases = aliases;
+            saveSettings(settings);
+          }
         }
         await auth.attach(win, serverUrl, target);
       } catch (error) {
@@ -3058,6 +3071,11 @@ function registerIpc() {
     const settings = loadSettings();
     const remaining = normalizeRecentServers(settings.recent_servers).filter((u) => u !== url);
     settings.recent_servers = remaining;
+    // Recents are compared normalized, as the page lists them.
+    const aliases = parseServerAliases(settings.server_aliases);
+    settings.server_aliases = Object.fromEntries(
+      Object.entries(aliases).filter(([, picked]) => normalizeRecentServers([picked])[0] !== url),
+    );
     saveSettings(settings);
     return excludingManagedServers(remaining, managed);
   });
@@ -3243,17 +3261,18 @@ function registerIpc() {
     }
     const win = BrowserWindow.fromWebContents(event.sender);
     const ephemeral = Boolean(win && windows.get(win)?.ephemeral);
+    const target = workspaceUrlForAlias(url);
     if (!ephemeral) {
       const settings = loadSettings();
-      settings.server_url = url;
+      settings.server_url = target;
       saveSettings(settings);
     }
     if (win) {
-      loadServerUrl(win, url)
+      loadServerUrl(win, target)
         .then(() => {
           if (ephemeral) return;
           const settings = loadSettings();
-          rememberRecentServer(settings, url); // bump to head of the recents
+          rememberRecentServer(settings, target); // bump to head of the recents
           saveSettings(settings);
         })
         .catch(() => {
@@ -3777,10 +3796,36 @@ function findKnownServerUrl(origin) {
     if (originOf(u) === origin) return u;
   }
   // A workspace host the user reached through an alias was connected to too.
-  if (Object.hasOwn(parseServerAliases(settings.server_aliases), origin)) {
-    return databricksWorkspaceUiUrl(origin);
-  }
-  return null;
+  return trustedAliasOrigins(settings).includes(origin) ? databricksWorkspaceUiUrl(origin) : null;
+}
+
+/**
+ * Workspace origins reached through an alias whose picked URL is still a
+ * recent server, so forgetting (or aging out) the pick also drops its trust.
+ *
+ * @param {Record<string, unknown>} settings
+ * @returns {string[]}
+ */
+function trustedAliasOrigins(settings) {
+  const recents = new Set(normalizeRecentServers(settings.recent_servers));
+  const aliases = parseServerAliases(settings.server_aliases);
+  return Object.keys(aliases).filter(
+    (origin) =>
+      recents.has(normalizeRecentServers([aliases[origin]])[0]) &&
+      databricksWorkspaceUiUrl(origin) !== null,
+  );
+}
+
+/**
+ * The URL to load for a picked server: an aliased pick loads its workspace
+ * host, where its stored sign-in token lives, so the switch stays silent.
+ *
+ * @param {string} url
+ * @returns {string}
+ */
+function workspaceUrlForAlias(url) {
+  const origin = aliasedWorkspaceOrigin(parseServerAliases(loadSettings().server_aliases), url);
+  return (origin && databricksWorkspaceUiUrl(origin)) || url;
 }
 
 /**
@@ -3806,7 +3851,7 @@ function knownOrigins() {
       }
     }
   }
-  for (const o of Object.keys(parseServerAliases(settings.server_aliases))) origins.add(o);
+  for (const o of trustedAliasOrigins(settings)) origins.add(o);
   return [...origins];
 }
 
