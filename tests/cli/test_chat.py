@@ -4112,6 +4112,7 @@ async def _run_one_shot(
     *,
     strict_completion: bool = False,
     terminal_status: str = "idle",
+    chat_cls: type | None = None,
 ) -> str | None:
     """
     Drive ``_query_sessions_once`` with a faked ``SessionsChat.query``.
@@ -4126,7 +4127,7 @@ async def _run_one_shot(
     # call time), not a chat-module-local alias.
     monkeypatch.setattr(
         "omnigent_client.SessionsChat",
-        _fake_sessions_chat_cls(query_impl, terminal_status=terminal_status),
+        chat_cls or _fake_sessions_chat_cls(query_impl, terminal_status=terminal_status),
     )
     monkeypatch.setattr(
         chat_module,
@@ -4305,6 +4306,62 @@ async def test_strict_prompt_reconciles_transport_failure_only_after_idle(monkey
     )
 
 
+async def test_strict_prompt_retains_query_error_when_failed_status_has_no_error_item(monkeypatch):
+    with pytest.raises(ClientOmnigentError, match=r"status: failed.*auth misconfigured"):
+        await _run_one_shot(
+            _FakeAPClient([]),
+            _raise_genuine_failure,
+            monkeypatch,
+            strict_completion=True,
+            terminal_status="failed",
+        )
+
+
+async def test_strict_prompt_preserves_persisted_error_when_refresh_is_unavailable(monkeypatch):
+    class Chat(_fake_sessions_chat_cls(_raise_turn_failed)):
+        async def refresh(self):
+            raise ClientOmnigentError("status endpoint unavailable")
+
+    client = _FakeAPClient([_item_user("hi"), _item_error("Prompt is too long")])
+    with pytest.raises(ClientOmnigentError, match="Prompt is too long"):
+        await _run_one_shot(
+            client, _raise_turn_failed, monkeypatch, strict_completion=True, chat_cls=Chat
+        )
+
+
+@pytest.mark.parametrize("query_times_out", [False, True])
+async def test_strict_prompt_refreshes_status_after_wait_budget_expires(
+    monkeypatch, query_times_out
+):
+    async def query(prompt):
+        if query_times_out:
+            raise TimeoutError
+        return await _return_text(prompt)
+
+    class Chat(_fake_sessions_chat_cls(query)):
+        server_idle = False
+        snapshot = "running"
+
+        @property
+        def status(self):
+            return self.snapshot
+
+        async def refresh(self):
+            self.snapshot = "idle" if self.server_idle else "running"
+
+        async def await_turn(self, *, timeout=None):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                # The server completes while the client's wait is cancelled.
+                self.server_idle = True
+
+    monkeypatch.setattr(chat_module, "_LOOP_TIMEOUT_S", 0.01)
+    client = _FakeAPClient([_item_user("hi"), _item_assistant("completed answer")])
+    result = await _run_one_shot(client, query, monkeypatch, strict_completion=True, chat_cls=Chat)
+    assert result == ("completed answer" if query_times_out else "direct answer")
+
+
 @pytest.mark.parametrize("query_impl", [_return_text, _raise_turn_failed])
 async def test_legacy_prompt_retains_text_despite_later_error(monkeypatch, query_impl):
     client = _FakeAPClient(
@@ -4396,6 +4453,11 @@ def test_prompt_result_sigterm_during_handler_cleanup_is_typed(monkeypatch):
     import signal
 
     previous = signal.getsignal(signal.SIGTERM)
+
+    def sentinel(signum, frame):
+        raise AssertionError("typed invocation handler not installed during cleanup")
+
+    signal.signal(signal.SIGTERM, sentinel)
     install = signal.signal
     injected = False
 
@@ -4413,7 +4475,7 @@ def test_prompt_result_sigterm_during_handler_cleanup_is_typed(monkeypatch):
         assert injected
         assert result.status == "failed"
         assert "terminated" in result.error
-        assert signal.getsignal(signal.SIGTERM) == previous
+        assert signal.getsignal(signal.SIGTERM) is sentinel
         assert not chat_module._STRICT_PROMPT_COMPLETION.get()
     finally:
         install(signal.SIGTERM, previous)

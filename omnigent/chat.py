@@ -578,7 +578,11 @@ class PromptResult:
 
 
 def run_prompt_result(**kwargs: Any) -> PromptResult:
-    """Run the same harness as the CLI, retaining its terminal outcome."""
+    """Run the CLI harness and retain its terminal outcome.
+
+    Output capture changes process-global streams; use an isolated process
+    when other threads may print or invoke this API concurrently.
+    """
     started = time.monotonic()
     output, errors = io.StringIO(), io.StringIO()
     status, error = "completed", None
@@ -2526,14 +2530,18 @@ async def _query_sessions_once(
         if strict_completion:
             try:
                 turn_error = await _persisted_turn_error(client, bound.id, strict=True)
-                await chat.refresh()
             except ClientOmnigentError as verification_error:
                 raise exc from verification_error
             if turn_error is not None:
                 raise ClientOmnigentError(turn_error) from exc
+            try:
+                await chat.refresh()
+            except ClientOmnigentError as verification_error:
+                raise exc from verification_error
             if chat.status != "idle":
                 raise ClientOmnigentError(
-                    f"Headless session did not reach terminal completion (status: {chat.status})"
+                    f"Headless session did not reach terminal completion "
+                    f"(status: {chat.status}): {exc}"
                 ) from exc
         reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
@@ -2566,6 +2574,7 @@ async def _query_sessions_once(
             turn_error = await _persisted_turn_error(client, bound.id, strict=True)
             if turn_error is not None:
                 raise ClientOmnigentError(turn_error) from None
+            await chat.refresh()
             if chat.status != "idle":
                 raise ClientOmnigentError(
                     f"Headless session did not reach terminal completion (status: {chat.status})"
@@ -2667,6 +2676,7 @@ async def _query_sessions_once(
         turn_error = await _persisted_turn_error(client, bound.id, strict=True)
         if turn_error is not None:
             raise ClientOmnigentError(turn_error) from None
+        await chat.refresh()
         if chat.status != "idle":
             raise ClientOmnigentError(
                 f"Headless session did not reach terminal completion (status: {chat.status})"
