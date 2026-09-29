@@ -11,8 +11,18 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.git_providers import reset_for_tests
+from omnigent.errors import OmnigentError
+from omnigent.git_providers import (
+    FacetModules,
+    Instances,
+    ParsedPullRequest,
+    ParsedRemote,
+    host_of,
+    register_provider,
+    reset_for_tests,
+)
 from omnigent.runner import github_resource, pr_resource
+from omnigent.runner.git_providers import azure_devops as azure_devops_facet
 from omnigent.runner.pr_resource import ProviderResolution
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 from tests.budgets import budget
@@ -24,6 +34,12 @@ GITHUB_CAPABILITIES = {
     "line_counts": True,
     "linked_pr_diff": True,
 }
+# An ssh config host alias (``Host github.com-work`` / ``HostName github.com``).
+ALIAS_ORIGIN = "git@github.com-work:o/r.git"
+ALIAS_PR_URL = "https://github.com/o/r/pull/7"
+AUTH_STATUS = ("auth", "status", "--json", "hosts")
+SIGNED_IN = {"hosts": {"github.com": [{"login": "alice", "active": True, "state": "success"}]}}
+FORGE_HOST = "forge.example.test"
 _GIT_IDENTITY = {
     "GIT_AUTHOR_NAME": "Test",
     "GIT_AUTHOR_EMAIL": "test@example.com",
@@ -52,6 +68,29 @@ def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
 
 
+def _git_value(repo: Path, *args: str) -> str:
+    result = subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+class _ForgeWithoutFacet:
+    """Claims ``forge.example.test`` remotes but has no pull request facet."""
+
+    id = "forge"
+    display_name = "Forge"
+    default_hosts = (FORGE_HOST,)
+    facets = FacetModules()
+
+    def matches_host(self, host: str, instances: Instances) -> bool:
+        return host == FORGE_HOST
+
+    def parse_remote_url(self, url: str, instances: Instances) -> ParsedRemote | None:
+        return ParsedRemote(self.id, FORGE_HOST, "o/r") if host_of(url) == FORGE_HOST else None
+
+    def parse_pr_url(self, url: str, instances: Instances) -> ParsedPullRequest | None:
+        return None
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     """A git checkout on ``feature`` with one commit and no remotes."""
@@ -70,6 +109,30 @@ def _forbid_gh(monkeypatch: pytest.MonkeyPatch) -> None:
         pytest.fail("gh ran for a workspace that GitHub does not serve")
 
     monkeypatch.setattr(github_resource, "_gh", forbidden)
+
+
+def _stub_gh(
+    monkeypatch: pytest.MonkeyPatch, responses: dict[tuple[str, ...], tuple[int, str, str]]
+) -> list[tuple[str, ...]]:
+    """Put ``gh`` on PATH and answer each call by its leading argv; return the calls.
+
+    Unmatched calls fail, as for a repository that ``gh`` cannot reach.
+    """
+    calls: list[tuple[str, ...]] = []
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
+        for prefix, value in responses.items():
+            if tuple(argv[: len(prefix)]) == prefix:
+                return value
+        return 1, "", "no stub"
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+    monkeypatch.setattr(github_resource, "_workspace_key", lambda _root: None)
+    return calls
 
 
 def test_github_info_equals_pr_info_and_keeps_the_legacy_fields(
@@ -135,9 +198,12 @@ def test_a_gitlab_origin_is_an_unsupported_remote(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _git(repo, "remote", "add", "origin", "https://gitlab.com/g/p.git")
-    _forbid_gh(monkeypatch)
+    # gh is installed and signed in, yet resolves no repository for this remote.
+    _stub_gh(monkeypatch, {AUTH_STATUS: (0, json.dumps(SIGNED_IN), "")})
 
-    assert pr_resource.resolve_provider(str(repo)) == ProviderResolution(None, "gitlab.com")
+    assert pr_resource.resolve_provider(str(repo)) == ProviderResolution(
+        "github", "gitlab.com", unclaimed=True
+    )
     info = pr_resource.pr_info(str(repo))
     assert (info["available"], info["reason"]) == (False, "unsupported_remote")
     assert info["remote_host"] == "gitlab.com"
@@ -146,8 +212,147 @@ def test_a_gitlab_origin_is_an_unsupported_remote(
     assert (session["prs"], session["tracking_available"]) == ([], True)
     assert pr_resource.pr_changed_files(str(repo))["data"] == []
     assert pr_resource.pr_diff(str(repo))["patch"] == ""
-    with pytest.raises(ValueError, match="No supported git provider"):
+    with pytest.raises(OmnigentError, match="is not available locally"):
         pr_resource.pr_file_diff(str(repo), "main", "a.txt")
+
+
+@pytest.mark.parametrize("gh_state", ["missing", "signed_out"])
+def test_an_unclaimed_origin_keeps_the_cli_and_sign_in_guidance(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, gh_state: str
+) -> None:
+    _git(repo, "remote", "add", "origin", "https://gitlab.com/g/p.git")
+    _stub_gh(monkeypatch, {("auth", "status"): (1, "", "not logged in")})
+    if gh_state == "missing":
+        monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
+
+    info = pr_resource.pr_info(str(repo))
+
+    assert (info["available"], info["provider"], info.get("reason")) == (True, "github", None)
+    assert info["auth"]["cli"] == {"name": "gh", "available": gh_state == "signed_out"}
+    assert info["auth"]["authenticated"] is False
+
+
+def test_an_unclaimed_origin_keeps_the_account_choice(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _git(repo, "remote", "add", "origin", ALIAS_ORIGIN)
+    accounts = [
+        {"login": "alice", "active": True, "state": "success"},
+        {"login": "bob", "active": False, "state": "success"},
+    ]
+    hosts = {"hosts": {"github.com": accounts}}
+    _stub_gh(monkeypatch, {AUTH_STATUS: (0, json.dumps(hosts), "")})
+
+    info = pr_resource.pr_info(str(repo))
+
+    # The active account cannot read the repository, but the panel can switch to another.
+    assert (info["available"], info["provider"], info["repo"]) == (True, "github", None)
+    assert [account["login"] for account in info["auth"]["accounts"]] == ["alice", "bob"]
+
+
+def test_an_ssh_alias_origin_falls_back_to_github_and_records_the_branch_pr(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _git(repo, "remote", "add", "origin", ALIAS_ORIGIN)
+    pr = {"number": 7, "title": "Alias PR", "state": "OPEN", "url": ALIAS_PR_URL}
+    _stub_gh(monkeypatch, {("pr", "view"): (0, json.dumps(pr), "")})
+
+    assert pr_resource.resolve_provider(str(repo)) == ProviderResolution(
+        "github", "github.com-work", unclaimed=True
+    )
+    info = pr_resource.pr_info(str(repo), session_id="session")
+
+    assert (info["provider"], info["selected_pr_url"]) == ("github", ALIAS_PR_URL)
+    assert [(listed["url"], listed["title"]) for listed in info["prs"]] == [
+        (ALIAS_PR_URL, "Alias PR")
+    ]
+    [entry] = SessionPrRegistry("session").list()
+    assert (entry.url, entry.relationship) == (ALIAS_PR_URL, "inferred")
+
+
+def test_reads_and_preferences_for_an_ssh_alias_origin_reach_github(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _git(repo, "remote", "add", "origin", ALIAS_ORIGIN)
+    files = [{"filename": "a.txt", "status": "modified", "additions": 1, "deletions": 1}]
+    calls = _stub_gh(
+        monkeypatch,
+        {
+            ("pr", "view"): (0, json.dumps({"number": 7}), ""),
+            ("pr", "diff"): (0, "alias-patch", ""),
+            ("api",): (0, json.dumps(files), ""),
+        },
+    )
+
+    assert [f["path"] for f in pr_resource.pr_changed_files(str(repo))["data"]] == ["a.txt"]
+    assert pr_resource.pr_diff(str(repo))["patch"] == "alias-patch"
+    assert pr_resource.pr_file_diff(str(repo), "", "a.txt")["after"] == "a"
+    pr_resource.set_pr_preference(str(repo), remote="upstream")
+    assert ("repo", "set-default", "upstream") in calls
+
+
+@pytest.mark.parametrize("url", ["ssh://git@github.com:22/o/r.git", "https://github.com:443/o/r"])
+def test_a_github_origin_with_a_port_resolves_to_github(repo: Path, url: str) -> None:
+    _git(repo, "remote", "add", "origin", url)
+
+    assert pr_resource.resolve_provider(str(repo)) == ProviderResolution("github", "github.com")
+
+
+def test_a_partial_clone_origin_is_still_matched(repo: Path) -> None:
+    _git(repo, "remote", "add", "origin", "https://github.com/acme/repo.git")
+    _git(repo, "remote", "add", "mirror", "https://gitlab.com/g/p.git")
+    # With these, ``git remote -v`` ends origin's fetch line with `` [blob:none]``.
+    _git(repo, "config", "remote.origin.promisor", "true")
+    _git(repo, "config", "remote.origin.partialclonefilter", "blob:none")
+
+    assert pr_resource.resolve_provider(str(repo)) == ProviderResolution("github", "github.com")
+
+
+def test_only_the_repository_config_pins_the_provider(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _git(repo, "remote", "add", "origin", "https://github.com/acme/repo.git")
+    global_config = tmp_path / "global.gitconfig"
+    _git(repo, "config", "--file", str(global_config), "omnigent.gitprovider", "forgejo")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    assert _git_value(repo, "config", "--get", "omnigent.gitprovider") == "forgejo"
+
+    assert pr_resource.resolve_provider(str(repo)) == ProviderResolution("github", "github.com")
+
+    _git(repo, "config", "omnigent.gitprovider", "Azure_DevOps")
+    worktree = tmp_path / "worktree"
+    _git(repo, "worktree", "add", "-q", "-b", "other", str(worktree))
+
+    for root in (repo, worktree):
+        assert pr_resource.resolve_provider(str(root)) == ProviderResolution(
+            "azure_devops", "github.com"
+        )
+
+
+def test_a_remote_whose_provider_has_no_facet_is_skipped(repo: Path) -> None:
+    register_provider(_ForgeWithoutFacet())
+    _git(repo, "remote", "add", "origin", f"https://{FORGE_HOST}/o/r.git")
+    assert pr_resource.resolve_provider(str(repo)) == ProviderResolution(
+        "github", FORGE_HOST, unclaimed=True
+    )
+
+    _git(repo, "remote", "add", "upstream", "https://github.com/acme/repo.git")
+
+    assert pr_resource.resolve_provider(str(repo)) == ProviderResolution("github", FORGE_HOST)
+
+
+def test_an_azure_devops_origin_routes_to_its_facet(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _git(repo, "remote", "add", "origin", "https://dev.azure.com/org/project/_git/repo")
+    _forbid_gh(monkeypatch)
+    ado_info = {"object": "session.github.info", "provider": "azure_devops"}
+    monkeypatch.setattr(azure_devops_facet.PULL_REQUESTS, "workspace_info", lambda _root: ado_info)
+
+    assert pr_resource.resolve_provider(str(repo)) == ProviderResolution(
+        "azure_devops", "dev.azure.com"
+    )
+    assert pr_resource.pr_info(str(repo)) == ado_info
 
 
 def test_git_config_provider_wins_over_remote_matching(repo: Path) -> None:
@@ -175,7 +380,9 @@ def test_a_ghes_origin_resolves_to_github_through_gh_host(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _git(repo, "remote", "add", "origin", "git@ghe.example.com:org/repo.git")
-    assert pr_resource.resolve_provider(str(repo)).provider is None
+    assert pr_resource.resolve_provider(str(repo)) == ProviderResolution(
+        "github", "ghe.example.com", unclaimed=True
+    )
 
     monkeypatch.setenv("GH_HOST", "ghe.example.com")
 

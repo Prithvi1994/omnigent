@@ -21,6 +21,7 @@ from filelock import Timeout as FileLockTimeout
 from omnigent.git_providers import host_of, load_facet, provider, providers, resolve_remote
 from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
+    ProviderCapabilities,
     PullRequestFacet,
     unsupported_remote_info,
 )
@@ -43,14 +44,18 @@ _PROVIDER_CONFIG_KEY = "omnigent.gitprovider"
 class ProviderResolution:
     """The git provider that serves a request.
 
-    :ivar provider: The provider id, or ``None`` when no provider claims the
-        workspace's remotes.
+    :ivar provider: The provider id, or ``None`` when no provider is registered.
+        A tracked PR or the ``omnigent.gitprovider`` setting can name a provider
+        without a pull request facet.
     :ivar remote_host: The tracked PR's host, else the host of the workspace's
-        first remote; the unsupported-remote payload names it.
+        first network remote; the unsupported-remote payload names it.
+    :ivar unclaimed: The workspace has a network remote, but no provider with a
+        pull request facet claims one, so the first registered provider serves it.
     """
 
     provider: str | None
     remote_host: str | None = None
+    unclaimed: bool = False
 
 
 def _git_output(argv: list[str], *, cwd: str) -> tuple[int | None, str]:
@@ -64,39 +69,51 @@ def _git_output(argv: list[str], *, cwd: str) -> tuple[int | None, str]:
     return result.returncode, result.stdout.decode("utf-8", errors="replace")
 
 
-def _remote_hosts(root: str) -> list[tuple[str, str]]:
-    """Return ``(url, host)`` for each remote with a network host, ``origin`` first.
+def _remote_urls(root: str) -> list[str]:
+    """Return each remote's first configured URL, ``origin`` first, then in config order.
 
-    Local-path and ``file://`` remotes belong to no provider, so they are left out.
+    Reads git config because ``git remote -v`` lines vary; a partial clone's
+    fetch line ends with its filter.
     """
-    rc, out = _git_output(["remote", "-v"], cwd=root)
+    rc, out = _git_output(["config", "-z", "--get-regexp", r"^remote\..*\.url$"], cwd=root)
     if rc != 0:
         return []
     urls: dict[str, str] = {}
-    for line in out.splitlines():
-        name, _, rest = line.partition("\t")
-        url, _, kind = rest.rpartition(" ")
-        if name and url and kind == "(fetch)":
-            urls.setdefault(name, url)
-    names = sorted(urls, key=lambda name: name != "origin")
-    return [(urls[name], host) for name in names if (host := host_of(urls[name]))]
+    for entry in out.split("\0"):
+        key, _, url = entry.partition("\n")
+        if key.startswith("remote.") and key.endswith(".url"):
+            urls.setdefault(key[len("remote.") : -len(".url")], url)
+    return [urls[name] for name in sorted(urls, key=lambda name: name != "origin")]
+
+
+def _configured_provider(root: str) -> str | None:
+    """Return the repository's ``omnigent.gitprovider`` value, lower-cased, if set.
+
+    Global and system config are ignored, so one setting cannot re-route every workspace.
+    """
+    rc, out = _git_output(["config", "--local", "--get", _PROVIDER_CONFIG_KEY], cwd=root)
+    return (out.strip().lower() or None) if rc == 0 else None
 
 
 def _workspace_provider(root: str) -> ProviderResolution:
     """Resolve the provider of the workspace itself, ignoring tracked PRs."""
-    remotes = _remote_hosts(root)
-    first_host = remotes[0][1] if remotes else None
-    rc, configured = _git_output(["config", "--get", _PROVIDER_CONFIG_KEY], cwd=root)
-    if rc == 0 and configured.strip():
-        return ProviderResolution(configured.strip().lower(), first_host)
-    for url, _host in remotes:
+    urls = _remote_urls(root)
+    first_host = next((host for url in urls if (host := host_of(url))), None)
+    configured = _configured_provider(root)
+    if configured:
+        return ProviderResolution(configured, first_host)
+    for url in urls:
         parsed = resolve_remote(url)
-        if parsed is not None:
+        if parsed is not None and _facet(parsed.provider) is not None:
             return ProviderResolution(parsed.provider, first_host)
-    if remotes:
-        return ProviderResolution(None, first_host)
-    default = next(iter(providers()), None)
-    return ProviderResolution(default.id if default is not None else None)
+    # No provider with a facet claims a remote, e.g. an ssh host alias; the first
+    # provider's CLI may still resolve it.
+    fallback = next(iter(providers()), None)
+    return ProviderResolution(
+        fallback.id if fallback is not None else None,
+        first_host,
+        unclaimed=first_host is not None,
+    )
 
 
 def _resolve(root: str, reference: PullRequestRef | None) -> ProviderResolution:
@@ -111,10 +128,11 @@ def resolve_provider(
 ) -> ProviderResolution:
     """Return the git provider that serves a panel request.
 
-    In order: the selected or first tracked PR's provider; the
+    In order: the selected or first tracked PR's provider; the repository's own
     ``omnigent.gitprovider`` git config value; the first remote (``origin``,
-    then the others) that a provider claims. When no remote has a network host,
-    the first registered provider serves the workspace.
+    then the others in config order) claimed by a provider with a pull request
+    facet. Otherwise the first registered provider serves the workspace, and
+    the resolution is ``unclaimed`` when the workspace has a network remote.
 
     :param root: Absolute workspace path.
     :param session_id: Session whose tracked PRs come first, if any.
@@ -151,13 +169,37 @@ def _default_pr(session_id: str | None, pr_url: str | None) -> SessionPullReques
     return entries[0] if entries else None
 
 
+def _cannot_serve(info: dict[str, Any], capabilities: ProviderCapabilities) -> bool:
+    """Whether a provider's workspace info shows that it cannot serve the workspace.
+
+    True when its CLI, if it has one, is present and signed in, yet no
+    repository resolved and the panel offers no other account to try.
+    """
+    auth = info.get("auth")
+    if info.get("available") is not True or not isinstance(auth, dict):
+        return False
+    cli = auth.get("cli")
+    if not auth.get("authenticated") or (isinstance(cli, dict) and not cli.get("available")):
+        # The panel shows the provider's install or sign-in guidance instead.
+        return False
+    repo = info.get("repo")
+    if info.get("pr") is not None or (isinstance(repo, dict) and repo.get("name_with_owner")):
+        return False
+    accounts = auth.get("accounts")
+    several_accounts = isinstance(accounts, list) and len(accounts) > 1
+    return not (capabilities.account_switching and several_accounts)
+
+
 def _workspace_info(root: str) -> dict[str, Any]:
     """Info for the workspace's branch, or the unsupported-remote payload."""
     resolution = _workspace_provider(root)
     facet = _facet(resolution.provider)
     if facet is None:
         return unsupported_remote_info(resolution.remote_host or "")
-    return facet.workspace_info(root)
+    info = facet.workspace_info(root)
+    if resolution.unclaimed and _cannot_serve(info, facet.capabilities):
+        return unsupported_remote_info(resolution.remote_host or "")
+    return info
 
 
 def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:

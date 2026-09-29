@@ -56,6 +56,7 @@ def test_explicit_repo_is_used_for_all_pr_reads(
 
     monkeypatch.setattr(github, "_gh", gh)
     monkeypatch.setattr(github, "_git", forbidden_git)
+    monkeypatch.setattr(pr_resource, "_git_output", forbidden_git)
     info = github.github_info(tracked, session_id="session", pr_url=B)
     assert info["pr"]["title"] == "Second repository"
     assert {pr["url"] for pr in info["prs"]} == {A, B}

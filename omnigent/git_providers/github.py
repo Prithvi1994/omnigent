@@ -18,7 +18,8 @@ from omnigent.git_providers import (
 # An unindented key in the gh CLI's hosts.yml names a host gh is signed in to.
 _HOSTS_YML_KEY = re.compile(r"^([A-Za-z0-9.-]+):\s*$")
 _SCP_REMOTE = re.compile(r"^[\w.\-]+@(?P<host>[\w.\-]+):(?P<path>.+)$")
-_URL_REMOTE = re.compile(r"^\w+://(?:[^@/]+@)?(?P<host>[\w.\-]+)/(?P<path>.+)$")
+# URL-style remotes may name a port, e.g. ``ssh://git@ghe.example.com:7999/o/r.git``.
+_URL_REMOTE = re.compile(r"^\w+://(?:[^@/]+@)?(?P<host>[\w.\-]+)(?::\d+)?/(?P<path>.+)$")
 
 
 def _valid_hostname(host: str) -> bool:
@@ -39,18 +40,32 @@ def _valid_hostname(host: str) -> bool:
     )
 
 
-def _gh_config_dir() -> Path:
-    """The gh CLI config dir (``GH_CONFIG_DIR``, else ``$XDG_CONFIG_HOME/gh``)."""
+def _gh_config_dir() -> str:
+    """Return the gh CLI config dir, chosen in gh's own order.
+
+    ``GH_CONFIG_DIR``, else ``$XDG_CONFIG_HOME/gh``, else ``%AppData%\\GitHub CLI``
+    on Windows, else ``~/.config/gh``.
+
+    :raises RuntimeError: When the home directory is needed but unknown.
+    """
     override = (os.environ.get("GH_CONFIG_DIR") or "").strip()
     if override:
-        return Path(override)
-    return Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "gh"
+        return override
+    xdg_config_home = os.environ.get("XDG_CONFIG_HOME")
+    if xdg_config_home:
+        return os.path.join(xdg_config_home, "gh")
+    app_data = os.environ.get("APPDATA")
+    if os.name == "nt" and app_data:
+        return os.path.join(app_data, "GitHub CLI")
+    return os.path.join(Path.home(), ".config", "gh")
 
 
 def _gh_signed_in_hosts() -> frozenset[str]:
     """Return the lower-cased top-level host keys of gh's ``hosts.yml``, if readable."""
     try:
-        text = (_gh_config_dir() / "hosts.yml").read_text(encoding="utf-8", errors="replace")
+        hosts_path = os.path.join(_gh_config_dir(), "hosts.yml")
+        with open(hosts_path, encoding="utf-8", errors="replace") as hosts_file:
+            text = hosts_file.read()
     except (OSError, RuntimeError):
         # RuntimeError: Path.home() found no home directory.
         return frozenset()

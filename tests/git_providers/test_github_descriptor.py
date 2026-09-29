@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -156,6 +157,35 @@ def test_github_remotes_parse(url: str) -> None:
     assert resolve_remote(url) == GITHUB_REMOTE
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ssh://git@github.com:22/o/r.git",
+        "https://github.com:443/o/r.git",
+        "http://github.com:80/o/r",
+        "https://token@github.com:443/o/r.git",
+    ],
+)
+def test_github_remotes_with_a_port_parse(url: str) -> None:
+    assert PROVIDER.parse_remote_url(url, EnvInstances()) == GITHUB_REMOTE
+    assert resolve_remote(url) == GITHUB_REMOTE
+
+
+@pytest.mark.parametrize("name", ["GH_HOST", "OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS"])
+@pytest.mark.parametrize(
+    "url", ["https://ghe.example.test:8443/o/r.git", "ssh://git@ghe.example.test:7999/o/r.git"]
+)
+def test_enterprise_remotes_with_a_port_parse_with_a_configured_host(
+    monkeypatch: pytest.MonkeyPatch, name: str, url: str
+) -> None:
+    assert resolve_remote(url) is None
+
+    monkeypatch.setenv(name, "ghe.example.test")
+
+    assert PROVIDER.parse_remote_url(url, EnvInstances()) == ENTERPRISE
+    assert resolve_remote(url) == ENTERPRISE
+
+
 def test_host_matching_ignores_case() -> None:
     assert PROVIDER.matches_host("GitHub.COM", EnvInstances())
     assert resolve_remote("git@GitHub.com:o/r.git") == GITHUB_REMOTE
@@ -225,6 +255,25 @@ def test_hosts_file_falls_back_to_the_xdg_and_home_config_dirs(
     (config_dir / "hosts.yml").write_text("ghe.example.test:\n    user: bob\n", encoding="utf-8")
 
     assert PROVIDER.matches_host("ghe.example.test", EnvInstances())
+
+
+@pytest.mark.parametrize(("platform", "found"), [("nt", True), ("posix", False)])
+def test_hosts_file_falls_back_to_appdata_only_on_windows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, platform: str, found: bool
+) -> None:
+    monkeypatch.delenv("GH_CONFIG_DIR")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    config_dir = tmp_path / "appdata" / "GitHub CLI"
+    config_dir.mkdir(parents=True)
+    (config_dir / "hosts.yml").write_text("ghe.example.test:\n    user: bob\n", encoding="utf-8")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", platform)
+        matched = PROVIDER.matches_host("ghe.example.test", EnvInstances())
+
+    assert matched is found
 
 
 def test_unreadable_hosts_file_is_ignored(gh_config_dir: Path) -> None:
