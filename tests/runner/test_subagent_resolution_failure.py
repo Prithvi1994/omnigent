@@ -491,3 +491,95 @@ async def test_background_title_metadata_outage_returns_503(
     assert response.status_code == 503, response.text
     assert response.json()["error"] == "spec_resolver_failed"
     assert not manager.spawns
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["background", "known_harness", "no_harness"])
+async def test_native_mirror_display_name_turn_explains_the_mirror(
+    path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A turn sent to a mirror whose display name is no bundle child names the mirror."""
+    owner, mirror = "conv_mirror_turn_owner", "conv_mirror_turn"
+    server = _ContractSnapshotClient(owner)
+    original_get = server.get
+
+    async def get(url: str, **kwargs: Any) -> Any:
+        if url.endswith(f"/v1/sessions/{mirror}"):
+            return httpx.Response(200, json=_mirror_snapshot(owner))
+        return await original_get(url, **kwargs)
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return _contract_root_spec(with_child=True)
+
+    monkeypatch.setattr(server, "get", get)
+    recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    manager = _RecordingManager(recording)
+    app = create_runner_app(
+        process_manager=manager,
+        spec_resolver=resolver,
+        server_client=server,
+    )  # type: ignore[arg-type]
+    async with _runner_test_client(app) as http:
+        result = await _CONTRACT_ADAPTERS[path](http, mirror, recording)
+        if path == "background":
+            assert result["status"] == 202
+            failure = _statuses(app, mirror)[-1]
+            assert failure["status"] == "failed"
+            error = failure["error"]
+        else:
+            assert result["status"] == 400
+            error = result["error"]
+    assert error["code"] == "invalid_input"
+    assert "mirrors the native sub-agent 'Explore'" in error["message"]
+    assert "renamed" not in error["message"]
+    assert not manager.spawns
+    assert not recording.posted_bodies
+
+
+@pytest.mark.asyncio
+async def test_native_mirror_display_name_init_explains_the_mirror() -> None:
+    """Session init for a mirror whose display name is no bundle child names the mirror."""
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitEnvelope,
+        RunnerSessionInitSnapshot,
+    )
+
+    owner, mirror = "conv_mirror_init_owner", "conv_mirror_init"
+    envelope = RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="test",
+        session_id=mirror,
+        agent_id="ag_contract_root",
+        sub_agent_name="Explore",
+        snapshot=RunnerSessionInitSnapshot(
+            created_at=0,
+            updated_at=0,
+            labels={"omnigent.wrapper": "claude-code-native-ui-subagent"},
+            parent_session_id=owner,
+        ),
+    )
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return _contract_root_spec(with_child=True)
+
+    manager = _RecordingManager(_RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS))
+    app = create_runner_app(
+        process_manager=manager,
+        spec_resolver=resolver,
+        server_client=_ContractSnapshotClient(owner),
+    )  # type: ignore[arg-type]
+    async with _runner_test_client(app) as http:
+        created = await http.post(
+            "/v1/sessions",
+            json={
+                "session_id": mirror,
+                "agent_id": "ag_contract_root",
+                "sub_agent_name": "Explore",
+                "session_init": envelope.model_dump(mode="json"),
+            },
+        )
+    assert created.status_code == 400, created.text
+    assert created.json()["error"]["code"] == "invalid_input"
+    assert "mirrors the native sub-agent 'Explore'" in created.json()["error"]["message"]
+    assert not manager.spawns

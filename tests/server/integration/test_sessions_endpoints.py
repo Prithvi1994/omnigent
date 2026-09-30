@@ -12487,6 +12487,35 @@ async def test_session_initialization_preserves_missing_spec_errors(
         assert restored.json()["runner_id"] == "runner_previous"
 
 
+async def test_rejected_rebind_without_previous_runner_clears_binding(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A first bind the runner rejects leaves the session unbound, not half-bound."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+
+    def reject(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            410, json={"error": {"code": "sub_agent_unresolved", "message": "private resolver"}}
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(reject), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+        monkeypatch.setattr(sessions_module, "_registered_runner_id", lambda _, rid, **kw: rid)
+        response = await client.patch(f"/v1/sessions/{sid}", json={"runner_id": "runner_rejected"})
+    assert response.status_code == 410, response.text
+    assert response.json()["error"]["code"] == "sub_agent_unresolved"
+    restored = await client.get(f"/v1/sessions/{sid}")
+    assert restored.json()["runner_id"] is None
+
+
 @pytest.mark.parametrize(
     "labels",
     [
