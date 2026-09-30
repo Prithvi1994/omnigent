@@ -795,9 +795,16 @@ function WorkspacePanelImpl({
     // screen now.
     if (sideChatToOpen.parentId !== conversationId) return;
     const { childId } = sideChatToOpen;
+    const awaiting = awaitingPendingIdsRef.current.shift();
+    // Keep closed launches in FIFO order until their child arrives, so the
+    // next open tab cannot accidentally inherit the cancelled fork's question.
+    if (awaiting !== undefined && !sideChats.tabs.includes(awaiting.id)) {
+      void stopSession(childId).catch(() => {});
+      clearSideChatToOpen();
+      return;
+    }
     // Started this session → live (not a dead restored Codex fork).
     sideChatsStartedThisSession.add(childId);
-    const awaiting = awaitingPendingIdsRef.current.shift();
     if (awaiting !== undefined) {
       sideChats.rekey(awaiting.id, childId);
       setInitialSideChatMessages((messages) => ({ ...messages, [childId]: awaiting.text }));

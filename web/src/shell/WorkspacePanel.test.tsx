@@ -9,6 +9,8 @@ import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
 import { writeDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
+import * as sessionsApi from "@/lib/sessionsApi";
+import { conversationRegistry } from "@/store/conversationRegistry";
 import { useChatStore } from "@/store/chatStore";
 import { WorkspacePanel } from "./WorkspacePanel";
 
@@ -28,10 +30,13 @@ vi.mock("@/components/chat/SideChatPane", () => ({
     initialMessage?: string;
     onStart: (text: string) => Promise<void>;
   }) => (
-    <div data-testid="side-chat-pane" data-child={childId}>
+    <div data-testid="side-chat-pane" data-child={childId} data-initial-message={initialMessage}>
       {initialMessage}
       <button type="button" onClick={() => void onStart("First question")}>
         Send first question
+      </button>
+      <button type="button" onClick={() => void onStart("Second question")}>
+        Send second question
       </button>
     </div>
   ),
@@ -884,31 +889,83 @@ describe("WorkspacePanel browser tab", () => {
   });
 });
 
-it("transfers the first question when a pending native side-chat tab becomes a child", async () => {
-  const original = useChatStore.getState();
-  const sendSide = vi.fn().mockResolvedValue(undefined);
-  useChatStore.setState({
-    conversationId: "conv_ws",
-    sessionHarness: "codex-native",
-    boundAgentId: "agent",
-    send: sendSide,
-  });
-  try {
-    renderWorkspace({ rightRailTab: "sidechat" });
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Side chat" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Send first question" }));
-    expect(sendSide).toHaveBeenCalledTimes(1);
-    act(() =>
-      useChatStore.setState({ sideChatToOpen: { parentId: "conv_ws", childId: "conv_new_side" } }),
-    );
-    await waitFor(() =>
-      expect(screen.getByTestId("side-chat-pane")).toHaveAttribute("data-child", "conv_new_side"),
-    );
-    expect(screen.getByTestId("side-chat-pane")).toHaveTextContent("First question");
-    expect(sendSide).toHaveBeenCalledTimes(1);
-  } finally {
-    cleanup();
-    useChatStore.setState(original);
-  }
-});
+it.each(["single", "overlapping", "closed-first"])(
+  "transfers each pending question to its own child (%s)",
+  async (scenario) => {
+    const overlapping = scenario !== "single";
+    const stop = vi.spyOn(sessionsApi, "stopSession").mockResolvedValue({ queued: false });
+    conversationRegistry.clear();
+    useChatStore.setState({ conversationId: null });
+    const original = useChatStore.getState();
+    const sendSide = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      conversationId: "conv_ws",
+      sessionHarness: "codex-native",
+      boundAgentId: "agent",
+      send: sendSide,
+    });
+    try {
+      renderWorkspace({ rightRailTab: "sidechat" });
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+      fireEvent.click(await screen.findByRole("menuitem", { name: "Side chat" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Send first question" }));
+      expect(sendSide).toHaveBeenCalledTimes(1);
+      if (overlapping) {
+        fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+        fireEvent.click(await screen.findByRole("menuitem", { name: "Side chat" }));
+        fireEvent.click(await screen.findByRole("button", { name: "Send second question" }));
+      }
+      if (scenario === "closed-first") {
+        fireEvent.click(screen.getByRole("button", { name: "Close Side chat 1" }));
+      }
+      act(() =>
+        useChatStore.setState({
+          sideChatToOpen: { parentId: "conv_ws", childId: "conv_new_side" },
+        }),
+      );
+      if (scenario === "closed-first") {
+        await waitFor(() => expect(stop).toHaveBeenCalledWith("conv_new_side"));
+      } else {
+        fireEvent.click(screen.getByRole("tab", { name: "Side chat 1" }));
+        await waitFor(() =>
+          expect(screen.getByTestId("side-chat-pane")).toHaveAttribute(
+            "data-child",
+            "conv_new_side",
+          ),
+        );
+        expect(screen.getByTestId("side-chat-pane")).toHaveAttribute(
+          "data-initial-message",
+          "First question",
+        );
+      }
+      if (overlapping) {
+        act(() =>
+          useChatStore.setState({
+            sideChatToOpen: { parentId: "conv_ws", childId: "conv_second_side" },
+          }),
+        );
+        fireEvent.click(
+          screen.getByRole("tab", {
+            name: scenario === "closed-first" ? "Side chat 1" : "Side chat 2",
+          }),
+        );
+        await waitFor(() =>
+          expect(screen.getByTestId("side-chat-pane")).toHaveAttribute(
+            "data-child",
+            "conv_second_side",
+          ),
+        );
+        expect(screen.getByTestId("side-chat-pane")).toHaveAttribute(
+          "data-initial-message",
+          "Second question",
+        );
+      }
+      expect(sendSide).toHaveBeenCalledTimes(overlapping ? 2 : 1);
+      expect(stop).toHaveBeenCalledTimes(scenario === "closed-first" ? 1 : 0);
+    } finally {
+      cleanup();
+      stop.mockRestore();
+      useChatStore.setState(original);
+    }
+  },
+);

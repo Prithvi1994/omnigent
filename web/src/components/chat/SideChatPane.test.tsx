@@ -99,45 +99,81 @@ describe("native side-chat first message", () => {
     expect(screen.queryByText("Hi")).toBeNull();
     act(() => conversationRegistry.acquire(childId).setState({ conversationLoadError: null }));
     expect(screen.getByText("Hi")).toBeInTheDocument();
-  });
-
-  it("keeps the first question ahead of the response and deduplicates persisted history", () => {
-    const { rerender } = render(<SideChatPane childId={childId} initialMessage="Hi" />);
-    expect(screen.getAllByText("Hi")).toHaveLength(1);
-    const ctx = {
-      agent: null,
-      depth: 0,
-      turn: 0,
-      timestamp: 0,
-      responseId: "turn_side",
-      itemId: "reply",
-    };
     act(() =>
       conversationRegistry.acquire(childId).setState({
-        blocks: [{ type: "text_done", ctx, fullText: "Hello Serena", hasCodeBlocks: false }],
-      }),
-    );
-    expect(
-      screen.getByText("Hi").compareDocumentPosition(screen.getByText("Hello Serena")) &
-        Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
-    act(() =>
-      conversationRegistry.acquire(childId).setState({
+        conversationLoadError: new Error("Reload failed"),
         blocks: [
           {
-            type: "user_message",
-            ctx: { ...ctx, itemId: "first-input" },
-            content: [{ type: "input_text", text: "Hi" }],
+            type: "text_done",
+            ctx: {
+              agent: null,
+              depth: 0,
+              turn: 0,
+              timestamp: 0,
+              responseId: "turn_side",
+              itemId: "reply",
+            },
+            fullText: "An existing response",
+            hasCodeBlocks: false,
           },
-          { type: "text_done", ctx, fullText: "Hello Serena", hasCodeBlocks: false },
         ],
       }),
     );
-    expect(screen.getAllByText("Hi")).toHaveLength(1);
-    rerender(<SideChatPane childId={childId} initialMessage="Hi" readOnly />);
-    expect(screen.getAllByText("Hi")).toHaveLength(1);
-    expect(send).not.toHaveBeenCalled();
+    expect(screen.getByText("Hi")).toBeInTheDocument();
+    expect(screen.getByText("An existing response")).toBeInTheDocument();
   });
+
+  it.each([false, true])(
+    "deduplicates persisted first question (leading routing notice: %s)",
+    (routingNotice) => {
+      const { rerender } = render(<SideChatPane childId={childId} initialMessage="Hi" />);
+      expect(screen.getAllByText("Hi")).toHaveLength(1);
+      const ctx = {
+        agent: null,
+        depth: 0,
+        turn: 0,
+        timestamp: 0,
+        responseId: "turn_side",
+        itemId: "reply",
+      };
+      act(() =>
+        conversationRegistry.acquire(childId).setState({
+          blocks: [{ type: "text_done", ctx, fullText: "Hello Serena", hasCodeBlocks: false }],
+        }),
+      );
+      expect(
+        screen.getByText("Hi").compareDocumentPosition(screen.getByText("Hello Serena")) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      act(() =>
+        conversationRegistry.acquire(childId).setState({
+          blocks: [
+            ...(routingNotice
+              ? [
+                  {
+                    type: "routing_decision" as const,
+                    ctx: { ...ctx, itemId: "routing" },
+                    model: "test-model",
+                    applied: true,
+                    rationale: "Selected model",
+                  },
+                ]
+              : []),
+            {
+              type: "user_message",
+              ctx: { ...ctx, itemId: "first-input" },
+              content: [{ type: "input_text", text: "Hi" }],
+            },
+            { type: "text_done", ctx, fullText: "Hello Serena", hasCodeBlocks: false },
+          ],
+        }),
+      );
+      expect(screen.getAllByText("Hi")).toHaveLength(1);
+      rerender(<SideChatPane childId={childId} initialMessage="Hi" readOnly />);
+      expect(screen.getAllByText("Hi")).toHaveLength(1);
+      expect(send).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe("side-chat working indicator", () => {
