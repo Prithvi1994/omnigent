@@ -23,6 +23,7 @@ from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
     ProviderCapabilities,
     PullRequestFacet,
+    local_git,
     unsupported_remote_info,
 )
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, SessionPullRequest
@@ -70,20 +71,9 @@ def _git_output(argv: list[str], *, cwd: str) -> tuple[int | None, str]:
 
 
 def _remote_urls(root: str) -> list[str]:
-    """Return each remote's first configured URL, ``origin`` first, then in config order.
-
-    Reads git config because ``git remote -v`` lines vary; a partial clone's
-    fetch line ends with its filter.
-    """
-    rc, out = _git_output(["config", "-z", "--get-regexp", r"^remote\..*\.url$"], cwd=root)
-    if rc != 0:
-        return []
-    urls: dict[str, str] = {}
-    for entry in out.split("\0"):
-        key, _, url = entry.partition("\n")
-        if key.startswith("remote.") and key.endswith(".url"):
-            urls.setdefault(key[len("remote.") : -len(".url")], url)
-    return [urls[name] for name in sorted(urls, key=lambda name: name != "origin")]
+    """Return each remote's first configured URL, ``origin`` first, then in config order."""
+    remotes = local_git.remote_urls(lambda argv: _git_output(argv, cwd=root))
+    return [url for _, url in remotes]
 
 
 def _configured_provider(root: str) -> str | None:

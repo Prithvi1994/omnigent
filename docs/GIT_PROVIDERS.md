@@ -403,7 +403,10 @@ Each step has a counterpart in the Azure DevOps provider.
    exposing `PULL_REQUESTS`. Implement every `PullRequestFacet` member, declare
    the `ProviderCapabilities`, and return the neutral and additive payload
    fields. Import panel-only dependencies, the client included, inside the
-   methods that use them, because the observer loads every facet. Test the facet
+   methods that use them, because the observer loads every facet. For local git
+   reads, use `omnigent/runner/git_providers/local_git.py`: the workspace's
+   remote URLs, the diff base of the checkout, and a file at a revision. Each of
+   its functions takes the facet's own git runner. Test the facet
    directly (`tests/runner/test_azure_devops_provider.py`) and through the
    dispatcher (`tests/runner/test_pr_resource_azure_devops.py`).
 5. Write the observer hooks `shell_pr_operations`, `pr_from_object`, and

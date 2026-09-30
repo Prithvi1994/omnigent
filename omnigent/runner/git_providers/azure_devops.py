@@ -39,6 +39,7 @@ from omnigent.runner.git_providers import (
     ShellPrOp,
     ShellSegment,
     azure_devops_observer,
+    local_git,
 )
 from omnigent.runner.session_prs import PullRequestRef
 
@@ -120,12 +121,32 @@ def _git(
         return None
 
 
+def _text_run(root: str) -> local_git.TextRun:
+    """Run git commands in ``root`` for :mod:`local_git`, decoding the output leniently."""
+
+    def run(argv: list[str]) -> tuple[int | None, str]:
+        result = _git(root, *argv)
+        if result is None:
+            return None, ""
+        return result.returncode, result.stdout.decode("utf-8", errors="replace")
+
+    return run
+
+
+def _bytes_run(root: str) -> Callable[[list[str]], tuple[int | None, bytes]]:
+    """Run git commands in ``root`` for :mod:`local_git`, keeping the output as bytes."""
+
+    def run(argv: list[str]) -> tuple[int | None, bytes]:
+        result = _git(root, *argv)
+        return (None, b"") if result is None else (result.returncode, result.stdout)
+
+    return run
+
+
 def _git_out(root: str, *args: str) -> str | None:
     """Return the output of a git command that succeeded, or ``None``."""
-    result = _git(root, *args)
-    if result is None or result.returncode != 0:
-        return None
-    return result.stdout.decode("utf-8", errors="replace")
+    rc, out = _text_run(root)(list(args))
+    return out if rc == 0 else None
 
 
 def _branch(root: str) -> str | None:
@@ -135,21 +156,11 @@ def _branch(root: str) -> str | None:
 
 
 def _remotes(root: str) -> list[tuple[str, AzureRepo]]:
-    """Return the workspace's Azure DevOps remotes as ``(name, repo)``, ``origin`` first.
-
-    Reads the configured URLs, before any ``url.<base>.insteadOf`` rewrite.
-    """
-    out = _git_out(root, "config", "-z", "--get-regexp", r"^remote\..+\.url$") or ""
-    urls: dict[str, str] = {}
-    for entry in out.split("\0"):
-        key, _, url = entry.partition("\n")
-        if key.startswith("remote.") and key.endswith(".url"):
-            urls.setdefault(key[len("remote.") : -len(".url")], url)
-    names = sorted(urls, key=lambda name: name != "origin")
+    """Return the workspace's Azure DevOps remotes as ``(name, repo)``, ``origin`` first."""
     return [
         (name, repo)
-        for name in names
-        if (repo := parse_azure_devops_remote(urls[name])) is not None
+        for name, url in local_git.remote_urls(_text_run(root))
+        if (repo := parse_azure_devops_remote(url)) is not None
     ]
 
 
@@ -263,72 +274,9 @@ class _PrFetches:
             done.set()
 
 
-def _read_blob(root: str, ref: str, path: str) -> bytes | None:
-    """Read a file at a local revision; only a confirmed absent tree entry means no content."""
-    result = _git(root, "show", f"{ref}:{path}")
-    if result is not None and result.returncode == 0:
-        return result.stdout
-    # Tree entries remain available in blobless clones even if a lazy blob fetch fails.
-    tree = _git(root, "--literal-pathspecs", "ls-tree", "-z", "--full-tree", ref, "--", path)
-    if tree is not None and tree.returncode == 0 and not tree.stdout:
-        return None
-    from omnigent.errors import ErrorCode, OmnigentError
-
-    raise OmnigentError(
-        f"Unable to read file content for {path!r} at {ref!r}. Check repository access "
-        "and connectivity, then retry; a partial clone may need to fetch missing objects.",
-        code=ErrorCode.INTERNAL_ERROR,
-    )
-
-
-def _resolve_diff_base(root: str, base: str) -> str:
-    """Resolve a base branch to the merge base of ``origin/<base>`` (or ``<base>``) and HEAD.
-
-    :raises OmnigentError: If the base is unavailable or shallow ancestry is missing.
-    """
-    from omnigent.errors import ErrorCode, OmnigentError
-
-    resolved: str | None = None
-    for candidate in (f"origin/{base}", base):
-        if _git_out(root, "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"):
-            resolved = candidate
-            break
-    if resolved is None:
-        raise OmnigentError(
-            f"Diff base {base!r} is not available locally. Fetch the base branch explicitly "
-            "with `git fetch origin <base>:refs/remotes/origin/<base>` (replace <base> "
-            "with the branch name), then retry. Single-branch clones do not fetch "
-            "other branches automatically.",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    result = _git(root, "merge-base", resolved, "HEAD")
-    if result is None:
-        return resolved
-    merge_base = result.stdout.decode("utf-8", errors="replace").strip()
-    if result.returncode == 0 and merge_base:
-        return merge_base
-    if result.returncode == 1:
-        shallow = _git_out(root, "rev-parse", "--is-shallow-repository")
-        if shallow is not None and shallow.strip() == "true":
-            raise OmnigentError(
-                f"No merge base found between HEAD and {resolved!r} in this shallow repository. "
-                "Fetch more history with `git fetch --deepen=100 origin` or "
-                "`git fetch --unshallow origin`, then retry. "
-                "Include both branch refspecs if origin tracks only one branch.",
-                code=ErrorCode.INVALID_INPUT,
-            )
-    return resolved
-
-
-def _checkout_text(root: str, ref: str, path: str) -> str | None:
-    """Read a file of the local checkout diff, decoding invalid UTF-8 leniently."""
-    data = _read_blob(root, ref, path)
-    return None if data is None else data.decode("utf-8", errors="replace")
-
-
 def _pr_text(root: str, ref: str, path: str) -> str | None:
     """Read a PR file at a local revision; binary content has no expanded context."""
-    data = _read_blob(root, ref, path)
+    data = local_git.read_file(_bytes_run(root), ref, path)
     if data is None:
         return None
     try:
@@ -1070,14 +1018,18 @@ class AzureDevOpsPullRequests:
     def _checkout_file_diff(
         self, root: str, base: str, path: str, deadline: float
     ) -> dict[str, Any]:
-        """Diff one file of the local checkout: HEAD against its merge base with ``base``."""
+        """Diff one file of the local checkout: HEAD against its merge base with ``base``.
+
+        Invalid UTF-8 is decoded leniently, as the GitHub panel does.
+        """
         resolved = base or self._branch_base(root, deadline)
-        diff_base = _resolve_diff_base(root, resolved) if resolved else None
+        run = _text_run(root)
+        diff_base = local_git.resolve_diff_base(run, resolved) if resolved else None
         return {
             "object": FILE_DIFF_OBJECT,
             "path": path,
-            "before": _checkout_text(root, diff_base, path) if diff_base is not None else None,
-            "after": _checkout_text(root, "HEAD", path),
+            "before": None if diff_base is None else local_git.read_file(run, diff_base, path),
+            "after": local_git.read_file(run, "HEAD", path),
         }
 
     def _branch_base(self, root: str, deadline: float) -> str | None:

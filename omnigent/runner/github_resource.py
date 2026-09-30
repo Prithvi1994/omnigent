@@ -63,8 +63,8 @@ from typing import Any
 from urllib.parse import quote
 
 from omnigent import config as _config
-from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner import pr_resource
+from omnigent.runner.git_providers import local_git
 from omnigent.runner.session_prs import PullRequestRef
 from omnigent.runtime.filesystem_registry import _git_timeout_seconds
 
@@ -874,66 +874,29 @@ def resolve_base_ref(root: str, base: str | None) -> str | None:
     return _workspace_github_info(root).get("base_ref")
 
 
+def _git_run(root: str) -> local_git.TextRun:
+    """Run git commands in ``root`` through :func:`_git`, for :mod:`local_git`."""
+
+    def run(argv: list[str]) -> tuple[int | None, str]:
+        rc, out, _ = _git(argv, cwd=root)
+        return rc, out
+
+    return run
+
+
 def _resolve_diff_base(root: str, base: str) -> str:
     """Resolve a base branch name to the ref to diff HEAD against.
 
-    Prefers the merge-base of ``origin/<base>`` (or ``<base>``) and HEAD, giving
-    the three-dot / "Files changed" semantics GitHub shows. A missing merge base
-    in a shallow repository raises instead of comparing branch tips. Full-history
-    repositories retain the base-tip fallback. An unavailable base ref raises.
+    See :func:`omnigent.runner.git_providers.local_git.resolve_diff_base`.
 
-    :param root: Absolute workspace path.
-    :param base: Base branch name, e.g. ``"main"``.
-    :returns: A ref (SHA or name) to diff against.
     :raises OmnigentError: If the base is unavailable or shallow ancestry is missing.
     """
-    candidates = [f"origin/{base}", base]
-    resolved: str | None = None
-    for candidate in candidates:
-        rc, _, _ = _git(["rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"], cwd=root)
-        if rc == 0:
-            resolved = candidate
-            break
-    if resolved is None:
-        raise OmnigentError(
-            f"Diff base {base!r} is not available locally. Fetch the base branch explicitly "
-            "with `git fetch origin <base>:refs/remotes/origin/<base>` (replace <base> "
-            "with the branch name), then retry. Single-branch clones do not fetch "
-            "other branches automatically.",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    rc, out, _ = _git(["merge-base", resolved, "HEAD"], cwd=root)
-    if rc == 0 and out.strip():
-        return out.strip()
-    if rc == 1:
-        shallow_rc, shallow, _ = _git(["rev-parse", "--is-shallow-repository"], cwd=root)
-        if shallow_rc == 0 and shallow.strip() == "true":
-            raise OmnigentError(
-                f"No merge base found between HEAD and {resolved!r} in this shallow repository. "
-                "Fetch more history with `git fetch --deepen=100 origin` or "
-                "`git fetch --unshallow origin`, then retry. "
-                "Include both branch refspecs if origin tracks only one branch.",
-                code=ErrorCode.INVALID_INPUT,
-            )
-    return resolved
+    return local_git.resolve_diff_base(_git_run(root), base)
 
 
 def _read_diff_content(root: str, ref: str, path: str) -> str | None:
     """Read a local diff side; only a confirmed absent tree entry means no content."""
-    rc, out, _ = _git(["show", f"{ref}:{path}"], cwd=root)
-    if rc == 0:
-        return out
-    # Tree entries remain available in blobless clones even if a lazy blob fetch fails.
-    tree_rc, entries, _ = _git(
-        ["--literal-pathspecs", "ls-tree", "-z", "--full-tree", ref, "--", path], cwd=root
-    )
-    if tree_rc == 0 and not entries:
-        return None
-    raise OmnigentError(
-        f"Unable to read file content for {path!r} at {ref!r}. Check repository access "
-        "and connectivity, then retry; a partial clone may need to fetch missing objects.",
-        code=ErrorCode.INTERNAL_ERROR,
-    )
+    return local_git.read_file(_git_run(root), ref, path)
 
 
 # GitHub pulls/files ``status`` → the status vocabulary the web list uses.
