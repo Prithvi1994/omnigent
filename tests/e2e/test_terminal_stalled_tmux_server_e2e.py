@@ -20,11 +20,11 @@ from pathlib import Path
 import psutil
 import pytest
 
+import omnigent.inner.terminal as terminal_mod
 from omnigent.inner.terminal import TerminalInstance
 
-# Upper bound a read probe may stay pinned on a stalled server before it must
-# give up and report liveness as unknown.
-PROBE_CEILING_S = 45.0
+# A pinned read probe must give up within its budget plus scheduling slack.
+PROBE_CEILING_S = terminal_mod._TMUX_PROBE_TIMEOUT_SECONDS + 5.0
 _WATCHER_POLL_S = 2.0
 
 pytestmark = [
@@ -36,7 +36,7 @@ pytestmark = [
 @pytest.fixture
 def short_parent() -> Iterator[Path]:
     # tmux's AF_UNIX socket path must stay under ~100 bytes; pytest's tmp_path is longer.
-    parent = Path(tempfile.mkdtemp(prefix="omni-8108-", dir="/tmp"))
+    parent = Path(tempfile.mkdtemp(prefix="omnigent-tmux-", dir="/tmp"))
     try:
         yield parent
     finally:
