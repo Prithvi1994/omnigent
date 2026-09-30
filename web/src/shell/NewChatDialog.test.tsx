@@ -6812,6 +6812,12 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-sandbox-option")).toBeNull();
     fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-see-more"));
     expect(screen.getByTestId("new-chat-landing-sandbox-option")).toBeTruthy();
+    // Closing the menu collapses them again.
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-host-menu"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-host-menu")).toBeNull());
+    fireEvent.pointerDown(chip(), { button: 0 });
+    expect(screen.queryByTestId("new-chat-landing-sandbox-option")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-sandbox-see-more")).toBeTruthy();
   });
 
   it("adds a GitHub repo from the picker with a branch", async () => {
