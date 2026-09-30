@@ -6,9 +6,13 @@ import { ImportContextModal } from "@/components/onboarding/ImportContextModal";
 import { Button } from "@/components/ui/button";
 import { useHarnessInventory, type HarnessInventory } from "@/hooks/useHarnessInventory";
 import { useHosts, type Host } from "@/hooks/useHosts";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import {
+  autoImportReviewDone,
   clearImportReviewRequest,
   importsReviewed,
+  markAutoImportReviewDone,
   markImportsReviewed,
   useImportReviewRequest,
   type ImportReviewTarget,
@@ -34,8 +38,11 @@ function InventoryModal({
     <ImportContextModal
       open={open}
       onOpenChange={(next) => {
-        // Confirm and dismiss both count as reviewed.
-        if (!next) markImportsReviewed(hostId);
+        // Confirm and dismiss both count as reviewed, and end this load's auto-open.
+        if (!next) {
+          markImportsReviewed(hostId);
+          markAutoImportReviewDone();
+        }
         onOpenChange(next);
       }}
       onConfirm={() => {}}
@@ -78,7 +85,9 @@ export function HostImportsDialog({
  * whose harnesses bring MCPs, skills, or plugins.
  */
 export function ImportReviewGate() {
+  const info = useServerInfo();
   const target = useImportReviewRequest();
+  if (!isFeatureEnabled(info, "import_review")) return null;
   if (target !== null) {
     return <RequestedImportReview key={target.hostId} target={target} />;
   }
@@ -119,16 +128,19 @@ function NewHostImportReview() {
   // Hosts with nothing to show this session; they're rechecked on the next load.
   const [emptyHostIds, setEmptyHostIds] = useState<ReadonlySet<string>>(() => new Set());
   // An open host keeps the modal even after it's marked reviewed; otherwise
-  // pick the first online host this device hasn't reviewed.
+  // pick the first online host this device hasn't reviewed, unless the modal
+  // already opened this load (the next host waits for a reload).
   const candidate =
     (openHostId !== null
       ? hosts?.find((host) => host.host_id === openHostId)
-      : hosts?.find(
-          (host) =>
-            host.status === "online" &&
-            !emptyHostIds.has(host.host_id) &&
-            !importsReviewed(host.host_id),
-        )) ?? null;
+      : autoImportReviewDone()
+        ? undefined
+        : hosts?.find(
+            (host) =>
+              host.status === "online" &&
+              !emptyHostIds.has(host.host_id) &&
+              !importsReviewed(host.host_id),
+          )) ?? null;
   const inventory = useHarnessInventory(candidate);
   const settled = candidate !== null && inventory.status === "ready";
 
@@ -138,6 +150,7 @@ function NewHostImportReview() {
     } else if (settled && inventory.isEmpty) {
       setEmptyHostIds((ids) => new Set(ids).add(candidate.host_id));
     } else if (settled) {
+      markAutoImportReviewDone();
       setOpenHostId(candidate.host_id);
     }
   }, [openHostId, settled, inventory.isEmpty, candidate]);

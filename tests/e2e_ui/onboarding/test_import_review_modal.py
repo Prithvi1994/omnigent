@@ -2,7 +2,8 @@
 
 ``/v1/hosts``, host-scoped ``/v1/skills``, and the host MCP inventory are
 stubbed so the test controls exactly what the host's harnesses report while
-the rest of the real UI runs against the live e2e server.
+the rest of the real UI runs against the live e2e server. ``/v1/info`` is
+patched to toggle the default-off ``import_review`` release feature.
 """
 
 from __future__ import annotations
@@ -70,6 +71,18 @@ _MCP_SERVERS = {
 }
 
 
+async def _set_import_review(page: Page, *, enabled: bool) -> None:
+    """Patch the live ``/v1/info`` so ``import_review`` has a fixed value."""
+
+    async def handle_info(route: Route) -> None:
+        response = await route.fetch()
+        info = await response.json()
+        info["features"] = {**info.get("features", {}), "import_review": enabled}
+        await route.fulfill(status=response.status, json=info)
+
+    await page.route("**/v1/info", handle_info)
+
+
 async def _register_routes(page: Page) -> None:
     async def handle_hosts(route: Route) -> None:
         await route.fulfill(json=_HOSTS)
@@ -85,6 +98,7 @@ async def _register_routes(page: Page) -> None:
     async def handle_mcp_servers(route: Route) -> None:
         await route.fulfill(json=_MCP_SERVERS)
 
+    await _set_import_review(page, enabled=True)
     await page.route("**/v1/hosts", handle_hosts)
     await page.route("**/v1/skills?*", handle_skills)
     await page.route(f"**/v1/hosts/{_HOST_ID}/mcp-servers", handle_mcp_servers)
@@ -159,6 +173,7 @@ async def _drive_empty(base_url: str) -> None:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
         try:
+            await _set_import_review(page, enabled=True)
             await page.route("**/v1/hosts", lambda route: route.fulfill(json=_HOSTS))
             await page.route("**/v1/skills?*", lambda route: route.fulfill(json={"skills": []}))
             await page.route(
@@ -178,5 +193,31 @@ async def _drive_empty(base_url: str) -> None:
                 f"window.localStorage.getItem('omnigent:imports-reviewed:{_HOST_ID}')"
             )
             assert reviewed is None
+        finally:
+            await browser.close()
+
+
+def test_import_review_is_hidden_while_the_feature_is_off(live_server: str) -> None:
+    """With ``import_review`` off, neither the modal nor its Settings entry shows."""
+    _run_in_fresh_loop(_drive_feature_off(live_server))
+
+
+async def _drive_feature_off(base_url: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            await _register_routes(page)
+            await _set_import_review(page, enabled=False)
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            await page.wait_for_timeout(1_000)
+            await expect(page.get_by_role("dialog", name="Your imports are ready")).to_be_hidden()
+
+            await page.goto(f"{base_url}/settings/import")
+            await expect(page.get_by_text("Import from a machine")).to_be_visible()
+            await expect(page.get_by_text("Harness imports")).to_have_count(0)
         finally:
             await browser.close()

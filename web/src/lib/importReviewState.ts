@@ -24,6 +24,24 @@ export function markImportsReviewed(hostId: string): void {
   }
 }
 
+// Set once the modal has shown on its own or been closed, so the gate
+// auto-opens at most once per page load even with several unreviewed hosts.
+let autoReviewDone = false;
+
+export function autoImportReviewDone(): boolean {
+  return autoReviewDone;
+}
+
+export function markAutoImportReviewDone(): void {
+  autoReviewDone = true;
+}
+
+/** Test-only: forget this page load's auto-open and any pending request. */
+export function resetImportReviewSessionForTests(): void {
+  autoReviewDone = false;
+  requestedTarget = null;
+}
+
 /** A host an explicit caller (e.g. onboarding's install step) wants reviewed. */
 export interface ImportReviewTarget {
   hostId: string;

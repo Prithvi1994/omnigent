@@ -4,10 +4,12 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Host } from "@/hooks/useHosts";
-import { clearImportReviewRequest, requestImportReview } from "@/lib/importReviewState";
+import { requestImportReview, resetImportReviewSessionForTests } from "@/lib/importReviewState";
 
 const authenticatedFetchMock = vi.hoisted(() => vi.fn());
+const features = vi.hoisted(() => ({ import_review: true }));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: authenticatedFetchMock }));
+vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => ({ features }) }));
 vi.mock("@/lib/nativeBridge", () => ({ isIOSShell: () => false }));
 
 import { ImportReviewGate, ReviewImportsPanel } from "./HostImportReview";
@@ -60,12 +62,92 @@ function skillRequestsFor(hostId: string) {
 beforeEach(() => {
   authenticatedFetchMock.mockReset();
   window.localStorage.clear();
-  clearImportReviewRequest();
+  resetImportReviewSessionForTests();
+  features.import_review = true;
 });
+
+const TITLE = "Your imports are ready";
+
+/** Waits long enough for another host's inventory to load and open the modal. */
+async function expectStaysClosed() {
+  await new Promise((resolve) => {
+    setTimeout(resolve, 100);
+  });
+  expect(screen.queryByText(TITLE)).toBeNull();
+}
+
+const CLOSE_METHODS: [string, () => void][] = [
+  ["the X button", () => fireEvent.click(screen.getByRole("button", { name: "Close" }))],
+  ["Confirm", () => fireEvent.click(screen.getByRole("button", { name: "Confirm" }))],
+  ["Escape", () => fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" })],
+  [
+    "an overlay click",
+    () => {
+      const overlay = document.querySelector('[data-slot="dialog-overlay"]');
+      if (!overlay) throw new Error("no dialog overlay");
+      // Radix dismisses on the click that follows an outside pointerdown.
+      fireEvent.pointerDown(overlay);
+      fireEvent.click(overlay);
+    },
+  ],
+];
 
 afterEach(cleanup);
 
 describe("ImportReviewGate", () => {
+  it("stays hidden and loads nothing while the import_review feature is off", async () => {
+    features.import_review = false;
+    serve([host("a")], { a: ["review"] });
+    renderWithClient(<ImportReviewGate />);
+
+    await expectStaysClosed();
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(CLOSE_METHODS)(
+    "closes on %s and doesn't reopen for the next unreviewed host",
+    async (_name, close) => {
+      serve([host("a"), host("b")], { a: ["from-a"], b: ["from-b"] });
+      renderWithClient(<ImportReviewGate />);
+
+      expect(await screen.findByText("/from-a")).toBeTruthy();
+      close();
+
+      await waitFor(() => expect(screen.queryByText(TITLE)).toBeNull());
+      await expectStaysClosed();
+      expect(window.localStorage.getItem("omnigent:imports-reviewed:a")).not.toBeNull();
+      expect(window.localStorage.getItem("omnigent:imports-reviewed:b")).toBeNull();
+    },
+  );
+
+  it("opens at most once per page load, even across remounts", async () => {
+    serve([host("a"), host("b")], { a: ["from-a"], b: ["from-b"] });
+    renderWithClient(<ImportReviewGate />);
+    expect(await screen.findByText("/from-a")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByText(TITLE)).toBeNull());
+
+    cleanup();
+    renderWithClient(<ImportReviewGate />);
+    await expectStaysClosed();
+    expect(skillRequestsFor("b")).toHaveLength(0);
+  });
+
+  it("keeps a dismissed host dismissed after a reload", async () => {
+    serve([host("a"), host("b")], { a: ["from-a"], b: ["from-b"] });
+    renderWithClient(<ImportReviewGate />);
+    expect(await screen.findByText("/from-a")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(screen.queryByText(TITLE)).toBeNull());
+
+    // A reload starts a new page session with the same localStorage.
+    cleanup();
+    resetImportReviewSessionForTests();
+    renderWithClient(<ImportReviewGate />);
+    expect(await screen.findByText("/from-b")).toBeTruthy();
+    expect(screen.queryByText("/from-a")).toBeNull();
+  });
+
   it("opens once for a new host and remembers the review", async () => {
     serve([host("a")], { a: ["review"] });
     renderWithClient(<ImportReviewGate />);
@@ -172,8 +254,10 @@ describe("ImportReviewGate with a requested host", () => {
 
     expect(await screen.findByText("/t")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
-    // With the request cleared, the gate falls back to unreviewed hosts.
-    expect(await screen.findByText("/o")).toBeTruthy();
+    // Closing ends this load's auto-open, so another unreviewed host waits.
+    await waitFor(() => expect(screen.queryByText(TITLE)).toBeNull());
+    await expectStaysClosed();
+    expect(skillRequestsFor("other")).toHaveLength(0);
   });
 });
 
