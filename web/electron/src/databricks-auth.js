@@ -56,9 +56,9 @@ function cookieMatchesOrigin(cookie, origin) {
 const SESSION_REJECTED = "SESSION_REJECTED";
 // Session-create was refused by the workspace IP access list (e.g. off the VPN).
 const IP_ACL_BLOCKED = "IP_ACL_BLOCKED";
-// Backoff for renewals that fail while the network is down (e.g. VPN reconnecting after wake).
-// Gives up two minutes after the first failure.
-const RENEWAL_RETRY_DELAYS_MS = [10_000, 20_000, 40_000, 50_000];
+// Retries while the network is down (e.g. VPN reconnecting after wake): every 5s for a
+// minute, then every 10s; gives up after two minutes.
+const RENEWAL_RETRY_DELAYS_MS = [...Array(12).fill(5_000), ...Array(6).fill(10_000)];
 // Session-create transport failures thrown by databricks-session.js.
 const SESSION_TRANSPORT_ERRORS = new Set([
   "Databricks session creation timed out",

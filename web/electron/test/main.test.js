@@ -292,7 +292,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { createWindow, createBrowserRegistryForWindow, loadServerUrl, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; } };";
+    "\nmodule.exports.testApi = { createWindow, createBrowserRegistryForWindow, loadServerUrl, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setPageLoadRetryDelaysMs: (delays) => { pageLoadRetryDelaysMs = delays; } };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -1500,6 +1500,102 @@ describe("HTTP error status fallback (src/main.js)", () => {
     aborted.emit("did-fail-load", -3, "ABORTED", "https://host.example/ml/omnigents/", true);
     await flush();
     assert.deepEqual(aborted.calls.loadFile, []);
+  });
+});
+
+// Right after wake, DNS/VPN may still be reconnecting: browser-auth windows
+// retry an unreachable page load in place instead of dropping to setup.
+describe("unreachable page load retry (src/main.js)", () => {
+  const workspace = "https://workspace.cloud.databricks.com/omnigent";
+  const page = `${workspace}/c/conv_1?tab=chat`;
+  const wait = (ms = 10) =>
+    new Promise((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  const failLoad = (h, code = -105, desc = "ERR_NAME_NOT_RESOLVED") =>
+    h.emit("did-fail-load", code, desc, page, true);
+
+  function browserHarness(t, delays = [1, 1]) {
+    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser" });
+    t.after(h.cleanup);
+    h.api.setPageLoadRetryDelaysMs(delays);
+    return h;
+  }
+
+  it("reloads the same URL and keeps the window pinned", async (t) => {
+    const h = browserHarness(t);
+    failLoad(h);
+    await wait();
+    assert.deepEqual(h.calls.loadURL, [[page]]);
+    assert.deepEqual(h.calls.loadFile, []);
+    assert.equal(h.api.windows.get(h.win).origin, new URL(workspace).origin);
+  });
+
+  it("falls back to the setup page with the error once retries run out", async (t) => {
+    const h = browserHarness(t);
+    /* oxlint-disable no-await-in-loop */
+    for (let i = 0; i < 3; i++) {
+      failLoad(h);
+      await wait();
+    }
+    /* oxlint-enable no-await-in-loop */
+    assert.deepEqual(h.calls.loadURL, [[page], [page]]);
+    assert.equal(h.calls.loadFile.length, 1);
+    assert.equal(h.calls.loadFile[0][0], h.api.SETUP_PAGE);
+    const params = new URLSearchParams(h.calls.loadFile[0][1].search);
+    assert.equal(params.get("error"), "ERR_NAME_NOT_RESOLVED (-105)");
+    assert.equal(params.get("url"), `${new URL(workspace).origin}/`);
+    assert.equal(h.api.windows.get(h.win).origin, null);
+  });
+
+  it("starts the schedule over after the page loads again", async (t) => {
+    const h = browserHarness(t, [1]);
+    failLoad(h);
+    await wait();
+    h.emit("did-navigate", page, 200, "OK");
+    failLoad(h);
+    await wait();
+    assert.deepEqual(h.calls.loadURL, [[page], [page]]);
+    assert.deepEqual(h.calls.loadFile, []);
+  });
+
+  it("drops a pending retry when the window is re-pinned", async (t) => {
+    const h = browserHarness(t, [20]);
+    failLoad(h);
+    h.api.pinWindow(h.win, "https://other.cloud.databricks.com");
+    await wait(40);
+    assert.deepEqual(h.calls.loadURL, []);
+  });
+
+  it("drops a pending retry when the window is unpinned", async (t) => {
+    const h = browserHarness(t, [20]);
+    failLoad(h);
+    h.api.pinWindow(h.win, null);
+    await wait(40);
+    assert.deepEqual(h.calls.loadURL, []);
+  });
+
+  it("goes straight to setup for other windows and non-network errors", async (t) => {
+    const embedded = loadNavigationHarness({ serverUrl: workspace, databricksMode: "embedded" });
+    t.after(embedded.cleanup);
+    embedded.api.setPageLoadRetryDelaysMs([1]);
+    failLoad(embedded);
+
+    const local = loadNavigationHarness({ serverUrl: "http://127.0.0.1:8000/" });
+    t.after(local.cleanup);
+    local.api.setPageLoadRetryDelaysMs([1]);
+    local.emit("did-fail-load", -105, "ERR_NAME_NOT_RESOLVED", "http://127.0.0.1:8000/", true);
+
+    const redirects = browserHarness(t, [1]);
+    failLoad(redirects, -310, "ERR_TOO_MANY_REDIRECTS");
+    await wait();
+
+    for (const h of [embedded, local, redirects]) {
+      assert.deepEqual(h.calls.loadURL, []);
+      assert.equal(h.calls.loadFile.length, 1);
+    }
+    const params = new URLSearchParams(redirects.calls.loadFile[0][1].search);
+    assert.equal(params.get("error"), "ERR_TOO_MANY_REDIRECTS (-310)");
   });
 });
 

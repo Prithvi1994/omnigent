@@ -457,8 +457,8 @@ describe("Databricks renewal during network outages", () => {
       await drain();
     }
     /* oxlint-enable no-await-in-loop */
-    assert.deepEqual(delays, [10_000, 20_000, 40_000, 50_000]);
-    assert.equal(h.calls.renew.length, 5);
+    assert.deepEqual(delays, [...Array(12).fill(5_000), ...Array(6).fill(10_000)]);
+    assert.equal(h.calls.renew.length, RENEWAL_RETRY_DELAYS_MS.length + 1);
     assert.deepEqual(h.calls.errors, []);
     assert.deepEqual(h.calls.load, [{ win, url: TARGET }]);
     // Back on the normal expiry schedule.
@@ -485,7 +485,7 @@ describe("Databricks renewal during network outages", () => {
       await drain();
     }
     /* oxlint-enable no-await-in-loop */
-    assert.equal(h.calls.renew.length, 5);
+    assert.equal(h.calls.renew.length, RENEWAL_RETRY_DELAYS_MS.length + 1);
     assert.equal(h.calls.errors.length, 1);
     assert.match(h.calls.errors[0].error.message, /ERR_INTERNET_DISCONNECTED/);
     assert.equal(h.timers.size, 0);
@@ -504,9 +504,9 @@ describe("Databricks renewal during network outages", () => {
     await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
     h.request(win, `${ORIGIN}/login.html`);
     await drain();
-    assert.equal(h.fireRetry(), 10_000);
+    assert.equal(h.fireRetry(), 5_000);
     await drain();
-    assert.equal(h.fireRetry(), 20_000);
+    assert.equal(h.fireRetry(), 5_000);
     await drain();
     assert.equal(h.calls.renew.length, 3);
     assert.deepEqual(h.calls.errors, []);
@@ -585,7 +585,7 @@ describe("Databricks renewal during network outages", () => {
     h.removeCookie();
     await drain();
     assert.equal(h.calls.renew.length, 1);
-    const retries = [...h.timers].filter(([, timer]) => timer.delay === 10_000);
+    const retries = [...h.timers].filter(([, timer]) => timer.delay === 5_000);
     assert.equal(retries.length, 2);
     online = true;
     for (const [id, timer] of retries) {

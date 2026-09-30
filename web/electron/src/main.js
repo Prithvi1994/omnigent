@@ -80,6 +80,7 @@ const {
   isDatabricksLoginUrl,
   createDatabricksAuth,
   SESSION_REJECTED,
+  RENEWAL_RETRY_DELAYS_MS,
 } = require("./databricks-auth");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
 const {
@@ -187,6 +188,7 @@ function onboardingMockSearch() {
  */
 function loadSetupPage(win, search = "") {
   abortConnectionAttempt(win);
+  cancelPageLoadRetry(win);
   // Fold in the dev-only onboarding mock (env-driven); caller params win on
   // conflict. No-op in packaged builds / when the mock is off.
   const mock = onboardingMockSearch();
@@ -316,6 +318,8 @@ let quitInstallFallbackMs = 3000;
 // Away-banner delay, `let` for the same reason: wiring tests shrink it via
 // testApi.setAwayBannerDelayMs instead of waiting out the real delay.
 let awayBannerDelayMs = AWAY_BANNER_DELAY_MS;
+// Unreachable-page retry schedule, `let` so wiring tests can shrink it via testApi.
+let pageLoadRetryDelaysMs = RENEWAL_RETRY_DELAYS_MS;
 
 /**
  * Permissions the SPA legitimately needs and we auto-grant. The dictation
@@ -635,6 +639,64 @@ function usesBrowserAuth(url) {
   return usesDatabricksBrowserAuth(url, databricksAuthMode);
 }
 
+// Chromium net errors that mean the host could not be reached at all.
+const UNREACHABLE_NET_ERRORS = new Set([
+  -7, // TIMED_OUT
+  -21, // NETWORK_CHANGED
+  -100, // CONNECTION_CLOSED
+  -101, // CONNECTION_RESET
+  -102, // CONNECTION_REFUSED
+  -104, // CONNECTION_FAILED
+  -105, // NAME_NOT_RESOLVED
+  -106, // INTERNET_DISCONNECTED
+  -109, // ADDRESS_UNREACHABLE
+  -118, // CONNECTION_TIMED_OUT
+  -137, // NAME_RESOLUTION_FAILED
+]);
+
+// Pending in-place retries of unreachable page loads: win → { attempt, timer }.
+const pageLoadRetries = new WeakMap();
+
+function cancelPageLoadRetry(win) {
+  clearTimeout(pageLoadRetries.get(win)?.timer);
+  pageLoadRetries.delete(win);
+}
+
+/**
+ * Reload a browser-auth page that failed to reach its host after the next
+ * backoff delay, keeping the window pinned. Returns false once retries run out.
+ *
+ * @param {BrowserWindow} win
+ * @param {string} origin The pinned origin the failed load belongs to.
+ * @param {string} url The failed URL (never logged: it carries conversation ids).
+ * @param {number} errorCode
+ * @returns {boolean} Whether a retry was scheduled.
+ */
+function schedulePageLoadRetry(win, origin, url, errorCode) {
+  const retry = pageLoadRetries.get(win) ?? { attempt: 0, timer: null };
+  const delayMs = pageLoadRetryDelaysMs[retry.attempt];
+  if (delayMs === undefined) {
+    cancelPageLoadRetry(win);
+    return false;
+  }
+  clearTimeout(retry.timer);
+  retry.attempt++;
+  console.log("[omnigent] databricks auth: page load retry scheduled", {
+    origin,
+    attempt: retry.attempt,
+    delayMs,
+    errorCode,
+  });
+  retry.timer = setTimeout(() => {
+    retry.timer = null;
+    if (win.isDestroyed() || pinnedOrigin(win) !== origin) return;
+    // A repeat failure re-enters did-fail-load, which schedules the next attempt.
+    win.loadURL(url).catch(() => {});
+  }, delayMs);
+  pageLoadRetries.set(win, retry);
+  return true;
+}
+
 function showDatabricksAuthRequired(win, serverUrl, error) {
   if (win.isDestroyed()) return;
   console.warn("[omnigent] databricks auth: connection requires sign-in", {
@@ -852,6 +914,7 @@ function pinWindow(win, origin, attemptToKeep) {
   if (!state) return;
   if (state.origin !== origin) {
     if (connectionAttempts.get(win) !== attemptToKeep) abortConnectionAttempt(win);
+    cancelPageLoadRetry(win);
     if (origin === null && usesBrowserAuth(state.origin)) databricksAuth?.rejectConnection(win);
     else databricksAuth?.detach(win);
     // Leaving a server: this window's unread contribution goes with it.
@@ -1517,6 +1580,13 @@ function registerNavigationFallbacks(win) {
       // not yank the window off its new destination.
       const failedOrigin = originOf(validatedURL ?? "");
       if (failedOrigin !== windows.get(win)?.origin) return;
+      // DNS/VPN may still be reconnecting right after wake: retry in place first.
+      if (
+        usesBrowserAuth(pinnedOrigin(win)) &&
+        UNREACHABLE_NET_ERRORS.has(errorCode) &&
+        schedulePageLoadRetry(win, failedOrigin, validatedURL, errorCode)
+      )
+        return;
       const params = new URLSearchParams({
         error: `${errorDescription || "load failed"} (${errorCode})`,
         // The failure often happens on a deep SPA route (e.g. /chat/…);
@@ -1535,7 +1605,11 @@ function registerNavigationFallbacks(win) {
   // main-frame-only and carries httpResponseCode; reuse the setup-page
   // fallback so the user sees the status and can change server / retry.
   win.webContents.on("did-navigate", (_event, url, httpResponseCode, httpStatusText) => {
-    if (httpResponseCode < 400) return;
+    if (httpResponseCode < 400) {
+      // The pinned server is reachable again, so a later outage gets the full schedule.
+      if (originOf(url ?? "") === windows.get(win)?.origin) cancelPageLoadRetry(win);
+      return;
+    }
     const state = windows.get(win);
     const failedOrigin = originOf(url ?? "");
     if (failedOrigin !== state?.origin) return;
@@ -1769,6 +1843,7 @@ function createWindow(targetUrl, opts = {}) {
 
   win.on("closed", () => {
     abortConnectionAttempt(win);
+    cancelPageLoadRetry(win);
     databricksAuth?.reset(win);
     // Destroy this window's embedded-browser views, else they leak webContents.
     try {
