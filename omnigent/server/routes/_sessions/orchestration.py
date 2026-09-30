@@ -8273,20 +8273,90 @@ async def _backfill_runner_items_on_reconnect(
     conversation_store: ConversationStore,
 ) -> None:
     """
-    Fetch authoritative items from the runner and backfill any missing to the store.
+    Recover a completed turn's items into the store after a mid-turn server restart.
 
-    When the server crashes mid-turn, the relay subscription may have missed SSE
-    events emitted while the server was down. On relay re-establishment, reconcile
-    the conversation store with the runner's authoritative session history to ensure
-    items from the completed turn are persisted.
+    When the server drops mid-turn, the relay subscription dies and the runner
+    stream has no replay buffer, so the assistant message and tool items emitted
+    during the outage are never persisted — they show only in the terminal view,
+    not the chat view. On relay re-establishment this reconciles the store against
+    the runner's session history (``GET /v1/sessions/{id}``), which is the harness
+    LLM-input history: ``message`` (role/content), ``function_call``
+    (call_id/name/arguments) and ``function_call_output`` (call_id/output).
 
-    Items are deduplicated by id: existing items in the store are not overwritten.
+    Deduplication is by CONTENT, not id: the live relay persists items without a
+    stable id, so their store ids never match anything on the runner. Each history
+    entry is reduced to a content signature; entries whose signature already exists
+    in the store are skipped, and the rest are appended with a deterministic
+    content-hash ``stable_id`` so repeated reconnects never insert duplicates.
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param runner_client: HTTP client pointed at the runner.
     :param conversation_store: Store for persisting items.
     :returns: None. Errors are logged but do not raise (best-effort recovery).
     """
+    import hashlib
+    import uuid
+
+    from omnigent.entities.conversation import (
+        FunctionCallData,
+        FunctionCallOutputData,
+        MessageData,
+    )
+
+    def _joined_text(content: object) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") in (
+                    "input_text",
+                    "output_text",
+                ):
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "\n".join(parts)
+        return ""
+
+    def _raw_signature(raw: dict[str, Any]) -> tuple[str, ...] | None:
+        item_type = raw.get("type")
+        if item_type == "message":
+            return ("message", str(raw.get("role", "user")), _joined_text(raw.get("content")))
+        if item_type == "function_call":
+            return (
+                "function_call",
+                str(raw.get("call_id")),
+                str(raw.get("name")),
+                str(raw.get("arguments")),
+            )
+        if item_type == "function_call_output":
+            return ("function_call_output", str(raw.get("call_id")), str(raw.get("output")))
+        return None
+
+    def _store_signature(item: ConversationItem) -> tuple[str, ...] | None:
+        data = item.data
+        if item.type == "message":
+            return (
+                "message",
+                str(getattr(data, "role", "user")),
+                _joined_text(getattr(data, "content", None)),
+            )
+        if item.type == "function_call":
+            return (
+                "function_call",
+                str(getattr(data, "call_id", None)),
+                str(getattr(data, "name", None)),
+                str(getattr(data, "arguments", None)),
+            )
+        if item.type == "function_call_output":
+            return (
+                "function_call_output",
+                str(getattr(data, "call_id", None)),
+                str(getattr(data, "output", None)),
+            )
+        return None
+
     try:
         resp = await runner_client.get(
             f"/v1/sessions/{session_id}",
@@ -8300,20 +8370,30 @@ async def _backfill_runner_items_on_reconnect(
                 extra={"session_id": session_id},
             )
             return
-        data = resp.json()
-        runner_items = data.get("items", [])
+        runner_items = resp.json().get("items", [])
         if not runner_items:
-            # No items to backfill
             return
-        # Fetch the store's existing items to deduplicate
+
+        # Page through ALL existing items — a fixed cap would miss older items
+        # and let backfill re-append them as duplicates.
+        def _list_all_items() -> list[ConversationItem]:
+            collected: list[ConversationItem] = []
+            after: str | None = None
+            while True:
+                page = conversation_store.list_items(
+                    conversation_id=session_id,
+                    limit=100,
+                    order="asc",
+                    after=after,
+                )
+                collected.extend(page.data)
+                if not page.has_more or not page.data:
+                    break
+                after = page.last_id
+            return collected
+
         try:
-            existing_page = await asyncio.to_thread(
-                conversation_store.list_items,
-                conversation_id=session_id,
-                limit=100,
-                order="desc",
-            )
-            existing_ids = {item.id for item in existing_page.data if item.id}
+            existing_items = await asyncio.to_thread(_list_all_items)
         except Exception:  # noqa: BLE001
             _logger.warning(
                 "Failed to fetch existing items for session=%s during backfill; "
@@ -8323,41 +8403,89 @@ async def _backfill_runner_items_on_reconnect(
                 extra={"session_id": session_id},
             )
             return
-        # Filter runner items that aren't already in the store
-        items_to_append = []
-        for runner_item in runner_items:
-            item_id = runner_item.get("id")
-            if item_id and item_id in existing_ids:
-                # Already persisted; skip
-                continue
-            # Convert runner item to NewConversationItem for idempotent append.
-            # Use the runner's item id as stable_id so duplicate appends are
-            # deduplicated rather than re-inserted.
-            try:
-                from omnigent.entities.conversation import NewConversationItem
 
-                # Extract fields needed for NewConversationItem; omit id/status/created_at
-                # which are store-managed. Use runner's id as stable_id for deduplication.
-                new_item = NewConversationItem(
-                    type=runner_item["type"],
-                    response_id=runner_item["response_id"],
-                    data=runner_item["data"],
-                    created_by=runner_item.get("created_by"),
-                    stable_id=item_id if isinstance(item_id, str) else None,
-                )
-                items_to_append.append(new_item)
-            except Exception:  # noqa: BLE001
+        # Content signatures already persisted, plus the agent to stamp on
+        # recovered assistant items (the validator requires a non-empty agent).
+        seen_signatures: set[tuple[str, ...]] = set()
+        recovery_agent = "assistant"
+        for item in existing_items:
+            sig = _store_signature(item)
+            if sig is not None:
+                seen_signatures.add(sig)
+            if item.type == "message":
+                agent = getattr(item.data, "agent", None)
+                if isinstance(agent, str) and agent:
+                    recovery_agent = agent
+
+        # One recovery response id groups the recovered items (e.g. a
+        # function_call with its output) into a single turn bubble.
+        recovery_response_id = f"recovery_{uuid.uuid4().hex}"
+        items_to_append: list[NewConversationItem] = []
+        for raw in runner_items:
+            sig = _raw_signature(raw)
+            if sig is None:
                 _logger.warning(
-                    "Failed to deserialize runner item for session=%s: %r",
+                    "Skipping unmappable runner history item for session=%s: type=%r",
                     session_id,
-                    runner_item,
+                    raw.get("type"),
                     extra={"session_id": session_id},
                 )
                 continue
+            if sig in seen_signatures:
+                continue
+            seen_signatures.add(sig)
+            item_type = str(raw["type"])
+            try:
+                if item_type == "message":
+                    role = str(raw.get("role", "user"))
+                    content = raw.get("content")
+                    if isinstance(content, str):
+                        content = [
+                            {
+                                "type": "output_text" if role == "assistant" else "input_text",
+                                "text": content,
+                            }
+                        ]
+                    elif not isinstance(content, list):
+                        content = []
+                    data: Any = MessageData(
+                        role=role,  # type: ignore[arg-type]
+                        content=content,
+                        agent=recovery_agent if role == "assistant" else None,
+                    )
+                elif item_type == "function_call":
+                    data = FunctionCallData(
+                        agent=recovery_agent,
+                        name=str(raw.get("name", "")),
+                        arguments=str(raw.get("arguments", "")),
+                        call_id=str(raw.get("call_id", "")),
+                    )
+                else:  # function_call_output
+                    data = FunctionCallOutputData(
+                        call_id=str(raw.get("call_id", "")),
+                        output=str(raw.get("output", "")),
+                    )
+            except Exception:  # noqa: BLE001
+                _logger.warning(
+                    "Failed to build recovery item for session=%s: %r",
+                    session_id,
+                    raw,
+                    extra={"session_id": session_id},
+                )
+                continue
+            stable_id = hashlib.sha256(f"{session_id}:{sig}".encode()).hexdigest()[:32]
+            items_to_append.append(
+                NewConversationItem(
+                    type=item_type,
+                    response_id=recovery_response_id,
+                    data=data,
+                    stable_id=stable_id,
+                )
+            )
+
         if not items_to_append:
-            # All runner items already in store
             return
-        # Append backfilled items to the store
+
         try:
             await asyncio.to_thread(
                 conversation_store.append,
