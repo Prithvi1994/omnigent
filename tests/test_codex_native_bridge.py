@@ -17,10 +17,12 @@ from omnigent.harnesses.codex_native.bridge import (
     clear_bridge_state,
     codex_home_for_bridge_dir,
     codex_mcp_config_overrides,
+    codex_terminal_interactive,
     mcp_startup_waiting_detail,
     pending_mcp_servers,
     prepare_bridge_dir,
     read_bridge_startup_error,
+    read_bridge_startup_failure,
     read_bridge_startup_timeout,
     read_bridge_state,
     read_codex_config_effort,
@@ -39,6 +41,30 @@ from omnigent.harnesses.codex_native.bridge import (
     write_codex_config_model,
     write_policy_hook_config,
 )
+
+
+def test_codex_terminal_interactive_requires_thread_and_enabled_composer(
+    bridge_dir: Path, tmp_path: Path
+) -> None:
+    """The KPI endpoint excludes pre-thread and disabled-composer frames."""
+    ready_pane = "Codex\n\n› Ask Codex to do anything\n  ? for shortcuts"
+
+    assert codex_terminal_interactive(bridge_dir, ready_pane) is False
+
+    write_bridge_state(
+        bridge_dir,
+        CodexNativeBridgeState(
+            session_id="conv_interactive",
+            socket_path="ws://127.0.0.1:1234",
+            thread_id="thread_interactive",
+            codex_home=str(tmp_path / "codex-home"),
+        ),
+    )
+
+    assert codex_terminal_interactive(bridge_dir, ready_pane) is True
+    assert codex_terminal_interactive(bridge_dir, "› Input disabled.") is False
+    assert codex_terminal_interactive(bridge_dir, "› Shutting down...") is False
+    assert codex_terminal_interactive(bridge_dir, "Codex is starting") is False
 
 
 def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Path) -> None:
@@ -550,6 +576,33 @@ def test_bridge_startup_error_round_trips_and_is_cleared(bridge_dir: Path) -> No
 
     clear_bridge_state(bridge_dir)
     assert read_bridge_startup_error(bridge_dir) is None
+
+
+def test_bridge_startup_failure_round_trips_structured_fields(bridge_dir: Path) -> None:
+    """
+    A pending-startup record carries its code, title and remediation, and a
+    message-only record (older runners) reads back with those fields unset.
+    """
+    write_bridge_startup_error(
+        bridge_dir,
+        "Codex is waiting for a sign-in in this session's terminal.",
+        code="databricks_sign_in_pending",
+        title="Codex can't start until you sign in to Databricks",
+        remediation="Open https://signin.example.com/device and enter code HQ7M-2KPD.",
+    )
+    failure = read_bridge_startup_failure(bridge_dir)
+    assert failure is not None
+    assert failure.code == "databricks_sign_in_pending"
+    assert failure.title == "Codex can't start until you sign in to Databricks"
+    assert failure.remediation is not None
+    assert "HQ7M-2KPD" in failure.remediation
+    assert read_bridge_startup_error(bridge_dir) == failure.message
+
+    write_bridge_startup_error(bridge_dir, "thread never started (TimeoutError)")
+    plain = read_bridge_startup_failure(bridge_dir)
+    assert plain is not None
+    assert plain.message == "thread never started (TimeoutError)"
+    assert (plain.code, plain.title, plain.remediation) == (None, None, None)
 
 
 def test_bridge_startup_timeout_round_trips_and_is_cleared(bridge_dir: Path) -> None:
