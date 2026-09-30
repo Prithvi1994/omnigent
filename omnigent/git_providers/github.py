@@ -60,18 +60,52 @@ def _gh_config_dir() -> str:
     return os.path.join(Path.home(), ".config", "gh")
 
 
-def _gh_signed_in_hosts() -> frozenset[str]:
-    """Return the lower-cased top-level host keys of gh's ``hosts.yml``, if readable."""
+def _read_gh_hosts(hosts_path: str) -> frozenset[str]:
+    """Return the lower-cased top-level host keys of the ``hosts.yml`` at *hosts_path*.
+
+    An unreadable file names no hosts.
+    """
     try:
-        hosts_path = os.path.join(_gh_config_dir(), "hosts.yml")
         with open(hosts_path, encoding="utf-8", errors="replace") as hosts_file:
             text = hosts_file.read()
-    except (OSError, RuntimeError):
-        # RuntimeError: Path.home() found no home directory.
+    except OSError:
         return frozenset()
     return frozenset(
         match[1].lower() for line in text.splitlines() if (match := _HOSTS_YML_KEY.match(line))
     )
+
+
+# The last parsed ``hosts.yml`` with the ``(path, mtime_ns, size)`` it was read at. A missing
+# file has ``(path, None, None)``. The tuple is replaced whole, so threads need no lock.
+_hosts_cache: tuple[tuple[str, int | None, int | None], frozenset[str]] | None = None
+
+
+def _gh_signed_in_hosts() -> frozenset[str]:
+    """Return the lower-cased top-level host keys of gh's ``hosts.yml``, if readable.
+
+    Every URL that resolves to another provider asks GitHub first, so the parsed set is
+    reused until the file's path, modification time, or size changes. A call that finds
+    the file unchanged costs one ``os.stat``. A missing or unreadable file names no hosts
+    until it appears or changes.
+    """
+    global _hosts_cache
+    try:
+        hosts_path = os.path.join(_gh_config_dir(), "hosts.yml")
+    except RuntimeError:
+        # Path.home() found no home directory.
+        return frozenset()
+    try:
+        info = os.stat(hosts_path)
+    except OSError:
+        signature: tuple[str, int | None, int | None] = (hosts_path, None, None)
+    else:
+        signature = (hosts_path, info.st_mtime_ns, info.st_size)
+    cached = _hosts_cache
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    hosts = frozenset() if signature[1] is None else _read_gh_hosts(hosts_path)
+    _hosts_cache = (signature, hosts)
+    return hosts
 
 
 class GitHubProvider:

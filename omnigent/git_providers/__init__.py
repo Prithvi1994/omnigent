@@ -95,7 +95,8 @@ class GitProvider(Protocol):
     """A standard-library-only description of one git forge.
 
     The data members are read-only so a provider can declare them as plain
-    class attributes or frozen dataclass fields.
+    class attributes or frozen dataclass fields. URL resolution logs a method
+    that raises and treats that provider as not recognizing the URL.
     """
 
     @property
@@ -157,6 +158,9 @@ def host_of(url: str) -> str | None:
 _lock = threading.RLock()
 _providers: tuple[GitProvider, ...] | None = None
 _registered: dict[str, GitProvider] = {}
+# Ids of the providers whose descriptor already raised once in this process.
+_failed_descriptors: set[str] = set()
+_failed_descriptors_lock = threading.Lock()
 
 
 def _module_paths() -> list[str]:
@@ -166,20 +170,25 @@ def _module_paths() -> list[str]:
 
 
 def _load_module_providers() -> list[GitProvider]:
-    """Import each provider module and collect its ``PROVIDER``, skipping broken modules."""
+    """Import each provider module and collect its ``PROVIDER``, skipping broken modules.
+
+    A module that raises any exception while it is imported or read is skipped, so one
+    broken module cannot hide the other providers.
+    """
     loaded: list[GitProvider] = []
     for module_path in _module_paths():
         try:
             module = importlib.import_module(module_path)
-        except ImportError:
+            descriptor = getattr(module, "PROVIDER", None)
+            descriptor_id = getattr(descriptor, "id", None)
+        except Exception:  # noqa: BLE001 — a broken provider module must not stop the others
             _logger.warning(
                 "Failed to import git provider module %s; skipping",
                 module_path,
                 exc_info=True,
             )
             continue
-        descriptor = getattr(module, "PROVIDER", None)
-        if descriptor is None or not isinstance(getattr(descriptor, "id", None), str):
+        if descriptor is None or not isinstance(descriptor_id, str):
             _logger.warning("Git provider module %s has no usable PROVIDER; skipping", module_path)
             continue
         loaded.append(descriptor)
@@ -198,7 +207,7 @@ def providers() -> tuple[GitProvider, ...]:
     """Return every provider: built-ins, env modules, then registered ones.
 
     Provider modules are imported on the first call and the result is cached
-    until :func:`reset_for_tests`.
+    until :func:`reset_for_tests`. A module that fails to import is skipped.
     """
     global _providers
     with _lock:
@@ -222,11 +231,13 @@ def register_provider(descriptor: GitProvider) -> None:
 
 
 def reset_for_tests() -> None:
-    """Forget loaded and registered providers so the next use reloads them."""
+    """Forget loaded and registered providers, and past failures, so the next use starts over."""
     global _providers
     with _lock:
         _providers = None
         _registered.clear()
+    with _failed_descriptors_lock:
+        _failed_descriptors.clear()
 
 
 def _is_module_or_parent(name: str | None, module_path: str) -> bool:
@@ -260,12 +271,57 @@ def load_facet(provider_id: str, kind: str) -> Any | None:
     return getattr(module, kind.upper(), None)
 
 
+def _log_descriptor_failure(descriptor: GitProvider, method: str) -> None:
+    """Warn with a traceback the first time a provider's descriptor raises, then use debug.
+
+    Call from an exception handler. Every URL resolution consults each descriptor, so one
+    that always raises would otherwise warn each time.
+    """
+    with _failed_descriptors_lock:
+        first = descriptor.id not in _failed_descriptors
+        _failed_descriptors.add(descriptor.id)
+    _logger.log(
+        logging.WARNING if first else logging.DEBUG,
+        "Git provider %s failed in %s; treating the URL as not recognized by it",
+        descriptor.id,
+        method,
+        exc_info=True,
+    )
+
+
+def _claims(descriptor: GitProvider, host: str, instances: Instances) -> bool:
+    """Return whether *descriptor* claims *host*; one that raises claims nothing."""
+    try:
+        return descriptor.matches_host(host, instances)
+    except Exception:  # noqa: BLE001 — a broken descriptor must not stop the other providers
+        _log_descriptor_failure(descriptor, "matches_host")
+        return False
+
+
+def _parse_remote(descriptor: GitProvider, url: str, instances: Instances) -> ParsedRemote | None:
+    """Return *descriptor*'s parse of a remote URL; one that raises parses nothing."""
+    try:
+        return descriptor.parse_remote_url(url, instances)
+    except Exception:  # noqa: BLE001 — a broken descriptor must not stop the other providers
+        _log_descriptor_failure(descriptor, "parse_remote_url")
+        return None
+
+
+def _parse_pr(descriptor: GitProvider, url: str, instances: Instances) -> ParsedPullRequest | None:
+    """Return *descriptor*'s parse of a pull request URL; one that raises parses nothing."""
+    try:
+        return descriptor.parse_pr_url(url, instances)
+    except Exception:  # noqa: BLE001 — a broken descriptor must not stop the other providers
+        _log_descriptor_failure(descriptor, "parse_pr_url")
+        return None
+
+
 def _candidates(url: str, instances: Instances) -> Iterator[GitProvider]:
     """Yield providers that claim the URL's host, then the rest, in registration order."""
     host = host_of(url)
     others: list[GitProvider] = []
     for descriptor in providers():
-        if host is not None and descriptor.matches_host(host, instances):
+        if host is not None and _claims(descriptor, host, instances):
             yield descriptor
         else:
             others.append(descriptor)
@@ -275,13 +331,15 @@ def _candidates(url: str, instances: Instances) -> Iterator[GitProvider]:
 def resolve_remote(url: str, instances: Instances | None = None) -> ParsedRemote | None:
     """Resolve a git remote URL with the first provider that parses it.
 
+    A descriptor that raises is logged and skipped, so the other providers still resolve.
+
     :param url: A git remote URL, e.g. ``"git@github.com:o/r.git"``.
     :param instances: Configured provider hosts; defaults to :class:`EnvInstances`.
     :returns: The parsed remote, or ``None`` when no provider recognizes it.
     """
     instances = EnvInstances() if instances is None else instances
     for descriptor in _candidates(url, instances):
-        parsed = descriptor.parse_remote_url(url, instances)
+        parsed = _parse_remote(descriptor, url, instances)
         if parsed is not None:
             return parsed
     return None
@@ -290,13 +348,15 @@ def resolve_remote(url: str, instances: Instances | None = None) -> ParsedRemote
 def resolve_pr_url(url: str, instances: Instances | None = None) -> ParsedPullRequest | None:
     """Resolve a pull request URL with the first provider that parses it.
 
+    A descriptor that raises is logged and skipped, so the other providers still resolve.
+
     :param url: A pull request URL, e.g. ``"https://github.com/o/r/pull/7"``.
     :param instances: Configured provider hosts; defaults to :class:`EnvInstances`.
     :returns: The parsed pull request, or ``None`` when no provider recognizes it.
     """
     instances = EnvInstances() if instances is None else instances
     for descriptor in _candidates(url, instances):
-        parsed = descriptor.parse_pr_url(url, instances)
+        parsed = _parse_pr(descriptor, url, instances)
         if parsed is not None:
             return parsed
     return None

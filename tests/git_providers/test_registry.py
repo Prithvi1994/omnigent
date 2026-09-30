@@ -363,3 +363,186 @@ def test_pull_request_ref_uses_a_registered_gitlab_descriptor() -> None:
     assert reference.repository == "g/s/p"
     assert reference.number == 7
     assert reference.url == GITLAB_MR
+
+
+# ── Broken providers ────────────────────────────────────────────────────────
+
+REGISTRY_LOGGER = "omnigent.git_providers"
+
+
+@dataclass(frozen=True, eq=False)
+class RaisingProvider:
+    """Claims ``git.example.test``; each descriptor method named in ``failing`` raises.
+
+    ``calls`` lists the methods that ran, so a test can tell that the registry consulted it.
+    ``parses`` makes ``parse_pr_url`` accept any URL, so a test can tell whether it was asked.
+    """
+
+    id: str
+    failing: frozenset[str]
+    parses: bool = False
+    calls: list[str] = field(default_factory=list)
+    display_name: str = "Raising"
+    default_hosts: tuple[str, ...] = ("git.example.test",)
+    facets: FacetModules = field(default_factory=FacetModules)
+
+    def _enter(self, method: str) -> None:
+        self.calls.append(method)
+        if method in self.failing:
+            raise KeyError(method)
+
+    def matches_host(self, host: str, instances: Instances) -> bool:
+        self._enter("matches_host")
+        return host in self.default_hosts
+
+    def parse_remote_url(self, url: str, instances: Instances) -> ParsedRemote | None:
+        self._enter("parse_remote_url")
+        return None
+
+    def parse_pr_url(self, url: str, instances: Instances) -> ParsedPullRequest | None:
+        self._enter("parse_pr_url")
+        if not self.parses:
+            return None
+        return ParsedPullRequest(
+            provider=self.id, host="git.example.test", repository="fake/repo", number=7, url=url
+        )
+
+
+def _registry_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [record for record in caplog.records if record.name == REGISTRY_LOGGER]
+
+
+def test_a_provider_module_that_raises_at_import_is_skipped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    (tmp_path / "gp_test_provider_raises.py").write_text(
+        "raise RuntimeError('provider import failed')\n", encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _provider_module(monkeypatch, "gp_test_forge_after", FakeProvider("forge_after"))
+    monkeypatch.setenv(
+        "OMNIGENT_GIT_PROVIDER_MODULES", "gp_test_provider_raises,gp_test_forge_after"
+    )
+
+    with caplog.at_level(logging.WARNING, logger=REGISTRY_LOGGER):
+        ids = _ids()
+
+    assert ids == [*BUILTIN_IDS, "forge_after"]
+    assert provider("github") is GITHUB
+    github_pr = resolve_pr_url("https://github.com/o/r/pull/7")
+    azure_pr = resolve_pr_url("https://dev.azure.com/contoso/web/_git/app/pullrequest/7")
+    assert github_pr is not None and github_pr.provider == "github"
+    assert azure_pr is not None and azure_pr.provider == "azure_devops"
+    [record] = _registry_records(caplog)
+    assert record.levelno == logging.WARNING
+    assert "gp_test_provider_raises" in record.getMessage()
+    assert record.exc_info is not None and record.exc_info[0] is RuntimeError
+
+
+def test_a_provider_module_whose_provider_attribute_raises_is_skipped(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    module = types.ModuleType("gp_test_provider_attribute_raises")
+
+    def module_getattr(name: str) -> object:
+        if name == "PROVIDER":
+            raise RuntimeError("PROVIDER is unavailable")
+        raise AttributeError(name)
+
+    module.__getattr__ = module_getattr
+    monkeypatch.setitem(sys.modules, "gp_test_provider_attribute_raises", module)
+    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_MODULES", "gp_test_provider_attribute_raises")
+
+    with caplog.at_level(logging.WARNING, logger=REGISTRY_LOGGER):
+        assert _ids() == BUILTIN_IDS
+
+    [record] = _registry_records(caplog)
+    assert "gp_test_provider_attribute_raises" in record.getMessage()
+
+
+@pytest.mark.parametrize("method", ["matches_host", "parse_pr_url"])
+def test_a_descriptor_that_raises_does_not_stop_pull_request_resolution(method: str) -> None:
+    # It would parse the URL if asked, so GitHub's answer shows that it was skipped.
+    raising = RaisingProvider("raising", frozenset({method}), parses=True)
+    register_provider(raising)
+
+    parsed = resolve_pr_url(GITHUB_SHAPED_PR)
+
+    assert method in raising.calls
+    assert parsed is not None and parsed.provider == "github"
+
+
+@pytest.mark.parametrize("method", ["matches_host", "parse_remote_url"])
+def test_a_descriptor_that_raises_does_not_stop_remote_resolution(method: str) -> None:
+    raising = RaisingProvider("raising", frozenset({method}))
+    register_provider(raising)
+    register_provider(FakeProvider("agnostic", any_host=True))
+
+    remote = resolve_remote("https://git.example.test/owner/repo.git")
+
+    assert method in raising.calls
+    assert remote is not None and remote.provider == "agnostic"
+
+
+def test_a_failing_descriptor_warns_once_then_logs_at_debug(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    register_provider(RaisingProvider("raising", frozenset({"matches_host"})))
+
+    with caplog.at_level(logging.DEBUG, logger=REGISTRY_LOGGER):
+        for _ in range(3):
+            resolve_pr_url(GITHUB_SHAPED_PR)
+
+    records = _registry_records(caplog)
+    assert [record.levelno for record in records] == [
+        logging.WARNING,
+        logging.DEBUG,
+        logging.DEBUG,
+    ]
+    assert all("Git provider raising failed in matches_host" in r.getMessage() for r in records)
+    assert records[0].exc_info is not None and records[0].exc_info[0] is KeyError
+
+
+def test_each_failing_descriptor_warns_once_across_its_methods(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    register_provider(RaisingProvider("first", frozenset({"matches_host", "parse_pr_url"})))
+    register_provider(RaisingProvider("second", frozenset({"matches_host"})))
+
+    with caplog.at_level(logging.DEBUG, logger=REGISTRY_LOGGER):
+        # No provider parses this URL, so each descriptor is asked for its claim and its parse.
+        assert resolve_pr_url("https://git.example.test/not-a-pull-request") is None
+        assert resolve_pr_url("https://git.example.test/not-a-pull-request") is None
+
+    levels = {
+        (name, method): [
+            record.levelno
+            for record in _registry_records(caplog)
+            if f"Git provider {name} failed in {method};" in record.getMessage()
+        ]
+        for name, method in [
+            ("first", "matches_host"),
+            ("first", "parse_pr_url"),
+            ("second", "matches_host"),
+        ]
+    }
+    assert levels == {
+        ("first", "matches_host"): [logging.WARNING, logging.DEBUG],
+        ("first", "parse_pr_url"): [logging.DEBUG, logging.DEBUG],
+        ("second", "matches_host"): [logging.WARNING, logging.DEBUG],
+    }
+
+
+def test_reset_for_tests_lets_the_next_failure_warn_again(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger=REGISTRY_LOGGER):
+        for _ in range(2):
+            register_provider(RaisingProvider("raising", frozenset({"matches_host"})))
+            resolve_pr_url(GITHUB_SHAPED_PR)
+            reset_for_tests()
+
+    assert [record.levelno for record in _registry_records(caplog)] == [
+        logging.WARNING,
+        logging.WARNING,
+    ]

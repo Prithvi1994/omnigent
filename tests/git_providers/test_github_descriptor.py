@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 import os
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
+from typing import IO, Any
 
 import pytest
 
+import omnigent.git_providers.github as github_module
 from omnigent.git_providers import (
     EnvInstances,
     ParsedPullRequest,
@@ -281,6 +285,168 @@ def test_unreadable_hosts_file_is_ignored(gh_config_dir: Path) -> None:
 
     assert not PROVIDER.matches_host("ghe.example.test", EnvInstances())
     assert resolve_remote(ENTERPRISE_REMOTE) is None
+
+
+# ── Hosts file cache ────────────────────────────────────────────────────────
+
+
+@dataclass
+class HostsFileIo:
+    """The stats and opens of a ``hosts.yml`` that the GitHub descriptor made."""
+
+    stats: int = 0
+    opens: int = 0
+
+
+@pytest.fixture
+def hosts_io(monkeypatch: pytest.MonkeyPatch) -> HostsFileIo:
+    """Count the ``os.stat`` and ``open`` calls on ``hosts.yml``; other paths pass through."""
+    io = HostsFileIo()
+    real_stat = os.stat
+
+    def is_hosts_file(path: object) -> bool:
+        return isinstance(path, str | os.PathLike) and os.path.basename(path) == "hosts.yml"
+
+    def counting_stat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if is_hosts_file(path):
+            io.stats += 1
+        return real_stat(path, *args, **kwargs)
+
+    def counting_open(file: Any, *args: Any, **kwargs: Any) -> IO[Any]:
+        if is_hosts_file(file):
+            io.opens += 1
+        return builtins.open(file, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", counting_stat)
+    # Shadows ``open`` in the descriptor module only.
+    monkeypatch.setattr(github_module, "open", counting_open, raising=False)
+    return io
+
+
+def test_an_unchanged_hosts_file_is_read_once_and_stat_once_per_call(
+    gh_config_dir: Path, hosts_io: HostsFileIo
+) -> None:
+    (gh_config_dir / "hosts.yml").write_text(
+        "ghe.example.test:\n    user: bob\n", encoding="utf-8"
+    )
+    hosts = ["ghe.example.test", "gitlab.com", "dev.azure.com", "GHE.Example.Test"] * 25
+
+    matched = [PROVIDER.matches_host(host, EnvInstances()) for host in hosts]
+
+    assert matched == [host.lower() == "ghe.example.test" for host in hosts]
+    assert hosts_io.opens == 1
+    assert hosts_io.stats == len(hosts)
+
+
+def test_resolving_urls_on_other_hosts_reads_the_hosts_file_once(
+    gh_config_dir: Path, hosts_io: HostsFileIo
+) -> None:
+    (gh_config_dir / "hosts.yml").write_text(
+        "ghe.example.test:\n    user: bob\n", encoding="utf-8"
+    )
+
+    for _ in range(10):
+        resolve_pr_url("https://dev.azure.com/contoso/web/_git/app/pullrequest/7")
+        resolve_remote("https://dev.azure.com/contoso/web/_git/app")
+
+    assert hosts_io.opens == 1
+
+
+@pytest.mark.parametrize(
+    ("new_content", "mtime_shift_ns", "new_host"),
+    [
+        # A longer file that keeps the old modification time.
+        pytest.param(
+            "ghe.example.test:\nother.example.test:\n", 0, "other.example.test", id="size"
+        ),
+        # A file of the same size with a later modification time.
+        pytest.param("ghf.example.test:\n", 10_000_000_000, "ghf.example.test", id="mtime"),
+    ],
+)
+def test_a_modified_hosts_file_is_read_again(
+    gh_config_dir: Path,
+    hosts_io: HostsFileIo,
+    new_content: str,
+    mtime_shift_ns: int,
+    new_host: str,
+) -> None:
+    hosts_file = gh_config_dir / "hosts.yml"
+    hosts_file.write_text("ghe.example.test:\n", encoding="utf-8")
+    written_ns = os.stat(hosts_file).st_mtime_ns
+    assert PROVIDER.matches_host("ghe.example.test", EnvInstances())
+    assert not PROVIDER.matches_host(new_host, EnvInstances())
+    assert hosts_io.opens == 1
+
+    hosts_file.write_text(new_content, encoding="utf-8")
+    os.utime(hosts_file, ns=(written_ns + mtime_shift_ns,) * 2)
+
+    assert PROVIDER.matches_host(new_host, EnvInstances())
+    assert hosts_io.opens == 2
+
+
+def test_a_hosts_file_that_appears_later_is_picked_up(
+    gh_config_dir: Path, hosts_io: HostsFileIo
+) -> None:
+    for _ in range(5):
+        assert not PROVIDER.matches_host("ghe.example.test", EnvInstances())
+    assert hosts_io.opens == 0
+
+    (gh_config_dir / "hosts.yml").write_text(
+        "ghe.example.test:\n    user: bob\n", encoding="utf-8"
+    )
+
+    assert PROVIDER.matches_host("ghe.example.test", EnvInstances())
+    assert hosts_io.opens == 1
+
+
+def test_an_unreadable_hosts_file_is_tried_once_until_it_changes(
+    gh_config_dir: Path, hosts_io: HostsFileIo
+) -> None:
+    hosts_path = gh_config_dir / "hosts.yml"
+    hosts_path.mkdir()
+    for _ in range(5):
+        assert not PROVIDER.matches_host("ghe.example.test", EnvInstances())
+    assert hosts_io.opens == 1
+
+    hosts_path.rmdir()
+    hosts_path.write_text("ghe.example.test:\n    user: bob\n", encoding="utf-8")
+
+    assert PROVIDER.matches_host("ghe.example.test", EnvInstances())
+    assert hosts_io.opens == 2
+
+
+def test_a_cached_hosts_file_does_not_answer_for_another_config_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("GH_CONFIG_DIR")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    windows_host, home_host = "win.example.test", "hom.example.test"
+    for config_dir, host in (
+        (tmp_path / "appdata" / "GitHub CLI", windows_host),
+        (tmp_path / "home" / ".config" / "gh", home_host),
+    ):
+        config_dir.mkdir(parents=True)
+        hosts_file = config_dir / "hosts.yml"
+        hosts_file.write_text(f"{host}:\n    user: bob\n", encoding="utf-8")
+        # Same size and modification time, so only the path tells the two files apart.
+        os.utime(hosts_file, ns=(1_700_000_000_000_000_000,) * 2)
+
+    def matches(platform: str) -> tuple[bool, bool]:
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "name", platform)
+            return (
+                PROVIDER.matches_host(windows_host, EnvInstances()),
+                PROVIDER.matches_host(home_host, EnvInstances()),
+            )
+
+    assert [matches(platform) for platform in ("nt", "posix", "posix", "nt")] == [
+        (True, False),
+        (False, True),
+        (False, True),
+        (True, False),
+    ]
 
 
 # ── Session PR registry ─────────────────────────────────────────────────────

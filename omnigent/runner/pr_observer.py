@@ -9,6 +9,9 @@ from __future__ import annotations
 import logging
 import re
 import shlex
+import threading
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 from omnigent.git_providers import load_facet, providers
 from omnigent.policies.builtins._shell import (
@@ -17,11 +20,14 @@ from omnigent.policies.builtins._shell import (
     real_invocation_tokens,
     unwrap_shell_command,
 )
-from omnigent.runner.git_providers import PullRequestFacet, ShellSegment
+from omnigent.runner.git_providers import PullRequestFacet, ShellPrOp, ShellSegment
 from omnigent.runner.git_providers.tool_output import output_text, pr_reference, result_objects
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, observation_key
 
 _logger = logging.getLogger(__name__)
+# Ids of the providers that already failed once in this process.
+_failed_providers: set[str] = set()
+_failed_providers_lock = threading.Lock()
 
 
 def _failed(result: object) -> bool:
@@ -108,20 +114,80 @@ def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
     return found
 
 
-def _facets() -> list[PullRequestFacet]:
-    """Load each provider's pull request facet, in registration order."""
-    facets: list[PullRequestFacet] = []
+def _log_provider_failure(provider_id: str, step: str) -> None:
+    """Warn with a traceback the first time a provider fails in this process, then use debug.
+
+    Call from an exception handler. The observer runs after every tool call, so a provider
+    that always fails would otherwise log a warning each time.
+    """
+    with _failed_providers_lock:
+        first = provider_id not in _failed_providers
+        _failed_providers.add(provider_id)
+    _logger.log(
+        logging.WARNING if first else logging.DEBUG,
+        "Git provider %s failed in %s; ignoring its answer",
+        provider_id,
+        step,
+        exc_info=True,
+    )
+
+
+@dataclass(frozen=True)
+class _ProviderFacet:
+    """A provider's pull request facet whose observer hooks never raise.
+
+    A hook that raises is logged and answers as if its provider recognized nothing,
+    so the other providers' answers still count.
+    """
+
+    provider_id: str
+    facet: PullRequestFacet
+
+    def shell_pr_operations(self, segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
+        """Return the provider's ops for *segments*, or none when it fails."""
+        try:
+            return list(self.facet.shell_pr_operations(segments))
+        except Exception:  # noqa: BLE001 — one provider's bug must not hide the others' PRs
+            _log_provider_failure(self.provider_id, "shell_pr_operations")
+            return []
+
+    def pr_from_object(self, obj: Mapping[str, object]) -> PullRequestRef | None:
+        """Return the PR the provider reads from *obj*, or ``None`` when it fails."""
+        try:
+            return self.facet.pr_from_object(obj)
+        except Exception:  # noqa: BLE001 — one provider's bug must not hide the others' PRs
+            _log_provider_failure(self.provider_id, "pr_from_object")
+            return None
+
+    def mcp_prs(
+        self, tool_name: str, arguments: dict[str, object], result: object
+    ) -> tuple[list[PullRequestRef], bool] | None:
+        """Return the provider's answer for an MCP tool call, or ``None`` when it fails."""
+        try:
+            answer = self.facet.mcp_prs(tool_name, arguments, result)
+            if answer is None:
+                return None
+            references, created = answer
+            return list(references), created
+        except Exception:  # noqa: BLE001 — one provider's bug must not hide the others' PRs
+            _log_provider_failure(self.provider_id, "mcp_prs")
+            return None
+
+
+def _facets() -> list[_ProviderFacet]:
+    """Load each provider's pull request facet, in registration order.
+
+    A facet module that fails to import for any reason is skipped.
+    """
+    facets: list[_ProviderFacet] = []
     for descriptor in providers():
         try:
             facet = load_facet(descriptor.id, "pull_requests")
-        except ImportError:
-            # A broken provider module must not stop the other providers' observation.
-            _logger.warning(
-                "Failed to load the %s pull request facet", descriptor.id, exc_info=True
-            )
+        except Exception:  # noqa: BLE001 — a broken provider must not stop the others
+            _log_provider_failure(descriptor.id, "load_facet")
             continue
         if facet is not None:
-            facets.append(facet)
+            facets.append(_ProviderFacet(descriptor.id, facet))
     return facets
 
 
@@ -138,7 +204,7 @@ def _created_pr_metadata(result: object) -> PullRequestRef | None:
     return pr_reference(pr.get("url"))
 
 
-def _object_pr(obj: dict[str, object], facets: list[PullRequestFacet]) -> PullRequestRef | None:
+def _object_pr(obj: dict[str, object], facets: list[_ProviderFacet]) -> PullRequestRef | None:
     """Read the generic URL fields of an output object, then provider-specific fields."""
     if ref := pr_reference(obj.get("html_url", obj.get("url"))):
         return ref
@@ -219,7 +285,7 @@ def observe_tool_completion(
             source=source,
             observation_id=observation_key(source, call_id, [tool_name, arguments, result]),
         )
-    except (OSError, ValueError, TypeError, TimeoutError):
+    except Exception:  # noqa: BLE001 — the observer must never change a tool call's result
         _logger.warning(
             "Failed to record session PRs", extra={"session_id": session_id}, exc_info=True
         )
