@@ -5,12 +5,14 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
 import type {
+  PullRequest,
   PullRequestAssociation,
   PullRequestAuth,
   PullRequestChangedFile,
+  PullRequestComment,
   PullRequestDiffResponse,
   PullRequestInfo,
 } from "@/hooks/usePullRequests";
@@ -121,6 +123,23 @@ function renderChanges() {
   const r = renderPanel();
   fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
   return r;
+}
+
+/** Silences console.error for the current test and returns a reader for the React
+ *  duplicate- and missing-key warnings logged so far. */
+function watchKeyWarnings(): () => string[] {
+  const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+  onTestFinished(() => errors.mockRestore());
+  return () =>
+    errors.mock.calls
+      .map(([message]) => String(message))
+      .filter((message) => /same key|unique "key"/.test(message));
+}
+
+/** The markdown body of each comment card, in rendered order. The fixtures used
+ *  with it have no PR description, so every markdown block is a comment. */
+function commentBodies(): (string | null)[] {
+  return screen.getAllByTestId("markdown").map((el) => el.textContent);
 }
 
 let scrollIntoView: ReturnType<typeof vi.fn>;
@@ -252,6 +271,31 @@ describe("PullRequestPanel", () => {
     expect(screen.getByText("Comments (1)")).toBeInTheDocument();
     expect(screen.getByText("octocat")).toBeInTheDocument();
     expect(screen.getByText("Looks good to me!")).toBeInTheDocument();
+  });
+
+  it("renders GitHub comments in order, including ones without a URL or time", () => {
+    const keyWarnings = watchKeyWarnings();
+    state.info!.data!.pr!.comments = [
+      {
+        author: "octocat",
+        body: "First",
+        created_at: "2026-09-05T07:32:02Z",
+        url: "https://example.com/pr/6000#c1",
+      },
+      {
+        author: "octocat",
+        body: "Second",
+        created_at: "2026-09-05T07:32:02Z",
+        url: "https://example.com/pr/6000#c2",
+      },
+      { author: null, body: "Third", created_at: null, url: null },
+      { author: null, body: "Fourth", created_at: null, url: null },
+    ];
+    renderPanel();
+
+    expect(screen.getByText("Comments (4)")).toBeInTheDocument();
+    expect(commentBodies()).toEqual(["First", "Second", "Third", "Fourth"]);
+    expect(keyWarnings()).toEqual([]);
   });
 
   it("shows Summary empty states when the PR has no body or comments", () => {
@@ -901,6 +945,121 @@ describe("PullRequestPanel", () => {
         "href",
         prUrl,
       );
+    });
+
+    describe("comment and check lists", () => {
+      // Every comment in one discussion thread carries the thread's URL.
+      const threadUrl = `${prUrl}?discussionId=3`;
+      const comment = (over: Partial<PullRequestComment>): PullRequestComment => ({
+        author: "Ada Lovelace",
+        author_id: "u-ada",
+        body: "",
+        created_at: "2026-09-05T07:32:02.100Z",
+        url: threadUrl,
+        ...over,
+      });
+      const withPr = (over: Partial<PullRequest>): PullRequestInfo =>
+        ado({ pr: { ...ado().pr!, ...over } });
+
+      it("renders every comment of a thread whose replies share one URL", () => {
+        const keyWarnings = watchKeyWarnings();
+        state.info!.data = withPr({
+          comments: [
+            comment({ body: "Why not reuse the helper?" }),
+            comment({
+              author: "Grace Hopper",
+              author_id: "u-grace",
+              body: "It predates the helper.",
+              created_at: "2026-09-05T08:01:40.250Z",
+            }),
+            comment({ body: "Fair, resolving this.", created_at: "2026-09-05T08:15:09.000Z" }),
+          ],
+        });
+        renderPanel();
+
+        expect(screen.getByText("Comments (3)")).toBeInTheDocument();
+        expect(commentBodies()).toEqual([
+          "Why not reuse the helper?",
+          "It predates the helper.",
+          "Fair, resolving this.",
+        ]);
+        const links = screen.getAllByRole("link", { name: "Open comment on Azure DevOps" });
+        expect(links.map((link) => link.getAttribute("href"))).toEqual([
+          threadUrl,
+          threadUrl,
+          threadUrl,
+        ]);
+        expect(keyWarnings()).toEqual([]);
+      });
+
+      it("keeps comments apart when they match on URL, time, and author", () => {
+        const keyWarnings = watchKeyWarnings();
+        state.info!.data = withPr({
+          comments: [comment({ body: "First of two" }), comment({ body: "Second of two" })],
+        });
+        renderPanel();
+
+        expect(commentBodies()).toEqual(["First of two", "Second of two"]);
+        expect(keyWarnings()).toEqual([]);
+      });
+
+      it("keeps an unchanged comment card mounted when a poll adds a reply above it", () => {
+        const keyWarnings = watchKeyWarnings();
+        const first = comment({
+          body: "Thread one",
+          created_at: "2026-09-05T07:00:00.000Z",
+          url: `${prUrl}?discussionId=1`,
+        });
+        const second = comment({
+          author: "Grace Hopper",
+          author_id: "u-grace",
+          body: "Thread two",
+          created_at: "2026-09-05T08:00:00.000Z",
+          url: `${prUrl}?discussionId=2`,
+        });
+        const reply = comment({
+          body: "Reply in thread one",
+          created_at: "2026-09-05T09:00:00.000Z",
+          url: first.url,
+        });
+        state.info!.data = withPr({ comments: [first, second] });
+        const { rerender } = renderPanel();
+        const card = screen.getByText("Thread two").closest("li");
+
+        // The next poll returns a reply to the first thread, ahead of the second.
+        state.info = { ...state.info!, data: withPr({ comments: [first, reply, second] }) };
+        rerender(<PullRequestPanel conversationId="conv_1" />);
+
+        expect(commentBodies()).toEqual(["Thread one", "Reply in thread one", "Thread two"]);
+        expect(screen.getByText("Thread two").closest("li")).toBe(card);
+        expect(keyWarnings()).toEqual([]);
+      });
+
+      it("lists every check in the hover card when checks share a build URL or a name", async () => {
+        const user = userEvent.setup();
+        const keyWarnings = watchKeyWarnings();
+        const buildUrl = "https://dev.azure.com/contoso/web/_build/results?buildId=41";
+        state.info!.data = withPr({
+          checks: {
+            passing: 4,
+            failing: 0,
+            pending: 0,
+            total: 4,
+            runs: [
+              { name: "Build", bucket: "passing", url: buildUrl },
+              { name: "Lint", bucket: "passing", url: buildUrl },
+              { name: "Deploy", bucket: "passing", url: null },
+              { name: "Deploy", bucket: "passing", url: null },
+            ],
+          },
+        });
+        renderPanel();
+
+        await user.hover(screen.getByRole("button", { name: /4\s*passed/ }));
+        const rows = await screen.findAllByRole("listitem");
+        expect(rows.map((row) => row.textContent)).toEqual(["Build", "Lint", "Deploy", "Deploy"]);
+        expect(keyWarnings()).toEqual([]);
+      });
     });
   });
 

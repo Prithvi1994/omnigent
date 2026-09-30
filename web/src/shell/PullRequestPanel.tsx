@@ -479,6 +479,18 @@ function PullRequestFileSection({
   );
 }
 
+/** React keys for items that can match on every identifying field (ADO replies share their
+ *  thread's URL): the fields plus a repeat count stay unique and keep their value across polls. */
+function listKeys<T>(items: readonly T[], identity: (item: T) => readonly unknown[]): string[] {
+  const seen = new Map<string, number>();
+  return items.map((item) => {
+    const base = JSON.stringify(identity(item));
+    const repeat = seen.get(base) ?? 0;
+    seen.set(base, repeat + 1);
+    return `${base}#${repeat}`;
+  });
+}
+
 /**
  * A CI-status pill (e.g. "✓ 66 passed"); hovering it reveals the individual job
  * names in that bucket, each with the status icon and a divider between rows.
@@ -502,6 +514,7 @@ function CheckPill({
 }) {
   if (count === 0) return null;
   const names = runs.filter((r) => r.name);
+  const keys = listKeys(names, (r) => [r.url, r.name]);
   return (
     <HoverCard openDelay={100} closeDelay={100}>
       <HoverCardTrigger asChild>
@@ -525,8 +538,8 @@ function CheckPill({
           <p className="px-1.5 py-1 text-muted-foreground">No job details.</p>
         ) : (
           <ul className="divide-y divide-border">
-            {names.map((r) => (
-              <li key={r.url ?? r.name} className="flex items-center gap-2 px-1.5 py-1.5">
+            {names.map((r, i) => (
+              <li key={keys[i]} className="flex items-center gap-2 px-1.5 py-1.5">
                 <span className="shrink-0">{icon}</span>
                 <span className="truncate" title={r.name}>
                   {r.name}
@@ -603,6 +616,7 @@ function PullRequestSummaryTab({
   comments: PullRequestComment[];
   providerLabel: string;
 }) {
+  const commentKeys = listKeys(comments, (c) => [c.url, c.created_at, c.author_id ?? c.author]);
   return (
     // Extra bottom padding so the last comment can scroll clear of the very
     // bottom edge, where it's awkward to read.
@@ -661,7 +675,7 @@ function PullRequestSummaryTab({
           <ul className="space-y-2">
             {comments.map((c, i) => (
               <PullRequestCommentCard
-                key={c.url ?? `${c.author}-${i}`}
+                key={commentKeys[i]}
                 comment={c}
                 providerLabel={providerLabel}
               />
