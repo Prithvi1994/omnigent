@@ -22,6 +22,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const { createRequire } = require("node:module");
 const path = require("node:path");
+const { pathToFileURL } = require("node:url");
 const vm = require("node:vm");
 const { EventEmitter } = require("node:events");
 
@@ -41,6 +42,7 @@ function loadNavigationHarness({
   ensureSession = async (_ses, origin) => origin,
   expandWorkspace = async (url) => url,
   realBrowserRegistry = false,
+  loadURL = async () => {},
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -105,6 +107,7 @@ function loadNavigationHarness({
     getURL: () => currentUrl,
     setWindowOpenHandler: () => {},
   };
+  const winListeners = new Map();
   const win = {
     webContents,
     contentView: { addChildView: () => {}, removeChildView: () => {} },
@@ -114,14 +117,21 @@ function loadNavigationHarness({
     getPosition: () => [0, 0],
     setPosition: () => {},
     maximize: () => {},
-    on: () => {},
+    on: (eventName, listener) => {
+      if (!winListeners.has(eventName)) winListeners.set(eventName, []);
+      winListeners.get(eventName).push(listener);
+    },
     loadFile: (...args) => {
       calls.loadFile.push(args);
+      const fileUrl = pathToFileURL(args[0]);
+      if (args[1]?.search) fileUrl.search = args[1].search;
+      currentUrl = fileUrl.href;
       return Promise.resolve();
     },
     loadURL: (...args) => {
       calls.loadURL.push(args);
-      return Promise.resolve();
+      currentUrl = args[0];
+      return loadURL(...args);
     },
   };
 
@@ -292,7 +302,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { createWindow, createBrowserRegistryForWindow, loadServerUrl, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setPageLoadRetryDelaysMs: (delays) => { pageLoadRetryDelaysMs = delays; } };";
+    "\nmodule.exports.testApi = { createWindow, createBrowserRegistryForWindow, loadServerUrl, pinWindow, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, disposeAuth: () => { databricksAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; } };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -341,6 +351,9 @@ function loadNavigationHarness({
     settingsPath: path.join(userData, "settings.json"),
     pickers,
     emit: (eventName, ...args) => webContents.emit(eventName, ...args),
+    emitWindow: (eventName) => {
+      for (const listener of winListeners.get(eventName) ?? []) listener();
+    },
     hasListener: (eventName) => listeners.has(eventName),
     setUrl: (url) => {
       currentUrl = url;
@@ -1503,99 +1516,239 @@ describe("HTTP error status fallback (src/main.js)", () => {
   });
 });
 
-// Right after wake, DNS/VPN may still be reconnecting: browser-auth windows
-// retry an unreachable page load in place instead of dropping to setup.
-describe("unreachable page load retry (src/main.js)", () => {
+// While a Databricks workspace is unreachable (e.g. VPN reconnecting after wake),
+// browser-auth windows show setup and keep reconnecting silently in the background.
+describe("Databricks reconnect from setup (src/main.js)", () => {
   const workspace = "https://workspace.cloud.databricks.com/omnigent";
+  const origin = new URL(workspace).origin;
   const page = `${workspace}/c/conv_1?tab=chat`;
+  const retrying = " Retrying automatically…";
+  const signInFailed = "Couldn't sign in to Databricks. Please try again.";
+  const offline = () => new TypeError("fetch failed");
   const wait = (ms = 10) =>
     new Promise((resolve) => {
       setTimeout(resolve, ms);
     });
-  const failLoad = (h, code = -105, desc = "ERR_NAME_NOT_RESOLVED") =>
-    h.emit("did-fail-load", code, desc, page, true);
+  const failLoad = (h, code = -105, desc = "ERR_NAME_NOT_RESOLVED", url = page) =>
+    h.emit("did-fail-load", code, desc, url, true);
+  const setupParams = (h, index = -1) =>
+    Object.fromEntries(new URLSearchParams(h.calls.loadFile.at(index)[1].search));
+  const setupEvent = (h) => ({
+    sender: h.webContents,
+    senderFrame: { url: `file://${h.api.SETUP_PAGE}` },
+  });
 
-  function browserHarness(t, delays = [1, 1]) {
-    const h = loadNavigationHarness({ serverUrl: workspace, databricksMode: "browser" });
+  function browserHarness(t, delays, options = {}) {
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      ...options,
+    });
     t.after(h.cleanup);
-    h.api.setPageLoadRetryDelaysMs(delays);
+    h.api.setReconnectDelaysMs(delays);
     return h;
   }
 
-  it("reloads the same URL and keeps the window pinned", async (t) => {
-    const h = browserHarness(t);
-    failLoad(h);
-    await wait();
-    assert.deepEqual(h.calls.loadURL, [[page]]);
-    assert.deepEqual(h.calls.loadFile, []);
-    assert.equal(h.api.windows.get(h.win).origin, new URL(workspace).origin);
-  });
-
-  it("falls back to the setup page with the error once retries run out", async (t) => {
-    const h = browserHarness(t);
-    /* oxlint-disable no-await-in-loop */
-    for (let i = 0; i < 3; i++) {
-      failLoad(h);
-      await wait();
-    }
-    /* oxlint-enable no-await-in-loop */
-    assert.deepEqual(h.calls.loadURL, [[page], [page]]);
-    assert.equal(h.calls.loadFile.length, 1);
-    assert.equal(h.calls.loadFile[0][0], h.api.SETUP_PAGE);
-    const params = new URLSearchParams(h.calls.loadFile[0][1].search);
-    assert.equal(params.get("error"), "ERR_NAME_NOT_RESOLVED (-105)");
-    assert.equal(params.get("url"), `${new URL(workspace).origin}/`);
-    assert.equal(h.api.windows.get(h.win).origin, null);
-  });
-
-  it("starts the schedule over after the page loads again", async (t) => {
-    const h = browserHarness(t, [1]);
-    failLoad(h);
-    await wait();
+  it("reconnects silently after a transient renewal failure and reopens the page", async (t) => {
+    let renewals = 0;
+    const h = browserHarness(t, [25], {
+      ensureSession: async (_ses, sessionOrigin) => {
+        if (renewals++ === 1) throw offline();
+        return sessionOrigin;
+      },
+    });
+    await h.api.loadServerUrl(h.win, workspace);
     h.emit("did-navigate", page, 200, "OK");
+    const session = h.calls.auth[0][0];
+    const dbauth = { name: "DBAUTH", domain: new URL(workspace).hostname, hostOnly: true };
+    session.cookies.emit("changed", {}, dbauth, "expired", true);
+    await wait(10);
+    assert.equal(h.api.windows.get(h.win).origin, null);
+    assert.deepEqual(setupParams(h), {
+      error: signInFailed + retrying,
+      url: workspace,
+      reconnect: "1",
+    });
+    await wait(50);
+    assert.equal(h.calls.auth.length, 3);
+    assert.equal(h.calls.auth[2][2].interactive, false);
+    assert.deepEqual(h.calls.loadURL.at(-1), [page]);
+    assert.equal(h.api.windows.get(h.win).origin, origin);
+    assert.equal(h.calls.loadFile.length, 1);
+  });
+
+  it("reconnects silently after an unreachable page load and reopens the page", async (t) => {
+    const h = browserHarness(t, [25]);
     failLoad(h);
-    await wait();
+    await wait(10);
+    assert.deepEqual(setupParams(h), {
+      error: `ERR_NAME_NOT_RESOLVED (-105)${retrying}`,
+      url: `${origin}/`,
+      reconnect: "1",
+    });
+    assert.equal(h.api.windows.get(h.win).origin, null);
+    await wait(50);
+    assert.equal(h.calls.auth.length, 1);
+    assert.equal(h.calls.auth[0][2].interactive, false);
+    assert.deepEqual(h.calls.loadURL, [[page]]);
+    assert.equal(h.api.windows.get(h.win).origin, origin);
+  });
+
+  it("advances on repeated unreachable loads and asks for Connect once retries run out", async (t) => {
+    let h;
+    h = browserHarness(t, [25, 25], {
+      loadURL: async (url) => {
+        failLoad(h, -105, "ERR_NAME_NOT_RESOLVED", url);
+        throw new Error("ERR_NAME_NOT_RESOLVED (-105) loading url");
+      },
+    });
+    failLoad(h);
+    await wait(100);
     assert.deepEqual(h.calls.loadURL, [[page], [page]]);
-    assert.deepEqual(h.calls.loadFile, []);
+    assert.equal(h.calls.loadFile.length, 3);
+    assert.equal(setupParams(h, 1).reconnect, "1");
+    assert.deepEqual(setupParams(h), { error: "ERR_NAME_NOT_RESOLVED (-105)", url: `${origin}/` });
+    await wait(20);
+    assert.equal(h.calls.loadURL.length, 2);
   });
 
-  it("drops a pending retry when the window is re-pinned", async (t) => {
-    const h = browserHarness(t, [20]);
-    failLoad(h);
-    h.api.pinWindow(h.win, "https://other.cloud.databricks.com");
-    await wait(40);
+  it("keeps the setup page between failed silent attempts, then shows the final message", async (t) => {
+    const h = browserHarness(t, [25, 25], {
+      ensureSession: async () => {
+        throw offline();
+      },
+    });
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace, "/c/conv_1"));
+    await wait(100);
+    assert.equal(h.calls.auth.length, 3);
+    assert.ok(h.calls.auth.every((call) => call[2].interactive === false));
+    assert.equal(h.calls.loadFile.length, 2);
+    assert.deepEqual(setupParams(h, 0), {
+      error: signInFailed + retrying,
+      url: workspace,
+      reconnect: "1",
+    });
+    assert.deepEqual(setupParams(h), { error: signInFailed, url: workspace });
     assert.deepEqual(h.calls.loadURL, []);
   });
 
-  it("drops a pending retry when the window is unpinned", async (t) => {
-    const h = browserHarness(t, [20]);
+  it("returns a failed deep link to its conversation", async (t) => {
+    let first = true;
+    const h = browserHarness(t, [25], {
+      ensureSession: async (_ses, sessionOrigin) => {
+        if (first) {
+          first = false;
+          throw offline();
+        }
+        return sessionOrigin;
+      },
+    });
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace, "/c/conv_1"));
+    await wait(50);
+    assert.deepEqual(h.calls.loadURL, [[`${workspace}/c/conv_1`]]);
+  });
+
+  it("starts a fresh loop when Connect fails transiently and cancels it when Connect is clicked", async (t) => {
+    let online = false;
+    const h = browserHarness(t, [40], {
+      ensureSession: async (_ses, sessionOrigin) => {
+        if (!online) throw offline();
+        return sessionOrigin;
+      },
+    });
+    h.api.registerIpc();
+    await assert.rejects(h.ipc.get("omnigent:set-server-url")(setupEvent(h), workspace));
+    await wait(10);
+    assert.equal(setupParams(h).reconnect, "1");
+    online = true;
+    await h.ipc.get("omnigent:set-server-url")(setupEvent(h), workspace);
+    await wait(70);
+    assert.deepEqual(
+      h.calls.auth.map((call) => call[2].interactive),
+      [true, true],
+    );
+    assert.deepEqual(h.calls.loadURL, [[workspace]]);
+  });
+
+  it("reconnects after a transient Connect failure", async (t) => {
+    const h = browserHarness(t, [25], {
+      ensureSession: async (_ses, sessionOrigin, options) => {
+        if (options.interactive) throw offline();
+        return sessionOrigin;
+      },
+    });
+    h.api.registerIpc();
+    await assert.rejects(h.ipc.get("omnigent:set-server-url")(setupEvent(h), workspace));
+    await wait(50);
+    assert.deepEqual(
+      h.calls.auth.map((call) => call[2].interactive),
+      [true, false],
+    );
+    assert.deepEqual(h.calls.loadURL, [[workspace]]);
+  });
+
+  it("stops when the window leaves the retrying setup page", async (t) => {
+    const h = browserHarness(t, [40]);
     failLoad(h);
-    h.api.pinWindow(h.win, null);
-    await wait(40);
+    await wait(10);
+    h.setUrl(`file://${h.api.SETUP_PAGE}?url=${encodeURIComponent(workspace)}`);
+    await wait(70);
+    assert.deepEqual(h.calls.auth, []);
     assert.deepEqual(h.calls.loadURL, []);
+  });
+
+  it("stops when the window closes", async (t) => {
+    const h = browserHarness(t, [40]);
+    h.api.createWindow(workspace);
+    await wait(10);
+    failLoad(h, -105, "ERR_NAME_NOT_RESOLVED", workspace);
+    await wait(10);
+    h.emitWindow("closed");
+    await wait(70);
+    assert.equal(h.calls.auth.length, 1);
+    assert.deepEqual(h.calls.loadURL, [[workspace]]);
+  });
+
+  it("does not retry credential failures", async (t) => {
+    const h = browserHarness(t, [25], {
+      ensureSession: async () => {
+        throw Object.assign(new Error("expired with no refresh token"), {
+          errorCode: "NO_REFRESH_TOKEN",
+        });
+      },
+    });
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace));
+    await wait(50);
+    assert.equal(h.calls.auth.length, 1);
+    assert.deepEqual(setupParams(h), {
+      error: "Session expired. Connect to sign in again.",
+      url: workspace,
+    });
   });
 
   it("goes straight to setup for other windows and non-network errors", async (t) => {
     const embedded = loadNavigationHarness({ serverUrl: workspace, databricksMode: "embedded" });
     t.after(embedded.cleanup);
-    embedded.api.setPageLoadRetryDelaysMs([1]);
+    embedded.api.setReconnectDelaysMs([1]);
     failLoad(embedded);
 
     const local = loadNavigationHarness({ serverUrl: "http://127.0.0.1:8000/" });
     t.after(local.cleanup);
-    local.api.setPageLoadRetryDelaysMs([1]);
+    local.api.setReconnectDelaysMs([1]);
     local.emit("did-fail-load", -105, "ERR_NAME_NOT_RESOLVED", "http://127.0.0.1:8000/", true);
 
     const redirects = browserHarness(t, [1]);
     failLoad(redirects, -310, "ERR_TOO_MANY_REDIRECTS");
-    await wait();
+    await wait(20);
 
     for (const h of [embedded, local, redirects]) {
       assert.deepEqual(h.calls.loadURL, []);
+      assert.deepEqual(h.calls.auth, []);
       assert.equal(h.calls.loadFile.length, 1);
+      assert.equal(setupParams(h).reconnect, undefined);
     }
-    const params = new URLSearchParams(redirects.calls.loadFile[0][1].search);
-    assert.equal(params.get("error"), "ERR_TOO_MANY_REDIRECTS (-310)");
+    assert.equal(setupParams(embedded).error, "ERR_NAME_NOT_RESOLVED (-105)");
+    assert.equal(setupParams(redirects).error, "ERR_TOO_MANY_REDIRECTS (-310)");
   });
 });
 

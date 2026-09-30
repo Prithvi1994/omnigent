@@ -9,7 +9,6 @@ const {
   usesDatabricksBrowserAuth,
   isDatabricksLoginUrl,
   isTransientRenewalError,
-  RENEWAL_RETRY_DELAYS_MS,
   IP_ACL_BLOCKED,
   createDatabricksAuth,
 } = require("../src/databricks-auth");
@@ -52,7 +51,7 @@ function harness({ mode = "browser", ensureSession, loadRejection } = {}) {
     getOrigin: (win) =>
       usesDatabricksBrowserAuth(windows.get(win), mode) ? windows.get(win) : null,
     isSetupUrl: (url) => url === "file:///setup/index.html",
-    onAuthRequired: (win, url, error) => calls.errors.push({ win, url, error }),
+    onAuthRequired: (win, url, error, details) => calls.errors.push({ win, url, error, details }),
     ensureSession: async (...args) => {
       calls.renew.push(args);
       if (ensureSession) return ensureSession(...args);
@@ -81,15 +80,6 @@ function harness({ mode = "browser", ensureSession, loadRejection } = {}) {
     windows.set(win, ORIGIN);
     return win;
   }
-  // Fire the single armed renewal-retry timer and return its delay.
-  function fireRetry() {
-    const retries = [...timers].filter(([, t]) => RENEWAL_RETRY_DELAYS_MS.includes(t.delay));
-    assert.equal(retries.length, 1);
-    const [id, { fn, delay }] = retries[0];
-    timers.delete(id);
-    fn();
-    return delay;
-  }
   function request(win, url, resourceType = "mainFrame") {
     let result;
     guard({ webContentsId: win.webContents.id, url, resourceType }, (value) => {
@@ -103,7 +93,6 @@ function harness({ mode = "browser", ensureSession, loadRejection } = {}) {
     windows,
     calls,
     timers,
-    fireRetry,
     request,
     session,
     removeCookie(cause = "expired") {
@@ -435,83 +424,30 @@ const ipAclBlocked = () =>
   });
 
 describe("Databricks renewal during network outages", () => {
-  it("retries a transient failure on the backoff schedule, then reloads the page", async (t) => {
-    let failures = RENEWAL_RETRY_DELAYS_MS.length;
-    const h = harness({
-      ensureSession: async () => {
-        if (failures-- > 0) throw offline();
-        return ORIGIN;
-      },
-    });
-    t.after(() => h.auth.dispose());
-    const win = h.window();
-    await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
-    h.request(win, `${ORIGIN}/login.html`);
-    await drain();
-    const delays = [];
-    // Each retry must settle before the next timer is armed.
-    /* oxlint-disable no-await-in-loop */
-    for (let i = 0; i < RENEWAL_RETRY_DELAYS_MS.length; i++) {
+  for (const [label, failure] of [
+    ["an unreachable workspace", offline],
+    ["a session-create refused by the IP access list", ipAclBlocked],
+  ]) {
+    it(`hands ${label} to the shell right away with the page to return to`, async (t) => {
+      const error = failure();
+      const h = harness({ ensureSession: () => Promise.reject(error) });
+      t.after(() => h.auth.dispose());
+      const win = h.window();
+      await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
+      win.webContents.emit("did-navigate", {}, `${ORIGIN}/omnigent/c/another-chat`);
+      h.request(win, `${ORIGIN}/login.html`);
+      await drain();
+      assert.equal(h.calls.renew.length, 1);
+      assert.equal(h.calls.errors.length, 1);
+      assert.equal(h.calls.errors[0].error, error);
+      assert.equal(h.calls.errors[0].url, `${ORIGIN}/omnigent`);
+      assert.deepEqual(h.calls.errors[0].details, {
+        returnUrl: `${ORIGIN}/omnigent/c/another-chat`,
+      });
+      assert.equal(h.timers.size, 0);
       assert.deepEqual(h.calls.load, []);
-      delays.push(h.fireRetry());
-      await drain();
-    }
-    /* oxlint-enable no-await-in-loop */
-    assert.deepEqual(delays, [...Array(12).fill(5_000), ...Array(6).fill(10_000)]);
-    assert.equal(h.calls.renew.length, RENEWAL_RETRY_DELAYS_MS.length + 1);
-    assert.deepEqual(h.calls.errors, []);
-    assert.deepEqual(h.calls.load, [{ win, url: TARGET }]);
-    // Back on the normal expiry schedule.
-    assert.deepEqual(
-      [...h.timers.values()].map((timer) => timer.delay),
-      [3_540_000],
-    );
-  });
-  it("requires sign-in once the retry schedule is exhausted", async (t) => {
-    const h = harness({
-      ensureSession: async () => {
-        throw new Error("net::ERR_INTERNET_DISCONNECTED");
-      },
     });
-    t.after(() => h.auth.dispose());
-    const win = h.window();
-    await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
-    h.request(win, `${ORIGIN}/login.html`);
-    await drain();
-    /* oxlint-disable no-await-in-loop */
-    for (let i = 0; i < RENEWAL_RETRY_DELAYS_MS.length; i++) {
-      assert.deepEqual(h.calls.errors, []);
-      h.fireRetry();
-      await drain();
-    }
-    /* oxlint-enable no-await-in-loop */
-    assert.equal(h.calls.renew.length, RENEWAL_RETRY_DELAYS_MS.length + 1);
-    assert.equal(h.calls.errors.length, 1);
-    assert.match(h.calls.errors[0].error.message, /ERR_INTERNET_DISCONNECTED/);
-    assert.equal(h.timers.size, 0);
-    assert.deepEqual(h.calls.load, []);
-  });
-  it("retries a session-create refused by the IP access list until the network is allowed", async (t) => {
-    let blocked = 2;
-    const h = harness({
-      ensureSession: async () => {
-        if (blocked-- > 0) throw ipAclBlocked();
-        return ORIGIN;
-      },
-    });
-    t.after(() => h.auth.dispose());
-    const win = h.window();
-    await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
-    h.request(win, `${ORIGIN}/login.html`);
-    await drain();
-    assert.equal(h.fireRetry(), 5_000);
-    await drain();
-    assert.equal(h.fireRetry(), 5_000);
-    await drain();
-    assert.equal(h.calls.renew.length, 3);
-    assert.deepEqual(h.calls.errors, []);
-    assert.deepEqual(h.calls.load, [{ win, url: TARGET }]);
-  });
+  }
   for (const [label, error] of [
     [
       "a dead refresh grant",
@@ -542,99 +478,6 @@ describe("Databricks renewal during network outages", () => {
       assert.equal(h.timers.size, 0);
     });
   }
-  it("joins blocked login requests to the renewal waiting out an outage", async (t) => {
-    let online = false;
-    const h = harness({
-      ensureSession: async () => {
-        if (!online) throw offline();
-        return ORIGIN;
-      },
-    });
-    t.after(() => h.auth.dispose());
-    const win = h.window();
-    await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
-    h.request(win, `${ORIGIN}/login.html`);
-    await drain();
-    /* oxlint-disable no-await-in-loop */
-    for (let i = 0; i < 3; i++) {
-      assert.deepEqual(h.request(win, `${ORIGIN}/login.html`, "xhr"), { cancel: true });
-      await drain();
-    }
-    /* oxlint-enable no-await-in-loop */
-    assert.deepEqual(h.calls.errors, []);
-    assert.equal(h.calls.renew.length, 1);
-    online = true;
-    h.fireRetry();
-    await drain();
-    assert.equal(h.calls.renew.length, 2);
-    assert.deepEqual(h.calls.errors, []);
-    assert.deepEqual(h.calls.load, [{ win, url: TARGET }]);
-  });
-  it("shares each retry attempt across windows on the same workspace", async (t) => {
-    let online = false;
-    const h = harness({
-      ensureSession: async () => {
-        if (!online) throw offline();
-        h.setCookie(cookie());
-        return ORIGIN;
-      },
-    });
-    t.after(() => h.auth.dispose());
-    await h.auth.attach(h.window(), `${ORIGIN}/omnigent`);
-    await h.auth.attach(h.window(), `${ORIGIN}/omnigent`);
-    h.removeCookie();
-    await drain();
-    assert.equal(h.calls.renew.length, 1);
-    const retries = [...h.timers].filter(([, timer]) => timer.delay === 5_000);
-    assert.equal(retries.length, 2);
-    online = true;
-    for (const [id, timer] of retries) {
-      h.timers.delete(id);
-      timer.fn();
-    }
-    await drain();
-    assert.equal(h.calls.renew.length, 2);
-    assert.deepEqual(h.calls.errors, []);
-  });
-  for (const stop of ["detach", "reset"]) {
-    it(`cancels pending retries on ${stop} without requiring sign-in`, async (t) => {
-      const h = harness({
-        ensureSession: async () => {
-          throw offline();
-        },
-      });
-      t.after(() => h.auth.dispose());
-      const win = h.window();
-      await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
-      h.request(win, `${ORIGIN}/login.html`);
-      await drain();
-      assert.equal(h.timers.size, 1);
-      h.auth[stop](win);
-      assert.equal(h.timers.size, 0);
-      await drain();
-      assert.equal(h.calls.renew.length, 1);
-      assert.deepEqual(h.calls.errors, []);
-    });
-  }
-  it("stops retrying silently once the window points at another server", async (t) => {
-    const h = harness({
-      ensureSession: async () => {
-        throw offline();
-      },
-    });
-    t.after(() => h.auth.dispose());
-    const win = h.window();
-    await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
-    h.request(win, `${ORIGIN}/login.html`);
-    await drain();
-    h.windows.set(win, "https://server.example");
-    h.fireRetry();
-    await drain();
-    assert.equal(h.calls.renew.length, 1);
-    assert.equal(h.timers.size, 0);
-    assert.deepEqual(h.calls.errors, []);
-    assert.deepEqual(h.calls.load, []);
-  });
 });
 
 describe("transient renewal error classification", () => {

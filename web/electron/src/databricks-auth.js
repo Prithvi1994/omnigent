@@ -56,9 +56,6 @@ function cookieMatchesOrigin(cookie, origin) {
 const SESSION_REJECTED = "SESSION_REJECTED";
 // Session-create was refused by the workspace IP access list (e.g. off the VPN).
 const IP_ACL_BLOCKED = "IP_ACL_BLOCKED";
-// Retries while the network is down (e.g. VPN reconnecting after wake): every 5s for a
-// minute, then every 10s; gives up after two minutes.
-const RENEWAL_RETRY_DELAYS_MS = [...Array(12).fill(5_000), ...Array(6).fill(10_000)];
 // Session-create transport failures thrown by databricks-session.js.
 const SESSION_TRANSPORT_ERRORS = new Set([
   "Databricks session creation timed out",
@@ -130,7 +127,6 @@ function createDatabricksAuth({
     if (!ctx) return;
     connections.delete(win);
     clearTimeoutFn(ctx.timer);
-    clearTimeoutFn(ctx.retryTimer);
     ctx.webContents.removeListener("did-navigate", ctx.onNavigate);
     ctx.webContents.removeListener("did-navigate-in-page", ctx.onNavigateInPage);
   }
@@ -161,7 +157,7 @@ function createDatabricksAuth({
   function fail(ctx, error) {
     if (!current(ctx)) return;
     rejectConnection(ctx.win);
-    onAuthRequired(ctx.win, ctx.serverUrl, error);
+    onAuthRequired(ctx.win, ctx.serverUrl, error, { returnUrl: ctx.returnUrl });
   }
 
   async function schedule(ctx) {
@@ -196,9 +192,9 @@ function createDatabricksAuth({
       shared: renewals.has(ctx.origin),
       reload,
     });
-    ctx.pending = renewWithRetries(ctx)
-      .then(async (renewed) => {
-        if (!renewed || !current(ctx)) return;
+    ctx.pending = sharedRenewal(ctx.origin)
+      .then(async () => {
+        if (!current(ctx)) return;
         await schedule(ctx);
         if (!current(ctx)) return;
         if (ctx.reloadVersion !== ctx.navigationVersion) return;
@@ -239,33 +235,6 @@ function createDatabricksAuth({
     return pending;
   }
 
-  /**
-   * Renew, waiting out transient failures on the backoff schedule while the page
-   * stays put. Resolves false when the window stopped being this connection.
-   */
-  async function renewWithRetries(ctx, attempt = 0) {
-    try {
-      await sharedRenewal(ctx.origin);
-      return true;
-    } catch (error) {
-      const delayMs = RENEWAL_RETRY_DELAYS_MS[attempt];
-      if (delayMs === undefined || !isTransientRenewalError(error) || !current(ctx)) throw error;
-      console.log("[omnigent] databricks auth: renewal retry scheduled", {
-        origin: ctx.origin,
-        attempt: attempt + 1,
-        delayMs,
-        error: renewalErrorKind(error),
-      });
-      // detach() clears this timer; the abandoned wait then never settles.
-      await new Promise((resolve) => {
-        ctx.retryTimer = setTimeoutFn(resolve, delayMs);
-        ctx.retryTimer?.unref?.();
-      });
-      ctx.retryTimer = null;
-      return current(ctx) && renewWithRetries(ctx, attempt + 1);
-    }
-  }
-
   function recover(win) {
     const ctx = connections.get(win);
     if (!ctx || !current(ctx)) return;
@@ -296,7 +265,6 @@ function createDatabricksAuth({
       serverUrl,
       returnUrl: loadUrl,
       timer: null,
-      retryTimer: null,
       pending: null,
       scheduleGeneration: 0,
       navigationVersion: 0,
@@ -410,7 +378,7 @@ module.exports = {
   isDatabricksLoginUrl,
   cookieMatchesOrigin,
   isTransientRenewalError,
-  RENEWAL_RETRY_DELAYS_MS,
+  renewalErrorKind,
   SESSION_REJECTED,
   IP_ACL_BLOCKED,
   createDatabricksAuth,
