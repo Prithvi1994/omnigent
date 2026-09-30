@@ -1,7 +1,11 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Host } from "@/hooks/useHosts";
-import { ONBOARDING_RUNNER_GRACE_MS, useOnboardingRunnerHost } from "./useOnboardingRunnerHost";
+import {
+  ONBOARDING_RUNNER_GRACE_MS,
+  resolveRunnerHost,
+  useOnboardingRunnerHost,
+} from "./useOnboardingRunnerHost";
 
 const bridge = vi.hoisted(() => ({
   takeOnboardingRunner: vi.fn<(consumer: string) => Promise<"local" | "remote" | null>>(),
@@ -162,5 +166,30 @@ describe("useOnboardingRunnerHost", () => {
     expect(result.current).toEqual({ pending: true, hostId: null });
     rerender({ hosts: [host("laptop"), host("box")] });
     expect(result.current).toEqual({ pending: false, hostId: "box" });
+  });
+});
+
+describe("resolveRunnerHost", () => {
+  it("names this machine for local and the only other online host for remote", () => {
+    const hosts = [host("laptop"), host("box"), host("old", "offline")];
+    expect(resolveRunnerHost("local", "laptop", hosts)).toEqual({
+      hostId: "laptop",
+      ambiguous: false,
+    });
+    expect(resolveRunnerHost("remote", "laptop", hosts)).toEqual({
+      hostId: "box",
+      ambiguous: false,
+    });
+  });
+
+  it("flags remote as ambiguous with several other online hosts", () => {
+    expect(resolveRunnerHost("remote", null, [host("a"), host("b")])).toEqual({
+      hostId: null,
+      ambiguous: true,
+    });
+    expect(resolveRunnerHost("remote", "laptop", [host("laptop")])).toEqual({
+      hostId: null,
+      ambiguous: false,
+    });
   });
 });

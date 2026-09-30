@@ -1,10 +1,13 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useHosts, type Host } from "@/hooks/useHosts";
-import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
+import {
+  ONBOARDING_RUNNER_GRACE_MS,
+  useOnboardingRunnerHost,
+} from "@/hooks/useOnboardingRunnerHost";
 import { clearImportReviewRequest, requestImportReview } from "@/lib/importReviewState";
 import type * as nativeBridge from "@/lib/nativeBridge";
 import { resetOnboardingRunnerForTests } from "@/lib/nativeBridge";
@@ -20,12 +23,18 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
 
 // The desktop shell's onboarding handoff: answers once, then reports nothing.
 const shellTake = vi.hoisted(() => vi.fn<() => Promise<"local" | "remote" | null>>());
-function installShell(runner: "local" | "remote" | null) {
+function installShell(
+  runner: "local" | "remote" | null,
+  identity: { cliInstalled: boolean; hostId: string | null } | null = {
+    cliInstalled: true,
+    hostId: "laptop",
+  },
+) {
   shellTake.mockReset().mockResolvedValueOnce(runner).mockResolvedValue(null);
   (window as unknown as Record<string, unknown>).omnigentDesktop = {
     kind: "electron",
     takeOnboardingRunner: () => shellTake(),
-    getHostIdentity: () => Promise.resolve({ cliInstalled: true, hostId: "laptop" }),
+    getHostIdentity: () => Promise.resolve(identity),
   };
 }
 
@@ -95,6 +104,13 @@ async function expectStaysClosed() {
   expect(screen.queryByText(TITLE)).toBeNull();
 }
 
+async function expectStaysOpenWith(text: string) {
+  await new Promise((resolve) => {
+    setTimeout(resolve, 100);
+  });
+  expect(screen.getByText(text)).toBeTruthy();
+}
+
 const CLOSE_METHODS: [string, () => void][] = [
   ["the X button", () => fireEvent.click(screen.getByRole("button", { name: "Close" }))],
   ["Confirm", () => fireEvent.click(screen.getByRole("button", { name: "Confirm" }))],
@@ -125,9 +141,8 @@ describe("ImportReviewGate", () => {
     serve([host("laptop"), host("box")], { laptop: ["from-laptop"], box: ["from-box"] });
     renderWithClient(<ImportReviewGate />);
 
-    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalled());
     await expectStaysClosed();
-    expect(skillRequestsFor("laptop")).toHaveLength(0);
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
   });
 
   it("stays closed when the desktop shell has no onboarding handoff", async () => {
@@ -182,13 +197,91 @@ describe("ImportReviewGate", () => {
     expect(skillRequestsFor("laptop")).toHaveLength(0);
   });
 
-  it("skips an onboarding host this device already reviewed", async () => {
-    window.localStorage.setItem("omnigent:imports-reviewed:laptop", "x");
-    installShell("local");
-    serve([host("laptop")], { laptop: ["from-laptop"] });
+  it("waits past the host picker's grace period for a slow remote host", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      installShell("remote");
+      serve([host("laptop")], { arca: ["from-arca"] });
+      const { client } = renderWithClient(
+        <>
+          <ImportReviewGate />
+          <HostPickerProbe />
+        </>,
+      );
+      expect(await screen.findByText("Connecting to Arca…")).toBeTruthy();
+
+      // A cold Arca boot outlasts the picker's grace period.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(ONBOARDING_RUNNER_GRACE_MS + 1_000);
+      });
+      expect(screen.getByText("Connecting to Arca…")).toBeTruthy();
+
+      serve([host("laptop"), host("arca")], { arca: ["from-arca"] });
+      await client.invalidateQueries({ queryKey: ["hosts"] });
+      expect(await screen.findByText("/from-arca")).toBeTruthy();
+      // The picker's own preselect still gave up.
+      expect(screen.getByTestId("picker-host").textContent).toBe("none");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows nothing when several hosts could be the remote runner", async () => {
+    installShell("remote");
+    serve([host("laptop"), host("arca"), host("box")], { arca: ["from-arca"], box: ["from-box"] });
     renderWithClient(<ImportReviewGate />);
 
     await waitFor(() => expect(shellTake).toHaveBeenCalledOnce());
+    await expectStaysClosed();
+    expect(screen.queryByText("Connecting to Arca…")).toBeNull();
+    expect(skillRequestsFor("arca")).toHaveLength(0);
+    expect(skillRequestsFor("box")).toHaveLength(0);
+  });
+
+  it.each(["local", "remote"] as const)(
+    "shows nothing for %s when the shell can't report this machine",
+    async (runner) => {
+      installShell(runner, null);
+      serve([host("laptop")], { laptop: ["from-laptop"] });
+      renderWithClient(<ImportReviewGate />);
+
+      await waitFor(() => expect(shellTake).toHaveBeenCalledOnce());
+      await expectStaysClosed();
+      expect(skillRequestsFor("laptop")).toHaveLength(0);
+    },
+  );
+
+  it("waits for this machine to come online after a local onboarding", async () => {
+    installShell("local");
+    serve([host("laptop", { status: "offline" })], { laptop: ["from-laptop"] });
+    const { client } = renderWithClient(<ImportReviewGate />);
+    expect(await screen.findByText("Connecting to laptop-machine…")).toBeTruthy();
+
+    serve([host("laptop")], { laptop: ["from-laptop"] });
+    await client.invalidateQueries({ queryKey: ["hosts"] });
+    expect(await screen.findByText("/from-laptop")).toBeTruthy();
+  });
+
+  it("keeps an identified remote host when another host comes online", async () => {
+    installShell("remote");
+    serve([host("laptop"), host("arca")], { arca: ["from-arca"] });
+    const { client } = renderWithClient(<ImportReviewGate />);
+    expect(await screen.findByText("/from-arca")).toBeTruthy();
+
+    serve([host("laptop"), host("arca"), host("box")], { arca: ["from-arca"], box: ["from-box"] });
+    await client.invalidateQueries({ queryKey: ["hosts"] });
+    await expectStaysOpenWith("/from-arca");
+  });
+
+  it("closes a waiting remote review once a second candidate appears", async () => {
+    installShell("remote");
+    serve([host("laptop")], {});
+    const { client } = renderWithClient(<ImportReviewGate />);
+    expect(await screen.findByText("Connecting to Arca…")).toBeTruthy();
+
+    serve([host("laptop"), host("arca"), host("box")], { arca: ["from-arca"] });
+    await client.invalidateQueries({ queryKey: ["hosts"] });
+    await waitFor(() => expect(screen.queryByText(TITLE)).toBeNull());
     await expectStaysClosed();
   });
 

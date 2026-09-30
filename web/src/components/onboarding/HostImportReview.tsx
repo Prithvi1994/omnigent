@@ -6,12 +6,12 @@ import { ImportContextModal } from "@/components/onboarding/ImportContextModal";
 import { Button } from "@/components/ui/button";
 import { useHarnessInventory, type HarnessInventory } from "@/hooks/useHarnessInventory";
 import { useHosts, type Host } from "@/hooks/useHosts";
-import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
+import { resolveRunnerHost } from "@/hooks/useOnboardingRunnerHost";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
+import { getHostIdentity, isElectronShell, takeOnboardingRunner } from "@/lib/nativeBridge";
 import {
   clearImportReviewRequest,
-  importsReviewed,
   markImportsReviewed,
   requestImportReview,
   useImportReviewRequest,
@@ -26,7 +26,8 @@ function InventoryModal({
   onOpenChange,
   loadingMessage,
 }: {
-  hostId: string;
+  /** Null while a requested host isn't identified yet; nothing is marked reviewed. */
+  hostId: string | null;
   /** Shown when the user has several machines. */
   hostName?: string;
   loadingMessage?: string;
@@ -39,7 +40,7 @@ function InventoryModal({
       open={open}
       onOpenChange={(next) => {
         // Confirm and dismiss both count as reviewed.
-        if (!next) markImportsReviewed(hostId);
+        if (!next && hostId !== null) markImportsReviewed(hostId);
         onOpenChange(next);
       }}
       onConfirm={() => {}}
@@ -87,22 +88,43 @@ export function ImportReviewGate() {
   return (
     <>
       <OnboardingImportReview />
-      {target !== null && <RequestedImportReview key={target.hostId} target={target} />}
+      {target !== null && (
+        <RequestedImportReview key={target.hostId ?? target.runner} target={target} />
+      )}
     </>
   );
 }
 
-/** Requests a review of the host onboarding handed over, once it resolves. */
+/** Requests a review of the runner onboarding handed over, once per page load. */
 function OnboardingImportReview() {
-  const { data: hosts } = useHosts();
-  const { hostId } = useOnboardingRunnerHost(hosts, "importReview");
-  const requested = useRef(false);
+  const asked = useRef(false);
   useEffect(() => {
-    if (hostId === null || requested.current) return;
-    requested.current = true;
-    if (!importsReviewed(hostId)) requestImportReview({ hostId });
-  }, [hostId]);
+    if (asked.current || !isElectronShell()) return;
+    asked.current = true;
+    void takeOnboardingRunner("importReview").then((runner) => {
+      if (runner) requestImportReview({ runner });
+    });
+  }, []);
   return null;
+}
+
+/**
+ * This machine's identity for a runner-only request: undefined while the shell
+ * answers, null when it can't say. A null `hostId` means it never hosted.
+ */
+function useLocalIdentity(enabled: boolean): { hostId: string | null } | null | undefined {
+  const [identity, setIdentity] = useState<{ hostId: string | null } | null | undefined>(undefined);
+  useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    void getHostIdentity().then((result) => {
+      if (!cancelled) setIdentity(result ? { hostId: result.hostId ?? null } : null);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [enabled]);
+  return identity;
 }
 
 /** Loading copy while the target isn't online; the default once it's fetching inventory. */
@@ -114,14 +136,42 @@ function connectingMessage(host: Host | null, runner: ImportReviewTarget["runner
   return "Connecting…";
 }
 
-/** Shows only the requested host, loading until it connects; never another host. */
+/**
+ * Shows only the requested host, loading until it connects; never another host.
+ * A runner-only request waits, without a time limit, until that runner's host
+ * can be identified, and shows nothing if several hosts could be it.
+ */
 function RequestedImportReview({ target }: { target: ImportReviewTarget }) {
   const { data: hosts } = useHosts();
-  const host = hosts?.find((candidate) => candidate.host_id === target.hostId) ?? null;
+  const byRunner = target.hostId === undefined;
+  const identity = useLocalIdentity(byRunner);
+  // Once identified, the host stays put even if more hosts come online.
+  const identified = useRef<string | null>(null);
+  let hostId: string | null = target.hostId ?? identified.current;
+  let ambiguous = false;
+  if (byRunner && identity && identified.current === null) {
+    if (target.runner === "local") {
+      hostId = identity.hostId;
+    } else {
+      ({ hostId, ambiguous } = resolveRunnerHost("remote", identity.hostId, hosts));
+    }
+    identified.current = hostId;
+  }
+  // Without this machine's identity, "remote" could mistake it for the other host.
+  const unresolvable =
+    byRunner && (identity === null || (target.runner === "local" && identity?.hostId === null));
+  useEffect(() => {
+    if (ambiguous || unresolvable) clearImportReviewRequest();
+  }, [ambiguous, unresolvable]);
+
+  const host = hosts?.find((candidate) => candidate.host_id === hostId) ?? null;
   const inventory = useHarnessInventory(host, { awaitConnection: true });
+  // Wait for the hosts and identity so an ambiguous remote never flashes open.
+  if (byRunner && (hosts === undefined || identity === undefined)) return null;
+  if (ambiguous || unresolvable) return null;
   return (
     <InventoryModal
-      hostId={target.hostId}
+      hostId={hostId}
       hostName={host?.name}
       loadingMessage={connectingMessage(host, target.runner)}
       inventory={inventory}
