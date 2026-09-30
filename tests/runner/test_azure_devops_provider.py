@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,10 +24,16 @@ import pytest
 from omnigent.runner import azure_devops_client
 from omnigent.runner.azure_devops_client import AzureToken
 from omnigent.runner.git_providers import PullRequestFacet
+from omnigent.runner.git_providers import azure_devops as azure_devops_facet
 from omnigent.runner.git_providers.azure_devops import PULL_REQUESTS, AzureDevOpsPullRequests
 from omnigent.runner.session_prs import PullRequestRef
 from tests.budgets import budget
-from tests.runner.azure_devops_fixtures import RecordingTransport, request_path, request_query
+from tests.runner.azure_devops_fixtures import (
+    Handler,
+    RecordingTransport,
+    request_path,
+    request_query,
+)
 
 pytest_plugins = ["tests.runner.azure_devops_fixtures"]
 
@@ -123,12 +130,14 @@ class Forge:
 
     :ivar seed: Has ``main`` and ``feature``, and is on ``feature``.
     :ivar workspace: Has only ``main``; its ``origin`` is :data:`ORIGIN`.
+    :ivar bare: The bare repository, which :data:`ORIGIN` reaches through ``insteadOf``.
     """
 
     seed: Path
     workspace: Path
     base_sha: str
     head_sha: str
+    bare: Path
 
 
 @pytest.fixture
@@ -169,8 +178,25 @@ def forge(tmp_path: Path) -> Forge:
     git(workspace, "fetch", "origin", "main")
     git(workspace, "checkout", "-b", "main", "FETCH_HEAD")
     return Forge(
-        seed, workspace, git(seed, "rev-parse", "main"), git(seed, "rev-parse", "feature")
+        seed, workspace, git(seed, "rev-parse", "main"), git(seed, "rev-parse", "feature"), bare
     )
+
+
+@pytest.fixture
+def fetches(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, float]]:
+    """Record the ref and the timeout of every ``git fetch`` the facet runs."""
+    recorded: list[tuple[str, float]] = []
+    real_git = azure_devops_facet._git
+
+    def recording_git(
+        root: str, *args: str, **kwargs: Any
+    ) -> subprocess.CompletedProcess[bytes] | None:
+        if args[0] == "fetch":
+            recorded.append((args[-1], kwargs["timeout"]))
+        return real_git(root, *args, **kwargs)
+
+    monkeypatch.setattr(azure_devops_facet, "_git", recording_git)
+    return recorded
 
 
 def pull_request(
@@ -218,6 +244,36 @@ def serve(
     transport.route("GET", f"{path}/statuses", json={"value": statuses or []})
     transport.route("GET", EVALUATIONS, json={"value": evaluations or []})
     transport.route("GET", f"{path}/threads", json={"value": threads or []})
+
+
+def fail(
+    transport: RecordingTransport, path: str, failure: int | type[httpx.TransportError]
+) -> None:
+    """Make requests for ``path`` fail with an HTTP status or a transport error."""
+    if isinstance(failure, int):
+        transport.route("GET", path, status=failure, json={"message": "TF400813"})
+        return
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise failure("request failed", request=request)
+
+    transport.route("GET", path, handler=handler)
+
+
+def when_all_started(barrier: threading.Barrier, body: Any) -> Handler:
+    """Answer with ``body`` once ``barrier.parties`` requests are waiting at the same time."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        barrier.wait()
+        return httpx.Response(200, json=body)
+
+    return handler
+
+
+def never_answers(request: httpx.Request) -> httpx.Response:
+    """Act as a server that never answers: wait out the request's timeout, then time out."""
+    time.sleep(request.extensions["timeout"]["read"])
+    raise httpx.ReadTimeout("timed out", request=request)
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +400,45 @@ def test_only_a_rejected_credential_reads_as_signed_out(
     assert info["pr"] is None
 
 
+@pytest.mark.parametrize("failure", [503, httpx.ReadTimeout], ids=["503", "timeout"])
+def test_a_branch_pr_that_fails_to_load_is_shown_from_its_list_entry(
+    facet: AzureDevOpsPullRequests,
+    workspace: Path,
+    ado_transport: RecordingTransport,
+    failure: int | type[httpx.TransportError],
+) -> None:
+    # The PR list truncates descriptions.
+    ado_transport.route("GET", PULLS, json={"value": [pull_request(description="## Summ")]})
+    serve(ado_transport, pull_request(), statuses=[status("build", "succeeded", 1)])
+    fail(ado_transport, PULL, failure)
+
+    info = facet.workspace_info(str(workspace))
+
+    pr = info["pr"]
+    assert (pr["number"], pr["url"], pr["title"], pr["body"]) == (
+        7,
+        PR_URL,
+        "Add the pipeline",
+        "## Summ",
+    )
+    assert (pr["head_ref"], pr["base_ref"], info["base_ref"]) == ("feature", "main", "main")
+    assert (pr["checks"]["passing"], pr["checks"]["total"]) == (1, 1)
+    assert info["auth"]["authenticated"] is True
+
+
+def test_a_denied_pr_read_after_the_list_reads_as_signed_out(
+    facet: AzureDevOpsPullRequests, workspace: Path, ado_transport: RecordingTransport
+) -> None:
+    ado_transport.route("GET", PULLS, json={"value": [pull_request()]})
+    serve(ado_transport, pull_request())
+    fail(ado_transport, PULL, 401)
+
+    info = facet.workspace_info(str(workspace))
+
+    assert info["pr"] is None
+    assert info["auth"]["authenticated"] is False
+
+
 def test_outside_a_git_checkout(
     facet: AzureDevOpsPullRequests, tmp_path: Path, ado_transport: RecordingTransport
 ) -> None:
@@ -351,6 +446,9 @@ def test_outside_a_git_checkout(
         "object": "session.github.info",
         "available": False,
         "reason": "not_a_git_repo",
+        "provider": "azure_devops",
+        "auth": None,
+        "capabilities": NO_CAPABILITIES,
     }
     assert ado_transport.requests == []
 
@@ -406,6 +504,33 @@ def test_reference_info_when_the_pr_cannot_be_read(
     assert info["auth"]["hint"] == HINT
     assert info["selected_pr_url"] == PR_URL
     assert not LEGACY_KEYS & info.keys()
+
+
+@pytest.mark.parametrize(
+    ("failure", "authenticated"),
+    [
+        (401, False),
+        (403, False),
+        (500, True),
+        (httpx.ReadTimeout, True),
+        (httpx.ConnectError, True),
+    ],
+    ids=["401", "403", "500", "timeout", "network"],
+)
+def test_reference_info_reads_as_signed_out_only_when_denied(
+    facet: AzureDevOpsPullRequests,
+    tmp_path: Path,
+    ado_transport: RecordingTransport,
+    failure: int | type[httpx.TransportError],
+    authenticated: bool,
+) -> None:
+    fail(ado_transport, PULL, failure)
+
+    info = facet.reference_info(str(tmp_path), reference())
+
+    assert info["pr"] is None
+    assert info["auth"]["authenticated"] is authenticated
+    assert info["selected_pr_url"] == PR_URL
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +679,111 @@ def test_comments_skip_deleted_and_system_entries_and_prefix_inline_ones(
 
 
 # ---------------------------------------------------------------------------
+# Concurrent reads and the request budget
+# ---------------------------------------------------------------------------
+
+
+def test_workspace_info_reads_the_pr_and_its_lists_at_once_on_one_client(
+    facet: AzureDevOpsPullRequests,
+    workspace: Path,
+    ado_transport: RecordingTransport,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ado_transport.route("GET", PULLS, json={"value": [pull_request()]})
+    # Each read waits until all four have started, so reads sent one at a time fail.
+    started = threading.Barrier(4, timeout=budget(10))
+    ado_transport.route("GET", PULL, handler=when_all_started(started, pull_request()))
+    for path in (f"{PULL}/statuses", EVALUATIONS, f"{PULL}/threads"):
+        ado_transport.route("GET", path, handler=when_all_started(started, {"value": []}))
+    deadlines: list[float | None] = []
+    real_client = azure_devops_client.AzureDevOpsClient
+
+    def counting_client(*args: Any, **kwargs: Any) -> azure_devops_client.AzureDevOpsClient:
+        deadlines.append(kwargs.get("deadline"))
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(azure_devops_client, "AzureDevOpsClient", counting_client)
+
+    info = facet.workspace_info(str(workspace))
+
+    assert (info["pr"]["number"], info["pr"]["body"]) == (7, "## Summary\n\nAdds CI.")
+    [deadline] = deadlines
+    assert deadline is not None
+    assert len(ado_transport.requests) == 5
+
+
+def test_reference_info_reads_the_lists_at_once_after_the_pr(
+    facet: AzureDevOpsPullRequests, tmp_path: Path, ado_transport: RecordingTransport
+) -> None:
+    ado_transport.route("GET", PULL, json=pull_request())
+    started = threading.Barrier(3, timeout=budget(10))
+    for path in (f"{PULL}/statuses", EVALUATIONS, f"{PULL}/threads"):
+        ado_transport.route("GET", path, handler=when_all_started(started, {"value": []}))
+
+    info = facet.reference_info(str(tmp_path), reference())
+
+    assert info["pr"]["number"] == 7
+    # The evaluations need the project id that the PR carries.
+    assert request_path(ado_transport.requests[0]) == PULL
+    assert len(ado_transport.requests) == 4
+
+
+def test_reads_that_outlast_the_budget_leave_checks_and_comments_empty(
+    facet: AzureDevOpsPullRequests,
+    workspace: Path,
+    ado_transport: RecordingTransport,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seconds = budget(0.5)
+    monkeypatch.setattr(azure_devops_facet, "_REQUEST_BUDGET_SECONDS", seconds)
+    ado_transport.route("GET", PULLS, json={"value": [pull_request()]})
+    ado_transport.route("GET", PULL, json=pull_request())
+    slow = (f"{PULL}/statuses", EVALUATIONS, f"{PULL}/threads")
+    for path in slow:
+        ado_transport.route("GET", path, handler=never_answers)
+
+    info = facet.workspace_info(str(workspace))
+
+    assert (info["pr"]["title"], info["pr"]["body"]) == (
+        "Add the pipeline",
+        "## Summary\n\nAdds CI.",
+    )
+    assert (info["pr"]["checks"], info["pr"]["comments"]) == (NO_CHECKS, [])
+    assert info["auth"]["authenticated"] is True
+    timeouts = [
+        request.extensions["timeout"]["read"]
+        for request in ado_transport.requests
+        if request_path(request) in slow
+    ]
+    assert len(timeouts) == 3
+    assert all(0 < timeout <= seconds for timeout in timeouts)
+
+
+def test_a_list_that_spends_the_budget_leaves_the_pr_from_its_entry(
+    facet: AzureDevOpsPullRequests,
+    workspace: Path,
+    ado_transport: RecordingTransport,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(azure_devops_facet, "_REQUEST_BUDGET_SECONDS", budget(0.5))
+
+    def late_list(request: httpx.Request) -> httpx.Response:
+        # The answer arrives just after the time left runs out.
+        time.sleep(request.extensions["timeout"]["read"] + 0.05)
+        return httpx.Response(200, json={"value": [pull_request(description="## Summ")]})
+
+    ado_transport.route("GET", PULLS, handler=late_list)
+    serve(ado_transport, pull_request())
+
+    info = facet.workspace_info(str(workspace))
+
+    assert [request_path(request) for request in ado_transport.requests] == [PULLS]
+    assert (info["pr"]["number"], info["pr"]["body"]) == (7, "## Summ")
+    assert (info["pr"]["checks"], info["pr"]["comments"]) == (NO_CHECKS, [])
+    assert (info["base_ref"], info["auth"]["authenticated"]) == ("main", True)
+
+
+# ---------------------------------------------------------------------------
 # Changed files and diffs
 # ---------------------------------------------------------------------------
 
@@ -634,6 +864,80 @@ def test_pr_diff_fetches_the_pr_and_diffs_it_from_the_merge_base(
     patch_file = tmp_path / "pr.patch"
     patch_file.write_text(patch)
     git(forge.workspace, "apply", "--check", str(patch_file))
+
+
+def diffed_files(patch: str) -> int:
+    return len(re.findall(r"^diff --git ", patch, flags=re.MULTILINE))
+
+
+def test_pr_diff_of_a_pr_whose_source_branch_is_gone_reads_the_merge_ref(
+    facet: AzureDevOpsPullRequests,
+    forge: Forge,
+    ado_transport: RecordingTransport,
+    fetches: list[tuple[str, float]],
+) -> None:
+    # Completing the PR deleted its source branch; the merge ref still has its commits.
+    git(forge.seed, "checkout", "-b", "merged", "main")
+    git(forge.seed, "merge", "--no-ff", "-m", "Merge PR 7", "feature")
+    git(forge.seed, "push", "origin", "HEAD:refs/pull/7/merge", ":refs/heads/feature")
+    completed = pull_request(7, "completed", head=forge.head_sha, base=forge.base_sha)
+    ado_transport.route("GET", PULL, json=completed)
+
+    first = facet.pr_diff(str(forge.workspace), reference())
+    again = facet.pr_diff(str(forge.workspace), reference())
+
+    assert diffed_files(first["patch"]) == 4
+    assert again == first
+    # The base is local, the source branch fetch fails, and the local commits end the fetching.
+    assert [ref for ref, _ in fetches] == ["refs/heads/feature", "refs/pull/7/merge"]
+    budget_seconds = azure_devops_facet._REQUEST_BUDGET_SECONDS
+    assert all(0 < timeout <= budget_seconds for _, timeout in fetches)
+
+
+def test_pr_diff_fetches_the_target_and_the_source_separately(
+    facet: AzureDevOpsPullRequests,
+    forge: Forge,
+    ado_transport: RecordingTransport,
+    fetches: list[tuple[str, float]],
+    tmp_path: Path,
+) -> None:
+    # A new clone has neither commit, and the PR's target branch is gone from the remote.
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    git(clone, "init")
+    git(clone, "remote", "add", "origin", ORIGIN)
+    git(clone, "config", f"url.{forge.bare}.insteadOf", ORIGIN)
+    pr = pull_request(head=forge.head_sha, base=forge.base_sha, targetRefName="refs/heads/gone")
+    ado_transport.route("GET", PULL, json=pr)
+
+    result = facet.pr_diff(str(clone), reference())
+
+    # The failed target fetch does not stop the source fetch, which brings both commits.
+    assert diffed_files(result["patch"]) == 4
+    assert [ref for ref, _ in fetches] == ["refs/heads/gone", "refs/heads/feature"]
+
+
+def test_pr_diff_does_not_fetch_a_pr_again_for_a_minute_after_fetches_fail(
+    facet: AzureDevOpsPullRequests,
+    forge: Forge,
+    ado_transport: RecordingTransport,
+    fetches: list[tuple[str, float]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The source branch is gone and the remote has no merge ref for the PR.
+    git(forge.seed, "push", "origin", ":refs/heads/feature")
+    abandoned = pull_request(7, "abandoned", head=forge.head_sha, base=forge.base_sha)
+    ado_transport.route("GET", PULL, json=abandoned)
+    unavailable = {"object": "session.github.pr_diff", "patch": ""}
+
+    assert facet.pr_diff(str(forge.workspace), reference()) == unavailable
+    assert [ref for ref, _ in fetches] == ["refs/heads/feature", "refs/pull/7/merge"]
+    assert facet.pr_diff(str(forge.workspace), reference()) == unavailable
+    assert len(fetches) == 2
+
+    monkeypatch.setattr(azure_devops_facet, "_FETCH_RETRY_SECONDS", 0.0)
+    assert facet.pr_diff(str(forge.workspace), reference()) == unavailable
+    assert len(fetches) == 4
 
 
 def test_pr_diff_for_a_pr_outside_the_workspace_remote(

@@ -780,6 +780,41 @@ def test_request_timeout_follows_env(
         assert ado._client.timeout == httpx.Timeout(expected)
 
 
+def test_each_request_times_out_at_the_deadline(ado_transport: RecordingTransport) -> None:
+    ado_transport.route("GET", PULL, json={"pullRequestId": 42})
+    deadline = time.monotonic() + 2.0
+
+    with AzureDevOpsClient("contoso", TOKEN, deadline=deadline, transport=ado_transport) as ado:
+        ado.get_pull_request("Proj", "repo", 42)
+        ado.get_pull_request("Proj", "repo", 42)
+
+    first, second = (request.extensions["timeout"] for request in ado_transport.requests)
+    assert 0 < second["read"] <= first["read"] <= 2.0
+    assert set(first.values()) == {first["read"]}
+
+
+def test_a_distant_deadline_keeps_the_configured_timeout(
+    ado_transport: RecordingTransport,
+) -> None:
+    ado_transport.route("GET", PULL, json={"pullRequestId": 42})
+    deadline = time.monotonic() + 3600.0
+
+    with AzureDevOpsClient("contoso", TOKEN, deadline=deadline, transport=ado_transport) as ado:
+        ado.get_pull_request("Proj", "repo", 42)
+
+    assert ado_transport.requests[0].extensions["timeout"]["read"] == 15.0
+
+
+def test_a_request_after_the_deadline_is_not_sent(ado_transport: RecordingTransport) -> None:
+    deadline = time.monotonic()
+
+    with AzureDevOpsClient("contoso", TOKEN, deadline=deadline, transport=ado_transport) as ado:
+        with pytest.raises(httpx.TimeoutException):
+            ado.get_pull_request("Proj", "repo", 42)
+
+    assert ado_transport.requests == []
+
+
 def test_close_and_context_manager(ado_transport: RecordingTransport) -> None:
     ado = AzureDevOpsClient("contoso", TOKEN, transport=ado_transport)
 

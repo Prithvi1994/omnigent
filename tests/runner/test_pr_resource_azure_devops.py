@@ -224,6 +224,20 @@ def test_branch_inference_records_the_azure_devops_ref(
     assert (entry.relationship, entry.source) == ("inferred", "branch")
 
 
+def test_branch_inference_survives_a_failed_pr_read(
+    workspace: Path, ado_transport: RecordingTransport
+) -> None:
+    serve_branch_pr(ado_transport)
+    ado_transport.route("GET", PULL, status=503, json={"message": "unavailable"})
+
+    info = pr_resource.pr_info(str(workspace), session_id=SESSION)
+
+    assert (info["pr"]["number"], info["pr"]["title"]) == (7, "Add the pipeline")
+    assert info["selected_pr_url"] == PR_URL
+    [entry] = SessionPrRegistry(SESSION).list()
+    assert (entry.url, entry.relationship, entry.source) == (PR_URL, "inferred", "branch")
+
+
 def test_a_branch_without_a_pr_infers_nothing(
     workspace: Path, ado_transport: RecordingTransport
 ) -> None:

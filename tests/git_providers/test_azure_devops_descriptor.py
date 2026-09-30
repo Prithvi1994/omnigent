@@ -368,14 +368,19 @@ def test_other_hosts_do_not_match(host: str) -> None:
     assert not PROVIDER.matches_host(host, EnvInstances())
 
 
-def test_configured_hosts_match_ignoring_case(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_configured_hosts_are_not_claimed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Azure DevOps Server is out of scope: the URL parsers read only the Services hosts.
     monkeypatch.setenv(
         "OMNIGENT_GIT_PROVIDER_AZURE_DEVOPS_HOSTS", "ado.example.test, Other.Example.Test"
     )
 
-    assert PROVIDER.matches_host("ADO.example.test", EnvInstances())
-    assert PROVIDER.matches_host("other.example.test", EnvInstances())
+    assert not PROVIDER.matches_host("ADO.example.test", EnvInstances())
+    assert not PROVIDER.matches_host("other.example.test", EnvInstances())
     assert not PROVIDER.matches_host("git.example.test", EnvInstances())
+    assert PROVIDER.matches_host("dev.azure.com", EnvInstances())
+    remote = "https://ado.example.test/org/project/_git/repo"
+    assert PROVIDER.parse_remote_url(remote, EnvInstances()) is None
+    assert PROVIDER.parse_pr_url(f"{remote}/pullrequest/42", EnvInstances()) is None
 
 
 # ── Session PR registry ─────────────────────────────────────────────────────

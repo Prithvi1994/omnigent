@@ -187,14 +187,11 @@ class AzureDevOpsProvider:
         pull_requests="omnigent.runner.git_providers.azure_devops",
     )
 
-    def matches_host(self, host: str, instances: Instances) -> bool:
-        """Claim the default hosts, any ``*.visualstudio.com`` host, and configured instances."""
+    def matches_host(self, host: str, instances: Instances) -> bool:  # noqa: ARG002
+        """Claim the default hosts and any ``*.visualstudio.com`` host."""
+        # Configured hosts stay unclaimed: the URL parsers read only Azure DevOps Services hosts.
         host = host.lower()
-        if not host:
-            return False
-        if host in self.default_hosts or host.endswith(_LEGACY_SUFFIX):
-            return True
-        return host in {configured.lower() for configured in instances.hosts_for(self.id)}
+        return bool(host) and (host in self.default_hosts or host.endswith(_LEGACY_SUFFIX))
 
     def parse_remote_url(self, url: str, instances: Instances) -> ParsedRemote | None:
         """Parse an HTTPS or SSH remote to ``org/project/repo`` on ``dev.azure.com``."""

@@ -3,9 +3,10 @@
 PR metadata, checks, comments, and changed files come from the Azure DevOps REST
 API through :mod:`omnigent.runner.azure_devops_client`, which contacts only
 ``dev.azure.com``. The whole-PR diff and file contents come from local git when
-the PR's commits are in the workspace. The observer imports this module on every
-tool completion, so the REST client and ``httpx`` load inside the functions that
-use them.
+the PR's commits are in the workspace. An info or whole-PR diff request stays
+within one time budget, under the server's limit for proxied runner reads. The
+observer imports this module on every tool completion, so the REST client and
+``httpx`` load inside the functions that use them.
 """
 
 from __future__ import annotations
@@ -14,8 +15,10 @@ import logging
 import os
 import re
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 from urllib.parse import quote
 
@@ -63,6 +66,10 @@ _UNEXPECTED_RESPONSE = "Azure DevOps returned an unexpected file response"
 _REVISION_LOAD_FAILED = "Azure DevOps could not load the selected file revision"
 _NO_CONTEXT = "Expanded context is unavailable for this file"
 _GIT_TIMEOUT_SECONDS = 30.0
+# One info or diff request's time budget, under the runner proxy's ten-second limit.
+_REQUEST_BUDGET_SECONDS = 8.0
+# Fetches that did not bring a PR's commits are not repeated for this long.
+_FETCH_RETRY_SECONDS = 60.0
 # The GitHub panel's caps; the check counts stay exact.
 _MAX_CHECK_RUNS = 300
 _MAX_COMMENTS = 100
@@ -93,7 +100,9 @@ _NO_PROMPT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never"}
 # ── Local git ─────────────────────────────────────────────────────────────────
 
 
-def _git(root: str, *args: str) -> subprocess.CompletedProcess[bytes] | None:
+def _git(
+    root: str, *args: str, timeout: float = _GIT_TIMEOUT_SECONDS
+) -> subprocess.CompletedProcess[bytes] | None:
     """Run ``git -C root``, or return ``None`` when git cannot start or times out."""
     try:
         return subprocess.run(
@@ -101,7 +110,7 @@ def _git(root: str, *args: str) -> subprocess.CompletedProcess[bytes] | None:
             stdin=subprocess.DEVNULL,
             capture_output=True,
             env={**os.environ, **_NO_PROMPT_ENV},
-            timeout=_GIT_TIMEOUT_SECONDS,
+            timeout=timeout,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -155,11 +164,47 @@ def _merge_base(root: str, base: str, head: str) -> str | None:
     return (out or "").strip() or None
 
 
-def _fetch(root: str, remote: str, refs: Sequence[str]) -> None:
-    """Fetch branches from ``remote`` so a PR's commits become local; failures are logged."""
-    result = _git(root, "fetch", "--no-tags", "--quiet", remote, *refs)
+def _fetch(root: str, remote: str, ref: str, deadline: float) -> bool:
+    """Fetch one ref from ``remote`` in the time left before ``deadline``; failures are logged.
+
+    :returns: Whether the fetch ran. It does not run once ``deadline`` has passed.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return False
+    timeout = min(_GIT_TIMEOUT_SECONDS, remaining)
+    result = _git(root, "fetch", "--no-tags", "--quiet", remote, ref, timeout=timeout)
     if result is None or result.returncode != 0:
-        _logger.info("azure_devops: could not fetch the pull request branches from %s", remote)
+        _logger.info("azure_devops: could not fetch %s from %s", ref, remote)
+    return True
+
+
+class _FailedFetches:
+    """PRs whose fetches did not bring their commits, by ``(workspace, remote, PR id)``.
+
+    An entry lasts :data:`_FETCH_RETRY_SECONDS`. Safe to use from several threads.
+    """
+
+    def __init__(self) -> None:
+        self._failed_at: dict[tuple[str, str, int], float] = {}
+        self._lock = threading.Lock()
+
+    def recent(self, key: tuple[str, str, int]) -> bool:
+        """Return whether the fetches for ``key`` failed less than the retry interval ago."""
+        with self._lock:
+            failed_at = self._failed_at.get(key)
+        return failed_at is not None and time.monotonic() - failed_at < _FETCH_RETRY_SECONDS
+
+    def add(self, key: tuple[str, str, int]) -> None:
+        """Remember that the fetches for ``key`` failed, and forget entries that lapsed."""
+        now = time.monotonic()
+        with self._lock:
+            self._failed_at = {
+                other: failed_at
+                for other, failed_at in self._failed_at.items()
+                if now - failed_at < _FETCH_RETRY_SECONDS
+            }
+            self._failed_at[key] = now
 
 
 def _read_blob(root: str, ref: str, path: str) -> bytes | None:
@@ -350,6 +395,12 @@ def _short_ref(ref: object) -> str | None:
     return ref.removeprefix("refs/heads/") if isinstance(ref, str) and ref else None
 
 
+def _branch_ref(pr: dict[str, Any], key: str) -> str | None:
+    """Return the PR's ref under ``key`` when it is a ``refs/heads/`` branch ref."""
+    ref = pr.get(key)
+    return ref if isinstance(ref, str) and ref.startswith("refs/heads/") else None
+
+
 def _reference_repo(reference: PullRequestRef) -> AzureRepo | None:
     """Return the repository of a tracked PR, whose ``repository`` is ``org/project/repo``."""
     parts = reference.repository.split("/")
@@ -525,15 +576,58 @@ def _comments(threads: list[dict[str, Any]], pr_url: str) -> list[dict[str, Any]
     return shaped
 
 
-def _pr_payload(
-    client: AzureDevOpsClient, repo: AzureRepo, pr: dict[str, Any], number: int, url: str
-) -> dict[str, Any]:
-    """Return the info payload's ``pr``; unreadable checks or comments come back empty."""
-    runs = _status_runs(_optional(client.statuses, repo.project, repo.repo, number))
+def _evaluations(
+    client: AzureDevOpsClient, repo: AzureRepo, pr: dict[str, Any], number: int
+) -> list[dict[str, Any]]:
+    """Read the PR's policy evaluations, which need the project id that ``pr`` carries."""
     project_id = _text(_nested(pr, "repository", "project", "id"))
-    if project_id is not None:
-        evaluations = _optional(client.policy_evaluations, repo.project, project_id, number)
-        runs.extend(_evaluation_runs(evaluations, repo))
+    if project_id is None:
+        return []
+    return _optional(client.policy_evaluations, repo.project, project_id, number)
+
+
+def _pr_or_listed(
+    client: AzureDevOpsClient, repo: AzureRepo, number: int, listed: dict[str, Any]
+) -> dict[str, Any]:
+    """Read a listed PR for its full description, which the PR list truncates.
+
+    When the read fails without a denial, the list entry stands in so the PR stays shown.
+
+    :raises _RestFailure: When the credentials are denied.
+    """
+    try:
+        return _call(client.get_pull_request, repo.project, repo.repo, number)
+    except _RestFailure as failure:
+        if failure.denied:
+            raise
+        return listed
+
+
+def _pr_payload(
+    client: AzureDevOpsClient,
+    repo: AzureRepo,
+    number: int,
+    url: str,
+    listed: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Read a PR with its statuses, policy evaluations, and threads; return the payload's ``pr``.
+
+    The three lists load at once, and one that cannot be read comes back empty. With
+    ``listed``, the PR's list entry, the PR loads alongside them; without it, they wait for
+    the PR, which carries the project id that the evaluations need.
+
+    :raises _RestFailure: When the PR cannot be read and no list entry stands in for it.
+    """
+    project, name = repo.project, repo.repo
+    pr = listed if listed is not None else _call(client.get_pull_request, project, name, number)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        full = None if listed is None else pool.submit(_pr_or_listed, client, repo, number, listed)
+        statuses = pool.submit(_optional, client.statuses, project, name, number)
+        evaluations = pool.submit(_evaluations, client, repo, pr, number)
+        threads = pool.submit(_optional, client.threads, project, name, number)
+        if full is not None:
+            pr = full.result()
+    runs = [*_status_runs(statuses.result()), *_evaluation_runs(evaluations.result(), repo)]
     description = pr.get("description")
     return {
         "number": number,
@@ -549,7 +643,7 @@ def _pr_payload(
         "base_sha": _commit(pr, "lastMergeTargetCommit"),
         "checks": _summarize(runs),
         "body": description if isinstance(description, str) and description.strip() else None,
-        "comments": _comments(_optional(client.threads, repo.project, repo.repo, number), url),
+        "comments": _comments(threads.result(), url),
     }
 
 
@@ -596,6 +690,7 @@ class AzureDevOpsPullRequests:
 
     def __init__(self, *, transport: httpx.BaseTransport | None = None) -> None:
         self._transport = transport
+        self._failed_fetches = _FailedFetches()
 
     @property
     def capabilities(self) -> ProviderCapabilities:
@@ -603,17 +698,25 @@ class AzureDevOpsPullRequests:
         return _CAPABILITIES
 
     def _client(
-        self, org: str, token: AzureToken, *, timeout: float | None = None
+        self, org: str, token: AzureToken, *, deadline: float | None = None
     ) -> AzureDevOpsClient:
         from omnigent.runner.azure_devops_client import AzureDevOpsClient
 
-        return AzureDevOpsClient(org, token, timeout=timeout, transport=self._transport)
+        return AzureDevOpsClient(org, token, deadline=deadline, transport=self._transport)
 
     def workspace_info(self, root: str) -> dict[str, Any]:
         """Return the checked-out branch, the workspace's Azure DevOps repository, and its PR."""
+        deadline = time.monotonic() + _REQUEST_BUDGET_SECONDS
         branch = _branch(root)
         if branch is None:
-            return {"object": INFO_OBJECT, "available": False, "reason": "not_a_git_repo"}
+            return {
+                "object": INFO_OBJECT,
+                "available": False,
+                "reason": "not_a_git_repo",
+                "provider": _PROVIDER_ID,
+                "auth": None,
+                "capabilities": _CAPABILITIES.to_json(),
+            }
         remotes = _remotes(root)
         repo = remotes[0][1] if remotes else None
         token = _token()
@@ -627,15 +730,13 @@ class AzureDevOpsPullRequests:
         if repo is None or token is None:
             return info
         try:
-            with self._client(repo.org, token) as client:
+            with self._client(repo.org, token, deadline=deadline) as client:
                 listed = _branch_pr(client, repo, branch)
                 if listed is None:
                     return info
                 number = listed["pullRequestId"]
-                # The PR list truncates descriptions, so read the PR itself.
-                pr = _call(client.get_pull_request, repo.project, repo.repo, number)
                 url = canonical_pr_url(repo.org, repo.project, repo.repo, number)
-                info["pr"] = _pr_payload(client, repo, pr, number, url)
+                info["pr"] = _pr_payload(client, repo, number, url, listed)
         except _RestFailure as failure:
             info["auth"]["authenticated"] = not failure.denied
             return info
@@ -648,6 +749,7 @@ class AzureDevOpsPullRequests:
         reference: PullRequestRef,
     ) -> dict[str, Any]:
         """Return the payload for one tracked PR, read by id from Azure DevOps."""
+        deadline = time.monotonic() + _REQUEST_BUDGET_SECONDS
         info = _info(
             authenticated=False,
             branch=None,
@@ -661,10 +763,11 @@ class AzureDevOpsPullRequests:
         if repo is None or token is None:
             return info
         try:
-            with self._client(repo.org, token) as client:
-                pr = _call(client.get_pull_request, repo.project, repo.repo, reference.number)
-                payload = _pr_payload(client, repo, pr, reference.number, reference.url)
-        except _RestFailure:
+            with self._client(repo.org, token, deadline=deadline) as client:
+                payload = _pr_payload(client, repo, reference.number, reference.url)
+        except _RestFailure as failure:
+            # Only a denied request means signed out; a timeout or server error does not.
+            info["auth"]["authenticated"] = not failure.denied
             return info
         info["auth"]["authenticated"] = True
         info.update(branch=payload["head_ref"], base_ref=payload["base_ref"], pr=payload)
@@ -689,11 +792,8 @@ class AzureDevOpsPullRequests:
         token = _token()
         if token is None:
             return None, False
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return None, True
         try:
-            with self._client(repo.org, token, timeout=remaining) as client:
+            with self._client(repo.org, token, deadline=deadline) as client:
                 pr = _call(client.get_pull_request, repo.project, repo.repo, reference.number)
         except _RestFailure as failure:
             # The request timeout is the time left, so a timeout means the deadline passed.
@@ -753,7 +853,8 @@ class AzureDevOpsPullRequests:
         return {"object": "list", "data": files, "has_more": False}
 
     def pr_diff(self, root: str, reference: PullRequestRef | None) -> dict[str, Any]:
-        """Diff the PR's head against its merge base in the workspace, fetching its branches."""
+        """Diff the PR's head against its merge base in the workspace, fetching missing commits."""
+        deadline = time.monotonic() + _REQUEST_BUDGET_SECONDS
         empty: dict[str, Any] = {"object": PR_DIFF_OBJECT, "patch": ""}
         remotes = _remotes(root)
         if reference is None:
@@ -770,7 +871,7 @@ class AzureDevOpsPullRequests:
         if token is None:
             return empty
         try:
-            with self._client(repo.org, token) as client:
+            with self._client(repo.org, token, deadline=deadline) as client:
                 number = _pr_number(client, root, repo, reference)
                 if number is None:
                     return empty
@@ -781,15 +882,8 @@ class AzureDevOpsPullRequests:
         base = _commit(pr, "lastMergeTargetCommit")
         if head is None or base is None:
             return empty
-        if not _has_commits(root, head, base):
-            refs = [
-                ref
-                for key in ("sourceRefName", "targetRefName")
-                if isinstance(ref := pr.get(key), str) and ref.startswith("refs/heads/")
-            ]
-            _fetch(root, remote, refs)
-            if not _has_commits(root, head, base):
-                return empty
+        if not self._ensure_commits(root, remote, number, pr, (head, base), deadline):
+            return empty
         merge_base = _merge_base(root, base, head)
         if merge_base is None:
             return empty
@@ -807,6 +901,45 @@ class AzureDevOpsPullRequests:
             head,
         )
         return {"object": PR_DIFF_OBJECT, "patch": patch or ""}
+
+    def _ensure_commits(
+        self,
+        root: str,
+        remote: str,
+        number: int,
+        pr: dict[str, Any],
+        commits: tuple[str, str],
+        deadline: float,
+    ) -> bool:
+        """Return whether the PR's ``(head, base)`` commits are local, fetching missing ones.
+
+        Fetches the target branch, the source branch, and then the PR's merge ref, each only
+        while a commit is still missing and time is left before ``deadline``. When fetches ran
+        and the commits are still missing, the PR is not fetched again for
+        :data:`_FETCH_RETRY_SECONDS`.
+        """
+        head, base = commits
+        if _has_commits(root, head, base):
+            return True
+        key = (root, remote, number)
+        if self._failed_fetches.recent(key):
+            return False
+        fetched = False
+        target = _branch_ref(pr, "targetRefName")
+        if target is not None and not _has_commits(root, base):
+            fetched |= _fetch(root, remote, target, deadline)
+        source = _branch_ref(pr, "sourceRefName")
+        if source is not None and not _has_commits(root, head):
+            fetched |= _fetch(root, remote, source, deadline)
+        if not _has_commits(root, head, base):
+            # Completing a PR often deletes its source branch. Azure Repos keeps a merge ref
+            # while the PR exists, whose parents are the PR's target and source commits.
+            fetched |= _fetch(root, remote, f"refs/pull/{number}/merge", deadline)
+        if _has_commits(root, head, base):
+            return True
+        if fetched:
+            self._failed_fetches.add(key)
+        return False
 
     def file_diff(
         self,

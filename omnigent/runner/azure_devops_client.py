@@ -304,7 +304,10 @@ class AzureDevOpsClient:
     ``Authorization: Bearer`` and a personal access token as ``Authorization: Basic``.
     Methods return parsed JSON. A non-2xx response raises :class:`AzureDevOpsError`.
     Transport failures raise :class:`httpx.HTTPError` unchanged. ``timeout`` replaces
-    the configured request timeout, in seconds.
+    the configured request timeout, in seconds. With ``deadline``, a ``time.monotonic()``
+    value, no request's timeout outlasts it, and a request made after it raises
+    :class:`httpx.TimeoutException` without being sent. One client can serve several
+    threads at once.
     """
 
     def __init__(
@@ -313,13 +316,16 @@ class AzureDevOpsClient:
         token: AzureToken,
         *,
         timeout: float | None = None,
+        deadline: float | None = None,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
+        self._timeout = _timeout_seconds() if timeout is None else timeout
+        self._deadline = deadline
         self._client = httpx.Client(
             base_url=f"https://{_ADO_HOST}/{quote(org, safe='')}",
             headers={"Authorization": _authorization(token), "Accept": "application/json"},
             verify=client_ssl_context(),
-            timeout=_timeout_seconds() if timeout is None else timeout,
+            timeout=self._timeout,
             follow_redirects=False,
             # Injectable transport for tests (httpx.MockTransport); None uses
             # the real network.
@@ -349,13 +355,22 @@ class AzureDevOpsClient:
         request is refused before it is sent unless it targets ``https://dev.azure.com``.
 
         :raises AzureDevOpsError: With status ``0`` when the URL is not on ``dev.azure.com``.
+        :raises httpx.TimeoutException: When the deadline has passed; nothing is sent.
         """
         path = "/".join(quote(str(segment), safe="") for segment in segments)
+        timeout = self._timeout
+        if self._deadline is not None:
+            timeout = min(timeout, self._deadline - time.monotonic())
         request = self._client.build_request(
-            "GET", path, params=[*params, ("api-version", api_version)]
+            "GET",
+            path,
+            params=[*params, ("api-version", api_version)],
+            timeout=max(timeout, 0.0),
         )
         if request.url.scheme != "https" or request.url.host != _ADO_HOST:
             raise AzureDevOpsError(0, f"Refusing to send a request outside https://{_ADO_HOST}")
+        if timeout <= 0:
+            raise httpx.TimeoutException("The request deadline has passed", request=request)
         return self._client.send(request, follow_redirects=False)
 
     def _get_json(
