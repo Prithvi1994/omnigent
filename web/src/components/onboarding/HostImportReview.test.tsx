@@ -3,14 +3,31 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { Host } from "@/hooks/useHosts";
-import { requestImportReview, resetImportReviewSessionForTests } from "@/lib/importReviewState";
+import { useHosts, type Host } from "@/hooks/useHosts";
+import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
+import { clearImportReviewRequest, requestImportReview } from "@/lib/importReviewState";
+import type * as nativeBridge from "@/lib/nativeBridge";
+import { resetOnboardingRunnerForTests } from "@/lib/nativeBridge";
 
 const authenticatedFetchMock = vi.hoisted(() => vi.fn());
 const features = vi.hoisted(() => ({ import_review: true }));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: authenticatedFetchMock }));
 vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => ({ features }) }));
-vi.mock("@/lib/nativeBridge", () => ({ isIOSShell: () => false }));
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof nativeBridge>()),
+  isIOSShell: () => false,
+}));
+
+// The desktop shell's onboarding handoff: answers once, then reports nothing.
+const shellTake = vi.hoisted(() => vi.fn<() => Promise<"local" | "remote" | null>>());
+function installShell(runner: "local" | "remote" | null) {
+  shellTake.mockReset().mockResolvedValueOnce(runner).mockResolvedValue(null);
+  (window as unknown as Record<string, unknown>).omnigentDesktop = {
+    kind: "electron",
+    takeOnboardingRunner: () => shellTake(),
+    getHostIdentity: () => Promise.resolve({ cliInstalled: true, hostId: "laptop" }),
+  };
+}
 
 import { ImportReviewGate, ReviewImportsPanel } from "./HostImportReview";
 
@@ -62,13 +79,15 @@ function skillRequestsFor(hostId: string) {
 beforeEach(() => {
   authenticatedFetchMock.mockReset();
   window.localStorage.clear();
-  resetImportReviewSessionForTests();
+  clearImportReviewRequest();
+  resetOnboardingRunnerForTests();
+  delete (window as unknown as Record<string, unknown>).omnigentDesktop;
   features.import_review = true;
 });
 
 const TITLE = "Your imports are ready";
 
-/** Waits long enough for another host's inventory to load and open the modal. */
+/** Waits long enough for a host's inventory to load and open the modal. */
 async function expectStaysClosed() {
   await new Promise((resolve) => {
     setTimeout(resolve, 100);
@@ -94,93 +113,97 @@ const CLOSE_METHODS: [string, () => void][] = [
 
 afterEach(cleanup);
 
+/** The new-session picker's read of the same onboarding handoff. */
+function HostPickerProbe() {
+  const { data: hosts } = useHosts();
+  const { hostId } = useOnboardingRunnerHost(hosts);
+  return <span data-testid="picker-host">{hostId ?? "none"}</span>;
+}
+
 describe("ImportReviewGate", () => {
-  it("stays hidden and loads nothing while the import_review feature is off", async () => {
-    features.import_review = false;
-    serve([host("a")], { a: ["review"] });
+  it("never opens on its own for an unreviewed online host", async () => {
+    serve([host("laptop"), host("box")], { laptop: ["from-laptop"], box: ["from-box"] });
     renderWithClient(<ImportReviewGate />);
 
-    await expectStaysClosed();
-    expect(authenticatedFetchMock).not.toHaveBeenCalled();
-  });
-
-  it.each(CLOSE_METHODS)(
-    "closes on %s and doesn't reopen for the next unreviewed host",
-    async (_name, close) => {
-      serve([host("a"), host("b")], { a: ["from-a"], b: ["from-b"] });
-      renderWithClient(<ImportReviewGate />);
-
-      expect(await screen.findByText("/from-a")).toBeTruthy();
-      close();
-
-      await waitFor(() => expect(screen.queryByText(TITLE)).toBeNull());
-      await expectStaysClosed();
-      expect(window.localStorage.getItem("omnigent:imports-reviewed:a")).not.toBeNull();
-      expect(window.localStorage.getItem("omnigent:imports-reviewed:b")).toBeNull();
-    },
-  );
-
-  it("opens at most once per page load, even across remounts", async () => {
-    serve([host("a"), host("b")], { a: ["from-a"], b: ["from-b"] });
-    renderWithClient(<ImportReviewGate />);
-    expect(await screen.findByText("/from-a")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Close" }));
-    await waitFor(() => expect(screen.queryByText(TITLE)).toBeNull());
-
-    cleanup();
-    renderWithClient(<ImportReviewGate />);
-    await expectStaysClosed();
-    expect(skillRequestsFor("b")).toHaveLength(0);
-  });
-
-  it("keeps a dismissed host dismissed after a reload", async () => {
-    serve([host("a"), host("b")], { a: ["from-a"], b: ["from-b"] });
-    renderWithClient(<ImportReviewGate />);
-    expect(await screen.findByText("/from-a")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Close" }));
-    await waitFor(() => expect(screen.queryByText(TITLE)).toBeNull());
-
-    // A reload starts a new page session with the same localStorage.
-    cleanup();
-    resetImportReviewSessionForTests();
-    renderWithClient(<ImportReviewGate />);
-    expect(await screen.findByText("/from-b")).toBeTruthy();
-    expect(screen.queryByText("/from-a")).toBeNull();
-  });
-
-  it("opens once for a new host and remembers the review", async () => {
-    serve([host("a")], { a: ["review"] });
-    renderWithClient(<ImportReviewGate />);
-
-    expect(await screen.findByText("Your imports are ready")).toBeTruthy();
-    expect(screen.getByText("/review")).toBeTruthy();
-    // A single host isn't named.
-    expect(screen.queryByText(/on a-machine/)).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
-
-    await waitFor(() => expect(screen.queryByText("Your imports are ready")).toBeNull());
-    expect(window.localStorage.getItem("omnigent:imports-reviewed:a")).not.toBeNull();
-
-    cleanup();
-    renderWithClient(<ImportReviewGate />);
     await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalled());
-    expect(screen.queryByText("Your imports are ready")).toBeNull();
+    await expectStaysClosed();
+    expect(skillRequestsFor("laptop")).toHaveLength(0);
   });
 
-  it("skips offline, reviewed, and empty hosts, and names the host among several", async () => {
-    window.localStorage.setItem("omnigent:imports-reviewed:reviewed", "x");
-    serve(
-      [host("offline", { status: "offline" }), host("reviewed"), host("empty"), host("fresh")],
-      { offline: ["a"], reviewed: ["b"], fresh: ["c"] },
-    );
+  it("stays closed when the desktop shell has no onboarding handoff", async () => {
+    installShell(null);
+    serve([host("laptop")], { laptop: ["from-laptop"] });
     renderWithClient(<ImportReviewGate />);
 
-    expect(await screen.findByText(/Found in your harnesses on fresh-machine\./)).toBeTruthy();
-    expect(screen.getByText("/c")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Close" }));
-    await waitFor(() => expect(screen.queryByText("Your imports are ready")).toBeNull());
-    expect(window.localStorage.getItem("omnigent:imports-reviewed:fresh")).not.toBeNull();
-    expect(window.localStorage.getItem("omnigent:imports-reviewed:empty")).toBeNull();
+    await waitFor(() => expect(shellTake).toHaveBeenCalledOnce());
+    await expectStaysClosed();
+  });
+
+  it.each([
+    ["local", "laptop"],
+    ["remote", "arca"],
+  ] as const)("opens for the %s host onboarding set up", async (runner, hostId) => {
+    installShell(runner);
+    serve([host("laptop"), host("arca")], { laptop: ["from-laptop"], arca: ["from-arca"] });
+    renderWithClient(<ImportReviewGate />);
+
+    expect(await screen.findByText(`/from-${hostId}`)).toBeTruthy();
+    expect(screen.getByText(new RegExp(`on ${hostId}-machine\\.`))).toBeTruthy();
+  });
+
+  it("shares the handoff with the new-session picker", async () => {
+    installShell("remote");
+    serve([host("laptop"), host("arca")], { arca: ["from-arca"] });
+    renderWithClient(
+      <>
+        <ImportReviewGate />
+        <HostPickerProbe />
+      </>,
+    );
+
+    expect(await screen.findByText("/from-arca")).toBeTruthy();
+    await waitFor(() => expect(screen.getByTestId("picker-host").textContent).toBe("arca"));
+    expect(shellTake).toHaveBeenCalledOnce();
+  });
+
+  it("leaves the handoff untouched while the import_review feature is off", async () => {
+    features.import_review = false;
+    installShell("local");
+    serve([host("laptop")], { laptop: ["from-laptop"] });
+    renderWithClient(
+      <>
+        <ImportReviewGate />
+        <HostPickerProbe />
+      </>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("picker-host").textContent).toBe("laptop"));
+    await expectStaysClosed();
+    expect(skillRequestsFor("laptop")).toHaveLength(0);
+  });
+
+  it("skips an onboarding host this device already reviewed", async () => {
+    window.localStorage.setItem("omnigent:imports-reviewed:laptop", "x");
+    installShell("local");
+    serve([host("laptop")], { laptop: ["from-laptop"] });
+    renderWithClient(<ImportReviewGate />);
+
+    await waitFor(() => expect(shellTake).toHaveBeenCalledOnce());
+    await expectStaysClosed();
+  });
+
+  it.each(CLOSE_METHODS)("closes on %s and stays closed", async (_name, close) => {
+    installShell("local");
+    serve([host("laptop"), host("box")], { laptop: ["from-laptop"], box: ["from-box"] });
+    renderWithClient(<ImportReviewGate />);
+
+    expect(await screen.findByText("/from-laptop")).toBeTruthy();
+    close();
+
+    await waitFor(() => expect(screen.queryByText(TITLE)).toBeNull());
+    await expectStaysClosed();
+    expect(window.localStorage.getItem("omnigent:imports-reviewed:laptop")).not.toBeNull();
+    expect(skillRequestsFor("box")).toHaveLength(0);
   });
 });
 
@@ -254,7 +277,7 @@ describe("ImportReviewGate with a requested host", () => {
 
     expect(await screen.findByText("/t")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
-    // Closing ends this load's auto-open, so another unreviewed host waits.
+    // Closing never falls through to another unreviewed host.
     await waitFor(() => expect(screen.queryByText(TITLE)).toBeNull());
     await expectStaysClosed();
     expect(skillRequestsFor("other")).toHaveLength(0);

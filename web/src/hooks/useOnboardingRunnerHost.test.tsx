@@ -4,7 +4,7 @@ import type { Host } from "@/hooks/useHosts";
 import { ONBOARDING_RUNNER_GRACE_MS, useOnboardingRunnerHost } from "./useOnboardingRunnerHost";
 
 const bridge = vi.hoisted(() => ({
-  takeOnboardingRunner: vi.fn<() => Promise<"local" | "remote" | null>>(),
+  takeOnboardingRunner: vi.fn<(consumer: string) => Promise<"local" | "remote" | null>>(),
   getHostIdentity: vi.fn<() => Promise<{ cliInstalled: boolean; hostId: string | null } | null>>(),
 }));
 vi.mock("@/lib/nativeBridge", () => ({
@@ -36,6 +36,14 @@ describe("useOnboardingRunnerHost", () => {
     await waitFor(() => expect(result.current.pending).toBe(false));
     expect(result.current.hostId).toBeNull();
     expect(bridge.takeOnboardingRunner).toHaveBeenCalledOnce();
+    expect(bridge.takeOnboardingRunner).toHaveBeenCalledWith("hostPicker");
+  });
+
+  it("takes the runner for the given consumer", async () => {
+    bridge.takeOnboardingRunner.mockResolvedValue("local");
+    const { result } = renderHook(() => useOnboardingRunnerHost([host("laptop")], "importReview"));
+    await waitFor(() => expect(result.current.hostId).toBe("laptop"));
+    expect(bridge.takeOnboardingRunner).toHaveBeenCalledWith("importReview");
   });
 
   it("resolves 'local' to this machine's host once it's online", async () => {

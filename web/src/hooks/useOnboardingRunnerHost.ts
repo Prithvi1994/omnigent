@@ -1,6 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import type { Host } from "@/hooks/useHosts";
-import { getHostIdentity, isElectronShell, takeOnboardingRunner } from "@/lib/nativeBridge";
+import {
+  getHostIdentity,
+  isElectronShell,
+  takeOnboardingRunner,
+  type OnboardingRunnerConsumer,
+} from "@/lib/nativeBridge";
 
 /** How long the new-session picker waits for the onboarding runner to come online. */
 export const ONBOARDING_RUNNER_GRACE_MS = 30_000;
@@ -10,8 +15,12 @@ export const ONBOARDING_RUNNER_GRACE_MS = 30_000;
  * this machine's host for "local", the only other online host for "remote".
  * `pending` holds the picker's own default while the runner is still coming
  * online; after the grace period it gives up and the normal default applies.
+ * Each *consumer* receives the onboarding choice once per page load.
  */
-export function useOnboardingRunnerHost(hosts: Host[] | undefined): {
+export function useOnboardingRunnerHost(
+  hosts: Host[] | undefined,
+  consumer: OnboardingRunnerConsumer = "hostPicker",
+): {
   pending: boolean;
   hostId: string | null;
 } {
@@ -23,8 +32,8 @@ export function useOnboardingRunnerHost(hosts: Host[] | undefined): {
   useEffect(() => {
     if (asked.current || runner !== undefined) return;
     asked.current = true;
-    void takeOnboardingRunner().then(setRunner, () => setRunner(null));
-  }, [runner]);
+    void takeOnboardingRunner(consumer).then(setRunner, () => setRunner(null));
+  }, [runner, consumer]);
 
   // This machine's host id, undefined until the shell answers. Nothing resolves
   // before then, or "remote" could mistake this laptop for the other host.

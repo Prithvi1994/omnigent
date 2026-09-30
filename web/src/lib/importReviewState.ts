@@ -1,5 +1,5 @@
-// Which hosts' harness imports this device has already reviewed, so the
-// import modal opens on its own only the first time a host shows up.
+// Which hosts' harness imports this device has already reviewed, and the host
+// an explicit caller (e.g. onboarding) wants the import modal opened for.
 
 import { useSyncExternalStore } from "react";
 
@@ -22,24 +22,6 @@ export function markImportsReviewed(hostId: string): void {
   } catch {
     // localStorage quota or access errors shouldn't break the app.
   }
-}
-
-// Set once the modal has shown on its own or been closed, so the gate
-// auto-opens at most once per page load even with several unreviewed hosts.
-let autoReviewDone = false;
-
-export function autoImportReviewDone(): boolean {
-  return autoReviewDone;
-}
-
-export function markAutoImportReviewDone(): void {
-  autoReviewDone = true;
-}
-
-/** Test-only: forget this page load's auto-open and any pending request. */
-export function resetImportReviewSessionForTests(): void {
-  autoReviewDone = false;
-  requestedTarget = null;
 }
 
 /** A host an explicit caller (e.g. onboarding's install step) wants reviewed. */
