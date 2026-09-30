@@ -3708,25 +3708,29 @@ def test_render_listing_default_marker_survives_non_utf8_console(
 # resolves it provider-ready — so the overview credits it via a row-level
 # fallback instead of reading "Not configured".
 
-_CODEX_ENV_KEY_CONFIG_TOML = """
-model_provider = "myproxy"
 
-[model_providers.myproxy]
-name = "My Proxy"
-base_url = "https://myproxy.example.com/v1"
-env_key = "MYPROXY_API_KEY"
-"""
+def _seed_codex_env_key_provider(home: str) -> None:
+    """Write a ``~/.codex/config.toml`` whose default provider authenticates via ``env_key``."""
+    from pathlib import Path
+
+    codex_dir = Path(home) / ".codex"
+    codex_dir.mkdir(parents=True)
+    (codex_dir / "config.toml").write_text(
+        'model_provider = "myproxy"\n'
+        "\n"
+        "[model_providers.myproxy]\n"
+        'name = "My Proxy"\n'
+        'base_url = "https://myproxy.example.com/v1"\n'
+        'env_key = "MYPROXY_API_KEY"\n'
+        'wire_api = "responses"\n'
+    )
 
 
-def _write_codex_env_key_config(home) -> None:
-    """Write a ``~/.codex/config.toml`` selecting a custom env_key provider.
+def _overview_status(options: list[str], selectable: list[bool], name: str) -> str:
+    from rich.text import Text
 
-    :param home: The tmp HOME directory (the ``isolated_config`` fixture
-        redirects ``$HOME`` there).
-    """
-    codex_dir = home / ".codex"
-    codex_dir.mkdir(exist_ok=True)
-    (codex_dir / "config.toml").write_text(_CODEX_ENV_KEY_CONFIG_TOML)
+    row = options[_overview_row_names(options, selectable).index(name)]
+    return Text.from_markup(row).plain
 
 
 def test_codex_own_config_status_credits_populated_env_key(isolated_config, monkeypatch) -> None:
@@ -3740,7 +3744,7 @@ def test_codex_own_config_status_credits_populated_env_key(isolated_config, monk
     from omnigent.cli_config import _codex_own_config_status
 
     monkeypatch.delenv("CODEX_HOME", raising=False)
-    _write_codex_env_key_config(isolated_config)
+    _seed_codex_env_key_provider(isolated_config)
 
     monkeypatch.setenv("MYPROXY_API_KEY", "populated-proxy-token")
     assert _codex_own_config_status({}) == "My Proxy (Codex config)"
@@ -3775,7 +3779,7 @@ def test_harness_overview_credits_codex_own_env_key_config(isolated_config, monk
     env var, not a self-contained table).
     """
     monkeypatch.delenv("CODEX_HOME", raising=False)
-    _write_codex_env_key_config(isolated_config)
+    _seed_codex_env_key_provider(isolated_config)
     monkeypatch.setenv("MYPROXY_API_KEY", "populated-proxy-token")
 
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
@@ -3785,21 +3789,46 @@ def test_harness_overview_credits_codex_own_env_key_config(isolated_config, monk
     assert _config_yaml(isolated_config).get("providers", {}) == {}
 
 
+def test_overview_credits_codex_config_env_key_provider(isolated_config, monkeypatch) -> None:
+    """A Codex configured by its own ``config.toml`` ``env_key`` provider is configured.
+
+    With the declared variable populated, a bare ``codex`` authenticates against
+    that provider, so the overview must not report Codex as ``Not configured``.
+    """
+    _seed_codex_env_key_provider(isolated_config)
+    monkeypatch.setenv("MYPROXY_API_KEY", "populated-proxy-token")
+
+    options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
+
+    status = _overview_status(options, selectable, "Codex")
+    assert "Not configured" not in status, status
+    assert "✓" in status, status
+
+
 # ── Pi native login (Pi original auth) ──────────────────────────────────────
 
 
-def _write_pi_auth_json(home) -> None:
-    """Seed a usable pi login under the test HOME (``~/.pi/agent/auth.json``).
-
-    :param home: The tmp HOME directory (the ``isolated_config`` fixture
-        redirects ``$HOME`` there).
-    """
+def _seed_pi_native_login(home: str) -> None:
+    """Write the auth.json a completed ``pi`` login leaves under ``~/.pi/agent``."""
     import json
+    import time
+    from pathlib import Path
 
-    agent_dir = home / ".pi" / "agent"
-    agent_dir.mkdir(parents=True, exist_ok=True)
+    agent_dir = Path(home) / ".pi" / "agent"
+    agent_dir.mkdir(parents=True)
     (agent_dir / "auth.json").write_text(
-        json.dumps({"anthropic": {"type": "oauth", "access": "at", "refresh": "rt", "expires": 1}})
+        json.dumps(
+            {
+                "anthropic": {
+                    "type": "oauth",
+                    "access": "fake-oauth-access-token",
+                    "refresh": "fake-oauth-refresh-token",
+                    "expires": int(time.time() * 1000) + 30 * 24 * 3600 * 1000,
+                }
+            }
+        )
     )
 
 
@@ -3813,7 +3842,7 @@ def test_harness_overview_credits_pi_native_login(isolated_config, monkeypatch) 
     the adoption callout and the Pi row must name it.
     """
     monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
-    _write_pi_auth_json(isolated_config)
+    _seed_pi_native_login(isolated_config)
 
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
     assert result.exit_code == 0, result.output
@@ -3827,6 +3856,23 @@ def test_harness_overview_credits_pi_native_login(isolated_config, monkeypatch) 
     assert entry["default"] is True or entry.get("default") == "pi"
 
 
+def test_overview_credits_pi_native_login(isolated_config, monkeypatch) -> None:
+    """A Pi signed in through its own CLI is a configured Pi harness.
+
+    ``pi`` runs on the login in ``~/.pi/agent/auth.json`` without any Omnigent
+    provider, so the overview must not tell that user Pi is ``Not configured``.
+    """
+    _seed_pi_native_login(isolated_config)
+
+    options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
+        monkeypatch
+    )
+
+    status = _overview_status(options, selectable, "Pi")
+    assert "Not configured" not in status, status
+    assert "✓" in status, status
+
+
 def test_pi_login_adoption_preserves_existing_pi_routing(isolated_config, monkeypatch) -> None:
     """Adoption must not flip pi off a configured key it already routes through.
 
@@ -3836,7 +3882,7 @@ def test_pi_login_adoption_preserves_existing_pi_routing(isolated_config, monkey
     nothing serves pi.
     """
     monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
-    _write_pi_auth_json(isolated_config)
+    _seed_pi_native_login(isolated_config)
     config_path = os.path.join(isolated_config, "config.yaml")
     with open(config_path, "w") as f:
         yaml.safe_dump(
@@ -3870,7 +3916,7 @@ def test_remove_pi_subscription_dismisses_detection(isolated_config, monkeypatch
     ``~/.pi/agent/auth.json`` and Remove would be a no-op.
     """
     monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
-    _write_pi_auth_json(isolated_config)
+    _seed_pi_native_login(isolated_config)
 
     # Open 1: plain open auto-adopts the detected pi login.
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")

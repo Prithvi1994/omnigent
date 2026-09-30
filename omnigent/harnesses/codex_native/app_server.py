@@ -63,6 +63,7 @@ from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
     _clean_codex_env,
     _codex_cli_version,
+    _codex_config_declared_env_key_allowance,
     _codex_home_config_source_from_env,
     _databricks_codex_auth_command,
     _databricks_codex_base_url,
@@ -1238,11 +1239,15 @@ async def discover_codex_model_options(*, codex_path: str | None = None) -> list
         port = _allocate_loopback_port()
         listen_url = f"ws://127.0.0.1:{port}"
         env = _clean_codex_env()
+        # Discovery runs against an empty CODEX_HOME, so the credential the
+        # user's config.toml declares via env_key must not reach it either.
+        provider_credentials = {
+            "DATABRICKS_BEARER",
+            "DATABRICKS_CODEX_TOKEN",
+            *_codex_config_declared_env_key_allowance(),
+        }
         for name in tuple(env):
-            if name.startswith("OPENAI_") or name in {
-                "DATABRICKS_BEARER",
-                "DATABRICKS_CODEX_TOKEN",
-            }:
+            if name.startswith("OPENAI_") or name in provider_credentials:
                 env.pop(name)
         env["CODEX_HOME"] = str(codex_home)
         discovery = await _start_codex_model_discovery_process(
@@ -3578,6 +3583,29 @@ def _codex_login_usable() -> bool:
     return codex_auth_has_credential(_codex_home_config_source_from_env() / "auth.json")
 
 
+def _codex_own_config_carries_launch(config_overrides: list[str]) -> bool:
+    """Whether Codex's own ``config.toml`` authenticates a provider-less launch.
+
+    A launch that pins no ``model_provider`` runs whatever provider the user's
+    config selects; a custom provider there that authenticates itself (an
+    ``env_key`` populated in the launch env, an auth command, an inline
+    bearer) never reads ``auth.json``, so a missing Codex login does not park
+    the TUI on its sign-in screen. Asks the same question host readiness asks
+    (:func:`~omnigent.onboarding.codex_auth_readiness.codex_config_effective_auth`
+    against the env the launch receives), so the router and the picker agree.
+
+    :param config_overrides: The launch's ``-c`` overrides; a
+        ``model_provider`` pin overrides the config's selection.
+    :returns: ``True`` when Codex's config carries the launch on its own.
+    """
+    from omnigent.onboarding.codex_auth_readiness import codex_config_effective_auth
+
+    if any(override.startswith(_MODEL_PROVIDER_OVERRIDE_PREFIX) for override in config_overrides):
+        return False
+    config_path = _codex_home_config_source_from_env() / "config.toml"
+    return codex_config_effective_auth(config_path, env=_clean_codex_env()) == "provider-ready"
+
+
 def _resolve_subscription_launch(
     entry: ProviderEntry, model: str | None, explicit: dict[str, object]
 ) -> NativeCodexLaunch:
@@ -3863,6 +3891,21 @@ def resolve_native_codex_launch(
             )
 
     if entry is None:
+        if _codex_own_config_carries_launch(no_provider_overrides):
+            log_info_once(
+                _logger,
+                "native-codex routing: Codex's own config.toml provider (no provider "
+                "configured for the Codex harness, no Databricks profile).",
+            )
+            return NativeCodexLaunch(
+                config_overrides=no_provider_overrides,
+                model=model,
+                profile=None,
+                summary=(
+                    "Codex's own config.toml provider (no provider configured for the "
+                    "codex harness, no Databricks profile)"
+                ),
+            )
         log_info_once(
             _logger,
             "native-codex routing: Codex CLI login (no provider configured for the Codex "
@@ -3911,7 +3954,9 @@ def resolve_native_codex_launch(
             "usable openai credential) — the TUI likely renders the sign-in screen "
             "and never starts a thread"
         ),
-        login_required=not _codex_login_usable(),
+        login_required=not (
+            _codex_login_usable() or _codex_own_config_carries_launch(no_provider_overrides)
+        ),
     )
 
 

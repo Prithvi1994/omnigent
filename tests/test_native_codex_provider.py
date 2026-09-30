@@ -796,6 +796,55 @@ def test_no_provider_but_codex_logged_in_is_not_login_required(
     assert launch.login_required is False
 
 
+def _write_codex_env_key_config(home: Path, env_key: str) -> None:
+    """Write a ``~/.codex/config.toml`` selecting a custom ``env_key`` provider."""
+    codex_dir = home / ".codex"
+    codex_dir.mkdir(parents=True, exist_ok=True)
+    (codex_dir / "config.toml").write_text(
+        'model_provider = "myproxy"\n'
+        "[model_providers.myproxy]\n"
+        'name = "My Proxy"\n'
+        'base_url = "https://myproxy.example.com/v1"\n'
+        f'env_key = "{env_key}"\n',
+        encoding="utf-8",
+    )
+
+
+def test_no_provider_but_codex_config_env_key_populated_is_not_login_required(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex's own ``env_key`` provider carries a provider-less launch.
+
+    No Omnigent provider and no Codex login, but the user's ``config.toml``
+    selects a custom provider whose declared variable is populated — the same
+    setup a bare ``codex`` runs on. The launch must defer to that config and
+    not be marked ``login_required``, or the runner fails every turn with
+    "Codex is not signed in" while the TUI would have authenticated fine.
+    """
+    _write_codex_env_key_config(_isolated, "MYPROXY_API_KEY")
+    monkeypatch.setenv("MYPROXY_API_KEY", "populated-proxy-token")
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert launch.config_overrides == []
+    assert launch.profile is None
+    assert "config.toml" in launch.summary
+    assert launch.login_required is False
+
+
+def test_no_provider_and_codex_config_env_key_unpopulated_marks_login_required(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ``env_key`` provider whose variable is unset cannot carry the launch."""
+    _write_codex_env_key_config(_isolated, "MYPROXY_API_KEY")
+    monkeypatch.delenv("MYPROXY_API_KEY", raising=False)
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert "Codex CLI login" in launch.summary
+    assert launch.login_required is True
+
+
 def test_routable_provider_is_not_login_required(_isolated: Path) -> None:
     """A provider that routes Codex never sets ``login_required``."""
     _seed(

@@ -1028,28 +1028,33 @@ def _write_pi_auth(home: Path, body: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "auth_json",
+    "auth",
     [
         # OAuth entry with a refresh token (renewable — the normal login).
-        '{"anthropic": {"type": "oauth", "access": "at-real", "refresh": "rt-real", '
-        '"expires": 1}}',
+        {"anthropic": {"type": "oauth", "access": "at-real", "refresh": "rt-real", "expires": 1}},
         # OAuth entry without a refresh token but not yet expired.
-        '{"anthropic": {"type": "oauth", "access": "at-real", "refresh": "", '
-        '"expires": 99999999999999}}',
+        {
+            "anthropic": {
+                "type": "oauth",
+                "access": "at-real",
+                "refresh": "",
+                "expires": 99999999999999,
+            }
+        },
         # Stored provider API key.
-        '{"openai": {"type": "api_key", "key": "sk-pi-real"}}',
+        {"openai": {"type": "api_key", "key": "sk-pi-real"}},
         # A usable entry among unusable ones still counts.
-        '{"a": {"type": "api_key", "key": ""}, "b": {"type": "api_key", "key": "k"}}',
+        {"a": {"type": "api_key", "key": ""}, "b": {"type": "api_key", "key": "k"}},
     ],
 )
-def test_pi_cli_login_detected(clean_env, auth_json: str) -> None:
+def test_pi_cli_login_detected(clean_env, auth: dict[str, object]) -> None:
     """A ``~/.pi/agent/auth.json`` carrying a credential is detected.
 
     Failure means a natively signed-in pi (a bare ``pi`` runs) keeps reading
     "Not configured" in the setup overview — the user's own login is never
     credited, the bug this detection fixes.
     """
-    _write_pi_auth(clean_env, auth_json)
+    _write_pi_auth(clean_env, json.dumps(auth))
     assert detect_providers() == [
         DetectedProvider(
             name="pi",

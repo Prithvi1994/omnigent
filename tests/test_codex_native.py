@@ -128,6 +128,33 @@ def test_codex_auth_unavailable_reason_absent_auth_json_needs_auth(
     assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
 
 
+def test_codex_auth_unavailable_reason_config_env_key_populated_is_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Codex's own ``env_key`` provider with the variable populated is available.
+
+    A bare ``codex`` authenticates against such a provider from the user's
+    environment, so the host must not gate the launch as needing a Codex login.
+    """
+    auth_path = tmp_path / "codex-home" / "auth.json"
+    _point_codex_auth_check_at(
+        monkeypatch,
+        auth_path,
+        binary_present=True,
+        config_toml=(
+            'model_provider = "myproxy"\n'
+            "\n"
+            "[model_providers.myproxy]\n"
+            'name = "My Proxy"\n'
+            'base_url = "https://myproxy.example.com/v1"\n'
+            'env_key = "MYPROXY_API_KEY"\n'
+        ),
+    )
+    monkeypatch.setenv("MYPROXY_API_KEY", "populated-proxy-token")
+
+    assert codex_native._codex_auth_unavailable_reason() is None
+
+
 def test_codex_auth_unavailable_reason_chatgpt_tokens_available(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -386,8 +413,9 @@ def test_codex_auth_unavailable_reason_config_env_key_scrubbed_needs_auth(
     """An ``env_key`` the launch env scrubs is not reported as available.
 
     Readiness resolves the variable in the same filtered env the launch hands
-    the CLI, so a variable outside Codex's allowed env families (here a bare
-    ``EXAMPLE_GATEWAY_TOKEN``) cannot mark the harness ready and then 401 on the
+    the CLI. The config's declared variable is normally forwarded, but
+    ``OPENAI_API_KEY`` stays denied (it would bill a developer key), so a
+    config declaring it cannot mark the harness ready and then 401 on the
     first turn.
     """
     auth_path = tmp_path / "codex-home" / "auth.json"  # never created
@@ -396,10 +424,10 @@ def test_codex_auth_unavailable_reason_config_env_key_scrubbed_needs_auth(
         auth_path,
         binary_present=True,
         config_toml=_ENV_KEY_CONFIG_TOML.replace(
-            'env_key = "OPENAI_EXAMPLE_GATEWAY_TOKEN"', 'env_key = "EXAMPLE_GATEWAY_TOKEN"'
+            'env_key = "OPENAI_EXAMPLE_GATEWAY_TOKEN"', 'env_key = "OPENAI_API_KEY"'
         ),
     )
-    monkeypatch.setenv("EXAMPLE_GATEWAY_TOKEN", "gw-token")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-secret")
 
     assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
 
