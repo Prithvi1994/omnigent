@@ -41,6 +41,18 @@ Generate the description from the actual diff and this session's context — lea
 with the motivation, then the change. Don't pass a `--body` that skips these
 sections.
 
+### Demo media
+
+Do not commit screenshots or recordings created only as PR or issue evidence.
+Upload them as GitHub attachments and embed the attachment URLs in the PR's
+Demo section or issue comments. Keep local captures outside the tracked tree,
+and redact private data before uploading.
+
+Commit media only when it serves maintained documentation, product assets, or
+test baselines, not merely to obtain a public demo URL. If attachment upload is
+unavailable, explain the limitation and ask for help instead of committing the
+files as a workaround.
+
 ## Finishing a task
 
 When you finish a task, print instructions to the user on how to test it: the
@@ -49,6 +61,9 @@ verify the result themselves. Prefer verification that is best performed by a
 human, such as concrete manual behavior checks, rather than only listing unit
 test commands. Don't leave the user guessing how to confirm the work — tell
 them exactly what to do.
+
+To drive the app yourself and prove a user-facing change on every entry point a
+user can reach, start with `feature-map/README.md`, then read the relevant maps and linked skills.
 
 ## Deprecating features
 
