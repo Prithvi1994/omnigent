@@ -93,7 +93,7 @@ export function SidebarServerPicker() {
   const currentServer = info.currentServer ?? null;
   const currentKey = currentServer === null ? null : serverKey(currentServer);
   const isCurrent = (url: string) =>
-    currentKey === null ? originOf(url) === info.currentOrigin : serverKey(url) === currentKey;
+    originOf(url) === info.currentOrigin || (currentKey !== null && serverKey(url) === currentKey);
   const currentIsManaged = managed.some(isCurrent);
   // The current server leads its section even when settings were edited out
   // from under us. Managed origins are not repeated under Recents.

@@ -690,21 +690,24 @@ describe("Databricks auth mode wiring", () => {
     const saved = (h) => JSON.parse(fs.readFileSync(h.settingsPath, "utf8"));
 
     // Sign-in at an account-level URL lands on the workspace's own host.
-    async function joinThroughAccount(t) {
+    async function joinThroughAccount(t, { recents, ...options } = {}) {
       const h = loadNavigationHarness({
         serverUrl: picked,
         databricksMode: "browser",
         ensureSession: async () => workspaceOrigin,
+        ...options,
       });
       t.after(h.cleanup);
       h.api.registerIpc();
+      if (recents) fs.writeFileSync(h.settingsPath, JSON.stringify({ recent_servers: recents }));
       await h.ipc.get("omnigent:set-server-url")(setupEvent(h), picked);
       h.setUrl(workspace);
       return h;
     }
 
     it("records the pick for the workspace host, and shows it in recents and the picker", async (t) => {
-      const h = await joinThroughAccount(t);
+      // An earlier direct connect to the workspace host gives way to the pick.
+      const h = await joinThroughAccount(t, { recents: [workspace] });
       assert.deepEqual(saved(h).server_aliases, { [workspaceOrigin]: picked });
       assert.equal(saved(h).server_url, workspace);
       assert.deepEqual(saved(h).recent_servers, [picked]);
@@ -738,6 +741,44 @@ describe("Databricks auth mode wiring", () => {
       );
       await tick();
       assert.equal(h.calls.auth.at(-1)[1], other);
+    });
+
+    it("drops the recent of a pick another pick replaced for the same workspace", async (t) => {
+      const h = await joinThroughAccount(t);
+      const bare = "https://accounts.cloud.databricks.com/omnigent";
+      await h.ipc.get("omnigent:set-server-url")(setupEvent(h), bare);
+      assert.deepEqual(saved(h).server_aliases, { [workspaceOrigin]: bare });
+      // The first pick no longer leads to the workspace's sign-in, so it isn't offered.
+      assert.deepEqual(saved(h).recent_servers, [bare]);
+      await h.ipc.get("omnigent:switch-server")(pageEvent(h), bare);
+      await tick();
+      const [, origin, options] = h.calls.auth.at(-1);
+      assert.equal(origin, workspaceOrigin);
+      assert.equal(options.interactive, false);
+    });
+
+    it("drops the alias when the workspace host is picked from the sidebar", async (t) => {
+      const managed = `${workspaceOrigin}/`;
+      const h = await joinThroughAccount(t, { managedServers: [managed] });
+      await h.ipc.get("omnigent:switch-server")(pageEvent(h), managed);
+      await tick();
+      assert.deepEqual(saved(h).server_aliases, {});
+      assert.deepEqual(saved(h).recent_servers, [managed]);
+      const picker = JSON.parse(
+        JSON.stringify(await h.ipc.get("omnigent:get-server-picker")(pageEvent(h))),
+      );
+      assert.equal(picker.currentOrigin, workspaceOrigin);
+      assert.equal(picker.currentServer, null);
+    });
+
+    it("drops the alias once its pick ages out of the recents", async (t) => {
+      const h = await joinThroughAccount(t);
+      for (let i = 0; i < 5; i++) {
+        // oxlint-disable-next-line no-await-in-loop -- Each connect bumps the recents in order.
+        await h.ipc.get("omnigent:set-server-url")(setupEvent(h), `https://s${i}.example.com/`);
+      }
+      assert.ok(!saved(h).recent_servers.includes(picked));
+      assert.deepEqual(saved(h).server_aliases, {});
     });
 
     it("records no alias when the connect fails", async (t) => {
@@ -823,6 +864,13 @@ describe("Databricks auth mode wiring", () => {
       // The page forgets the normalized URL it was shown.
       const [listed] = await h.ipc.get("omnigent:get-recent-servers")(setupEvent(h));
       await h.ipc.get("omnigent:forget-recent-server")(setupEvent(h), listed);
+      assert.deepEqual(saved(h).server_aliases, {});
+      assert.deepEqual(saved(h).recent_servers, []);
+    });
+
+    it("drops the alias when its pick is forgotten in another equivalent form", async (t) => {
+      const h = await joinThroughAccount(t);
+      await h.ipc.get("omnigent:forget-recent-server")(setupEvent(h), picked);
       assert.deepEqual(saved(h).server_aliases, {});
       assert.deepEqual(saved(h).recent_servers, []);
     });

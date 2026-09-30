@@ -189,6 +189,23 @@ describe("SidebarServerPicker", () => {
     );
     expect(other).toBeDefined();
     fireEvent.click(other!);
-    expect(switchServer).toHaveBeenCalledWith("https://accounts.example.com/?o=2");
+    await waitFor(() =>
+      expect(switchServer).toHaveBeenCalledWith("https://accounts.example.com/?o=2"),
+    );
+  });
+
+  it("doesn't offer the workspace host it moved to as another server", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://dbc-1.cloud.databricks.com",
+      currentServer: "https://accounts.example.com/omnigent?o=1",
+      managedServers: ["https://dbc-1.cloud.databricks.com/"],
+      recentServers: ["https://accounts.example.com/?o=1"],
+    });
+    renderPicker();
+    await openMenu();
+    const managedRow = screen
+      .getAllByRole("menuitem")
+      .find((item) => /dbc-1\.cloud\.databricks\.com/.test(item.textContent ?? ""));
+    expect(managedRow).toHaveAttribute("data-disabled");
   });
 });

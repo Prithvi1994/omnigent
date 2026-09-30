@@ -1318,6 +1318,39 @@ function rememberRecentServer(settings, url) {
       (u) => typeof u === "string" && serverIdentity(aliasedServerUrl(aliases, u)) !== identity,
     ),
   ].slice(0, MAX_RECENT_SERVERS);
+  // A pick that aged out of the recents takes its alias with it.
+  if (settings.server_aliases !== undefined) {
+    const listed = new Set(settings.recent_servers.map(serverIdentity));
+    settings.server_aliases = Object.fromEntries(
+      Object.entries(aliases).filter(([, pick]) => listed.has(serverIdentity(pick))),
+    );
+  }
+}
+
+/**
+ * Record an explicit connect to `picked` that landed on `connected`: update the
+ * aliases (see withConnectAlias), then the recents. Mutates `settings`.
+ *
+ * @param {Record<string, unknown>} settings Settings object from loadSettings().
+ * @param {string} picked The URL the user picked.
+ * @param {string} connected The server URL it loaded.
+ */
+function rememberConnect(settings, picked, connected) {
+  const before = parseServerAliases(settings.server_aliases);
+  const after = withConnectAlias(before, picked, connected);
+  settings.server_aliases = after;
+  // A pick whose workspace host now maps elsewhere, or nowhere, can't reach that
+  // host's stored sign-in anymore, so its recent goes too.
+  const kept = new Set(Object.values(after).map(serverIdentity));
+  const stale = new Set(
+    Object.values(before)
+      .map(serverIdentity)
+      .filter((identity) => !kept.has(identity)),
+  );
+  if (Array.isArray(settings.recent_servers)) {
+    settings.recent_servers = settings.recent_servers.filter((u) => !stale.has(serverIdentity(u)));
+  }
+  rememberRecentServer(settings, connected);
 }
 
 // ---------------------------------------------------------------------------
@@ -3022,12 +3055,7 @@ function registerIpc() {
       // moved to another host maps it back to the pick, for recents and the picker.
       if (!ephemeral) {
         const settings = loadSettings();
-        settings.server_aliases = withConnectAlias(
-          parseServerAliases(settings.server_aliases),
-          target,
-          resolvedServerUrl,
-        );
-        rememberRecentServer(settings, resolvedServerUrl);
+        rememberConnect(settings, target, resolvedServerUrl);
         saveSettings(settings);
       }
       return {};
@@ -3066,12 +3094,15 @@ function registerIpc() {
     }
     const managed = managedServerUrls();
     const settings = loadSettings();
-    const remaining = normalizeRecentServers(settings.recent_servers).filter((u) => u !== url);
-    settings.recent_servers = remaining;
     // Recents are compared normalized, as the page lists them.
+    const forgotten = serverIdentity(url) ?? url;
+    const remaining = normalizeRecentServers(settings.recent_servers).filter(
+      (u) => u !== forgotten,
+    );
+    settings.recent_servers = remaining;
     const aliases = parseServerAliases(settings.server_aliases);
     settings.server_aliases = Object.fromEntries(
-      Object.entries(aliases).filter(([, picked]) => serverIdentity(picked) !== url),
+      Object.entries(aliases).filter(([, picked]) => serverIdentity(picked) !== forgotten),
     );
     saveSettings(settings);
     return excludingManagedServers(remaining, managed);
@@ -3252,7 +3283,8 @@ function registerIpc() {
     if (!isPinnedOriginSender(event)) {
       throw new Error("switch-server is only available to a connected server page");
     }
-    const recents = loadSettings().recent_servers;
+    const settings = loadSettings();
+    const recents = settings.recent_servers;
     const knownRecent = Array.isArray(recents) && recents.includes(url);
     const knownManaged = managedServerUrls().includes(url);
     if (!knownRecent && !knownManaged) {
@@ -3260,19 +3292,18 @@ function registerIpc() {
     }
     const win = BrowserWindow.fromWebContents(event.sender);
     const ephemeral = Boolean(win && windows.get(win)?.ephemeral);
-    const target = workspaceUrlForAlias(url);
+    const target = workspaceUrlForAlias(parseServerAliases(settings.server_aliases), url);
     if (!ephemeral) {
-      const settings = loadSettings();
       settings.server_url = target;
       saveSettings(settings);
     }
     if (win) {
       loadServerUrl(win, target)
-        .then(() => {
+        .then((connected) => {
           if (ephemeral) return;
-          const settings = loadSettings();
-          rememberRecentServer(settings, target); // bump to head of the recents
-          saveSettings(settings);
+          const latest = loadSettings();
+          rememberConnect(latest, url, connected); // bump to head of the recents
+          saveSettings(latest);
         })
         .catch(() => {
           // Load failure falls back via did-fail-load → setup page w/ error.
@@ -3818,11 +3849,12 @@ function trustedAliasOrigins(settings) {
  * The URL to load for a picked server: an aliased pick loads its workspace
  * host, where its stored sign-in token lives, so the switch stays silent.
  *
+ * @param {Record<string, string>} aliases From parseServerAliases.
  * @param {string} url
  * @returns {string}
  */
-function workspaceUrlForAlias(url) {
-  const origin = aliasedWorkspaceOrigin(parseServerAliases(loadSettings().server_aliases), url);
+function workspaceUrlForAlias(aliases, url) {
+  const origin = aliasedWorkspaceOrigin(aliases, url);
   return (origin && databricksWorkspaceUiUrl(origin)) || url;
 }
 
