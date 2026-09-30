@@ -1,35 +1,26 @@
-"""E2E: ACP sessions must display the active harness model, not the spec pin.
+"""E2E: ACP sessions display the harness's active model, not the agent spec's pin.
 
-An agent whose spec pins an executor model (the builtin ``hello_world``
-fixture agent pins ``gpt-4o-mini``) is launched with a self-authenticated
-ACP harness override (Grok Build). The ACP process owns its own model and
-reports the one it actually runs (``grok-4.6``); the spec's pinned model
-never executes.
+An agent whose spec pins an executor model (``hello_world`` pins ``gpt-4o-mini``)
+is launched with the Grok Build ACP harness override. Before the ACP process
+reports a model, the composer must show the harness identity; after the first
+turn it must show, and keep across a reload, the model the process reported.
 
-Expected behavior, split into the two facets asserted here:
-
-1. **Pre-report** (``test_fresh_acp_session_shows_harness_identity_not_spec_model``):
-   before the ACP process has reported anything, the composer identifies the
-   session by the selected harness identity (Grok Build) — it must NOT claim
-   the pinned spec model the ACP process will never run.
-2. **Post-report** (``test_acp_reported_model_persists_and_displays``): after
-   the first turn, the ACP-reported active model is displayed live and
-   persisted, so a reload still shows it instead of the spec pin.
-
-The journey is driven for real: the builtin ``grok`` ACP CLI harness row is
-pointed at a hermetic fake Grok Build agent (an executable Python script
-speaking the Agent Client Protocol on stdio, mirroring
-``tests/e2e_ui/files/test_files_tab_survives_acp_reply.py``) via the
-``harness.grok.command`` config override, which the runner re-reads from
-``config.yaml`` at dispatch time. The session is created with
-``harness_override: "grok"`` — the same JSON create the web new-chat harness
-picker issues — and the SPA is driven through the session page.
+The rig is a dedicated server + runner with an isolated ``HOME`` /
+``OMNIGENT_CONFIG_HOME`` whose ``config.yaml`` points the builtin ``grok`` row
+at a hermetic fake Grok Build agent (an ACP-over-stdio script), so no developer
+or CI configuration is read or written.
 """
 
 from __future__ import annotations
 
 import os
+import secrets
+import signal
+import subprocess
+import sys
+import time
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -37,27 +28,28 @@ import pytest
 import yaml
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import _ensure_runner_online, _server_state
+from tests.e2e_ui.conftest import _BUILD_OUTPUT, _REPO_ROOT, _TEST_AGENT_YAML, _find_free_port
 
-# The builtin fixture agent registered by the spawned live_server. Its spec
-# pins ``executor.model: gpt-4o-mini`` — an agent with a pinned executor
-# model the ACP process never runs.
+# The builtin agent the rig registers; its spec pins ``executor.model``.
 _PINNED_AGENT_NAME = "hello_world"
 _SPEC_PINNED_MODEL = "gpt-4o-mini"
 
-# What the fake Grok Build ACP agent reports as its active model, and the
-# harness identity label the composer should show before any report.
+# What the fake Grok Build agent reports as its active model, and the harness
+# identity the composer must show before any report.
 _ACP_ACTIVE_MODEL = "grok-4.6"
 _HARNESS_IDENTITY = "Grok Build"
-
 _ACP_REPLY_TEXT = "Grok Build reply: hello from fake-grok"
 
-# A minimal Grok Build stand-in speaking the Agent Client Protocol over
-# stdio. It reports its active model the way real ACP agents do — a ``model``
-# config option with a ``currentValue`` in the ``session/new`` result — then
-# streams one deterministic reply chunk and completes the turn with token
-# usage (no ``model`` key: the executor stamps the reported active model).
-# Stdlib only; launched as ``<this script> agent stdio`` (args ignored).
+# Boot budget for the spawned server + runner pair on a loaded CI box.
+_RIG_TIMEOUT_S = 90.0
+_RIG_POLL_INTERVAL_S = 0.5
+
+# Proxy-blind client: CI's egress proxy must not intercept loopback requests.
+_client = httpx.Client(trust_env=False)
+
+# Grok Build stand-in speaking the Agent Client Protocol over stdio: reports its
+# model as a ``model`` config option in the ``session/new`` result, then streams
+# one reply and completes the turn with usage that carries no model key.
 _FAKE_GROK_AGENT = r"""#!/usr/bin/env python3
 import sys, json
 
@@ -97,141 +89,196 @@ for line in sys.stdin:
 """
 
 
-def _config_yaml_path() -> Path:
-    """The global omnigent config file the server/runner processes read.
+@dataclass
+class _AcpRig:
+    """A dedicated server + runner pair with an isolated home and config."""
 
-    Mirrors ``omnigent.onboarding.provider_config._config_path``: the spawned
-    server and runner inherit this process's environment, so computing the
-    path from the same ``$OMNIGENT_CONFIG_HOME`` fallback chain targets the
-    file the runner's dispatch-time ``load_config()`` re-reads.
-    """
-    config_home = os.environ.get("OMNIGENT_CONFIG_HOME")
-    config_dir = Path(config_home) if config_home else Path.home() / ".omnigent"
-    return config_dir / "config.yaml"
+    base_url: str
+    runner_id: str
 
 
 def _builtin_agent_id(base_url: str, name: str) -> str:
     """Resolve a builtin agent's id by name from ``GET /v1/agents``."""
-    resp = httpx.get(f"{base_url}/v1/agents?limit=100", timeout=10.0)
+    resp = _client.get(f"{base_url}/v1/agents?limit=100", timeout=10.0)
     resp.raise_for_status()
     agent = next((a for a in resp.json()["data"] if a["name"] == name), None)
     if agent is None:
-        pytest.fail(
-            f"Builtin agent {name!r} not registered on {base_url}. The spawned "
-            f"live_server seeds it via OMNIGENT_BUILTIN_AGENT_DIRS; an external "
-            f"--ui-base-url server won't have it."
-        )
+        pytest.fail(f"Builtin agent {name!r} is not registered on the rig at {base_url}.")
     return str(agent["id"])
 
 
-@pytest.fixture
-def grok_override_session(
-    live_server: str,
-    tmp_path: Path,
-    tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[tuple[str, str]]:
-    """A session on the pinned-model agent with the Grok Build ACP override.
+def _wait_until_online(
+    base_url: str,
+    runner_id: str,
+    procs: list[subprocess.Popen[bytes]],
+    work: Path,
+) -> None:
+    """Block until the rig's server is healthy and its runner reports online."""
+    deadline = time.monotonic() + _RIG_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if any(proc.poll() is not None for proc in procs):
+            break
+        try:
+            if _client.get(f"{base_url}/health", timeout=2).status_code == 200:
+                status = _client.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2)
+                if status.status_code == 200 and status.json().get("online"):
+                    return
+        except httpx.HTTPError:
+            pass
+        time.sleep(_RIG_POLL_INTERVAL_S)
+    raise RuntimeError(
+        f"ACP e2e rig did not come online within {_RIG_TIMEOUT_S:.0f}s.\n"
+        f"Server log:\n{(work / 'server.log').read_text()[-3000:]}\n"
+        f"Runner log:\n{(work / 'runner.log').read_text()[-3000:]}"
+    )
 
-    Points the builtin ``grok`` harness row at the hermetic fake agent via
-    the ``harness.grok.command`` config override (backed up and restored),
-    creates the session with ``harness_override: "grok"`` — the same JSON
-    create the web new-chat harness picker issues — and binds it to the
-    spawned runner.
+
+@pytest.fixture
+def acp_rig(
+    built_spa: None,
+    tmp_path_factory: pytest.TempPathFactory,
+    request: pytest.FixtureRequest,
+) -> Iterator[_AcpRig]:
+    """Spawn an isolated server + runner whose ``grok`` harness row runs the fake agent."""
+    if request.config.getoption("--ui-base-url"):
+        pytest.skip("the ACP reported-model e2e requires an isolated spawned server")
+
+    work = tmp_path_factory.mktemp("acp_reported_model")
+    config_home = work / "config-home"
+    home_dir = work / "home"
+    artifacts = work / "artifacts"
+    for path in (config_home, home_dir, artifacts):
+        path.mkdir(parents=True, exist_ok=True)
+
+    fake_grok = work / "fake-grok"
+    fake_grok.write_text(_FAKE_GROK_AGENT)
+    fake_grok.chmod(0o755)
+    # The runner re-reads this config at dispatch, so the fake command is in
+    # place for the first turn without touching any real config.yaml.
+    (config_home / "config.yaml").write_text(
+        yaml.safe_dump({"harness": {"grok": {"command": str(fake_grok)}}})
+    )
+    agent_yaml = work / f"{_PINNED_AGENT_NAME}.yaml"
+    agent_yaml.write_text(_TEST_AGENT_YAML)
+
+    port = _find_free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    binding_token = secrets.token_urlsafe(32)
+
+    from omnigent.runner.identity import token_bound_runner_id
+
+    runner_id = token_bound_runner_id(binding_token)
+    no_proxy = ",".join(filter(None, [os.environ.get("NO_PROXY", ""), "127.0.0.1,localhost"]))
+    shared_env = {
+        **os.environ,
+        # Import omnigent from the worktree, not a stale installed copy.
+        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+        "OMNIGENT_CONFIG_HOME": str(config_home),
+        "HOME": str(home_dir),
+        "OMNIGENT_WEB_UI_DIST": str(_BUILD_OUTPUT),
+        "NO_PROXY": no_proxy,
+        "no_proxy": no_proxy,
+    }
+    server_env = {**shared_env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token}
+    runner_env = {
+        **shared_env,
+        "OMNIGENT_RUNNER_ID": runner_id,
+        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
+        "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
+        "RUNNER_SERVER_URL": base_url,
+    }
+
+    server_log = (work / "server.log").open("w")
+    runner_log = (work / "runner.log").open("w")
+    procs: list[subprocess.Popen[bytes]] = []
+    try:
+        procs.append(
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "omnigent.cli",
+                    "server",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                    "--database-uri",
+                    f"sqlite:///{work}/test.db",
+                    "--artifact-location",
+                    str(artifacts),
+                    "--agent",
+                    str(agent_yaml),
+                ],
+                env=server_env,
+                stdout=server_log,
+                stderr=subprocess.STDOUT,
+                cwd=str(_REPO_ROOT),
+            )
+        )
+        procs.append(
+            subprocess.Popen(
+                [sys.executable, "-m", "omnigent.runner._entry"],
+                env=runner_env,
+                stdout=runner_log,
+                stderr=subprocess.STDOUT,
+                cwd=str(_REPO_ROOT),
+            )
+        )
+        _wait_until_online(base_url, runner_id, procs, work)
+        yield _AcpRig(base_url=base_url, runner_id=runner_id)
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGTERM)
+        for proc in procs:
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        server_log.close()
+        runner_log.close()
+
+
+@pytest.fixture
+def grok_override_session(acp_rig: _AcpRig) -> tuple[str, str]:
+    """A session on the pinned-model agent, created with ``harness_override: "grok"``.
+
+    The same JSON create the web new-chat harness picker issues, bound to the
+    rig's runner so the first turn dispatches to the fake agent.
 
     :returns: ``(base_url, session_id)``.
     """
-    # The fake Grok Build binary: an executable ACP-speaking script, spawned
-    # by the runner as ``<script> agent stdio`` (the row's argv).
-    fake_grok = tmp_path / "fake-grok"
-    fake_grok.write_text(_FAKE_GROK_AGENT)
-    fake_grok.chmod(0o755)
-
-    # Point the grok row at it through config — re-read by the runner at
-    # dispatch time, so no runner restart is needed. Back up whatever the
-    # machine already had and restore it on teardown.
-    config_path = _config_yaml_path()
-    original = config_path.read_bytes() if config_path.exists() else None
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    cfg: dict[str, object] = {}
-    if original is not None:
-        loaded = yaml.safe_load(original.decode()) or {}
-        if isinstance(loaded, dict):
-            cfg = loaded
-    harness_block = cfg.get("harness")
-    if isinstance(harness_block, str):
-        harness_block = {"default": harness_block}
-    if not isinstance(harness_block, dict):
-        harness_block = {}
-    harness_block["grok"] = {"command": str(fake_grok)}
-    cfg["harness"] = harness_block
-    config_path.write_text(yaml.safe_dump(cfg))
-
-    respawned_runner = None
-    session_id: str | None = None
-    try:
-        # Earlier tests may deliberately stop the session-scoped runner.
-        respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
-        runner_id = str(_server_state["runner_id"])
-
-        agent_id = _builtin_agent_id(live_server, _PINNED_AGENT_NAME)
-        create_resp = httpx.post(
-            f"{live_server}/v1/sessions",
-            json={"agent_id": agent_id, "harness_override": "grok"},
-            timeout=30.0,
-        )
-        create_resp.raise_for_status()
-        session_id = str(create_resp.json()["id"])
-        patch_resp = httpx.patch(
-            f"{live_server}/v1/sessions/{session_id}",
-            json={"runner_id": runner_id},
-            timeout=10.0,
-        )
-        patch_resp.raise_for_status()
-
-        yield (live_server, session_id)
-    finally:
-        try:
-            if session_id is not None:
-                httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        finally:
-            try:
-                if original is None:
-                    config_path.unlink(missing_ok=True)
-                else:
-                    config_path.write_bytes(original)
-            finally:
-                if respawned_runner is not None:
-                    respawned_runner.terminate()
-                    try:
-                        respawned_runner.wait(timeout=5)
-                    except Exception:  # best-effort teardown
-                        respawned_runner.kill()
-                        respawned_runner.wait(timeout=5)
+    agent_id = _builtin_agent_id(acp_rig.base_url, _PINNED_AGENT_NAME)
+    create = _client.post(
+        f"{acp_rig.base_url}/v1/sessions",
+        json={"agent_id": agent_id, "harness_override": "grok"},
+        timeout=30.0,
+    )
+    create.raise_for_status()
+    session_id = str(create.json()["id"])
+    bind = _client.patch(
+        f"{acp_rig.base_url}/v1/sessions/{session_id}",
+        json={"runner_id": acp_rig.runner_id},
+        timeout=10.0,
+    )
+    bind.raise_for_status()
+    return (acp_rig.base_url, session_id)
 
 
 def test_fresh_acp_session_shows_harness_identity_not_spec_model(
     page: Page,
     grok_override_session: tuple[str, str],
 ) -> None:
-    """Pre-report: the composer shows the harness identity, not the spec pin.
-
-    The reported journey's first observable failure: open a fresh session
-    created with the Grok Build ACP harness override, before any turn. The
-    ACP process owns its model and has not reported one yet, so the composer
-    must identify the session by the selected harness identity — it must NOT
-    display the agent spec's pinned executor model, which this session never
-    runs. Under the bug the label reads the spec pin (``gpt-4o-mini`` here)
-    and this test fails on the first expect.
-    """
+    """Before any model report, the composer shows the harness identity, not the spec pin."""
     base_url, session_id = grok_override_session
     page.goto(f"{base_url}/c/{session_id}")
 
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible(timeout=30_000)
 
-    # The composer's session-config trigger (model/harness label). Once the
-    # snapshot hydrates, correct behavior renders the harness identity; the
-    # positive expectation doubles as the hydration wait.
+    # The positive expectation doubles as the snapshot-hydration wait.
     config_value = page.get_by_test_id("composer-agent-config-value")
     expect(config_value).to_be_visible(timeout=30_000)
     expect(config_value).to_contain_text(_HARNESS_IDENTITY, timeout=30_000)
@@ -242,36 +289,21 @@ def test_acp_reported_model_persists_and_displays(
     page: Page,
     grok_override_session: tuple[str, str],
 ) -> None:
-    """Post-report: the ACP-reported active model displays and persists.
-
-    Drive one real turn through the fake Grok Build ACP agent, which reports
-    ``grok-4.6`` as its active model. The composer must flip to the reported
-    model once the turn completes (the ``session.model`` push), and a reload
-    must still show it (the persisted ``reported_model`` on the snapshot)
-    rather than the spec's pinned model.
-    """
+    """After a turn, the composer shows the reported model live and again after a reload."""
     base_url, session_id = grok_override_session
     page.goto(f"{base_url}/c/{session_id}")
 
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible(timeout=30_000)
-
-    # The reported user action: a message to the ACP-override session.
     composer.fill("Say hello")
     composer.press("Enter")
 
-    # The fake agent streams a deterministic reply; once it renders, the turn
-    # has completed and the agent's model report has reached the server.
+    # Once the fake agent's reply renders, its model report has reached the server.
     expect(page.get_by_text(_ACP_REPLY_TEXT)).to_be_visible(timeout=90_000)
-
-    # Live display: the composer model label must show the ACP-reported
-    # active model, not the spec pin.
     model_value = page.get_by_test_id("composer-agent-model-value")
     expect(model_value).to_contain_text(_ACP_ACTIVE_MODEL, timeout=30_000)
     expect(model_value).not_to_contain_text(_SPEC_PINNED_MODEL)
 
-    # Persistence: a reload re-renders from the session snapshot, which must
-    # carry the reported model instead of falling back to the spec pin.
     page.reload()
     expect(page.get_by_label("Message the agent")).to_be_visible(timeout=30_000)
     model_value = page.get_by_test_id("composer-agent-model-value")

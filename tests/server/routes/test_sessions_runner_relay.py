@@ -269,14 +269,17 @@ class _ScriptedRunnerClient:
 
 @pytest.mark.asyncio
 async def test_relay_persists_acp_reported_model(db_uri: str) -> None:
-    """A vendor-owned ACP model becomes the session's durable active model."""
+    """An ACP report lands on ``reported_model`` and leaves the user's pinned request alone.
+
+    ``session.model`` is also the first event the relay publishes for the turn.
+    """
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
 
     sessions_module._runner_relay_tasks.clear()
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation()
-    store.update_conversation(conv.id, harness_override="grok")
+    store.update_conversation(conv.id, harness_override="grok", model_override="claude-opus-5")
     release = asyncio.Event()
     fake_runner = _ScriptedRunnerClient(
         release,
@@ -313,7 +316,7 @@ async def test_relay_persists_acp_reported_model(db_uri: str) -> None:
         # user's ``model_override`` request.
         refreshed = store.get_conversation(conv.id)
         assert refreshed.reported_model == "grok-4.6"
-        assert refreshed.model_override is None
+        assert refreshed.model_override == "claude-opus-5"
     finally:
         release.set()
         if collector is not None:
