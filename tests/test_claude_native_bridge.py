@@ -11938,7 +11938,7 @@ def test_hold_approval_wait_marker_refreshes_until_released(
 
 @pytest.mark.parametrize("request_id", [None, "req_failed", "invalid\nidentifier", 123])
 @pytest.mark.parametrize("nested_flag", [False, True])
-def test_api_error_diagnostics_do_not_borrow_previous_request(
+def test_api_diagnostics_do_not_borrow_previous_request(
     tmp_path: Path, request_id: object, nested_flag: bool
 ) -> None:
     transcript = tmp_path / "session.jsonl"
@@ -11966,8 +11966,10 @@ def test_api_error_diagnostics_do_not_borrow_previous_request(
     (error["message"] if nested_flag else error)["isApiErrorMessage"] = True
     transcript.write_text(json.dumps(success) + "\n" + json.dumps(error) + "\n")
     _, _, items = read_transcript_items_since(transcript, 0, agent_name="claude-native-ui")
-    assert items[0].api_error_diagnostics is None
-    attrs = items[1].api_error_diagnostics
+    assert items[0].api_diagnostics is not None
+    assert items[0].api_diagnostics["claude_request_id"] == "req_previous"
+    assert items[0].api_diagnostics["claude_is_api_error"] == "false"
+    attrs = items[1].api_diagnostics
     assert attrs is not None
     assert attrs["claude_request_id_status"] == (
         "present_on_error_record" if request_id == "req_failed" else "missing_on_error_record"
@@ -11980,4 +11982,4 @@ def test_api_error_diagnostics_do_not_borrow_previous_request(
     assert attrs["claude_reported_model"] == "test-model"
     assert "private" not in json.dumps(attrs)
     assert "req_previous" not in json.dumps(attrs)
-    assert "api_error_diagnostics" not in items[1].data
+    assert "api_diagnostics" not in items[1].data

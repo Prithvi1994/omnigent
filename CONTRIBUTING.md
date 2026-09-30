@@ -303,24 +303,52 @@ Notes:
 
 ### Diagnosing native Claude API failures
 
-The standard process logger emits two warning events that the configured debug-log
-sink also ships: `claude_native_stop_failure` after forwarding a failed hook, and
-`claude_native_api_error` after forwarding a CLI-authored API-error transcript item.
-Filter by `session_id` and these event names. The hook event carries its recording
-time and error category; the transcript event carries the original record time,
-CLI version, reported model, message ID, and transcript UUID when supplied.
-`omnigent_response_id` is Omnigent's display grouping, not an inference request ID.
+Native Claude launches enable a private, per-launch structured diagnostics file.
+The independent collector emits `claude_native_stream_failure` warnings through
+the standard process logger and configured log sync, even before transcript
+discovery or while transcript delivery is stalled. The event preserves the CLI's
+error class/type, connection code, watchdog flag, HTTP status, stream event counts,
+and timing. This helps distinguish server-class API errors, connection failures,
+and timeouts; it does not assign fault to a gateway or provider. These are failed
+stream attempts and may include recovered retries or internal subagent requests;
+they are not a count of failed user turns.
 
-`claude_request_id` comes only from `requestId` on that error's transcript record.
-It is distinct from the log sink's `request_id`, which identifies an Omnigent RPC.
-Its equivalence to a gateway or provider response-header ID is not verified; check
-that before joining service logs. CLI-synthesized errors can omit it, so
-`claude_request_id_status` explicitly reports `missing_on_error_record` or
-`not_provided_by_hook`. We never borrow the preceding successful response's ID.
-Missing IDs still require CLI/provider-side diagnostics or timestamp correlation.
-These events contain allowlisted metadata, not prompts or response/error bodies.
-They follow the existing forwarding cursors; replay can repeat an event, and
-unsuccessful forwarding does not emit it.
+The collector exports only allowlisted fields from `cli_stream_failed` records.
+It never exports raw headers, bodies, or arbitrary diagnostic events. Local files
+live in the owner-only bridge directory, are created with mode `0600`, and rotate
+after 4 MiB with one predecessor retained. Reads and record sizes are bounded;
+`claude_native_diagnostics_omitted` reports drops. Rotation is best-effort during
+writer bursts. Set `OMNIGENT_CLAUDE_STREAM_DIAGNOSTICS_ENABLED=0` to disable capture.
+An explicit `CLAUDE_CODE_DIAGNOSTICS_FILE` is preserved and never ingested. This is
+independent of the existing opt-in for raw harness stderr/debug logging. CLI
+versions that do not support structured diagnostics simply produce no records.
+
+For correlation, filter by `session_id` and these additional events:
+
+- `claude_native_stop_failure` (warning): hook timestamp and error category.
+- `claude_native_api_error` (warning): CLI-authored API-error transcript metadata.
+- `claude_native_api_response` (info): assistant transcript records carrying request
+  IDs, including partial output and tool calls. Multiple content-block records can
+  share a request/message ID; these are not token deltas or inference counts.
+
+Transcript metadata includes the original record time, CLI version, reported
+model, message ID, and transcript UUID when supplied. `omnigent_response_id` is a
+display grouping, not an inference ID. Transcript events follow forwarding cursors;
+replay can repeat them, and unsuccessful forwarding does not emit them.
+
+`claude_request_id` comes from the original transcript record or the structured
+failure's response metadata, as its status field indicates. It is distinct from
+the log sink's `request_id`, which identifies an Omnigent RPC. In the inspected
+Claude Code 2.1.284 client, response-record IDs originate from HTTP `request-id`,
+falling back to `x-amzn-requestid`; this does not capture a gateway's separate
+`x-request-id`. Structured diagnostic response IDs are further limited to the
+CLI's accepted provider-ID format. Other CLI versions may differ.
+
+Synthetic errors can omit the ID, so `claude_request_id_status` explicitly reports
+missing values. We never assign a preceding response's ID to a later error. Verify
+ID equivalence with your gateway/provider before joining service logs; absent IDs
+still require server-side or timestamp correlation. No prompt, response, or error
+body is added to these events.
 
 ## Tests
 
