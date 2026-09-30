@@ -213,6 +213,8 @@ class ErrorCode:
     :cvar SUB_AGENT_UNRESOLVED: The session's named sub-agent is absent
         from its parent spec (HTTP 410), for example after a bundle rename.
         The caller must restore the definition or dispatch a declared name.
+        Servers predating this code relay their generic error instead; the
+        runner still rejects the dispatch.
     :cvar UPSTREAM_CANCELLED: A backing upstream call (e.g. a gRPC
         dependency behind an embedding route) was cancelled by its peer
         mid-flight — an upstream teardown or restart, not our fault and

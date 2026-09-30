@@ -9004,8 +9004,10 @@ async def test_create_session_reinit_preserves_existing_inbox() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("harness_override", [None, "hermes"])
 async def test_unresolvable_sub_agent_is_rejected_at_session_create(
     caplog: pytest.LogCaptureFixture,
+    harness_override: str | None,
 ) -> None:
     """A root sharing the requested child's name cannot substitute for that child."""
     conv = "conv_unresolvable_sub_agent_create"
@@ -9036,6 +9038,7 @@ async def test_unresolvable_sub_agent_is_rejected_at_session_create(
                     "session_id": conv,
                     "agent_id": "ag_root",
                     "sub_agent_name": "worker",
+                    **({"harness_override": harness_override} if harness_override else {}),
                 },
             )
 

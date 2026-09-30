@@ -583,3 +583,88 @@ async def test_native_mirror_display_name_init_explains_the_mirror() -> None:
     assert created.json()["error"]["code"] == "invalid_input"
     assert "mirrors the native sub-agent 'Explore'" in created.json()["error"]["message"]
     assert not manager.spawns
+
+
+@pytest.mark.asyncio
+async def test_native_mirror_background_turn_without_agent_id_explains_the_mirror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A background turn whose body names no agent still cannot run a mirror on its owner."""
+    owner, mirror = "conv_mirror_bare_owner", "conv_mirror_bare"
+    server = _ContractSnapshotClient(owner)
+    original_get = server.get
+
+    async def get(url: str, **kwargs: Any) -> Any:
+        if url.endswith(f"/v1/sessions/{mirror}"):
+            return httpx.Response(200, json=_mirror_snapshot(owner))
+        return await original_get(url, **kwargs)
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return _contract_root_spec(with_child=True)
+
+    monkeypatch.setattr(server, "get", get)
+    recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    manager = _RecordingManager(recording)
+    app = create_runner_app(
+        process_manager=manager,
+        spec_resolver=resolver,
+        server_client=server,
+    )  # type: ignore[arg-type]
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            f"/v1/sessions/{mirror}/events",
+            json={"type": "message", "role": "user", "content": "hi"},
+        )
+        assert response.status_code == 202, response.text
+        await _await_bg_turn_task(mirror)
+        failure = _statuses(app, mirror)[-1]
+    assert failure["status"] == "failed"
+    assert failure["error"]["code"] == "invalid_input"
+    assert "mirrors the native sub-agent 'Explore'" in failure["error"]["message"]
+    assert not manager.spawns
+    assert not recording.posted_bodies
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["known_harness", "no_harness"])
+async def test_direct_stream_to_mirror_during_owner_outage_fails_cleanly(
+    path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unreadable owner metadata is a controlled failure that releases the turn slot."""
+    owner, mirror = "conv_mirror_outage_owner", "conv_mirror_outage"
+    server = _ContractSnapshotClient(owner)
+    original_get = server.get
+    owner_down = True
+
+    async def get(url: str, **kwargs: Any) -> Any:
+        if url.endswith(f"/v1/sessions/{mirror}"):
+            return httpx.Response(200, json=_mirror_snapshot(owner))
+        if url.endswith(f"/v1/sessions/{owner}") and owner_down:
+            return httpx.Response(503)
+        return await original_get(url, **kwargs)
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return _contract_root_spec(with_child=True)
+
+    monkeypatch.setattr(server, "get", get)
+    recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    manager = _RecordingManager(recording)
+    app = create_runner_app(
+        process_manager=manager,
+        spec_resolver=resolver,
+        server_client=server,
+    )  # type: ignore[arg-type]
+    async with _runner_test_client(app) as http:
+        result = await _CONTRACT_ADAPTERS[path](http, mirror, recording)
+        assert result["status"] == 500, result
+        assert result["error"]["code"] == "internal_error"
+        assert "mirrors" not in result["error"]["message"]
+        assert not manager.spawns
+        assert not recording.posted_bodies
+
+        # The slot was released: the repaired follow-up is answered, not buffered.
+        owner_down = False
+        result = await _CONTRACT_ADAPTERS[path](http, mirror, recording)
+        assert result["status"] == 400, result
+        assert "mirrors the native sub-agent 'Explore'" in result["error"]["message"]
+    assert not manager.spawns

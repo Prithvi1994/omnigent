@@ -3801,6 +3801,24 @@ def create_runner_app(
             )
         return snapshot
 
+    def _reject_mirror_turn_without_child(session_id: str, spec_entry: _SpecEntry | None) -> None:
+        """Refuse a turn for a mirror whose display name is not a declared child.
+
+        Resolution hands a mirror its owner's spec for resources; a turn must not
+        run on it. A failed resolution is left to its own retryable error.
+        """
+        snapshot = _session_snapshot_cache.get(session_id)
+        if (
+            spec_entry is not None
+            and snapshot is not None
+            and snapshot.sub_agent_name
+            and snapshot.parent_session_id
+            and is_parent_owned_subagent_labels(snapshot.labels)
+            and _native_runtime._resolve_sub_agent_spec_entry(spec_entry, snapshot.sub_agent_name)
+            is None
+        ):
+            raise _mirror_turn_error(session_id, snapshot.sub_agent_name)
+
     async def _session_workspace_value(session_id: str) -> str | None:
         if session_id not in _session_workspace_cache:
             generation = _session_cache_generation(session_id)
@@ -9037,6 +9055,7 @@ def create_runner_app(
                         exc_info=True,
                         extra={"session_id": conv},
                     )
+                _reject_mirror_turn_without_child(conv, cached_spec_entry)
             cached_spec = _unwrap_resolved_spec(cached_spec_entry)
 
         cached_spec_workdir = _resolved_spec_workdir(cached_spec_entry)
@@ -9451,6 +9470,14 @@ def create_runner_app(
                 # A known harness cannot make an unresolved child safe to run.
                 if isinstance(exc, OmnigentError) and exc.code == ErrorCode.SUB_AGENT_UNRESOLVED:
                     raise
+                mirror_snapshot = _session_snapshot_cache.get(conv_id)
+                if (
+                    mirror_snapshot is not None
+                    and mirror_snapshot.parent_session_id
+                    and is_parent_owned_subagent_labels(mirror_snapshot.labels)
+                ):
+                    # A mirror has no spec of its own to fall back to.
+                    raise
                 _logger.warning(
                     "Session-aware spec resolution failed for %s; falling back to the "
                     "turn's agent_id",
@@ -9458,20 +9485,7 @@ def create_runner_app(
                     exc_info=True,
                     extra={"session_id": conv_id},
                 )
-            # Resolution hands a mirror its parent's spec; a mirrored sub-agent that
-            # is not a declared child must not run a turn on it.
-            direct_snapshot = _session_snapshot_cache.get(conv_id)
-            if (
-                direct_snapshot is not None
-                and direct_snapshot.sub_agent_name
-                and direct_snapshot.parent_session_id
-                and is_parent_owned_subagent_labels(direct_snapshot.labels)
-                and _native_runtime._resolve_sub_agent_spec_entry(
-                    direct_spec_entry, direct_snapshot.sub_agent_name
-                )
-                is None
-            ):
-                raise _mirror_turn_error(conv_id, direct_snapshot.sub_agent_name)
+            _reject_mirror_turn_without_child(conv_id, direct_spec_entry)
         startup_envelope = _fresh_session_init_envelope(conv_id)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
         if not harness_name:
@@ -10582,6 +10596,17 @@ def create_runner_app(
                     except OmnigentError as exc:
                         _on_proxy_stream_end(
                             conversation_id, error={"code": exc.code, "message": exc.message}
+                        )
+                        raise
+                    except Exception as exc:
+                        # Any setup failure must release the turn slot, or later
+                        # messages buffer behind a turn that never started.
+                        _on_proxy_stream_end(
+                            conversation_id,
+                            error={
+                                "code": "runner_error",
+                                "message": _client_safe_error_detail(exc, context="turn setup"),
+                            },
                         )
                         raise
                     if not isinstance(response, StreamingResponse):
@@ -12523,12 +12548,9 @@ def create_runner_app(
                     )
                 spec_entry = await spec_resolver(agent_id, session_id)
                 if spec_entry is None:
-                    # The session still references agent_id, but its stored bundle
-                    # no longer resolves (deleted or rebound out from under the
-                    # live session). A session-lifecycle condition, not a generic
-                    # NOT_FOUND: the distinct code lets the terminal-ensure and
-                    # turn-dispatch paths surface a lifecycle reason instead of a
-                    # runner startup fault.
+                    # Stored bundle no longer resolves (deleted/rebound): the distinct
+                    # lifecycle code lets ensure/dispatch paths report a lifecycle
+                    # reason instead of a runner startup fault.
                     raise OmnigentError(
                         f"session spec resolver: agent {agent_id!r} for "
                         f"session {session_id!r} was not found",
@@ -14045,7 +14067,8 @@ async def _resolve_harness_config(
         via :func:`_resolve_sub_agent_spec_entry` before harness derivation,
         so the spawn-env advertises the child's bundle rather than the
         parent's. ``None`` for top-level sessions.
-    :param selected_spec_entry: Already selected session spec; avoids resolving its parent again.
+    :param selected_spec_entry: Already selected session spec. It outranks
+        ``agent_id`` and ``sub_agent_name``: session metadata is authoritative.
     :param cwd: Runtime working directory for harnesses that need it.
     :returns: ``(harness, spawn_env)`` derived from the resolved spec.
     :raises RuntimeError: When a spec_resolver is configured but the spec
