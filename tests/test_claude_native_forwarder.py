@@ -26,7 +26,6 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 import omnigent.harnesses.claude_native.forwarder as forwarder
-from omnigent.debug_logging import record_to_row
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     BtwOverlay,
@@ -2505,7 +2504,6 @@ async def test_forwarder_posts_external_session_status_on_stop_failure_hook(
 @pytest.mark.asyncio
 async def test_forwarder_attaches_stop_failure_reason_to_failed_edge(
     tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
     payload_fields: dict[str, str],
     expected_detail: str,
 ) -> None:
@@ -2544,9 +2542,6 @@ async def test_forwarder_attaches_stop_failure_reason_to_failed_edge(
     )
     try:
         request = await _get_recorded_request(server)
-        await _wait_for_json_state(
-            bridge_dir / "hook_forwarder.json", lambda state: state.get("event_cursor") == 2
-        )
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -2554,20 +2549,6 @@ async def test_forwarder_attaches_stop_failure_reason_to_failed_edge(
         server.shutdown()
         server.server_close()
         thread.join(timeout=5.0)
-
-    failures = [
-        r for r in caplog.records if getattr(r, "event_name", None) == "claude_native_stop_failure"
-    ]
-    assert len(failures) == 1
-    assert failures[0].session_id == "conv_abc"
-    assert failures[0].attributes["failure_category"] == payload_fields["error"]
-    assert failures[0].attributes["claude_request_id_status"] == "not_provided_by_hook"
-    assert isinstance(failures[0].attributes["hook_recorded_at"], float)
-    row = record_to_row(failures[0], source="runner")
-    assert row["event_name"] == "claude_native_stop_failure"
-    assert row["session_id"] == "conv_abc"
-    assert row["attributes"]["claude_request_id_status"] == "not_provided_by_hook"
-    assert "last_assistant_message" not in row["attributes"]
 
     # ``failure_detail``, not ``output``: wire output is labeled a Codex error.
     assert request["body"] == {
@@ -11896,164 +11877,3 @@ async def test_timed_out_batch_is_split_not_dropped(
     updated = checkpoint.state.subagents["split"]
     assert updated.byte_offset == 30
     assert updated.seen_source_ids == tuple(item.source_id for item in items)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("request_id", [None, "req_failed"])
-async def test_forwarder_logs_api_error_metadata_once(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, request_id: str | None
-) -> None:
-    bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
-    transcript = tmp_path / "session.jsonl"
-    transcript.write_text(
-        json.dumps(
-            {
-                "type": "assistant",
-                "uuid": "failure",
-                "sessionId": "claude_session",
-                "requestId": request_id,
-                "isApiErrorMessage": True,
-                "message": {"role": "assistant", "content": "private error body"},
-            }
-        )
-        + "\n"
-    )
-    state = forwarder.TranscriptForwardState(transcript_path=transcript, line_cursor=0)
-    posted = []
-
-    def accept(request: httpx.Request) -> httpx.Response:
-        # Exercise real forwarding and cursor deduplication without an external server.
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={})
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(accept), base_url="http://test"
-    ) as client:
-        for _ in range(2):
-            state = await forwarder._forward_available_items(
-                client=client,
-                session_id="conv_failed",
-                bridge_dir=bridge_dir,
-                agent_name="claude-native-ui",
-                state=state,
-                retry_tracker=forwarder._PostRetryTracker(),
-                dedupe=forwarder._ForwardDedupeState(),
-            )
-    records = [
-        r for r in caplog.records if getattr(r, "event_name", None) == "claude_native_api_error"
-    ]
-    assert len(records) == 1
-    row = record_to_row(records[0], source="runner")
-    assert row["session_id"] == "conv_failed"
-    attrs = row["attributes"]
-    assert attrs.get("claude_request_id") == request_id
-    assert attrs["claude_request_id_status"] == (
-        "present_on_error_record" if request_id else "missing_on_error_record"
-    )
-    assert attrs["gateway_request_id_verified"] == "false"
-    assert "private error body" not in json.dumps(row)
-    assert "api_diagnostics" not in json.dumps(posted)
-
-
-@pytest.mark.asyncio
-async def test_forwarder_logs_response_ids_without_assigning_them_to_error(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    caplog.set_level(logging.INFO, logger=forwarder.__name__)
-    bridge_dir = tmp_path / "bridge"
-    bridge_dir.mkdir()
-    transcript = tmp_path / "session.jsonl"
-    records = [
-        {
-            "type": "assistant",
-            "uuid": "partial",
-            "requestId": "req_stream",
-            "sessionId": "claude_session",
-            "isAbortedMidStream": True,
-            "message": {
-                "role": "assistant",
-                "id": "msg_stream",
-                "content": [
-                    {"type": "text", "text": "private partial output"},
-                    {"type": "thinking", "thinking": "private reasoning"},
-                ],
-            },
-        },
-        {
-            "type": "assistant",
-            "uuid": "tool",
-            "requestId": "req_stream",
-            "sessionId": "claude_session",
-            "message": {
-                "role": "assistant",
-                "id": "msg_stream",
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "id": "call_tool",
-                        "name": "Read",
-                        "input": {"path": "private"},
-                    },
-                ],
-            },
-        },
-        {
-            "type": "assistant",
-            "uuid": "unidentified",
-            "message": {"role": "assistant", "content": "private response without request ID"},
-        },
-        {
-            "type": "assistant",
-            "uuid": "failure",
-            "isApiErrorMessage": True,
-            "message": {"role": "assistant", "content": "private error body"},
-        },
-    ]
-    transcript.write_text("".join(json.dumps(record) + "\n" for record in records))
-    state = forwarder.TranscriptForwardState(transcript_path=transcript, line_cursor=0)
-    posted = []
-
-    def accept(request: httpx.Request) -> httpx.Response:
-        # Keep the transport local while exercising parsing, forwarding, and deduplication.
-        posted.append(json.loads(request.content))
-        return httpx.Response(202, json={})
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(accept), base_url="http://test"
-    ) as client:
-        for _ in range(2):
-            state = await forwarder._forward_available_items(
-                client=client,
-                session_id="conv_failed",
-                bridge_dir=bridge_dir,
-                agent_name="claude-native-ui",
-                state=state,
-                retry_tracker=forwarder._PostRetryTracker(),
-                dedupe=forwarder._ForwardDedupeState(),
-            )
-    responses = [
-        record_to_row(record, source="runner")
-        for record in caplog.records
-        if getattr(record, "event_name", None) == "claude_native_api_response"
-    ]
-    assert len(responses) == 2
-    assert {row["attributes"]["claude_transcript_uuid"] for row in responses} == {
-        "partial",
-        "tool",
-    }
-    for row in responses:
-        assert row["attributes"]["claude_request_id"] == "req_stream"
-        assert row["attributes"]["claude_message_id"] == "msg_stream"
-        assert row["attributes"]["claude_request_id_status"] == "present_on_response_record"
-        assert row["attributes"]["gateway_request_id_verified"] == "false"
-        assert "private" not in json.dumps(row)
-    failures = [
-        record_to_row(record, source="runner")
-        for record in caplog.records
-        if getattr(record, "event_name", None) == "claude_native_api_error"
-    ]
-    assert len(failures) == 1
-    assert "claude_request_id" not in failures[0]["attributes"]
-    assert failures[0]["attributes"]["claude_request_id_status"] == "missing_on_error_record"
-    assert "api_diagnostics" not in json.dumps(posted)

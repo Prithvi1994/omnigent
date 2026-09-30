@@ -323,32 +323,13 @@ An explicit `CLAUDE_CODE_DIAGNOSTICS_FILE` is preserved and never ingested. This
 independent of the existing opt-in for raw harness stderr/debug logging. CLI
 versions that do not support structured diagnostics simply produce no records.
 
-For correlation, filter by `session_id` and these additional events:
-
-- `claude_native_stop_failure` (warning): hook timestamp and error category.
-- `claude_native_api_error` (warning): CLI-authored API-error transcript metadata.
-- `claude_native_api_response` (info): assistant transcript records carrying request
-  IDs, including partial output and tool calls. Multiple content-block records can
-  share a request/message ID; these are not token deltas or inference counts.
-
-Transcript metadata includes the original record time, CLI version, reported
-model, message ID, and transcript UUID when supplied. `omnigent_response_id` is a
-display grouping, not an inference ID. Transcript events follow forwarding cursors;
-replay can repeat them, and unsuccessful forwarding does not emit them.
-
-`claude_request_id` comes from the original transcript record or the structured
-failure's response metadata, as its status field indicates. It is distinct from
-the log sink's `request_id`, which identifies an Omnigent RPC. In the inspected
-Claude Code 2.1.284 client, response-record IDs originate from HTTP `request-id`,
-falling back to `x-amzn-requestid`; this does not capture a gateway's separate
-`x-request-id`. Structured diagnostic response IDs are further limited to the
-CLI's accepted provider-ID format. Other CLI versions may differ.
-
-Synthetic errors can omit the ID, so `claude_request_id_status` explicitly reports
-missing values. We never assign a preceding response's ID to a later error. Verify
-ID equivalence with your gateway/provider before joining service logs; absent IDs
-still require server-side or timestamp correlation. No prompt, response, or error
-body is added to these events.
+Filter synced logs by `session_id` and `claude_native_stream_failure`.
+`claude_request_id` is included only when supplied in the structured failure's
+response metadata; `claude_request_id_status` makes absence explicit. It is
+distinct from the sink's `request_id`, which identifies an Omnigent RPC, and is
+not a verified gateway inference ID. The inspected Claude Code 2.1.284 diagnostic
+schema limits response IDs to its accepted provider-ID format. Other CLI versions
+may differ. Missing IDs still require server-side or timestamp correlation.
 
 ## Tests
 
