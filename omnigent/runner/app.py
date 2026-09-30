@@ -60,7 +60,7 @@ from omnigent.entities.session_resources import (
     session_resource_view_to_dict,
     terminal_resource_id,
 )
-from omnigent.errors import ErrorCode, ErrorPhase, OmnigentError
+from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.harness_aliases import (
     canonicalize_harness,
     is_native_harness,
@@ -3467,20 +3467,19 @@ def create_runner_app(
             )
         return "\n".join(parts)
 
-    def _build_required_terminal_error(event: TerminalExitEvent) -> dict[str, str]:
+    def _build_required_terminal_error(
+        event: TerminalExitEvent, diagnosis: FailureDiagnosis | None
+    ) -> dict[str, str]:
         """Build the structured ``session.status`` error for a required-terminal exit.
 
         Always carries ``code`` + a fully-composed ``message`` (back-compat: the
         REPL and older clients render it verbatim). When the failure is
         recognized, also carries ``title`` / ``cause`` / ``remediation`` so the
         web UI can render a friendly card instead of the raw enum + blob.
+
+        :param event: The required terminal's exit event.
+        :param diagnosis: The exit's :func:`classify_terminal_failure` result.
         """
-        # Classify once; the message formatter reuses the same diagnosis.
-        diagnosis = classify_terminal_failure(
-            command=event.command,
-            exit_status=event.exit_status,
-            output=event.last_output,
-        )
         message = _format_required_terminal_exit_output(event, diagnosis)
         error: dict[str, str] = {"code": "required_terminal_exited", "message": message}
         if diagnosis is not None:
@@ -3588,7 +3587,13 @@ def create_runner_app(
         # Record the exit before releasing the harness: the release severs any
         # in-flight turn stream, whose failure handler then reports this exit
         # instead of the transport error the severed socket raises.
-        error = _build_required_terminal_error(event)
+        # Classify once; the error card and the failure log share the diagnosis.
+        diagnosis = classify_terminal_failure(
+            command=event.command,
+            exit_status=event.exit_status,
+            output=event.last_output,
+        )
+        error = _build_required_terminal_error(event, diagnosis)
         _required_terminal_exit_errors[event.session_id] = error
         # A dead required terminal cannot still be working a turn.
         _native_pane_status.pop(event.session_id, None)
@@ -3633,7 +3638,16 @@ def create_runner_app(
             event.terminal_name,
             event.session_id,
             error.get("message"),
-            extra={"session_id": event.session_id},
+            extra=debug_event(
+                "required_terminal_exited",
+                session_id=event.session_id,
+                terminal_name=event.terminal_name,
+                terminal_exit_status=event.exit_status,
+                error_code=error["code"],
+                # An unrecognized exit is the harness CLI dying under the runner.
+                error_category=(diagnosis.category if diagnosis else ErrorCategory.RUNNER).value,
+                error_impact=ErrorImpact.BLOCKING.value,
+            ),
         )
         _publish_event(
             event.session_id,

@@ -61,7 +61,15 @@ from omnigent.entities.conversation import (
     parse_item_data,
 )
 from omnigent.entities.permission import SessionPermission
-from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
+from omnigent.errors import (
+    ErrorCategory,
+    ErrorCode,
+    ErrorImpact,
+    ErrorPhase,
+    OmnigentError,
+    category_for_code,
+    restart_on_stale_cursor,
+)
 from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
@@ -3507,10 +3515,12 @@ async def _persist_external_acp_subagent_start(
         if adopted is None:
             raise
         await asyncio.to_thread(conversation_store.set_labels, adopted.id, labels)
-        _publish_session_created(parent_id, adopted.id, parent_conv.agent_id)
+        await _publish_session_created(
+            parent_id, adopted.id, parent_conv.agent_id, conversation_store
+        )
         return adopted.id
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
+    await _publish_session_created(parent_id, child.id, parent_conv.agent_id, conversation_store)
     return child.id
 
 
@@ -3554,10 +3564,11 @@ def _find_subagent_child_by_title(
         after = page.last_id
 
 
-def _publish_session_created(
+async def _publish_session_created(
     parent_id: str,
     child_session_id: str,
     agent_id: str | None,
+    conversation_store: ConversationStore,
 ) -> None:
     """
     Emit ``session.created`` on the parent's stream for a child session.
@@ -3572,6 +3583,7 @@ def _publish_session_created(
     :param agent_id: Agent id stamped on the child (the parent's
         agent), e.g. ``"ag_abc123"``. ``None`` only for legacy parents
         without one.
+    :param conversation_store: Store for the durable parent-chat activity link.
     """
     event = SessionCreatedEvent(
         type="session.created",
@@ -3581,6 +3593,11 @@ def _publish_session_created(
         parent_session_id=parent_id,
     )
     session_stream.publish(parent_id, event.model_dump())
+    from omnigent.server.subagent_activity import record_subagent_activity
+
+    await record_subagent_activity(
+        child_session_id, "delegated", conversation_store, parent_id=parent_id
+    )
 
 
 async def _persist_external_subagent_start(
@@ -3675,6 +3692,11 @@ async def _persist_external_subagent_start(
         subagent_id,
     )
     if existing is not None:
+        from omnigent.server.subagent_activity import record_subagent_activity
+
+        await record_subagent_activity(
+            existing.id, "delegated", conversation_store, parent_id=parent_id
+        )
         return existing.id
 
     # Title format mirrors omnigent-spawned children
@@ -3733,10 +3755,12 @@ async def _persist_external_subagent_start(
         # Subagents rail) have never heard about the child — emit it now.
         # In the concurrent-race case the winner also published; a
         # duplicate event is a harmless extra cache invalidation.
-        _publish_session_created(parent_id, adopted.id, parent_conv.agent_id)
+        await _publish_session_created(
+            parent_id, adopted.id, parent_conv.agent_id, conversation_store
+        )
         return adopted.id
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
+    await _publish_session_created(parent_id, child.id, parent_conv.agent_id, conversation_store)
     return child.id
 
 
@@ -3832,10 +3856,12 @@ async def _create_and_publish_antigravity_child(
         # An orphaned row's creator died before publishing, so live clients have
         # never heard about this child; a duplicate publish in the race case is a
         # harmless extra cache invalidation.
-        _publish_session_created(parent_id, existing.id, parent_conv.agent_id)
+        await _publish_session_created(
+            parent_id, existing.id, parent_conv.agent_id, conversation_store
+        )
         return existing.id
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
+    await _publish_session_created(parent_id, child.id, parent_conv.agent_id, conversation_store)
     return child.id
 
 
@@ -4113,11 +4139,13 @@ async def _create_and_publish_codex_child(
             # this child — emit it now. In the concurrent-race case the
             # winner also published; the duplicate is a harmless extra
             # cache invalidation.
-            _publish_session_created(parent_id, existing.id, parent_conv.agent_id)
+            await _publish_session_created(
+                parent_id, existing.id, parent_conv.agent_id, conversation_store
+            )
             return existing.id
         raise
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
+    await _publish_session_created(parent_id, child.id, parent_conv.agent_id, conversation_store)
     return child.id
 
 
@@ -4213,11 +4241,13 @@ async def _create_and_publish_devin_child(
             )
         if existing is not None:
             await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
-            _publish_session_created(parent_id, existing.id, parent_conv.agent_id)
+            await _publish_session_created(
+                parent_id, existing.id, parent_conv.agent_id, conversation_store
+            )
             return existing.id
         raise
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    _publish_session_created(parent_id, child.id, parent_conv.agent_id)
+    await _publish_session_created(parent_id, child.id, parent_conv.agent_id, conversation_store)
     return child.id
 
 
@@ -5872,20 +5902,36 @@ async def _launch_runner_on_host_locked(
             # No result yet — fall through to the caller's connect wait, which
             # preserves the prior fire-and-forget timing for a slow-but-fine host.
             host_conn.pending_launches.pop(request_id, None)
+            # A slow host, not a refusal: the launch may still land.
             _logger.warning(
                 "Host launch acknowledgement timed out",
                 extra=debug_event(
-                    "runner_launch_failed", stage="runner_launch", error_code="host_launch_timeout"
+                    "runner_launch_failed",
+                    stage="runner_launch",
+                    error_code="host_launch_timeout",
+                    error_category=ErrorCategory.HOST.value,
+                    error_impact=ErrorImpact.TRANSIENT.value,
+                    error_phase=ErrorPhase.RUNNER_LAUNCH.value,
                 ),
             )
             return _HostLaunchAttempt(runner_id=new_runner_id)
         if result.get("status") == "failed":
+            refusal_code = result.get("error_code")
+            # Unmapped codes (spawn failures) are attributed on the host's own row.
+            refusal_category: str | None = None
+            if isinstance(refusal_code, str):
+                mapped = category_for_code(refusal_code)
+                if mapped is not ErrorCategory.UNKNOWN:
+                    refusal_category = mapped.value
             _logger.error(
                 "Host refused runner launch",
                 extra=debug_event(
                     "runner_launch_failed",
                     stage="runner_launch",
-                    error_code=result.get("error_code"),
+                    error_code=refusal_code,
+                    error_category=refusal_category,
+                    error_impact=ErrorImpact.BLOCKING.value,
+                    error_phase=ErrorPhase.RUNNER_LAUNCH.value,
                 ),
             )
             return _HostLaunchAttempt(
@@ -7036,6 +7082,8 @@ def _build_new_item(
             f"invalid data for {body.type!r} item: {exc}",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+    if isinstance(data, MessageData) and data.role == "user" and not data.is_meta:
+        data = data.model_copy(update={"user_authored": True})
     return NewConversationItem(
         type=body.type,
         response_id=response_id,
