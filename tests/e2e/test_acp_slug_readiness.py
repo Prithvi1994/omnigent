@@ -17,12 +17,7 @@ from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_ex
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
-_ACP_CONFIG_YAML = """\
-acp:
-  agents:
-    - name: TraeX
-      command: traex acp serve
-"""
+_ACP_CONFIG_YAML = "acp:\n  agents:\n    - name: TraeX\n      command: traex acp serve\n"
 
 _ACP_SLUG = "traex"
 _ACP_HARNESS_KEY = f"acp:{_ACP_SLUG}"

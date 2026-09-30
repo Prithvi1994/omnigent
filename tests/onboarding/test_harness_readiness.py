@@ -1456,3 +1456,25 @@ def test_antigravity_sdk_readiness_keys_off_gemini_credential(
         )
     )
     assert configured_harness_map()["antigravity"] is True
+
+
+def test_configured_harness_map_keys_configured_acp_slugs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured ``acp:<slug>`` agent reads ready under its own picker key."""
+    # The picker looks this exact spelling up and the launch gate already accepts
+    # the slug, so an absent key would read as "needs setup" for a launchable agent.
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
+
+    _no_clis_installed(monkeypatch)
+    monkeypatch.setattr(
+        "omnigent.onboarding.acp_auth.acp_agents",
+        lambda config=None: [AcpAgentEntry(slug="traex", name="TraeX", command="traex acp serve")],
+    )
+    assert harness_is_configured("acp:traex") is True
+
+    result = configured_harness_map()
+    assert result["acp"] is True
+    assert result.get("acp:traex") is True, (
+        f"launchable acp:traex reads {result.get('acp:traex')!r} in the readiness map"
+    )
