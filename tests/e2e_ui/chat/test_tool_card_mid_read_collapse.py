@@ -146,31 +146,9 @@ def _step_card(page: Page, step: int) -> Locator:
     return page.locator('[data-slot="collapsible"]', has=_step_row(page, step)).last
 
 
-_LAYOUT_TOP_JS = """
-(el) => {
-  let scroller = el.parentElement;
-  while (scroller) {
-    const overflowY = getComputedStyle(scroller).overflowY;
-    if (overflowY === "auto" || overflowY === "scroll") break;
-    scroller = scroller.parentElement;
-  }
-  const top = el.getBoundingClientRect().top;
-  if (!scroller) return top + window.scrollY;
-  return top - scroller.getBoundingClientRect().top + scroller.scrollTop;
-}
-"""
-
-
-def _row_layout_top(row: Locator) -> float | None:
-    """The row's top edge within the transcript's scroll content.
-
-    Measured against the scroll container rather than the viewport: the
-    transcript keeps following appended rows while it is pinned to the
-    bottom, so a viewport offset also moves whenever a new step lands below.
-    """
-    if row.count() == 0:
-        return None
-    return float(row.first.evaluate(_LAYOUT_TOP_JS))
+def _row_top(row: Locator) -> float | None:
+    box = row.bounding_box() if row.count() > 0 else None
+    return None if box is None else box["y"]
 
 
 @pytest.mark.timeout(300)
@@ -197,7 +175,7 @@ def test_expanded_tool_card_survives_next_tool_call(
     panel = _step_card(page, 1).locator('[data-slot="collapsible-content"]')
     expect(panel).to_have_attribute("data-state", "open")
     expect(panel.get_by_text("Parameters", exact=True)).to_be_visible()
-    tops_before = {step: _row_layout_top(_step_row(page, step)) for step in range(1, _STEPS)}
+    tops_before = {step: _row_top(_step_row(page, step)) for step in range(1, _STEPS)}
     page.wait_for_timeout(1_500)
 
     # Step 4 lands while the card is open; the wrap-up call is still gated,
@@ -216,7 +194,7 @@ def test_expanded_tool_card_survives_next_tool_call(
     fold_shown = fold.count() > 0 and fold.first.is_visible()
     shifts = {
         step: None
-        if tops_before[step] is None or (top := _row_layout_top(_step_row(page, step))) is None
+        if tops_before[step] is None or (top := _row_top(_step_row(page, step))) is None
         else round(top - tops_before[step])
         for step in (2, 3)
     }
@@ -226,12 +204,12 @@ def test_expanded_tool_card_survives_next_tool_call(
             "the tool card the user expanded folded away when the next tool call "
             f"landed: step-1 row still visible={step1_present}, "
             f"closed '{_RUN_FOLD_LABEL}' fold shown={fold_shown}, "
-            f"rows 2/3 moved within the transcript by {shifts} px"
+            f"rows 2/3 moved vertically by {shifts} px"
         )
     expect(panel.get_by_text("Parameters", exact=True)).to_be_visible()
     assert not fold_shown, "the open step-1 card must not be replaced by a run fold"
     assert all(shift == 0 for shift in shifts.values()), (
-        f"rows the user was reading moved within the transcript by {shifts} px when step 4 landed"
+        f"rows the user was reading moved by {shifts} px when step 4 landed"
     )
 
     # Let the turn finish.

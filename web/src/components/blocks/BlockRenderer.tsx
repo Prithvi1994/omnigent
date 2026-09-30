@@ -29,7 +29,10 @@ import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } fro
 import { ChevronRightIcon } from "lucide-react";
 import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
+import {
+  ConversationScrollLockContext,
+  type ConversationScrollLock,
+} from "@/components/ai-elements/conversation";
 import type { RenderItem } from "@/lib/renderItems";
 import type { SessionStatus } from "@/lib/types";
 import type { ActiveResponse } from "@/store/types";
@@ -256,16 +259,23 @@ export function BlockRenderer({
     showsWorking,
   });
 
+  const scrollLock = useContext(ConversationScrollLockContext);
   const userOpenedTools = useRef<Set<string>>(new Set());
   const toolOpenState = useMemo<ToolOpenState>(
     () => ({
       isOpen: (key) => userOpenedTools.current.has(key),
       setOpen: (key, open) => {
-        if (open) userOpenedTools.current.add(key);
-        else userOpenedTools.current.delete(key);
+        if (!open) {
+          userOpenedTools.current.delete(key);
+          return;
+        }
+        userOpenedTools.current.add(key);
+        // The card was opened to be read: stop the bottom-pinned transcript
+        // from scrolling it away as it grows or as later steps land below.
+        releaseBottomLock(scrollLock);
       },
     }),
-    [],
+    [scrollLock],
   );
 
   // Fold a turn that did work AND either answered here or continues in a
@@ -632,11 +642,7 @@ function TurnWorkedFold({
     // the expand's resize otherwise fires the library's scrollToBottom
     // (isAtBottom is still true from the pre-click view), overriding
     // the snap and riding the bottom — the click appears to do nothing.
-    if (scrollLock) {
-      scrollLock.stopScroll();
-      scrollLock.state.isAtBottom = false;
-      scrollLock.state.escapedFromLock = true;
-    }
+    releaseBottomLock(scrollLock);
     const scroller = nearestScrollContainer(row);
     // Park native scroll anchoring across the expand commit. The
     // restore deliberately outlives the effect (no cleanup): the timer
@@ -696,6 +702,17 @@ function nearestScrollContainer(el: HTMLElement): HTMLElement | null {
     if (overflowY === "auto" || overflowY === "scroll") return p;
   }
   return null;
+}
+
+/**
+ * Release StickToBottom's bottom-lock so content growth stops pulling the
+ * view down; the reader resumes following via the scroll-to-bottom button.
+ */
+function releaseBottomLock(scrollLock: ConversationScrollLock | null): void {
+  if (!scrollLock) return;
+  scrollLock.stopScroll();
+  scrollLock.state.isAtBottom = false;
+  scrollLock.state.escapedFromLock = true;
 }
 
 /** "8s", "1m 46s", "1h 2m" — matches the native CLIs' worked-for stamps. */

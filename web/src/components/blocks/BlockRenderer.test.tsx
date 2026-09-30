@@ -660,6 +660,46 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.queryByText(/tool_1/)).toBeNull();
       expect(screen.getByText("Called 2 tools")).toBeDefined();
     });
+
+    it("releases the transcript's bottom lock when the user opens a card", () => {
+      // Pinned to the bottom, the scroller would otherwise follow the card's
+      // growth and every later step, scrolling the opened card away mid-read.
+      lockState.isAtBottom = true;
+      lockState.escapedFromLock = false;
+      lockStopScroll.mockReset();
+      const message: RenderItem = { kind: "text", itemId: "m0", text: "Working.", final: true };
+      const { container, rerender } = render(
+        <ConversationScrollLockContext.Provider value={lockValue}>
+          {withProviders(
+            <BlockRenderer items={[message, tool(1), tool(2), tool(3)]} sessionStatus="running" />,
+          )}
+        </ConversationScrollLockContext.Provider>,
+      );
+
+      expandCard(container, "tool_2");
+      expect(lockStopScroll).toHaveBeenCalledTimes(1);
+      expect(lockState.isAtBottom).toBe(false);
+      expect(lockState.escapedFromLock).toBe(true);
+
+      // Re-parenting the opened card on the next step remounts it open
+      // without another release, and closing it releases nothing either.
+      lockState.isAtBottom = true;
+      lockState.escapedFromLock = false;
+      rerender(
+        <ConversationScrollLockContext.Provider value={lockValue}>
+          {withProviders(
+            <BlockRenderer
+              items={[message, tool(1), tool(2), tool(3), tool(4)]}
+              sessionStatus="running"
+            />,
+          )}
+        </ConversationScrollLockContext.Provider>,
+      );
+      expect(cardFor(container, "tool_2")!.textContent).toContain("Parameters");
+      expandCard(container, "tool_2");
+      expect(lockStopScroll).toHaveBeenCalledTimes(1);
+      expect(lockState.isAtBottom).toBe(true);
+    });
   });
 
   describe("settled-turn process fold (Worked row)", () => {
