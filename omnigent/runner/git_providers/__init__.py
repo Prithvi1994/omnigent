@@ -39,7 +39,10 @@ Additive fields:
 - ``capabilities``: :meth:`ProviderCapabilities.to_json`; null for an unsupported remote.
 - ``remote_host``: only with ``reason: "unsupported_remote"``.
 - PR associations in ``prs`` carry ``provider``.
-- A comment may carry ``author_id``, the author's stable id on the provider.
+- ``pr`` may carry ``author_id``, the PR author's stable id on the provider; optional,
+  may be null.
+- A comment may carry ``author_id``, the author's stable id on the provider; optional,
+  may be null.
 - A changed file's ``lines_added`` and ``lines_removed`` may be null.
 - The PR diff may carry ``unavailable_reason: "pr_outside_workspace"`` with an
   empty ``patch``.

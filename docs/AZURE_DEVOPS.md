@@ -17,6 +17,11 @@ uses the first one it finds:
    Azure DevOps resource and reuses the token until five minutes before it
    expires. When no one is signed in, it tries again after a minute.
 
+Before either of these, `resolve_token` reads
+`~/.config/omnigent/azure-devops/token.json` (`access_token` and `expires_at`,
+in epoch seconds) and uses its token until `expires_at` passes. Nothing writes
+this file yet, and it is reserved for a later sandbox credential part.
+
 The host looks for `az` on `PATH`, then at `/opt/homebrew/bin/az` and
 `/usr/local/bin/az`. Processes started by a service manager or a desktop app
 often run without Homebrew on `PATH`.

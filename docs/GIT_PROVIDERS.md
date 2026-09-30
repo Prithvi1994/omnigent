@@ -277,19 +277,26 @@ send:
   It is null for an unsupported remote.
 - `remote_host`: sent only with `reason: "unsupported_remote"`.
 - `provider` on each association in `prs`.
-- `author_id` on a comment: the author's stable id on the provider.
+- `author_id` on `pr` and on each comment: the author's stable id on the
+  provider. Optional, may be null.
 
 | Capability | Meaning | Read by |
 | --- | --- | --- |
-| `account_switching` | The user can choose among several signed-in CLI accounts. `auth.accounts` lists them and `set_preference` accepts `account`. | The dispatcher and the panel's account selector |
+| `account_switching` | The user can choose among several signed-in CLI accounts. `auth.accounts` lists them and `set_preference` accepts `account`. | The dispatcher and the web panel's account selector |
 | `base_remote_selection` | The user can choose the base remote, which `set_preference` accepts as `remote`. | The dispatcher |
-| `line_counts` | Changed files carry line counts. Without it, `lines_added` and `lines_removed` are null. | Nothing yet. The facet honors it. |
-| `linked_pr_diff` | A PR linked from outside the workspace's repository still has a diff. Without it, `pr_diff` returns `unavailable_reason: "pr_outside_workspace"` for that PR. | Nothing yet. The facet honors it. |
+| `line_counts` | Changed files carry line counts. Without it, `lines_added` and `lines_removed` are null. | Informational |
+| `linked_pr_diff` | A PR linked from outside the workspace's repository still has a diff. Without it, `pr_diff` returns `unavailable_reason: "pr_outside_workspace"` for that PR. | Informational |
 
 GitHub sets all four. Azure DevOps sets none. The dispatcher passes a preference
-choice to the facet only when the matching capability is set. The panel offers
-its account selector only when `account_switching` is set and `auth.accounts`
-has more than one entry.
+choice to the facet only when the matching capability is set. The web panel
+offers its account selector only when `account_switching` is set and
+`auth.accounts` has more than one entry.
+
+`line_counts` and `linked_pr_diff` are informational. The facet honors them
+itself, and the web panel relies on the data at runtime: null line counts and
+`unavailable_reason`. Of the four flags, the web panel reads only
+`account_switching`, and the dispatcher reads `account_switching` and
+`base_remote_selection`. Other clients of the info payload can use all four.
 
 GitHub also sends the legacy top-level fields `gh_available`, `authenticated`,
 `accounts`, and `selected_account`. `auth` supersedes them. They are deprecated

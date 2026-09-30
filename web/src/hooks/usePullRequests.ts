@@ -52,8 +52,9 @@ export interface PullRequestChecks {
 export interface PullRequestComment {
   /** Commenter's GitHub login, or null when unknown. */
   author: string | null;
-  /** The author's stable id, for providers whose display names aren't unique. */
-  author_id?: string;
+  /** The author's stable id, for providers whose display names aren't unique.
+   *  Null when the provider has none. */
+  author_id?: string | null;
   /** Comment body (GitHub-flavored markdown). */
   body: string;
   /** ISO-8601 creation time, or null. */
@@ -70,6 +71,9 @@ export interface PullRequest {
   url: string;
   is_draft: boolean;
   author: string | null;
+  /** The author's stable id, for providers whose display names aren't unique.
+   *  Null when the provider has none. */
+  author_id?: string | null;
   base_ref: string | null;
   head_ref: string | null;
   checks: PullRequestChecks;
