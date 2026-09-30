@@ -8,12 +8,14 @@ designs/SESSION_GIT_WORKTREE.md.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+
+_logger = logging.getLogger(__name__)
 
 # fetch/add can be slow on large repos; bound it so git can't hang the
 # host's tunnel loop.
@@ -26,22 +28,6 @@ _MAX_DIR_COLLISION_SUFFIX: int = 50
 # (``..``, leading ``-``/``.``, ``/`` edges, ``.lock``, ``@{`` are
 # checked separately.)
 _INVALID_BRANCH_CHARS = re.compile(r"[\x00-\x20~^:?*\[\\\x7f]")
-
-# Provider classification is intentionally conservative. ``github.com`` is a
-# verified GitHub host; arbitrary enterprise domains and SSH aliases may point
-# anywhere, so they remain unknown rather than being guessed from their name.
-_GITHUB_REMOTE_HOSTS = frozenset({"github.com"})
-_KNOWN_NON_GITHUB_REMOTE_HOSTS = frozenset(
-    {
-        "bitbucket.org",
-        "codeberg.org",
-        "dev.azure.com",
-        "gitlab.com",
-        "ssh.dev.azure.com",
-    }
-)
-_SCP_REMOTE = re.compile(r"^(?:[^/@\s]+@)?(?P<host>[^/:\s]+):.+$")
-_WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
 class WorktreeError(Exception):
@@ -209,9 +195,6 @@ class WorktreeInfo:
         worktrees.
     :param detached: ``True`` when the worktree has a detached HEAD
         (no branch checked out).
-    :param remote_provider: ``"github"`` only for a remote whose hostname is
-        verified as GitHub, ``"other"`` for a recognized non-GitHub or local
-        remote, and ``None`` when no usable remote or provider proof exists.
     :param updated_at: Unix epoch seconds of the checked-out HEAD commit, or
         ``None`` when the commit timestamp cannot be resolved.
     """
@@ -220,71 +203,7 @@ class WorktreeInfo:
     branch: str | None
     is_main: bool
     detached: bool
-    remote_provider: str | None = None
     updated_at: int | None = None
-
-
-def _remote_hostname(remote_url: str) -> str | None:
-    """Return a remote URL's normalized hostname, local marker, or ``None``.
-
-    ``""`` represents a local path/file remote, which is definitively not a
-    GitHub-hosted remote. Unknown SSH aliases and unparseable values return
-    ``None`` so callers fail closed.
-
-    :param remote_url: Git remote URL read from local repository config.
-    :returns: Lowercase hostname, ``""`` for a local remote, or ``None``.
-    """
-    candidate = remote_url.strip()
-    if not candidate:
-        return None
-    if candidate.startswith(("/", "./", "../", "~/")) or _WINDOWS_ABSOLUTE.match(candidate):
-        return ""
-
-    if candidate.startswith("file:"):
-        return ""
-
-    if "://" not in candidate:
-        scp = _SCP_REMOTE.match(candidate)
-        if scp:
-            return scp.group("host").lower()
-
-    try:
-        parsed = urlsplit(candidate)
-    except ValueError:
-        return None
-    if parsed.scheme == "file":
-        return ""
-    if parsed.scheme:
-        return parsed.hostname.lower() if parsed.hostname else None
-    return None
-
-
-def _remote_provider(repo_root: str) -> str | None:
-    """Classify configured remotes without network or credential access.
-
-    One bounded, argv-only ``git config`` read collects local remote URLs. The
-    URLs are never returned or logged; only the coarse provider classification
-    leaves the host. GitHub Enterprise domains and SSH aliases intentionally
-    remain unknown because local URL text alone cannot prove their provider.
-
-    :param repo_root: Resolved main work tree path.
-    :returns: ``"github"``, ``"other"``, or ``None``.
-    """
-    result = _run_git(["config", "--get-regexp", r"^remote\..*\.url$"], cwd=repo_root)
-    if result.returncode not in (0, 1):
-        return None
-
-    saw_other = False
-    for line in result.stdout.splitlines():
-        parts = line.split(maxsplit=1)
-        if len(parts) != 2:
-            continue
-        hostname = _remote_hostname(parts[1])
-        if hostname in _GITHUB_REMOTE_HOSTS:
-            return "github"
-        if hostname == "" or hostname in _KNOWN_NON_GITHUB_REMOTE_HOSTS:
-            saw_other = True
-    return "other" if saw_other else None
 
 
 def _commit_updated_ats(repo_root: str, heads: list[str | None]) -> dict[str, int]:
@@ -307,7 +226,7 @@ def _commit_updated_ats(repo_root: str, heads: list[str | None]) -> dict[str, in
     return timestamps
 
 
-def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
+def list_worktrees(*, repo_path: str, for_cleanup: bool = False) -> list[WorktreeInfo]:
     """List the git worktrees of the repository containing ``repo_path``.
 
     Resolves the main work tree first (so a linked worktree resolves the
@@ -317,15 +236,23 @@ def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
 
     :param repo_path: Absolute path inside a git repository — the
         directory the user picked, e.g. ``"/Users/alice/myrepo"``.
+        If removed or replaced by a file, resolve from a surviving parent.
+    :param for_cleanup: Recover a stored canonical workspace without following
+        replacement symlinks. The caller must verify the recorded cleanup root.
     :returns: One :class:`WorktreeInfo` per worktree, main first.
     :raises WorktreeError: If ``repo_path`` is not a directory or not
         inside a git work tree, or if ``git worktree list`` fails.
     """
-    repo_root = _main_work_tree(repo_path)
-    try:
-        remote_provider = _remote_provider(repo_root)
-    except WorktreeError:
-        remote_provider = None
+    search_path = Path(repo_path)
+    # Picker paths may use symlinks; stored cleanup paths were already canonicalized.
+    if for_cleanup:
+        for ancestor in reversed((search_path, *search_path.parents)):
+            if ancestor.is_symlink():
+                search_path = ancestor.parent
+                break
+    while not search_path.is_dir() and search_path.parent != search_path:
+        search_path = search_path.parent
+    repo_root = _main_work_tree(str(search_path))
     result = _run_git(["worktree", "list", "--porcelain"], cwd=repo_root)
     if result.returncode != 0:
         raise _git_error("git worktree list failed", result)
@@ -362,7 +289,6 @@ def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
             branch=worktree_branch,
             is_main=index == 0,
             detached=worktree_detached,
-            remote_provider=remote_provider,
             updated_at=updated_ats.get(worktree_head) if worktree_head is not None else None,
         )
         for index, (worktree_path, worktree_branch, worktree_detached, worktree_head) in enumerate(
@@ -466,10 +392,12 @@ class CreatedWorktree:
         ``"/Users/alice/myrepo-worktrees/feature-login"``.
     :param branch: The branch checked out in the worktree, e.g.
         ``"feature/login"``.
+    :param workspace: Selected directory relocated into the new worktree.
     """
 
     worktree_path: str
     branch: str
+    workspace: str
 
 
 def create_worktree(
@@ -500,7 +428,7 @@ def create_worktree(
     :param existing_branch: When ``True``, check out the pre-existing
         ``branch_name`` into a fresh worktree instead of creating a new
         branch.
-    :returns: The created worktree's path and branch.
+    :returns: The worktree root, branch, and relocated selected directory.
     :raises WorktreeError: If the branch name is invalid, the path is
         not a git repo, the base ref can't be resolved, or
         ``git worktree add`` fails (e.g. the branch already exists in
@@ -517,6 +445,10 @@ def create_worktree(
     # (``…/feature-worktrees/<branch>``); resolving to the main repo keeps
     # all worktrees as siblings (``…/myrepo-worktrees/<branch>``).
     repo_root = _main_work_tree(repo_path)
+    prefix = _run_git(["rev-parse", "--show-prefix"], cwd=repo_path)
+    if prefix.returncode != 0:
+        raise _git_error("could not resolve selected repository directory", prefix)
+    relative_directory = prefix.stdout.rstrip("\n")
     if existing_branch:
         if not _local_branch_exists(repo_root, branch_name):
             raise WorktreeError(
@@ -545,6 +477,29 @@ def create_worktree(
         )
     if base_branch is not None:
         _ensure_base_resolvable(repo_root, base_branch)
+    validated_commit: str | None = None
+    if relative_directory:
+        revision = f"refs/heads/{branch_name}" if existing_branch else (base_branch or "HEAD")
+        resolved = _run_git(
+            ["rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}"], cwd=repo_root
+        )
+        if resolved.returncode != 0:
+            raise _git_error("could not resolve worktree revision", resolved)
+        validated_commit = resolved.stdout.strip()
+        directory = _run_git(
+            ["cat-file", "-t", f"{validated_commit}:{relative_directory.rstrip('/')}"],
+            cwd=repo_root,
+        )
+        if directory.returncode != 0:
+            raise WorktreeError(
+                f"selected directory {relative_directory!r} does not exist in {revision!r}; "
+                "choose another directory or base branch"
+            )
+        if directory.stdout.strip() != "tree":
+            raise WorktreeError(
+                f"selected path {relative_directory!r} is not a directory in {revision!r}; "
+                "choose another directory or base branch"
+            )
     worktree_path = _resolve_worktree_path(repo_root, branch_name)
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -554,15 +509,47 @@ def create_worktree(
         add_args = ["worktree", "add", str(worktree_path), "--end-of-options", branch_name]
     else:
         add_args = ["worktree", "add", "-b", branch_name, str(worktree_path)]
+        if validated_commit is not None:
+            # Let Git set up tracking from the requested ref before checking out the pinned commit.
+            add_args.insert(2, "--no-checkout")
         if base_branch is not None:
-            # --end-of-options: treat base_branch as a rev, never a git flag,
-            # so a user-supplied value starting with '-' can't inject an
-            # option.
             add_args += ["--end-of-options", base_branch]
     result = _run_git(add_args, cwd=repo_root)
     if result.returncode != 0:
         raise _git_error("git worktree add failed", result)
-    return CreatedWorktree(worktree_path=str(worktree_path), branch=branch_name)
+    if validated_commit is not None:
+        try:
+            if existing_branch:
+                checked_out = _run_git(["rev-parse", "--verify", "HEAD"], cwd=str(worktree_path))
+                if checked_out.returncode != 0:
+                    raise _git_error("could not verify worktree revision", checked_out)
+                if checked_out.stdout.strip() != validated_commit:
+                    raise WorktreeError(
+                        f"branch {branch_name!r} changed during worktree creation; retry"
+                    )
+            else:
+                # This request owns the new branch and its not-yet-populated checkout.
+                checkout = _run_git(
+                    ["checkout", "--force", "-B", branch_name, validated_commit],
+                    cwd=str(worktree_path),
+                )
+                if checkout.returncode != 0:
+                    raise _git_error("could not check out validated worktree revision", checkout)
+        except WorktreeError:
+            try:
+                remove_worktree(
+                    worktree_path=str(worktree_path),
+                    branch=branch_name,
+                    delete_branch=not existing_branch,
+                )
+            except WorktreeError:
+                _logger.warning("Could not roll back worktree %s", worktree_path, exc_info=True)
+            raise
+    return CreatedWorktree(
+        worktree_path=str(worktree_path),
+        branch=branch_name,
+        workspace=str(worktree_path / relative_directory),
+    )
 
 
 def _main_repo_for_worktree(worktree_path: str) -> str:
@@ -604,7 +591,7 @@ def remove_worktree(
     still checked out in a linked worktree. ``git worktree remove``
     refuses to remove the main work tree.
 
-    :param worktree_path: Absolute path of the worktree to remove,
+    :param worktree_path: Canonical absolute root of the worktree to remove,
         e.g. ``"/Users/alice/myrepo-worktrees/feature-login"``.
     :param branch: Branch to delete when ``delete_branch`` is
         ``True``, e.g. ``"feature/login"``. ``None`` skips branch
@@ -614,9 +601,18 @@ def remove_worktree(
     :raises WorktreeError: If the worktree path is missing/invalid, or
         a git command fails.
     """
+    if not Path(worktree_path).exists():
+        raise WorktreeError(f"worktree path does not exist: {worktree_path}")
+    if not Path(worktree_path).is_dir():
+        raise WorktreeError(f"worktree path is not a directory: {worktree_path}")
     main_repo = _main_repo_for_worktree(worktree_path)
+    root = _run_git(["rev-parse", "--show-toplevel"], cwd=worktree_path)
+    if root.returncode != 0:
+        raise _git_error("could not resolve worktree root", root)
+    if os.path.normcase(root.stdout.strip()) != os.path.normcase(os.path.abspath(worktree_path)):
+        raise WorktreeError(f"path is not the expected worktree root: {worktree_path}")
     remove_result = _run_git(
-        ["worktree", "remove", "--force", worktree_path],
+        ["worktree", "remove", "--force", root.stdout.strip()],
         cwd=main_repo,
     )
     if remove_result.returncode != 0:

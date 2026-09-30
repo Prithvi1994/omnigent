@@ -57,10 +57,22 @@ describe("RecentWorkspaceList", () => {
     cleanup();
   });
 
-  it("keeps zero inter-row gap and preserves each row's hit height", () => {
+  it("matches the modal list's compact dimensions and one-pixel gap", () => {
     renderList();
-    expect(screen.getByTestId("recent-workspace-list")).toHaveClass("gap-0");
-    expect(screen.getByTestId("recent-workspace-select-0")).toHaveClass("py-1.5");
+    expect(screen.getByTestId("recent-workspace-list")).toHaveClass("gap-px");
+    expect(screen.getByTestId("recent-workspace-row-0")).toHaveClass("h-7", "rounded-md");
+    expect(screen.getByTestId("recent-workspace-select-0")).toHaveClass(
+      "h-full",
+      "gap-2",
+      "px-2",
+      "py-[3px]",
+      "text-ui",
+      "leading-4",
+    );
+    expect(screen.getByTestId("recent-workspace-select-0").querySelector("svg")).toHaveClass(
+      "size-4",
+    );
+    expect(screen.getByTestId("recent-workspace-browse-0")).toHaveClass("size-5", "rounded-md");
   });
 
   it("keeps select and browse as sibling actions without cross-triggering", () => {
@@ -77,19 +89,17 @@ describe("RecentWorkspaceList", () => {
     expect(onSelect).toHaveBeenCalledTimes(1);
   });
 
-  it("uses GitHub icons only for positively verified GitHub providers", async () => {
-    authenticatedFetchMock
-      .mockResolvedValueOnce(response("github"))
-      .mockResolvedValueOnce(response("other"));
-    renderList();
+  it.each([undefined, null, "other", "github"] as const)(
+    "uses Git icons regardless of provider metadata (%s)",
+    async (remoteProvider) => {
+      authenticatedFetchMock.mockResolvedValue(response(remoteProvider));
+      renderList({ paths: ["/repo"] });
 
-    expect(await screen.findByTestId("recent-workspace-icon-0-github")).toHaveClass(
-      "lucide-folder-git-2",
-    );
-    expect(await screen.findByTestId("recent-workspace-icon-1-folder")).toHaveClass(
-      "lucide-folder",
-    );
-  });
+      expect(await screen.findByTestId("recent-workspace-icon-0-git")).toHaveClass(
+        "lucide-folder-git-2",
+      );
+    },
+  );
 
   it("marks the selected project folder without changing the separate browse action", () => {
     renderList({ selectedPath: "/one" });
@@ -101,19 +111,23 @@ describe("RecentWorkspaceList", () => {
     );
   });
 
-  it("falls back to folder icons for legacy, offline, and unavailable metadata", async () => {
+  it("uses folder icons for non-Git directories and offline hosts", async () => {
     authenticatedFetchMock
-      .mockResolvedValueOnce(response())
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ message: "not a git repository" }), { status: 400 }),
+      )
       .mockRejectedValueOnce(new Error("host offline"));
-    renderList();
+    const { client } = renderList();
 
     await waitFor(() => {
+      expect(client.getQueryState(["host-worktrees", "host_1", "/one"])?.status).toBe("success");
+      expect(client.getQueryState(["host-worktrees", "host_1", "/two"])?.status).toBe("error");
       expect(screen.getByTestId("recent-workspace-icon-0-folder")).toBeInTheDocument();
       expect(screen.getByTestId("recent-workspace-icon-1-folder")).toBeInTheDocument();
     });
   });
 
-  it("does not reuse a previous path's GitHub icon when a row path changes", async () => {
+  it("does not reuse a previous path's Git icon when a row path changes", async () => {
     let resolveNext: ((value: Response) => void) | undefined;
     authenticatedFetchMock.mockResolvedValueOnce(response("github")).mockImplementationOnce(
       () =>
@@ -123,7 +137,7 @@ describe("RecentWorkspaceList", () => {
     );
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const { rerender } = renderList({ paths: ["/github"] }, client);
-    expect(await screen.findByTestId("recent-workspace-icon-0-github")).toBeInTheDocument();
+    expect(await screen.findByTestId("recent-workspace-icon-0-git")).toBeInTheDocument();
 
     rerender(
       <QueryClientProvider client={client}>
@@ -136,9 +150,11 @@ describe("RecentWorkspaceList", () => {
       </QueryClientProvider>,
     );
     expect(screen.getByTestId("recent-workspace-icon-0-folder")).toBeInTheDocument();
-    expect(screen.queryByTestId("recent-workspace-icon-0-github")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("recent-workspace-icon-0-git")).not.toBeInTheDocument();
 
-    resolveNext?.(response("other"));
+    resolveNext?.(
+      new Response(JSON.stringify({ message: "not a git repository" }), { status: 400 }),
+    );
     await waitFor(() =>
       expect(authenticatedFetchMock).toHaveBeenLastCalledWith(
         "/v1/hosts/host_1/worktrees?path=%2Fordinary",

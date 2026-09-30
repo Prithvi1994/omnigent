@@ -15,7 +15,7 @@ import sys
 import tempfile
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, cast
 
@@ -26,6 +26,7 @@ from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
 
 from omnigent.models import model_catalog
+from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -50,6 +51,12 @@ from omnigent.harnesses.codex_native.process_registry import (
     reconcile_codex_native_process_registry,
     register_codex_native_process,
     unregister_codex_native_process,
+)
+from omnigent.harnesses.codex_native.stderr_diagnostics import (
+    MAX_STDERR_RECORD_BYTES,
+    CodexStderrDiagnostics,
+    codex_app_server_diagnostic_env,
+    report_capture_start_failure,
 )
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
@@ -77,7 +84,12 @@ from omnigent.inner.databricks_executor import (
     _read_databrickscfg_host,
 )
 from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug, codex_spawn_model
-from omnigent.process_logging import log_info_once, log_once, redact_log_text
+from omnigent.process_logging import (
+    harness_stderr_capture_enabled,
+    log_info_once,
+    log_once,
+    redact_log_text,
+)
 from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS
 
 _logger = logging.getLogger(__name__)
@@ -853,6 +865,23 @@ class CodexAppServerResponseError(RuntimeError):
         super().__init__(str(error))
 
 
+def is_stale_active_turn_error(error: CodexAppServerResponseError) -> bool:
+    """Whether Codex rejected a turn id that ended or was replaced.
+
+    Codex 0.154.0 returns ``-32600`` with no ``data`` for these errors, so this
+    depends on its steer/interrupt message wording, including quoted turn ids.
+
+    :param error: Structured JSON-RPC response error.
+    :returns: ``True`` only for an ended or superseded active turn.
+    """
+    if error.code != -32600 or error.message is None:
+        return False
+    message = error.message.strip().casefold()
+    return message in {"no active turn to steer", "no active turn to interrupt"} or (
+        "expected active turn id" in message and "but found" in message
+    )
+
+
 #: JSON-RPC internal-error code codex returns when its thread-store fails.
 _CODEX_INTERNAL_ERROR_CODE = -32603
 
@@ -916,7 +945,8 @@ class CodexAppServerClient:
         self._ws: ClientConnection | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._pending_requests: dict[int, asyncio.Future[CodexMessage]] = {}
-        self._events: asyncio.Queue[CodexMessage] = asyncio.Queue()
+        # ``None`` marks the end of the event stream (reader exited).
+        self._events: asyncio.Queue[CodexMessage | None] = asyncio.Queue()
         self._next_id = 1
 
     async def connect(self) -> None:
@@ -938,6 +968,9 @@ class CodexAppServerClient:
                 max_size=_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES,
                 compression=None,
             )
+        # Fresh queue per connection so a previous stream's end marker
+        # cannot end this connection's consumers.
+        self._events = asyncio.Queue()
         self._reader_task = asyncio.create_task(
             self._reader_loop(),
             name="codex-native-app-server-reader",
@@ -995,16 +1028,28 @@ class CodexAppServerClient:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[CodexMessage] = loop.create_future()
         self._pending_requests[request_id] = future
-        await self._ws.send(
-            json.dumps(
-                {
-                    "id": request_id,
-                    "method": method,
-                    "params": params,
-                }
+        try:
+            await self._ws.send(
+                json.dumps(
+                    {
+                        "id": request_id,
+                        "method": method,
+                        "params": params,
+                    }
+                )
             )
-        )
-        response = await future
+            if self._reader_task is not None:
+                await asyncio.wait(
+                    (future, self._reader_task), return_when=asyncio.FIRST_COMPLETED
+                )
+                if not future.done():
+                    raise ConnectionError(
+                        f"Codex app-server disconnected before responding to {method}"
+                    )
+            response = await future
+        finally:
+            self._pending_requests.pop(request_id, None)
+            future.cancel()
         error = response.get("error")
         if error:
             exc = CodexAppServerResponseError(error)
@@ -1053,10 +1098,20 @@ class CodexAppServerClient:
         """
         Yield app-server notifications until the connection closes.
 
+        Delivers notifications buffered before the stream ended, then
+        terminates once the reader is gone (disconnect, reader failure,
+        or client close), so waiting consumers wake instead of blocking
+        forever on events that can no longer arrive.
+
         :returns: Async iterator of notification envelopes.
         """
         while True:
-            yield await self._events.get()
+            message = await self._events.get()
+            if message is None:
+                # Re-signal so every other waiting or future consumer ends too.
+                self._events.put_nowait(None)
+                return
+            yield message
 
     async def _reader_loop(self) -> None:
         """
@@ -1065,35 +1120,39 @@ class CodexAppServerClient:
         :returns: None.
         """
         assert self._ws is not None
-        async for raw in self._ws:
-            if not isinstance(raw, str):
-                continue
-            decoded: object = json.loads(raw)
-            message = _string_object_dict(decoded)
-            if message is None:
-                _logger.warning("Ignoring non-object Codex app-server message")
-                continue
-            if (
-                "id" in message
-                and "method" not in message
-                and ("result" in message or "error" in message)
-            ):
-                raw_id = message["id"]
-                request_id: int | None = None
-                if isinstance(raw_id, int):
-                    request_id = raw_id
-                elif isinstance(raw_id, str):
-                    with contextlib.suppress(ValueError):
-                        request_id = int(raw_id)
-                future = (
-                    self._pending_requests.pop(request_id, None)
-                    if request_id is not None
-                    else None
-                )
-                if future is not None and not future.done():
-                    future.set_result(message)
-                continue
-            await self._events.put(message)
+        try:
+            async for raw in self._ws:
+                if not isinstance(raw, str):
+                    continue
+                decoded: object = json.loads(raw)
+                message = _string_object_dict(decoded)
+                if message is None:
+                    _logger.warning("Ignoring non-object Codex app-server message")
+                    continue
+                if (
+                    "id" in message
+                    and "method" not in message
+                    and ("result" in message or "error" in message)
+                ):
+                    raw_id = message["id"]
+                    request_id: int | None = None
+                    if isinstance(raw_id, int):
+                        request_id = raw_id
+                    elif isinstance(raw_id, str):
+                        with contextlib.suppress(ValueError):
+                            request_id = int(raw_id)
+                    future = (
+                        self._pending_requests.pop(request_id, None)
+                        if request_id is not None
+                        else None
+                    )
+                    if future is not None and not future.done():
+                        future.set_result(message)
+                    continue
+                await self._events.put(message)
+        finally:
+            # Wake iter_events() consumers: no further events can arrive.
+            self._events.put_nowait(None)
 
 
 def _codex_rejects_request_field(exc: CodexAppServerResponseError, field: str) -> bool:
@@ -1411,7 +1470,8 @@ def mark_launch_default(rows: list[_JsonObject], pinned_model: str | None) -> li
     A pinned model no visible row names (a hidden configured default is
     explicitly supported) marks NO default: crowning a different visible
     model would let the launch path pin a model the configuration never
-    selected. Only an unpinned launch keeps Codex's own first default.
+    selected. Without a pin, prefer Omnigent's launch default when visible;
+    otherwise keep Codex's own first default.
     Rows are otherwise verbatim.
 
     Codex's own ``isDefault`` is its built-in preference, which says nothing
@@ -1425,14 +1485,24 @@ def mark_launch_default(rows: list[_JsonObject], pinned_model: str | None) -> li
     from omnigent.models.codex_model_vocabulary import comparable_model_id
 
     codex_default_index: int | None = None
+    omnigent_default_index: int | None = None
     pinned_index: int | None = None
     pinned_key = comparable_model_id(pinned_model) if pinned_model else None
+    omnigent_default_key = comparable_model_id(CODEX_DEFAULT_MODEL)
     marked: list[_JsonObject] = []
     for index, row in enumerate(rows):
         cleaned = {key: value for key, value in row.items() if key != "isDefault"}
         marked.append(cleaned)
         if codex_default_index is None and row.get("isDefault") is True:
             codex_default_index = index
+        if omnigent_default_index is None:
+            for spelling in (row.get("id"), row.get("model")):
+                if (
+                    isinstance(spelling, str)
+                    and comparable_model_id(spelling) == omnigent_default_key
+                ):
+                    omnigent_default_index = index
+                    break
         if pinned_index is None and pinned_key is not None:
             for spelling in (row.get("id"), row.get("model")):
                 if isinstance(spelling, str) and comparable_model_id(spelling) == pinned_key:
@@ -1442,6 +1512,8 @@ def mark_launch_default(rows: list[_JsonObject], pinned_model: str | None) -> li
         # The effective model is authoritative even when hidden from the
         # visible rows; never substitute a model the config did not select.
         default_index = pinned_index
+    elif omnigent_default_index is not None:
+        default_index = omnigent_default_index
     else:
         default_index = codex_default_index
     if default_index is not None:
@@ -1518,7 +1590,7 @@ async def probe_codex_model_options(
 
 
 async def _read_codex_probe_default(client: CodexAppServerClient) -> str | None:
-    """Read Codex's effective default; older servers retain their model/list default."""
+    """Read Codex's effective explicit default; older servers defer to catalog shaping."""
     try:
         try:
             response = await client.request("config/read", {"includeLayers": False})
@@ -1531,7 +1603,7 @@ async def _read_codex_probe_default(client: CodexAppServerClient) -> str | None:
             exc.code == -32600 and "unknown variant `config/read`" in (exc.message or "")
         ):
             raise
-        _logger.info("Codex config/read unavailable; keeping the model/list default")
+        _logger.info("Codex config/read unavailable; deferring to catalog default shaping")
         return None
     result = response.get("result")
     config = result.get("config") if isinstance(result, dict) else None
@@ -1563,7 +1635,7 @@ def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | No
     profile_host = _read_databrickscfg_host(launch.profile) if launch.profile is not None else None
     return fingerprint_of(
         "codex-native",
-        "isolated-picker-v3",
+        "isolated-picker-v4",
         _codex_config_identity(_codex_home_config_source_from_env()),
         (launch.profile, (profile_host or "").rstrip("/")) if launch.profile is not None else None,
         launch.model,
@@ -1801,6 +1873,9 @@ class CodexNativeAppServer:
     router_hooks_registered: bool = False
     reconcile_process_registry: bool = True
     config_profile: str | None = None
+    session_id: str | None = None
+    stderr_capture_error_type: str | None = field(default=None, init=False)
+    _stderr_diagnostics: CodexStderrDiagnostics | None = field(default=None, init=False)
 
     async def start(self) -> None:
         """
@@ -1955,7 +2030,9 @@ class CodexNativeAppServer:
             listen_url=resolved_listen,
             config_overrides=self.config_overrides,
         )
-        proc_env = {**self.env, "CODEX_HOME": str(self.codex_home)}
+        proc_env = codex_app_server_diagnostic_env(
+            {**self.env, "CODEX_HOME": str(self.codex_home)}
+        )
         self.process_owner_lock = acquire_codex_native_process_owner_lock()
         try:
             self.proc = await asyncio.create_subprocess_exec(
@@ -2174,14 +2251,27 @@ class CodexNativeAppServer:
             unregister_codex_native_process(self.process_registry_tag)
         if self.process_owner_lock is not None:
             self.process_owner_lock.close()
-        if self.stderr_task is not None:
-            self.stderr_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.stderr_task
-        self.proc = None
-        self.stderr_task = None
-        self.process_registry_tag = None
-        self.process_owner_lock = None
+        try:
+            if self.stderr_task is not None and self._stderr_diagnostics is not None:
+                # The process has exited; allow buffered output to reach EOF.
+                # A descendant can still hold the pipe open, so bound the wait.
+                await asyncio.wait({self.stderr_task}, timeout=1.0)
+        finally:
+            try:
+                if self.stderr_task is not None:
+                    self.stderr_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await self.stderr_task
+            finally:
+                diagnostics, self._stderr_diagnostics = self._stderr_diagnostics, None
+                self.proc = None
+                self.stderr_task = None
+                self.process_registry_tag = None
+                self.process_owner_lock = None
+                if diagnostics is not None:
+                    diagnostics.finish()
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(diagnostics.close)
 
     async def _wait_until_ready(self) -> CodexAppServerClient:
         """
@@ -2240,18 +2330,62 @@ class CodexNativeAppServer:
         :returns: None.
         """
         assert self.proc is not None and self.proc.stderr is not None
-        while True:
-            line = await self.proc.stderr.readline()
-            if not line:
-                return
-            text = line.decode("utf-8", errors="replace").rstrip()
-            if len(text) >= _STDERR_CHUNK_LIMIT:
-                text = f"{text[:_STDERR_CHUNK_LIMIT]}...[truncated]"
+        diagnostics = None
+        capture_enabled = harness_stderr_capture_enabled()
+        self.stderr_capture_error_type = None
+        if capture_enabled:
+            try:
+                diagnostics = CodexStderrDiagnostics(
+                    session_id=self.session_id, bridge_dir=self.bridge_dir, pid=self.proc.pid
+                )
+            except Exception as exc:  # noqa: BLE001 - capture must never stop pipe draining
+                self.stderr_capture_error_type = type(exc).__name__[:128]
+                report_capture_start_failure(
+                    session_id=self.session_id,
+                    pid=self.proc.pid,
+                    error_type=self.stderr_capture_error_type,
+                )
+        self._stderr_diagnostics = diagnostics
+        pending = bytearray()
+        omitted_bytes = 0
+        record_limit = MAX_STDERR_RECORD_BYTES if diagnostics is not None else _STDERR_CHUNK_LIMIT
+
+        def record_line(*, newline: bool = False) -> None:
+            text = pending[:_STDERR_CHUNK_LIMIT].decode("utf-8", errors="replace").rstrip()
+            if omitted_bytes or len(pending) > _STDERR_CHUNK_LIMIT:
+                text = f"{text}...[truncated]"
             if self.recent_stderr is not None:
                 self.recent_stderr.append(text)
                 if len(self.recent_stderr) > 20:
                     self.recent_stderr.pop(0)
-            _logger.debug("codex-native app-server stderr: %s", text)
+            if diagnostics is not None:
+                diagnostics.submit(
+                    bytes(pending) + (b"\n" if newline else b""), bytes_omitted=omitted_bytes
+                )
+            elif not capture_enabled:
+                _logger.debug("codex-native app-server stderr: %s", text)
+
+        try:
+            # readline() raises on long diagnostics. Keep draining the pipe even
+            # after truncating a line, or stderr backpressure can stall Codex.
+            while chunk := await self.proc.stderr.read(8 * 1024):
+                parts = chunk.split(b"\n")
+                for index, part in enumerate(parts):
+                    remaining = record_limit - len(pending)
+                    pending.extend(part[:remaining])
+                    omitted_bytes += max(0, len(part) - remaining)
+                    if index < len(parts) - 1:
+                        record_line(newline=True)
+                        pending.clear()
+                        omitted_bytes = 0
+        except Exception:
+            _logger.exception("Codex app-server stderr drain failed")
+            raise
+        finally:
+            if pending or omitted_bytes:
+                record_line()
+            if diagnostics is not None:
+                diagnostics.finish()
 
 
 def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) -> str:
@@ -2901,12 +3035,15 @@ def _resolve_databricks_codex_model(
         # simply fails the listing and drops to the ucode-state fallback below,
         # which is already keyed by ``host``.
         servable = discover_databricks_codex_models(host, creds.token)
-    except Exception:  # noqa: BLE001 — cached ucode state is the launch fallback
+    except Exception as exc:  # noqa: BLE001 — cached ucode state is the launch fallback
+        # Recoverable fallback; frames are debug-only so a TTY-mirrored
+        # host console stays concise.
         _logger.warning(
             "native-codex: live Databricks model discovery failed for profile %r; "
-            "falling back to ucode state",
+            "falling back to ucode state (%s)",
             profile,
-            exc_info=True,
+            exc,
+            exc_info=_logger.isEnabledFor(logging.DEBUG),
         )
         try:
             from omnigent.onboarding.ucode_state import read_ucode_state
@@ -2934,6 +3071,7 @@ def build_codex_native_server(
     model: str | None,
     profile: str | None,
     bridge_dir: Path,
+    session_id: str | None = None,
     ap_server_url: str | None = None,
     ap_auth_headers: dict[str, str] | None = None,
     python_executable: str | None = None,
@@ -2959,6 +3097,7 @@ def build_codex_native_server(
         ``"<your-profile>"``.
     :param bridge_dir: Native Codex bridge directory; the policy hook is
         pointed at it and reads the session id + Omnigent coordinates from it.
+    :param session_id: Owning session for diagnostics before bridge state exists.
     :param ap_server_url: Omnigent server base URL the policy hook POSTs tool
         calls to, e.g. ``"http://127.0.0.1:8787"``. ``None`` registers
         the hook but writes no Omnigent coordinates (hook no-ops).
@@ -3062,6 +3201,7 @@ def build_codex_native_server(
         config_profile=codex_config_profile(terminal_launch_args),
         cwd=cwd,
         bridge_dir=bridge_dir,
+        session_id=session_id,
         developer_instructions=developer_instructions,
         ap_server_url=ap_server_url,
         ap_auth_headers=ap_auth_headers,

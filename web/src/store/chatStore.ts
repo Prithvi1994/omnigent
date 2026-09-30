@@ -66,6 +66,7 @@ import {
   bindOnlyOnlineRunner,
   createSession,
   getSessionSlim,
+  getSessionUsage,
   fetchSessionItemsPage,
   INITIAL_WINDOW_ITEMS,
   interrupt as interruptSession,
@@ -107,6 +108,7 @@ import {
   type ConversationsInfiniteData,
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
+import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import { isSideChatCommand, usesNativeSideChatFork } from "@/lib/sideChat";
 // Re-exported below so existing `@/store/chatStore` importers keep working; the
 // pure helpers live in a leaf module so low-level session hooks can gate on temp
@@ -131,7 +133,7 @@ import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
 import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
-import { getCurrentAuthorId } from "@/lib/identity";
+import { getCurrentAuthorId, resolveSessionHost } from "@/lib/identity";
 import { getOmnigentHostConfig } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
 // and would form a routing↔store import cycle).
@@ -146,8 +148,11 @@ import { getSessionHost } from "@/lib/sessionHost";
 import { isSystemUserContent, taskNotificationMarkerContent } from "@/lib/systemMessage";
 import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
 import type { StoredReplyDraft } from "@/lib/replyDraft";
+import { toast } from "sonner";
 
 export interface SendOptions {
+  /** Compact is a control event, not a user-message turn. */
+  command?: "compact";
   /** Client-only quote provenance, retained if the composer needs to retry. */
   replyDraft?: StoredReplyDraft;
   /**
@@ -340,6 +345,7 @@ export function beginLocalConversation(
   const bubble: PendingUserMessage = {
     tempId: pendingMsgTempId,
     content,
+    initialDraft: { text, files: files ?? [] },
     createdAtS: Math.floor(Date.now() / 1000),
     ...(selfAuthor !== null ? { author: selfAuthor } : {}),
   };
@@ -383,6 +389,16 @@ export function beginLocalConversation(
   return { tempConvId, pendingMsgTempId, createToken };
 }
 
+/** Whether a temporary conversation still owns its unsent first message. */
+export function hasPendingLocalMessage(tempConvId: string): boolean {
+  return (
+    conversationRegistry
+      .peek(tempConvId)
+      ?.getState()
+      .pendingUserMessages.some((message) => message.initialDraft !== undefined) ?? false
+  );
+}
+
 /**
  * Hydrate a client-only conversation onto its real server id once
  * `createSession` returns: rekey the registry entry (carrying the optimistic
@@ -406,6 +422,8 @@ export function hydrateLocalConversation(
   isStillViewing: () => boolean = () => true,
   project?: LocalConversationProject,
 ): void {
+  const shouldSend = hasPendingLocalMessage(tempConvId);
+  const restoredDraft = conversationRegistry.peek(tempConvId)?.getState().failedSendDraft;
   // Registry entry (carrying the optimistic bubble) + the sidebar row, both
   // id-addressed. Rekey the row BEFORE the caller's refetch so a lagging index
   // can't drop it. No send-chain migration: the composer is read-only for a temp
@@ -413,6 +431,9 @@ export function hydrateLocalConversation(
   // the chain under the real id directly.
   conversationRegistry.rekey(tempConvId, realId);
   rekeyConvRow(tempConvId, realId, text, project);
+  if (restoredDraft) {
+    setterFor(realId)({ failedSendDraft: { ...restoredDraft, conversationId: realId } });
+  }
 
   const stillViewing = useChatStore.getState().conversationId === tempConvId && isStillViewing();
   if (stillViewing) {
@@ -420,6 +441,14 @@ export function hydrateLocalConversation(
     conversationRegistry.setActive(realId);
     mirrorActiveEntry();
     navigate(`/c/${realId}`, { replace: true });
+  }
+
+  if (!shouldSend) {
+    // Creation can finish after Interrupt; bind the empty session without sending.
+    void ensureBoundSession(agentId, useChatStore.getState, undefined, realId).catch(() => {
+      // bindStream records load failures on the conversation.
+    });
+    return;
   }
 
   const store = useChatStore.getState();
@@ -482,6 +511,8 @@ export function removeLocalConversation(tempConvId: string): boolean {
 export interface PendingUserMessage {
   tempId: string;
   content: MessageContentBlock[];
+  /** Unsent draft awaiting session/model readiness, including unuploaded files. */
+  initialDraft?: { text: string; files: File[] };
   /** Client epoch seconds stamped ONCE at send time — the optimistic
    *  bubble's display timestamp. Stamping here (not at render or
    *  promotion) keeps the shown time pinned to when the user hit send.
@@ -514,6 +545,8 @@ export interface PendingUserMessage {
  * directly (no serialization concern).
  */
 export interface QueuedMessage {
+  /** Captured at enqueue time so background dispatch preserves the control. */
+  command?: "compact";
   /** Client-only id, e.g. `q_1`. */
   queueId: string;
   /** Fully-assembled message text (mentions/quotes already applied). */
@@ -838,16 +871,15 @@ export interface ConversationState {
   tokensUsed: number | null;
   /**
    * Cumulative session spend in USD, server-computed (the same total
-   * the cost-budget policy gates on). Seeded from the session snapshot
-   * and updated by ``session.usage`` SSE events. ``null`` when the
-   * session is **unpriced** — no turn has been priced yet — so the UI
-   * renders "—" rather than a misleading ``$0.00``.
+   * the cost-budget policy gates on). Hydrated independently of the
+   * session metadata and updated by ``session.usage`` SSE events.
+   * ``null`` while unknown or unpriced, never a misleading ``$0.00``.
    */
   sessionCostUsd: number | null;
   /**
    * Per-model usage breakdown over the active session's subtree (itself +
-   * sub-agents), keyed by raw harness model id. Seeded from the session
-   * snapshot on bind and replaced wholesale by ``session.usage`` SSE events
+   * sub-agents), keyed by raw harness model id. Hydrated separately on
+   * bind and replaced wholesale by ``session.usage`` SSE events
    * that carry a per-model change (an event without it leaves the cached
    * map untouched). ``null`` until per-model usage is recorded. The
    * agent-info popover renders this directly; any aggregate view (total
@@ -1173,7 +1205,7 @@ export interface ChatActions {
   setClaudePermissionMode: (mode: string) => Promise<void>;
   /**
    * Switch a running codex-native session's approval/sandbox mode (e.g. to
-   * ``"read-only"``). Rejects when the live Codex thread could not accept the
+   * ``"full-access"``). Rejects when the live Codex thread could not accept the
    * update, so callers surface the error rather than assuming it landed.
    * No-ops when there is no active conversation.
    */
@@ -1235,6 +1267,10 @@ let queryClient: QueryClient | null = null;
 const streamEventRevisions = new Map<string, number>();
 conversationRegistry.subscribeDisposed((id) => streamEventRevisions.delete(id));
 
+// Reconnects share a binding; only one usage request may hydrate it at a time.
+const sessionUsageHydrations = new WeakSet<AbortController>();
+const sessionUsageRevisions = new WeakMap<ConversationEntry, { cost: number; models: number }>();
+
 // Snapshot reconciliation must teach the already-running stream pump which
 // native preview messages have finalized, including warm session revisits.
 const nativePreviewTombstonesByController = new WeakMap<AbortController, Set<string>>();
@@ -1270,6 +1306,57 @@ let queueSeq = 0;
 // which take minutes — so this only ever fires on a send that is truly stuck,
 // never reordering a slow one.
 const SEND_CHAIN_MAX_WAIT_MS = 180_000;
+
+function modelSelectionPending(state: ConversationState): boolean {
+  // Claude reports its model before a prompt; other native CLIs may need a turn.
+  return (
+    state.pendingModelChange !== null ||
+    (state.sessionModelSeeded && state.sessionHarness === "claude-native")
+  );
+}
+
+/** Keep the draft local while native model startup or a model switch is pending. */
+function waitForModelSelection(conversationId: string, tempId: string): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const finish = (ready: boolean, error?: Error) => {
+      clearTimeout(timer);
+      unsubscribe();
+      unsubscribeDisposed();
+      if (error) reject(error);
+      else resolve(ready);
+    };
+    const check = () => {
+      const entry = conversationRegistry.peek(conversationId);
+      const state = entry?.getState();
+      if (
+        !state ||
+        entry?.disposed ||
+        !state.pendingUserMessages.some((p) => p.tempId === tempId && p.initialDraft)
+      ) {
+        finish(false);
+      } else if (state.conversationLoadError || state.sessionStatus === "failed") {
+        finish(
+          false,
+          state.conversationLoadError ?? new Error("Session failed before the message was sent."),
+        );
+      } else if (!modelSelectionPending(state)) {
+        finish(true);
+      }
+    };
+    const unsubscribe = conversationRegistry.subscribe((id) => {
+      if (id === conversationId) check();
+    });
+    const unsubscribeDisposed = conversationRegistry.subscribeDisposed((id) => {
+      if (id === conversationId) finish(false);
+    });
+    const timer = setTimeout(
+      () =>
+        finish(false, new Error("The model did not finish starting. Please retry the message.")),
+      SEND_CHAIN_MAX_WAIT_MS,
+    );
+    check();
+  });
+}
 
 /**
  * Read one conversation's server-side status from the sidebar cache.
@@ -1741,7 +1828,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   historyGeneration: 0,
 
   enqueueMessage: (text, files, replyDraft) => {
-    const { conversationId, boundAgentId } = get();
+    const { conversationId, boundAgentId, sessionHarness } = get();
     if (conversationId === null) return;
     queueSeq += 1;
     const queueId = `q_${queueSeq}`;
@@ -1752,6 +1839,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         {
           queueId,
           text,
+          ...(isCompactControl(sessionHarness, text, files) ? { command: "compact" as const } : {}),
           stableId,
           conversationId,
           ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
@@ -1806,6 +1894,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const target = s.queuedMessages.find((m) => m.queueId === queueId);
     const agentId = target?.agentId ?? s.boundAgentId;
     if (target === undefined || agentId === null) return;
+    if (target.command === "compact" && rejectBusyCompact(target.conversationId)) return;
     // Remove BEFORE the POST so a concurrent flush can't also send it.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
     void s.send(target.text, agentId, target.files, queuedSendOptions(target));
@@ -1814,13 +1903,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   steerAllQueuedMessages: (conversationId) => {
     const s = get();
     const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
-    if (own.length === 0 || own.some((m) => (m.agentId ?? s.boundAgentId) === null)) return;
-    const batchOrder = new Map(own.map((m, index) => [m.queueId, index]));
+    if (own.length === 0) return;
+    // SDK buffers compact with the rest of the batch; Codex needs an idle turn.
+    const compactIndex =
+      setterForState(conversationId)?.sessionHarness === "claude-sdk"
+        ? -1
+        : own.findIndex((m) => m.command === "compact");
+    if (compactIndex === 0) {
+      s.steerMessage(own[0]!.queueId);
+      return;
+    }
+    const batch = compactIndex < 0 ? own : own.slice(0, compactIndex);
+    if (batch.some((m) => (m.agentId ?? s.boundAgentId) === null)) return;
+    const batchOrder = new Map(batch.map((m, index) => [m.queueId, index]));
     // Remove BEFORE the POSTs so a concurrent flush can't also send one.
     setActive({
-      queuedMessages: s.queuedMessages.filter((m) => m.conversationId !== conversationId),
+      queuedMessages: s.queuedMessages.filter((m) => !batchOrder.has(m.queueId)),
     });
-    for (const m of own) {
+    for (const m of batch) {
       const agentId = m.agentId ?? s.boundAgentId;
       if (agentId === null) continue;
       void s.send(m.text, agentId, m.files, queuedSendOptions(m, batchOrder));
@@ -1908,6 +2008,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const now = Date.now();
     for (const conversationId of candidateIds) {
       if (statusById.get(conversationId) !== "idle") continue;
+      // The sidebar can still say idle while a compact control starts.
+      const local = setterForState(conversationId);
+      if (local?.sessionHarness === "codex-native" || local?.sessionHarness === "claude-sdk") {
+        if (local.sessionStatus === "running") continue;
+        if (local.status === "streaming") {
+          if (!sendLatchIsStranded(local)) continue;
+          // Recover the same stranded send state as the foreground flush.
+          sendChains.delete(conversationId);
+          setterFor(conversationId)({ status: "idle", sendLatchedAt: null });
+        }
+      }
       // Skip a conversation mid-POST or in its post-failure cooldown so a
       // persistent failure can't spin this into a tight retry loop (the effect
       // re-fires on every re-queue, and a failed POST leaves the row idle).
@@ -1916,12 +2027,21 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (cooldownUntil !== undefined && cooldownUntil > now) continue;
       const head = get().queuedMessages.find((m) => m.conversationId === conversationId);
       if (head === undefined || head.requiresRetry) continue;
+      const compactAgentId = head.agentId ?? local?.boundAgentId;
+      if (head.command === "compact" && !compactAgentId) continue;
 
       // Remove BEFORE the work starts so a re-entrant trigger can't double-send.
       backgroundFlushInFlight.add(conversationId);
       setActive((st) => ({
         queuedMessages: st.queuedMessages.filter((m) => m.queueId !== head.queueId),
       }));
+      if (head.command === "compact") {
+        conversationRegistry.acquire(conversationId);
+        void s
+          .send(head.text, compactAgentId!, head.files, queuedSendOptions(head))
+          .finally(() => backgroundFlushInFlight.delete(conversationId));
+        continue;
+      }
       // Join the SAME send chain the foreground path uses for this
       // conversation. A queued message can hand off from the foreground flush
       // (send() → its chain) to here the moment the user navigates away, and
@@ -2040,6 +2160,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (opensSideChat) {
       useChatStore.setState({ awaitingSideChatFor: pinnedId ?? get().conversationId });
     }
+    const targetState = pinnedId === null ? get() : setterForState(pinnedId);
+    const compacts =
+      opts?.command === "compact" || isCompactControl(targetState?.sessionHarness, text, files);
+    if (compacts && rejectBusyCompact(pinnedId ?? get().conversationId)) {
+      opts?.onError?.("Compact is disabled while a chat is in progress");
+      return;
+    }
+    const skipPendingBubble = opensSideChat || compacts;
+    const initialDraft =
+      opts?.reusePendingTempId != null
+        ? targetState?.pendingUserMessages.find((p) => p.tempId === opts.reusePendingTempId)
+            ?.initialDraft
+        : !skipPendingBubble &&
+            targetState &&
+            (modelSelectionPending(targetState) ||
+              (targetState.sessionModelSeeded && targetState.sessionHarness === null))
+          ? { text, files: files ?? [] }
+          : undefined;
     const alreadyStreaming =
       opts?.reusePendingTempId != null
         ? false
@@ -2088,13 +2226,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const selfAuthor = getCurrentAuthorId();
     if (reuseTempId === null) {
       pinnedSetter((s) => ({
-        pendingUserMessages: opensSideChat
+        pendingUserMessages: skipPendingBubble
           ? s.pendingUserMessages
           : [
               ...s.pendingUserMessages,
               {
                 tempId,
                 content,
+                ...(initialDraft ? { initialDraft } : {}),
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
               },
@@ -2126,14 +2265,30 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // The session this send actually posts to, once resolved. Read in the
     // catch to decide whether a failure may touch the active session's UI.
     let postedSessionId: string | null = null;
+    let initialDispatched = false;
+    const initialSendPending = () => {
+      const id = postedSessionId ?? submitConversationId;
+      const state = id === null ? get() : setterForState(id);
+      return state?.pendingUserMessages.some((p) => p.tempId === tempId && p.initialDraft);
+    };
 
     try {
       await waitForPrior();
+      if (initialDraft && !initialSendPending()) return;
       // `rekey` runs INSIDE the call, the moment `createSession` returns and
       // before the new id is published — a send issued during the bind would
       // otherwise resolve that id, find an empty chain, and overtake this POST.
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
+      if (initialDraft && !(await waitForModelSelection(sessionId, tempId))) return;
+
+      if (compacts) {
+        // Compact controls emit turn status edges, but no user
+        // message acknowledgement. Keep the send latch without a pending bubble.
+        await postEvent(sessionId, { type: "compact", data: {} });
+        queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+        return;
+      }
 
       // Upload any attached files and build the real content blocks with
       // server-assigned file_ids (input_image for images, input_file
@@ -2145,6 +2300,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...fileBlocks,
         ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
       ];
+      if (initialDraft && !initialSendPending()) return;
 
       // Promote "pending:<filename>" to real file_ids. Claude-native's
       // session.input.consumed is text-only (transcript round-trip
@@ -2163,6 +2319,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }));
       }
 
+      if (initialDraft) {
+        // From this point Interrupt belongs to the runner, not the local draft.
+        setterFor(sessionId)((s) => ({
+          pendingUserMessages: s.pendingUserMessages.map((p) =>
+            p.tempId === tempId ? { ...p, initialDraft: undefined } : p,
+          ),
+          status: "streaming",
+          sendLatchedAt: Date.now(),
+        }));
+        initialDispatched = true;
+      }
       const postResult = await postEvent(sessionId, {
         type: "message",
         data: {
@@ -2217,6 +2384,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // status transitions that happen during the turn.
       queryClient?.invalidateQueries({ queryKey: ["conversations"] });
     } catch (err) {
+      if (initialDraft && !initialDispatched && !initialSendPending()) return;
       const { message, code } = describeSendFailure(err);
       // A codex `/side` that armed the side-chat latch (line ~2103) but then
       // failed — e.g. the host is too old and the server refused — must disarm
@@ -2432,8 +2600,29 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   stop: () => {
-    const sessionId = get().conversationId;
+    const state = get();
+    const sessionId = state.conversationId;
     if (!sessionId) return;
+    const initialDraft = state.pendingUserMessages.find((p) => p.initialDraft)?.initialDraft;
+    if (initialDraft) {
+      const draft = getSessionDraft(sessionId) ?? initialDraft;
+      setSessionDraft(sessionId, draft);
+      setActive({
+        pendingUserMessages: [],
+        status: "idle",
+        sendLatchedAt: null,
+        failedSendDraft: { ...draft, conversationId: sessionId },
+      });
+      // A local follow-up must not prevent Interrupt from stopping earlier work.
+      if (
+        state.activeResponse?.state !== "streaming" &&
+        state.sessionStatus !== "running" &&
+        state.sessionStatus !== "waiting" &&
+        state.backgroundTaskCount === 0
+      )
+        return;
+    }
+    if (isTempConvId(sessionId)) return;
     // Fire-and-forget interrupt; the server emits session.interrupted
     // + response.incomplete on the open stream, which the pump
     // translates into the cancelled bubble decoration. We deliberately
@@ -3007,12 +3196,33 @@ function setActive(partial: Partial<ChatState> | ((state: ChatState) => Partial<
 
 // ── Internal helpers ─────────────────────────────────────
 
+function isCompactControl(
+  harness: string | null | undefined,
+  text: string,
+  files?: File[],
+): boolean {
+  return (
+    (harness === "codex-native" || harness === "claude-sdk") &&
+    !files?.length &&
+    text.trim() === "/compact"
+  );
+}
+
+function rejectBusyCompact(conversationId: string | null): boolean {
+  const state = conversationId === null ? undefined : setterForState(conversationId);
+  if (state?.sessionHarness === "claude-sdk") return false;
+  if (state?.status !== "streaming" && state?.sessionStatus !== "running") return false;
+  toast.error("Compact is disabled while a chat is in progress", { richColors: true });
+  return true;
+}
+
 function queuedSendOptions(
   message: QueuedMessage,
   batchOrder?: ReadonlyMap<string, number>,
 ): SendOptions {
   const stableId = message.stableId ?? randomUUID().replace(/-/g, "");
   return {
+    command: message.command,
     replyDraft: message.replyDraft,
     stableId,
     pinnedConversationId: message.conversationId,
@@ -3792,7 +4002,10 @@ async function bindStream(
   // agentbricks/mas/.claude/skills/sync-omnigents/SKILL.md.
   if (getOmnigentHostConfig().fetcher && getSessionHost(id) === null) {
     try {
-      await getSessionSlim(id);
+      // Prefer the registered resolver: it walks a hostless sub-agent child up
+      // to its host-bound ancestor. Without one, the bare snapshot still seeds
+      // a top-level session's own host.
+      await (resolveSessionHost(id) ?? getSessionSlim(id));
     } catch {
       // Best-effort: a failed resolve (bad id, transient) falls through to the
       // unkeyed open; the snapshot fetch surfaces the real error.
@@ -3841,7 +4054,8 @@ async function bindStream(
   if (queryClient === null) {
     throw new Error("chatStore.bindStream: queryClient not initialized");
   }
-  const launchBeforeFetch = mcpStartupBeforeSnapshot(id, get());
+  const stateBeforeFetch = get();
+  const launchBeforeFetch = mcpStartupBeforeSnapshot(id, stateBeforeFetch);
   try {
     // One larger page, so opening a session is a single round trip that then
     // stays still — rather than a small page followed by background growth
@@ -3992,7 +4206,7 @@ async function bindStream(
               message: session.lastTaskError.message,
               source: "",
               code: session.lastTaskError.code,
-              ...structuredErrorFields(session.lastTaskError),
+              ...structuredErrorFields(session.lastTaskError, session.lastTaskError.agent_name),
             }
           : null;
       return {
@@ -4035,8 +4249,14 @@ async function bindStream(
         // back re-projects (it does not re-bind, so it cannot recompute it).
         sessionReasoningEffort: effectiveEffort,
         tokensUsed: session.lastTotalTokens ?? null,
-        sessionCostUsd: session.totalCostUsd ?? null,
-        sessionUsageByModel: session.usageByModel ?? null,
+        sessionCostUsd:
+          state.sessionCostUsd !== stateBeforeFetch.sessionCostUsd
+            ? state.sessionCostUsd
+            : (session.totalCostUsd ?? state.sessionCostUsd),
+        sessionUsageByModel:
+          state.sessionUsageByModel !== stateBeforeFetch.sessionUsageByModel
+            ? state.sessionUsageByModel
+            : (session.usageByModel ?? state.sessionUsageByModel),
         todos: (session.todos ?? []) as {
           content: string;
           status: "pending" | "in_progress" | "completed";
@@ -4044,6 +4264,7 @@ async function bindStream(
         }[],
       };
     });
+    if (session.usageIncluded === false) void hydrateSessionUsage(id);
     racedNativeModelOptions.delete(id);
   } catch (err) {
     if (isConversationDisposed(id)) return;
@@ -4051,6 +4272,52 @@ async function bindStream(
       loadingConversation: false,
       conversationLoadError: err instanceof Error ? err : new Error(String(err)),
     });
+  }
+}
+
+/** Hydrate display-only subtree totals without delaying session reconciliation. */
+async function hydrateSessionUsage(id: string): Promise<void> {
+  const entry = conversationRegistry.peek(id);
+  const before = entry?.getState();
+  const controller = before?.abortController;
+  if (
+    entry === undefined ||
+    entry.disposed ||
+    before === undefined ||
+    controller == null ||
+    controller.signal.aborted ||
+    sessionUsageHydrations.has(controller)
+  ) {
+    return;
+  }
+  sessionUsageHydrations.add(controller);
+  const revisionsBeforeFetch = sessionUsageRevisions.get(entry) ?? { cost: 0, models: 0 };
+  try {
+    const usage = await getSessionUsage(id, { signal: controller.signal });
+    if (
+      usage.id !== id ||
+      controller.signal.aborted ||
+      conversationRegistry.peek(id) !== entry ||
+      entry.getState().abortController !== controller
+    ) {
+      return;
+    }
+    const revisions = sessionUsageRevisions.get(entry) ?? { cost: 0, models: 0 };
+    // A live cost/model update during the read wins independently for each field.
+    entrySetter(entry)((state) => ({
+      ...(revisions.cost === revisionsBeforeFetch.cost &&
+      state.sessionCostUsd === before.sessionCostUsd
+        ? { sessionCostUsd: usage.totalCostUsd ?? state.sessionCostUsd }
+        : {}),
+      ...(revisions.models === revisionsBeforeFetch.models &&
+      state.sessionUsageByModel === before.sessionUsageByModel
+        ? { sessionUsageByModel: usage.usageByModel ?? state.sessionUsageByModel }
+        : {}),
+    }));
+  } catch {
+    // Usage is optional display data; retain known totals or leave them unknown.
+  } finally {
+    sessionUsageHydrations.delete(controller);
   }
 }
 
@@ -4106,15 +4373,10 @@ function nextReconnectDelay(failedOpens: number): number {
  *   streaming `activeResponse` — without one there is no rid to scope
  *   the drop.
  * - Native live previews (`live:<message_id>` provisional blocks): the
- *   replay is one CUMULATIVE delta per in-flight message (the joined
- *   text so far). Appending that replay to a surviving preview would
- *   double the text. A message that committed
- *   during the gap is excluded from the replay entirely; its preview
- *   must vanish too, or it would double-render beside the committed
- *   item the reconnect backfill splices in. So previews are dropped
- *   unconditionally (NOT gated on `activeResponse` — native sessions
- *   stream mid-turn while `session.status`-driven, e.g. parked on a
- *   permission prompt).
+ *   same server replays one cumulative delta, so discard that server's
+ *   streamed suffix before appending the replay. After a server restart,
+ *   retain the prior server's prefix, which the new process cannot replay.
+ *   Committed items remove their previews during snapshot reconciliation.
  *
  * Committed blocks are kept in place so they aren't lost (the replay
  * won't resend them) and dedupe by `itemId` against the live tail.
@@ -4124,7 +4386,31 @@ function nextReconnectDelay(failedOpens: number): number {
  * ApprovalCard here would orphan the parked prompt until a full page
  * refresh.
  */
-function dropEphemeralInFlightBlocks(id: string, set: Setter): void {
+function markLivePreviewsInterrupted(id: string, set: Setter): void {
+  set((state) => {
+    if (
+      state.conversationId !== id ||
+      state.sessionStatus === "failed" ||
+      state.activeResponse?.state === "failed" ||
+      state.activeResponse?.state === "cancelled" ||
+      !state.blocks.some(isLiveProvisionalBlock)
+    ) {
+      return {};
+    }
+    const blocks = state.blocks.map((block) =>
+      isLiveProvisionalBlock(block) && block.type === "text_done" && !block.previewInterrupted
+        ? { ...block, previewInterrupted: true }
+        : block,
+    );
+    return blocks.some((block, index) => block !== state.blocks[index]) ? { blocks } : {};
+  });
+}
+
+function dropEphemeralInFlightBlocks(
+  id: string,
+  set: Setter,
+  nativePreviewBaselines: ReadonlyMap<string, string> | null = null,
+): void {
   set((s) => {
     if (s.conversationId !== id) return {};
     const active = s.activeResponse;
@@ -4132,12 +4418,29 @@ function dropEphemeralInFlightBlocks(id: string, set: Setter): void {
       active !== null && active.state === "streaming" && active.responseId
         ? active.responseId
         : null;
-    const kept = s.blocks.filter((b) => {
-      if (isLiveProvisionalBlock(b)) return false;
-      if (b.type === "elicitation" || b.type === "error") return true;
-      return rid === null || b.ctx.responseId !== rid || Boolean(b.ctx.itemId);
-    });
-    if (kept.length === s.blocks.length) return {};
+    const kept: AnyBlock[] = [];
+    for (const block of s.blocks) {
+      if (isLiveProvisionalBlock(block)) {
+        const prefix = nativePreviewBaselines?.get(block.ctx.itemId ?? "");
+        if (prefix === undefined) continue;
+        kept.push(
+          block.type === "text_done" && block.fullText !== prefix
+            ? { ...block, fullText: prefix, hasCodeBlocks: prefix.includes("```") }
+            : block,
+        );
+      } else if (
+        block.type === "elicitation" ||
+        block.type === "error" ||
+        rid === null ||
+        block.ctx.responseId !== rid ||
+        Boolean(block.ctx.itemId)
+      ) {
+        kept.push(block);
+      }
+    }
+    if (kept.length === s.blocks.length && kept.every((block, i) => block === s.blocks[i])) {
+      return {};
+    }
     return { blocks: kept };
   });
 }
@@ -4216,11 +4519,11 @@ function reconnectStatusPatch(
   } else if (
     session.status === "running" &&
     session.activeResponseId != null &&
-    s.activeResponse?.responseId !== session.activeResponseId
+    (s.activeResponse?.responseId !== session.activeResponseId || isStaleCompletedResponse(s))
   ) {
     // Mid-turn (re)connect: reopen the streaming lifecycle from the snapshot.
-    // Guarded on a differing responseId so we never downgrade a live
-    // activeResponse that already matches (e.g. one cancelled in this tab).
+    // A stale completion of this same id must not suppress a continuing turn;
+    // leave a locally cancelled response with the same id untouched.
     patch.activeResponse = {
       responseId: session.activeResponseId,
       state: "streaming",
@@ -4293,6 +4596,18 @@ async function reconcileActiveSessionStatus(
     return;
   }
   set((s) => reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch));
+  if (session.usageIncluded === false) void hydrateSessionUsage(id);
+  const ignored = nativePreviewTombstonesByController.get(controller);
+  if (
+    ignored &&
+    get().blocks.some(
+      (block) =>
+        isLiveProvisionalBlock(block) && block.type === "text_done" && block.previewInterrupted,
+    )
+  ) {
+    // Retry a missed final-item backfill on the existing status-reconcile cadence.
+    await reconcileOnReconnect(id, set, get, ignored);
+  }
 }
 
 /**
@@ -4604,6 +4919,7 @@ async function reconcileOnReconnect(
     return;
   }
   if (stale()) return;
+  if (session.usageIncluded === false) void hydrateSessionUsage(id);
 
   // Page backwards until the fetched window reaches the pre-gap transcript
   // or the conversation start. A single newest page is not enough: a gap
@@ -4658,6 +4974,10 @@ async function reconcileOnReconnect(
       currentBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
     const unseen = snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
+    const reconciledBlocks =
+      s.isNativeTerminalSession && unseen.some((b) => b.type === "text_done" && b.ctx.itemId)
+        ? withoutInterruptedNativePreviews(currentBlocks, ignoredNativeMessageIds)
+        : currentBlocks;
     const patch: Partial<ChatState> = reconnectStatusPatch(session, s, launchBeforeFetch);
     // `session.input.consumed` is not replayed, so recovered user blocks are
     // the durable equivalent of its FIFO acknowledgement.
@@ -4667,7 +4987,7 @@ async function reconcileOnReconnect(
     if (recoveredUserInputs > 0) {
       patch.pendingUserMessages = s.pendingUserMessages.slice(recoveredUserInputs);
     }
-    let nextBlocks = currentBlocks;
+    let nextBlocks = reconciledBlocks;
     if (unseen.length > 0) {
       // Splice the gap's committed items ahead of the active turn's
       // replayed in-flight region (its itemId-less blocks, rebuilt by the
@@ -4678,7 +4998,7 @@ async function reconcileOnReconnect(
       const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
       // A card answered before the gap whose call the gap persisted comes
       // back rebuilt in `unseen` — drop the live copy before anchoring.
-      const kept = withoutRebuiltUserInputCards(currentBlocks, unseen);
+      const kept = withoutRebuiltUserInputCards(reconciledBlocks, unseen);
       let at = -1;
       if (rid) {
         at = kept.findIndex((b) => b.ctx.responseId === rid && !b.ctx.itemId);
@@ -4819,6 +5139,8 @@ export async function startStreamPump(
   // established stream — failed opens leave it false so a recovered first
   // connect is still treated as initial, not a reconnect.
   let hasConnected = false;
+  let previousStreamEpoch: string | null = null;
+  const nativePreviewBaselines = new Map<string, string>();
   // A reconnect loop is inherently sequential — open → pump → reconnect —
   // so its awaits cannot be parallelized; no-await-in-loop doesn't apply.
   /* eslint-disable no-await-in-loop */
@@ -4927,18 +5249,42 @@ export async function startStreamPump(
         }
 
         const reconnecting = hasConnected;
+        const streamEpoch = streamRes.headers.get("x-omnigent-stream-epoch");
         hasConnected = true;
         failedOpens = 0;
         consecutive404s = 0;
         presenceIdle.noteReported(idle);
         streamAttemptActivity.set(attempt, Date.now());
         if (reconnecting) {
-          dropEphemeralInFlightBlocks(id, set);
+          if (previousStreamEpoch === null || streamEpoch === null) {
+            nativePreviewBaselines.clear();
+          } else if (previousStreamEpoch !== streamEpoch) {
+            nativePreviewBaselines.clear();
+            for (const block of get().blocks) {
+              if (isLiveProvisionalBlock(block) && block.type === "text_done" && block.ctx.itemId) {
+                nativePreviewBaselines.set(block.ctx.itemId, block.fullText);
+              }
+            }
+          }
+          const liveIds = new Set(
+            get()
+              .blocks.filter(isLiveProvisionalBlock)
+              .map((block) => block.ctx.itemId),
+          );
+          for (const itemId of nativePreviewBaselines.keys()) {
+            if (!liveIds.has(itemId)) nativePreviewBaselines.delete(itemId);
+          }
+          dropEphemeralInFlightBlocks(
+            id,
+            set,
+            nativePreviewBaselines.size > 0 ? nativePreviewBaselines : null,
+          );
         } else {
           // Fresh connection (not a reconnect) — clear any stale SSE log from
           // a previous stream bind so the debug panel starts clean.
           clearSseLog(id);
         }
+        previousStreamEpoch = streamEpoch;
         // Guard the byte stream with a silence watchdog: the server
         // heartbeats every 15 s, so a longer gap means a half-open socket
         // (laptop sleep, network path change, proxy reap). The guard ends
@@ -4979,6 +5325,9 @@ export async function startStreamPump(
         }
         // Only a transport drop is reconnectable; everything else ends the loop.
         if (reason !== "dropped") break;
+        if (!controller.signal.aborted && !isConversationDisposed(id)) {
+          markLivePreviewsInterrupted(id, set);
+        }
       } finally {
         controller.signal.removeEventListener("abort", onOuterAbort);
         presenceAttemptControllers.delete(attempt);
@@ -5133,6 +5482,25 @@ function withoutNativePreviews(blocks: AnyBlock[], messageIds: Set<string>): Any
   });
 }
 
+/** A completed item supersedes interrupted previews; never guess by text. */
+function withoutInterruptedNativePreviews(
+  blocks: AnyBlock[],
+  ignoredMessages: Set<string>,
+): AnyBlock[] {
+  if (
+    !blocks.some(
+      (block) =>
+        isLiveProvisionalBlock(block) && block.type === "text_done" && block.previewInterrupted,
+    )
+  ) {
+    return blocks;
+  }
+  for (const block of blocks) {
+    if (isLiveProvisionalBlock(block)) ignoreLivePreview(block, ignoredMessages);
+  }
+  return blocks.filter((block) => !isLiveProvisionalBlock(block));
+}
+
 /**
  * Build a provisional in-flight assistant-text block for live streaming.
  *
@@ -5156,7 +5524,12 @@ function withoutNativePreviews(blocks: AnyBlock[], messageIds: Set<string>): Any
  * :param responseId: the live turn's id, or `itemId` when none.
  * :returns: a `TextDone` block ready to push into `blocks`.
  */
-function makeLiveTextBlock(itemId: string, text: string, responseId: string): TextDone {
+function makeLiveTextBlock(
+  itemId: string,
+  text: string,
+  responseId: string,
+  streamIndex?: number,
+): TextDone {
   return {
     type: "text_done",
     // ``timestamp`` matches the reducer's monotonic source (not wall
@@ -5171,6 +5544,7 @@ function makeLiveTextBlock(itemId: string, text: string, responseId: string): Te
     },
     fullText: text,
     hasCodeBlocks: text.includes("```"),
+    ...(streamIndex !== undefined ? { streamIndex } : {}),
   };
 }
 
@@ -5190,7 +5564,7 @@ function makeLiveTextBlock(itemId: string, text: string, responseId: string): Te
  * :param delta: incremental text for this chunk, e.g. ``"Hello "``.
  * :returns: nothing; mutates `blocks` in the store.
  */
-function applyLiveDelta(set: Setter, messageId: string, delta: string): void {
+function applyLiveDelta(set: Setter, messageId: string, delta: string, index?: number): void {
   const itemId = LIVE_ITEM_PREFIX + messageId;
   set((s) => {
     const startupPatch =
@@ -5206,14 +5580,22 @@ function applyLiveDelta(set: Setter, messageId: string, delta: string): void {
       const responseId = live?.state === "streaming" ? live.responseId : itemId;
       return {
         ...startupPatch,
-        blocks: [...s.blocks, makeLiveTextBlock(itemId, delta, responseId)],
+        blocks: [...s.blocks, makeLiveTextBlock(itemId, delta, responseId, index)],
       };
     }
     const existing = s.blocks[at]!;
     if (existing.type !== "text_done") return {};
     const fullText = existing.fullText + delta;
     const next = s.blocks.slice();
-    next[at] = { ...existing, fullText, hasCodeBlocks: fullText.includes("```") };
+    const missedChunk =
+      index !== undefined && existing.streamIndex !== undefined && index > existing.streamIndex + 1;
+    next[at] = {
+      ...existing,
+      fullText,
+      hasCodeBlocks: fullText.includes("```"),
+      ...(index !== undefined ? { streamIndex: index } : {}),
+      ...(missedChunk ? { previewInterrupted: true } : {}),
+    };
     return { ...startupPatch, blocks: next };
   });
 }
@@ -5292,17 +5674,14 @@ async function* tapLiveDeltas(
     }
     if (ev.type === "text_delta" && ev.messageId !== undefined) {
       if (!isConversationDisposed(id) && !ignored.has(ev.messageId)) {
-        // A scheduled wake streams its first deltas ahead of the batch
-        // that names the new turn. They must not preview into the
-        // PREVIOUS turn's bubble (anonymous blocks glue to the trailing
-        // group — killing its fold and inflating its worked-for span):
-        // ignore the rest of the message so its text renders only via the
-        // authoritative item, which lands in the new turn's bubble.
-        if (isStaleCompletedResponse(get())) {
+        // An unnamed scheduled wake must not preview into a completed turn.
+        // A running snapshot proves work resumed even if the restarted server
+        // lost its active response id; its preview gets a synthetic bubble.
+        if (isStaleCompletedResponse(get()) && get().sessionStatus !== "running") {
           ignored.add(ev.messageId);
           continue;
         }
-        applyLiveDelta(set, ev.messageId, ev.delta);
+        applyLiveDelta(set, ev.messageId, ev.delta, ev.index);
       }
       continue;
     }
@@ -5532,6 +5911,28 @@ export async function pumpStreamEvents(
         continue;
       }
 
+      if (
+        block.type === "text_done" &&
+        block.ctx.itemId &&
+        !isLiveProvisionalBlock(block) &&
+        get().isNativeTerminalSession &&
+        get().blocks.some(
+          (candidate) =>
+            isLiveProvisionalBlock(candidate) &&
+            candidate.type === "text_done" &&
+            candidate.previewInterrupted,
+        )
+      ) {
+        flush();
+        set((s) => {
+          const blocks = withoutInterruptedNativePreviews(s.blocks, ignoredMessages);
+          return blocks === s.blocks ? {} : { blocks };
+        });
+        // The in-band item is already authoritative; also reconcile any
+        // other persisted items whose live event was missed in the gap.
+        void reconcileOnReconnect(id, set, get, ignoredMessages);
+      }
+
       // Native preview cleanup must run before the generic dedup below:
       // when a snapshot merge (reconnect/rebind) inserted this
       // authoritative item while its `live:*` preview was still on
@@ -5661,7 +6062,7 @@ export async function pumpStreamEvents(
         // in-flight preview — the first-turn "no spinner" bug. On a matching
         // (or absent) active response this is the normal terminal path.
         const active = get().activeResponse;
-        const endedId = block.response?.id ?? block.ctx?.responseId ?? "";
+        const endedId = block.response?.id || block.ctx?.responseId || "";
         if (active !== null && active.responseId !== endedId) {
           continue;
         }
@@ -6117,6 +6518,20 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       if (event.usageByModel !== undefined) {
         patch.sessionUsageByModel = event.usageByModel;
       }
+      if (event.totalCostUsd !== undefined || event.usageByModel !== undefined) {
+        const entry =
+          sourceConversationId === null
+            ? undefined
+            : conversationRegistry.peek(sourceConversationId);
+        if (entry !== undefined && !entry.disposed) {
+          // A same-value receipt is still newer than an in-flight usage read.
+          const revisions = sessionUsageRevisions.get(entry);
+          sessionUsageRevisions.set(entry, {
+            cost: (revisions?.cost ?? 0) + (event.totalCostUsd !== undefined ? 1 : 0),
+            models: (revisions?.models ?? 0) + (event.usageByModel !== undefined ? 1 : 0),
+          });
+        }
+      }
       if (Object.keys(patch).length > 0) {
         applyToConversation(patch);
       }
@@ -6322,6 +6737,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           patch.backgroundTaskCount = 0;
           patch.backgroundTasks = [];
         }
+        if (event.status === "failed" && s.blocks.some(isLiveProvisionalBlock)) {
+          patch.blocks = s.blocks.map((block) =>
+            isLiveProvisionalBlock(block) && block.type === "text_done" && block.previewInterrupted
+              ? { ...block, previewInterrupted: false }
+              : block,
+          );
+        }
         if (event.responseId !== undefined && event.status === "running") {
           patch.status = "streaming";
           patch.activeResponse = {
@@ -6407,16 +6829,32 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         // Deduplicate repeated status edges for one response, but preserve the
         // same failure on later turns so each rejected prompt has a visible error.
         const statusError = event.error;
+        const statusResponseId = event.responseId ?? s.activeResponse?.responseId ?? "";
         const hasMatchingStatusError =
           statusError != null &&
           s.blocks.some(
             (block) =>
               block.type === "error" &&
-              block.ctx.responseId === (event.responseId ?? "") &&
+              block.ctx.responseId === statusResponseId &&
               block.code === statusError.code &&
               block.message === statusError.message,
           );
         if (event.status === "failed" && statusError != null && !hasMatchingStatusError) {
+          const responseAgents = new Set(
+            s.blocks.flatMap((block) =>
+              event.responseId &&
+              block.ctx.responseId === event.responseId &&
+              (block.type === "response_start" ||
+                block.type === "text_done" ||
+                block.type === "tool_group" ||
+                block.type === "reasoning_block") &&
+              block.ctx.agent?.trim()
+                ? [block.ctx.agent.trim()]
+                : [],
+            ),
+          );
+          const statusAgentName =
+            responseAgents.size === 1 ? responseAgents.values().next().value : undefined;
           patch.blocks = [
             ...s.blocks,
             {
@@ -6426,13 +6864,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 depth: 0,
                 turn: 0,
                 timestamp: 0,
-                responseId: event.responseId ?? "",
+                responseId: statusResponseId,
                 itemId: null,
               },
               message: statusError.message,
               source: "",
               code: statusError.code,
-              ...structuredErrorFields(statusError),
+              ...structuredErrorFields(statusError, statusAgentName),
             } satisfies ErrorBlock,
           ];
         }
@@ -6548,7 +6986,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // steal a real queued message's bubble. Hold the head back for a marker.
           const eventContent = userContentFromEvent(event);
           if (eventContent !== null && isSystemUserContent(eventContent)) return {};
-          if (s.pendingUserMessages.length === 0) return {};
+          if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft)
+            return {};
           return { pendingUserMessages: s.pendingUserMessages.slice(1) };
         }
 
@@ -6582,7 +7021,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         }
 
         // 2. FIFO head fallback (id not adopted yet / cross-client).
-        //    Skipped for a mirrored system marker (the vendor CLI's own
+        //    Skipped for an unsent draft or a mirrored system marker (the vendor CLI's own
         //    interrupt record): it is synthesized by the CLI, never queued
         //    here, so popping the head would hand the queued message's
         //    uploads to the marker and leave the real message empty. A
@@ -6591,7 +7030,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         //    branch 1 and never reaches this fallback.
         const eventContent = userContentFromEvent(event);
         const head =
-          eventContent !== null && isSystemUserContent(eventContent)
+          (eventContent !== null && isSystemUserContent(eventContent)) ||
+          s.pendingUserMessages[0]?.initialDraft
             ? undefined
             : s.pendingUserMessages[0];
         if (head) {
@@ -6634,10 +7074,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // so the optimistic bubble in `pendingUserMessages` would
       // otherwise linger next to the rendered SlashCommandBlock
       // until refresh. Pop the FIFO head here to ack the local
-      // send; non-empty guard so observing clients (with no pending
-      // bubble) just render the block.
+      // send; observing clients and drafts still held locally cannot
+      // acknowledge a send, so they just render the block.
       applyToConversation((s) => {
-        if (s.pendingUserMessages.length === 0) return {};
+        if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft) return {};
         const [, ...rest] = s.pendingUserMessages;
         return { pendingUserMessages: rest };
       });
@@ -7095,20 +7535,23 @@ function failUnavailableStream(set: Setter, error: string): void {
 // within the connect-grace + relaunch window.
 const RUNNER_UNAVAILABLE_CODE = "runner_unavailable";
 
+// Replace only the server's no-context fallback; preserve phase-specific detail.
+const RUNNER_UNAVAILABLE_TERSE_MESSAGE = "No runner bound for session";
+
 /**
  * Turn a thrown send failure into user-facing banner text + a code.
  *
- * The runner-unavailable 503 gets self-explanatory copy (and no raw code in
- * the banner title) so a slow/never-online runner reads as a clear, retryable
- * message rather than the server's terse "No runner bound for session". Other
- * failures fall back to the error's own message, carrying the machine code
- * when present for debuggability.
+ * Keep the runner-unavailable code and any phase-specific detail. Replace
+ * only the server's no-context message with friendly copy.
  */
 function describeSendFailure(err: unknown): { message: string; code: string } {
   if (err instanceof ApiError && err.code === RUNNER_UNAVAILABLE_CODE) {
+    const informative = err.message && err.message !== RUNNER_UNAVAILABLE_TERSE_MESSAGE;
     return {
-      message: "The runner didn't come online in time. Please try again.",
-      code: "",
+      message: informative
+        ? err.message
+        : "The runner didn't come online in time. Please try again.",
+      code: RUNNER_UNAVAILABLE_CODE,
     };
   }
   if (err instanceof ApiError) {

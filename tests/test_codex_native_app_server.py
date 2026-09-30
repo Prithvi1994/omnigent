@@ -53,6 +53,28 @@ from omnigent.inner.codex_executor import (
 )
 
 
+@pytest.mark.parametrize(
+    ("code", "message", "expected"),
+    [
+        (-32600, "no active turn to steer", True),
+        (-32600, "no active turn to interrupt", True),
+        (-32600, " NO ACTIVE TURN TO INTERRUPT ", True),
+        (-32600, "expected active turn id `turn_a` but found `turn_b`", True),
+        (-32600, "expected active turn id turn_a but found turn_b", True),
+        (-32600, "thread not found", False),
+        (-32600, "invalid turn id", False),
+        (-32600, "expected active turn id", False),
+        (-32600, "cannot steer a review turn", False),
+        (-32603, "no active turn to interrupt", False),
+        (-32603, "expected active turn id turn_a but found turn_b", False),
+        (-32600, None, False),
+    ],
+)
+def test_is_stale_active_turn_error(code: int, message: str | None, expected: bool) -> None:
+    error = CodexAppServerResponseError({"code": code, "message": message})
+    assert app_server.is_stale_active_turn_error(error) is expected
+
+
 @pytest.mark.parametrize("method", ["turn/start", "turn/steer"])
 async def test_rejected_request_traceback_identifies_rpc(method: str) -> None:
     """RPC errors keep their structured payload and add only request identity."""
@@ -1687,7 +1709,8 @@ def test_mark_launch_default_preserves_a_hidden_configured_default() -> None:
 
     Hidden configured models are explicitly supported: crowning a different
     visible model would let a Default launch pin a model the configuration
-    never selected. An unpinned launch still keeps Codex's own first default.
+    never selected. With no Sol row, an unpinned launch falls back to Codex's
+    own first default.
     """
     from omnigent.harnesses.codex_native.app_server import mark_launch_default
 
@@ -1698,6 +1721,25 @@ def test_mark_launch_default_preserves_a_hidden_configured_default() -> None:
     assert [row.get("isDefault") for row in unpinned] == [True, None]
     pinned = mark_launch_default(rows, "gpt-5.4")
     assert [row.get("isDefault") for row in pinned] == [None, True]
+
+
+def test_mark_launch_default_prefers_omnigent_default_over_codex_default() -> None:
+    """An unpinned catalog prefers Sol over Codex's current catalog default."""
+    from omnigent.harnesses.codex_native.app_server import mark_launch_default
+
+    rows = [
+        {"id": "gpt-6-astra", "isDefault": True},
+        {"id": "system.ai.gpt-5-6-sol"},
+    ]
+
+    assert mark_launch_default(rows, None) == [
+        {"id": "gpt-6-astra"},
+        {"id": "system.ai.gpt-5-6-sol", "isDefault": True},
+    ]
+    assert mark_launch_default(rows, "gpt-6-astra") == [
+        {"id": "gpt-6-astra", "isDefault": True},
+        {"id": "system.ai.gpt-5-6-sol"},
+    ]
 
 
 @pytest.mark.parametrize("reprobe", [False, True])
@@ -3973,8 +4015,8 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
 
     The plain Codex-login shape carries no ``DATABRICKS_HOST`` and no
     provider overrides beyond what the launch resolved (here the dismissal
-    pin), and with no launch-pinned model Codex's own default marker
-    stands.
+    pin). With no launch-pinned model, Omnigent's Sol default wins when it is
+    visible; otherwise Codex's own default marker stands.
     """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.models import model_catalog_store
@@ -4302,6 +4344,44 @@ def test_resolve_databricks_codex_model_matches_servable_ids() -> None:
             _resolve_databricks_codex_model("https://h.example.com", "prof", "databricks-gpt-9-9")
             == "databricks-gpt-9-9"
         )
+
+
+def test_resolve_databricks_codex_model_discovery_failure_warns_without_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The ucode-state fallback warns in one actionable line, frame-free."""
+    import logging
+    from unittest.mock import patch
+
+    from omnigent.harnesses.codex_native.app_server import _resolve_databricks_codex_model
+
+    def _raise(profile: str | None) -> None:
+        raise OSError(
+            "token-less profile; run `databricks auth login --profile prof` "
+            "to refresh the OAuth session"
+        )
+
+    with (
+        patch(
+            "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+            side_effect=_raise,
+        ),
+        patch("omnigent.onboarding.ucode_state.read_ucode_state", return_value=None),
+        caplog.at_level(logging.WARNING, logger="omnigent.harnesses.codex_native.app_server"),
+    ):
+        resolved = _resolve_databricks_codex_model(
+            "https://h.example.com", "prof", "databricks-gpt-9-9"
+        )
+
+    assert resolved == "databricks-gpt-9-9"
+    warning = next(
+        r for r in caplog.records if "live Databricks model discovery failed" in r.getMessage()
+    )
+    assert not warning.exc_info, (
+        "a recoverable ucode-state fallback must not log a traceback at WARNING; "
+        "host logging mirrors it to the user's terminal"
+    )
+    assert "databricks auth login --profile prof" in warning.getMessage()
 
 
 def test_probe_codex_home_bridges_provider_tables_and_credential(
