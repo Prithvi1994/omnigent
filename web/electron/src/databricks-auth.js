@@ -54,8 +54,11 @@ function cookieMatchesOrigin(cookie, origin) {
 
 // The workspace rejected a freshly minted session, so stored credentials can't recover it.
 const SESSION_REJECTED = "SESSION_REJECTED";
+// Session-create was refused by the workspace IP access list (e.g. off the VPN).
+const IP_ACL_BLOCKED = "IP_ACL_BLOCKED";
 // Backoff for renewals that fail while the network is down (e.g. VPN reconnecting after wake).
-const RENEWAL_RETRY_DELAYS_MS = [10_000, 20_000, 40_000, 80_000, 160_000];
+// Gives up two minutes after the first failure.
+const RENEWAL_RETRY_DELAYS_MS = [10_000, 20_000, 40_000, 50_000];
 // Session-create transport failures thrown by databricks-session.js.
 const SESSION_TRANSPORT_ERRORS = new Set([
   "Databricks session creation timed out",
@@ -65,14 +68,16 @@ const SESSION_TRANSPORT_ERRORS = new Set([
 
 /**
  * Whether a silent renewal failure is worth retrying: a network/timeout failure
- * with no HTTP response, or an HTTP 5xx/429. Credential and protocol failures
- * (missing/dead tokens, 4xx, unexpected redirects) are not.
+ * with no HTTP response, an HTTP 5xx/429, or a session-create refused by the
+ * workspace IP access list (off the VPN). Credential and protocol failures
+ * (missing/dead tokens, other 4xx, unexpected redirects) are not.
  *
  * @param {unknown} error
  * @returns {boolean}
  */
 function isTransientRenewalError(error) {
   if (!error || typeof error !== "object") return false;
+  if (error.errorCode === IP_ACL_BLOCKED) return true;
   if (error.status != null) {
     return error.status === 429 || (error.status >= 500 && error.status <= 599);
   }
@@ -87,6 +92,7 @@ function isTransientRenewalError(error) {
 
 /** A short, secret-free label for a renewal failure. */
 function renewalErrorKind(error) {
+  if (error?.errorCode === IP_ACL_BLOCKED) return IP_ACL_BLOCKED;
   if (error?.status != null) return `HTTP ${error.status}`;
   const message = typeof error?.message === "string" ? error.message : "";
   if (message.startsWith("net::ERR_")) return message.split(/\s/)[0];
@@ -406,5 +412,6 @@ module.exports = {
   isTransientRenewalError,
   RENEWAL_RETRY_DELAYS_MS,
   SESSION_REJECTED,
+  IP_ACL_BLOCKED,
   createDatabricksAuth,
 };

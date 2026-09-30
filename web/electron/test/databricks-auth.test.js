@@ -10,6 +10,7 @@ const {
   isDatabricksLoginUrl,
   isTransientRenewalError,
   RENEWAL_RETRY_DELAYS_MS,
+  IP_ACL_BLOCKED,
   createDatabricksAuth,
 } = require("../src/databricks-auth");
 
@@ -427,6 +428,11 @@ describe("Databricks browser session lifecycle", () => {
 });
 
 const offline = () => new TypeError("fetch failed");
+const ipAclBlocked = () =>
+  Object.assign(new Error("/auth/session/create (no redirect) returned HTTP 403"), {
+    status: 403,
+    errorCode: IP_ACL_BLOCKED,
+  });
 
 describe("Databricks renewal during network outages", () => {
   it("retries a transient failure on the backoff schedule, then reloads the page", async (t) => {
@@ -451,8 +457,8 @@ describe("Databricks renewal during network outages", () => {
       await drain();
     }
     /* oxlint-enable no-await-in-loop */
-    assert.deepEqual(delays, [10_000, 20_000, 40_000, 80_000, 160_000]);
-    assert.equal(h.calls.renew.length, 6);
+    assert.deepEqual(delays, [10_000, 20_000, 40_000, 50_000]);
+    assert.equal(h.calls.renew.length, 5);
     assert.deepEqual(h.calls.errors, []);
     assert.deepEqual(h.calls.load, [{ win, url: TARGET }]);
     // Back on the normal expiry schedule.
@@ -479,11 +485,32 @@ describe("Databricks renewal during network outages", () => {
       await drain();
     }
     /* oxlint-enable no-await-in-loop */
-    assert.equal(h.calls.renew.length, 6);
+    assert.equal(h.calls.renew.length, 5);
     assert.equal(h.calls.errors.length, 1);
     assert.match(h.calls.errors[0].error.message, /ERR_INTERNET_DISCONNECTED/);
     assert.equal(h.timers.size, 0);
     assert.deepEqual(h.calls.load, []);
+  });
+  it("retries a session-create refused by the IP access list until the network is allowed", async (t) => {
+    let blocked = 2;
+    const h = harness({
+      ensureSession: async () => {
+        if (blocked-- > 0) throw ipAclBlocked();
+        return ORIGIN;
+      },
+    });
+    t.after(() => h.auth.dispose());
+    const win = h.window();
+    await h.auth.attach(win, `${ORIGIN}/omnigent`, TARGET);
+    h.request(win, `${ORIGIN}/login.html`);
+    await drain();
+    assert.equal(h.fireRetry(), 10_000);
+    await drain();
+    assert.equal(h.fireRetry(), 20_000);
+    await drain();
+    assert.equal(h.calls.renew.length, 3);
+    assert.deepEqual(h.calls.errors, []);
+    assert.deepEqual(h.calls.load, [{ win, url: TARGET }]);
   });
   for (const [label, error] of [
     [
@@ -631,6 +658,7 @@ describe("transient renewal error classification", () => {
         status: 502,
       }),
       Object.assign(new Error("token endpoint 429"), { status: 429 }),
+      ipAclBlocked(),
     ]) {
       assert.equal(isTransientRenewalError(error), true, String(error?.message));
     }

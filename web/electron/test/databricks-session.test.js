@@ -10,6 +10,14 @@ const vm = require("node:vm");
 const { createRequire } = require("node:module");
 
 const ORIGIN = "https://workspace.cloud.databricks.com";
+// Shape of the workspace IP access list rejection seen off the corporate VPN.
+const IP_ACL_RESPONSE = {
+  body: JSON.stringify({
+    error_code: "403",
+    message:
+      "Source IP address: 203.0.113.7 is blocked by Databricks IP ACL for workspace: 1234567890",
+  }),
+};
 const COOKIE = {
   name: "DBAUTH",
   domain: new URL(ORIGIN).hostname,
@@ -169,12 +177,6 @@ describe("Databricks session preparation", () => {
         });
       },
     ],
-    [
-      "a network failure",
-      () => {
-        throw new TypeError("fetch failed");
-      },
-    ],
   ]) {
     it(`falls back to browser sign-in on connect with ${label}`, async () => {
       const h = harness({ stored });
@@ -188,14 +190,48 @@ describe("Databricks session preparation", () => {
     let requests = 0;
     const h = harness({
       respond(req) {
-        if (++requests === 1) req.emit("error", new Error("net::ERR_NAME_NOT_RESOLVED"));
-        else req.emit("redirect", 302, "GET", `${ORIGIN}/omnigent`, {});
+        req.emit(
+          "redirect",
+          302,
+          "GET",
+          `${ORIGIN}${++requests === 1 ? "/login" : "/omnigent"}`,
+          {},
+        );
       },
     });
     assert.equal(await h.ensureDatabricksSession(h.ses, ORIGIN), ORIGIN);
     assert.equal(h.calls.stored, 1);
     assert.equal(h.calls.browser, 1);
     assert.equal(h.requests.length, 2);
+  });
+  it("reports an unreachable workspace on connect instead of opening the browser", async () => {
+    let requests = 0;
+    const lookup = harness({
+      stored: () => {
+        throw new TypeError("fetch failed");
+      },
+    });
+    await assert.rejects(lookup.ensureDatabricksSession(lookup.ses, ORIGIN), /fetch failed/);
+    assert.equal(lookup.calls.browser, 0);
+    const mint = harness({
+      respond(req) {
+        requests++;
+        req.emit("error", new Error("net::ERR_NAME_NOT_RESOLVED"));
+      },
+    });
+    await assert.rejects(mint.ensureDatabricksSession(mint.ses, ORIGIN), /ERR_NAME_NOT_RESOLVED/);
+    assert.equal(mint.calls.browser, 0);
+    assert.equal(requests, 1);
+  });
+  it("reports an IP access list block on connect instead of opening the browser", async () => {
+    const h = harness({ respond: (req, response) => response(req, 403, false, IP_ACL_RESPONSE) });
+    await assert.rejects(h.ensureDatabricksSession(h.ses, ORIGIN), (error) => {
+      assert.equal(error.errorCode, "IP_ACL_BLOCKED");
+      return true;
+    });
+    assert.equal(h.calls.stored, 1);
+    assert.equal(h.calls.browser, 0);
+    assert.equal(h.requests.length, 1);
   });
   it("sends an account URL through browser sign-in since tokens are stored per workspace", async () => {
     const account = "https://accounts.cloud.databricks.com";
@@ -319,6 +355,29 @@ describe("Databricks cookie minting", () => {
     assert.match(output, /PERMISSION_DENIED/);
     assert.match(output, /trace-123/);
     assert.doesNotMatch(output, /private-/);
+  });
+  it("labels a session-create 403 from the workspace IP access list without logging the address", async () => {
+    const h = harness({ respond: (req, response) => response(req, 403, false, IP_ACL_RESPONSE) });
+    await assert.rejects(h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent"), (error) => {
+      assert.equal(error.status, 403);
+      assert.equal(error.errorCode, "IP_ACL_BLOCKED");
+      assert.doesNotMatch(error.message, /203\.0\.113\.7|IP ACL/);
+      return true;
+    });
+    const output = JSON.stringify(h.logs);
+    assert.match(output, /IP_ACL_BLOCKED/);
+    assert.doesNotMatch(output, /203\.0\.113\.7|IP ACL/);
+  });
+  it("leaves a plain session-create 403 unlabeled", async () => {
+    const h = harness({
+      respond: (req, response) =>
+        response(req, 403, false, { body: JSON.stringify({ message: "Forbidden" }) }),
+    });
+    await assert.rejects(h.mintSessionCookie(h.ses, ORIGIN, "token", "/omnigent"), (error) => {
+      assert.equal(error.status, 403);
+      assert.equal(error.errorCode, undefined);
+      return true;
+    });
   });
   it("distinguishes a landing-page 403 from a session-create 403", async () => {
     const h = harness({ follow: (req, response) => response(req, 403) });

@@ -19,7 +19,11 @@ const {
 } = require("./databricks-oauth");
 const { parseAccountFromToken, listRunningWorkspaces } = require("./databricks-account");
 const { isDatabricksOAuthServerUrl } = require("./url");
-const { cookieMatchesOrigin } = require("./databricks-auth");
+const {
+  cookieMatchesOrigin,
+  isTransientRenewalError,
+  IP_ACL_BLOCKED,
+} = require("./databricks-auth");
 
 const SESSION_CREATE_PATH = "/auth/session/create";
 // Bound on the session-create request so a stalled socket can't hang connect.
@@ -81,8 +85,10 @@ async function ensureDatabricksSession(
       });
       console.log("[omnigent] databricks session: connected with stored credentials", { origin });
       return restored;
-    } catch {
+    } catch (error) {
       signal?.throwIfAborted();
+      // A browser sign-in can't finish while the workspace is unreachable either.
+      if (isTransientRenewalError(error)) throw error;
       // The token and session modules already logged the underlying failure.
       console.log("[omnigent] databricks session: stored credentials unusable; signing in", {
         origin,
@@ -315,6 +321,9 @@ async function mintSessionCookie(
         if (typeof code === "string" && /^[a-zA-Z][a-zA-Z0-9_]{0,63}$/.test(code)) errorCode = code;
       } catch {
         /* HTML and unstructured errors are not displayed. */
+      }
+      if (status === 403 && /is blocked by Databricks IP ACL/.test(errorBody)) {
+        errorCode = IP_ACL_BLOCKED;
       }
       const details = [errorCode, requestId && `request ID ${requestId}`]
         .filter(Boolean)
