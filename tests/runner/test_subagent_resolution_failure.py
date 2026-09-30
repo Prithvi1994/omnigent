@@ -376,3 +376,118 @@ async def test_native_mirror_with_cyclic_parent_fails_instead_of_hanging(
         response = await asyncio.wait_for(http.get(f"/v1/sessions/{mirror}/resources"), timeout=10)
     assert response.status_code == 500, response.text
     assert not manager.spawns
+
+
+@pytest.mark.asyncio
+async def test_native_mirrors_naming_each_other_fail_instead_of_deadlocking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two mirrors recorded as each other's parent fail concurrently rather than hang."""
+    first, second = "conv_mirror_a", "conv_mirror_b"
+    server = _ContractSnapshotClient(first)
+    original_get = server.get
+
+    async def get(url: str, **kwargs: Any) -> Any:
+        if url.endswith(f"/v1/sessions/{first}"):
+            return httpx.Response(200, json=_mirror_snapshot(second))
+        if url.endswith(f"/v1/sessions/{second}"):
+            return httpx.Response(200, json=_mirror_snapshot(first))
+        return await original_get(url, **kwargs)
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return _contract_root_spec(with_child=True)
+
+    monkeypatch.setattr(server, "get", get)
+    manager = _RecordingManager(_RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS))
+    app = create_runner_app(
+        process_manager=manager,
+        spec_resolver=resolver,
+        server_client=server,
+    )  # type: ignore[arg-type]
+    async with _runner_test_client(app) as http:
+        responses = await asyncio.wait_for(
+            asyncio.gather(
+                http.get(f"/v1/sessions/{first}/resources"),
+                http.get(f"/v1/sessions/{second}/resources"),
+            ),
+            timeout=10,
+        )
+    assert [response.status_code for response in responses] == [500, 500]
+    assert not manager.spawns
+
+
+@pytest.mark.asyncio
+async def test_legacy_child_with_mirror_label_is_treated_as_a_mirror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A persisted row carrying a mirror label resolves through its parent.
+
+    Clients can no longer write these labels, so a row that has them was
+    stamped by the server; the runner keeps trusting them.
+    """
+    owner, child = "conv_legacy_owner", "conv_legacy_child"
+    server = _ContractSnapshotClient(owner)
+    original_get = server.get
+    calls = []
+
+    async def get(url: str, **kwargs: Any) -> Any:
+        if url.endswith(f"/v1/sessions/{child}"):
+            return httpx.Response(
+                200, json={**_mirror_snapshot(owner), "sub_agent_name": "worker_renamed"}
+            )
+        return await original_get(url, **kwargs)
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        calls.append(session_id)
+        return _contract_root_spec(with_child=True)
+
+    monkeypatch.setattr(server, "get", get)
+    manager = _RecordingManager(_RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS))
+    app = create_runner_app(
+        process_manager=manager,
+        spec_resolver=resolver,
+        server_client=server,
+    )  # type: ignore[arg-type]
+    async with _runner_test_client(app) as http:
+        response = await http.get(f"/v1/sessions/{child}/resources")
+    assert response.status_code == 200, response.text
+    assert calls == [owner]
+    assert not manager.spawns
+
+
+@pytest.mark.asyncio
+async def test_background_title_metadata_outage_returns_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A metadata outage yields a retryable 503, never a permanent 410 for a mirror."""
+    mirror = "conv_title_outage"
+    server = _ContractSnapshotClient("conv_title_outage_owner")
+    original_get = server.get
+
+    async def get(url: str, **kwargs: Any) -> Any:
+        if url.endswith(f"/v1/sessions/{mirror}"):
+            return httpx.Response(503)
+        return await original_get(url, **kwargs)
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return _contract_root_spec(with_child=True)
+
+    monkeypatch.setattr(server, "get", get)
+    manager = _RecordingManager(_RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS))
+    app = create_runner_app(
+        process_manager=manager,
+        spec_resolver=resolver,
+        server_client=server,
+    )  # type: ignore[arg-type]
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            f"/v1/sessions/{mirror}/background-title",
+            json={
+                "prompt": "summarize this",
+                "agent_id": "ag_contract_root",
+                "sub_agent_name": "Explore",
+            },
+        )
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == "spec_resolver_failed"
+    assert not manager.spawns

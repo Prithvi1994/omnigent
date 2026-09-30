@@ -4011,11 +4011,11 @@ def create_runner_app(
                 },
             )
 
-        sub_agent_name = body.sub_agent_name or await _recover_sub_agent_name(conversation_id)
         resolver_agent_id = body.agent_id or _session_agent_ids.get(conversation_id)
         resolver_cwd = await _session_runtime_cwd(conversation_id)
-        # Session-aware resolution keeps native mirrors on their parent's spec
-        # and rejects a stale child before any title harness is chosen.
+        # Session-aware resolution keeps native mirrors on their parent's spec and
+        # rejects a stale child before any title harness is chosen; without readable
+        # metadata the child's identity is unknown, so no title is generated.
         title_spec_entry: _SpecEntry | None = None
         if spec_resolver is not None:
             try:
@@ -4026,12 +4026,12 @@ def create_runner_app(
                         status_code=exc.http_status,
                         content={"error": exc.code, "detail": exc.message},
                     )
-                _logger.warning(
-                    "Session-aware spec resolution failed for %s title; falling back "
-                    "to the request's agent_id",
-                    conversation_id,
-                    exc_info=True,
-                    extra={"session_id": conversation_id},
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "spec_resolver_failed",
+                        "detail": _client_safe_error_detail(exc, context="spec resolve"),
+                    },
                 )
         try:
             effective_harness, spawn_env = await _resolve_harness_config(
@@ -4041,7 +4041,6 @@ def create_runner_app(
                 session_id=conversation_id,
                 model_override=body.model_override,
                 harness_override=body.harness_override,
-                sub_agent_name=sub_agent_name,
                 selected_spec_entry=title_spec_entry,
                 cwd=resolver_cwd,
             )
@@ -4057,19 +4056,11 @@ def create_runner_app(
                     session_id=conversation_id,
                     model_override=body.model_override,
                     harness_override=resolver_harness,
-                    sub_agent_name=sub_agent_name,
                     selected_spec_entry=title_spec_entry,
                     cwd=resolver_cwd,
                 )
                 if resolved_harness != resolver_harness:
                     return BackgroundSessionTitleResponse(status="unsupported")
-        except OmnigentError as exc:
-            if exc.code != ErrorCode.SUB_AGENT_UNRESOLVED:
-                raise
-            return JSONResponse(
-                status_code=exc.http_status,
-                content={"error": exc.code, "detail": exc.message},
-            )
         except (httpx.HTTPError, RuntimeError) as exc:
             return JSONResponse(
                 status_code=503,
@@ -9460,6 +9451,20 @@ def create_runner_app(
         stream_spec = _unwrap_resolved_spec(
             direct_spec_entry if dispatch is None else _session_spec_cache.get(conv_id)
         )
+        if stream_spec is None and dispatch is not None and spec_resolver is not None:
+            # An agent switch above evicts the cache; re-select the session's spec
+            # so the copy-on-write harness check still sees it.
+            try:
+                stream_spec = _unwrap_resolved_spec(await _resolve_session_spec_entry(conv_id))
+            except (OmnigentError, httpx.HTTPError, RuntimeError, ValueError) as exc:
+                if isinstance(exc, OmnigentError) and exc.code == ErrorCode.SUB_AGENT_UNRESOLVED:
+                    raise
+                _logger.warning(
+                    "Spec re-selection failed for %s after an agent switch",
+                    conv_id,
+                    exc_info=True,
+                    extra={"session_id": conv_id},
+                )
         if has_copy_on_write(
             getattr(stream_spec, "os_env", None)
         ) or resource_registry.uses_copy_on_write(conv_id):
@@ -9526,6 +9531,8 @@ def create_runner_app(
                     reraise=True,
                 )
             except Exception as exc:
+                if isinstance(exc, OmnigentError) and exc.code == ErrorCode.SUB_AGENT_UNRESOLVED:
+                    raise
                 _logger.exception(
                     "opencode-native cold-boot ensure failed for %s",
                     conv_id,
@@ -9685,7 +9692,7 @@ def create_runner_app(
             # background path pre-composes).
             _instr_body = body
             if dispatch is None:
-                with contextlib.suppress(OmnigentError, httpx.HTTPError, RuntimeError, ValueError):
+                try:
                     _instr_spec_ds = _unwrap_resolved_spec(direct_spec_entry)
                     if _instr_spec_ds is not None:
                         _per_req_instr = cast(str | None, body.get("instructions"))
@@ -9736,6 +9743,14 @@ def create_runner_app(
                                         _ds_delivery.value,
                                         extra={"session_id": conv_id},
                                     )
+                except (RuntimeError, ValueError):
+                    _logger.warning(
+                        "Instruction composition failed for %s; sending the request's own "
+                        "instructions",
+                        conv_id,
+                        exc_info=True,
+                        extra={"session_id": conv_id},
+                    )
             event_body = _wrap_as_message_event(_instr_body)
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _response_id: str | None = None
@@ -12432,46 +12447,53 @@ def create_runner_app(
             if session_id in _session_spec_cache:
                 return _session_spec_cache[session_id]
             snapshot = await _require_session_snapshot(session_id)
-            if snapshot.parent_session_id and is_parent_owned_subagent_labels(snapshot.labels):
-                # Native display identities refer to the runtime-owning parent's spec.
-                return await _resolve_session_spec_entry(
-                    snapshot.parent_session_id, _resolving=_resolving | {session_id}
-                )
-            agent_id = snapshot.agent_id
-            if not agent_id:
-                raise OmnigentError(
-                    f"session spec resolver: session {session_id!r} has no agent_id",
-                    code=ErrorCode.NOT_FOUND,
-                )
-            spec_entry = await spec_resolver(agent_id, session_id)
-            if spec_entry is None:
-                # The session still references agent_id, but its stored bundle
-                # no longer resolves (deleted or rebound out from under the
-                # live session). A session-lifecycle condition, not a generic
-                # NOT_FOUND: the distinct code lets the terminal-ensure and
-                # turn-dispatch paths surface a lifecycle reason instead of a
-                # runner startup fault.
-                raise OmnigentError(
-                    f"session spec resolver: agent {agent_id!r} for "
-                    f"session {session_id!r} was not found",
-                    code=ErrorCode.SESSION_AGENT_MISSING,
-                )
-            sub_agent_name = snapshot.sub_agent_name
-            # Root the child at its own bundle dir. Always wrapped, so an
-            # unresolvable workdir registers nothing rather than falling back
-            # to the parent's bundle root.
-            if sub_agent_name:
-                _session_sub_agent_names[session_id] = sub_agent_name
-                if _unwrap_resolved_spec(spec_entry) is not None:
-                    sub_entry = _native_runtime._resolve_sub_agent_spec_entry(
-                        spec_entry, sub_agent_name
+            mirror_owner = (
+                snapshot.parent_session_id
+                if snapshot.parent_session_id and is_parent_owned_subagent_labels(snapshot.labels)
+                else None
+            )
+            if mirror_owner is None:
+                agent_id = snapshot.agent_id
+                if not agent_id:
+                    raise OmnigentError(
+                        f"session spec resolver: session {session_id!r} has no agent_id",
+                        code=ErrorCode.NOT_FOUND,
                     )
-                    if sub_entry is None:
-                        raise _unresolved_sub_agent_error(session_id, sub_agent_name)
-                    spec_entry = sub_entry
-            if _session_cache_generation_is_current(session_id, generation):
-                _session_spec_cache[session_id] = spec_entry
-            return spec_entry
+                spec_entry = await spec_resolver(agent_id, session_id)
+                if spec_entry is None:
+                    # The session still references agent_id, but its stored bundle
+                    # no longer resolves (deleted or rebound out from under the
+                    # live session). A session-lifecycle condition, not a generic
+                    # NOT_FOUND: the distinct code lets the terminal-ensure and
+                    # turn-dispatch paths surface a lifecycle reason instead of a
+                    # runner startup fault.
+                    raise OmnigentError(
+                        f"session spec resolver: agent {agent_id!r} for "
+                        f"session {session_id!r} was not found",
+                        code=ErrorCode.SESSION_AGENT_MISSING,
+                    )
+                sub_agent_name = snapshot.sub_agent_name
+                # Root the child at its own bundle dir. Always wrapped, so an
+                # unresolvable workdir registers nothing rather than falling back
+                # to the parent's bundle root.
+                if sub_agent_name:
+                    _session_sub_agent_names[session_id] = sub_agent_name
+                    if _unwrap_resolved_spec(spec_entry) is not None:
+                        sub_entry = _native_runtime._resolve_sub_agent_spec_entry(
+                            spec_entry, sub_agent_name
+                        )
+                        if sub_entry is None:
+                            raise _unresolved_sub_agent_error(session_id, sub_agent_name)
+                        spec_entry = sub_entry
+                if _session_cache_generation_is_current(session_id, generation):
+                    _session_spec_cache[session_id] = spec_entry
+                return spec_entry
+        # Native display identities refer to the runtime-owning parent's spec,
+        # resolved outside this session's lock so two mirrors recorded as each
+        # other's parent cannot wait on each other's locks.
+        return await _resolve_session_spec_entry(
+            mirror_owner, _resolving=_resolving | {session_id}
+        )
 
     async def _resolve_session_agent_spec(session_id: str) -> AgentSpec | None:
         entry = await _resolve_session_spec_entry(session_id)
