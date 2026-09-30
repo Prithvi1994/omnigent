@@ -436,6 +436,11 @@ describe("Databricks auth mode wiring", () => {
     );
   });
 
+  const ipAclBlocked = () =>
+    Object.assign(new Error("/auth/session/create (no redirect) returned HTTP 403"), {
+      status: 403,
+      errorCode: "IP_ACL_BLOCKED",
+    });
   const vpnRetrying = "Check that you're connected to the VPN. Retrying automatically…";
   const vpnFinal = "Check that you're connected to the VPN, then click Connect.";
   for (const [label, internalFeatures, failure, retryingMessage, finalMessage] of [
@@ -452,6 +457,20 @@ describe("Databricks auth mode wiring", () => {
       () => new TypeError("fetch failed"),
       "Can't reach Databricks. Check your network connection. Retrying automatically…",
       "Couldn't reach Databricks. Check your network connection, then click Connect.",
+    ],
+    [
+      "asks about the VPN on a Databricks-managed device when the IP access list blocks it",
+      true,
+      ipAclBlocked,
+      `Databricks blocked this network. ${vpnRetrying}`,
+      `Databricks blocked this network. ${vpnFinal}`,
+    ],
+    [
+      "suggests an allowed network elsewhere when the IP access list blocks it",
+      false,
+      ipAclBlocked,
+      "Databricks blocked this network. Connect from a network the workspace allows. Retrying automatically…",
+      "Databricks blocked this network. Connect from a network the workspace allows, then click Connect.",
     ],
   ]) {
     it(label, async (t) => {

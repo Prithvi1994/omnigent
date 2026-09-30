@@ -82,6 +82,7 @@ const {
   isTransientRenewalError,
   renewalErrorKind,
   SESSION_REJECTED,
+  IP_ACL_BLOCKED,
 } = require("./databricks-auth");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
 const {
@@ -749,17 +750,20 @@ function asksAboutVpn(serverUrl) {
 }
 
 /**
- * The connect-page message for an unreachable Databricks workspace.
+ * The connect-page message for an unreachable Databricks workspace, or one whose
+ * IP access list blocked this network (`blocked`).
  *
  * @param {string | null | undefined} serverUrl
- * @param {{ retrying?: boolean }} [options] Whether a silent reconnect is pending.
+ * @param {{ blocked?: boolean, retrying?: boolean }} [options] `retrying`: a silent
+ *   reconnect is pending.
  * @returns {string}
  */
-function unreachableMessage(serverUrl, { retrying = false } = {}) {
-  const problem = retrying ? "Can't reach Databricks." : "Couldn't reach Databricks.";
-  const hint = asksAboutVpn(serverUrl)
-    ? "Check that you're connected to the VPN"
-    : "Check your network connection";
+function unreachableMessage(serverUrl, { blocked = false, retrying = false } = {}) {
+  let problem = retrying ? "Can't reach Databricks." : "Couldn't reach Databricks.";
+  if (blocked) problem = "Databricks blocked this network.";
+  let hint = "Check your network connection";
+  if (asksAboutVpn(serverUrl)) hint = "Check that you're connected to the VPN";
+  else if (blocked) hint = "Connect from a network the workspace allows";
   return `${problem} ${hint}${retrying ? ". Retrying automatically…" : ", then click Connect."}`;
 }
 
@@ -781,7 +785,12 @@ function showDatabricksAuthRequired(win, serverUrl, error, { returnUrl } = {}) {
   if (!retrying) cancelReconnect(win);
   let message = "Couldn't sign in to Databricks. Please try again.";
   if (expired) message = "Session expired. Connect to sign in again.";
-  else if (transient) message = unreachableMessage(serverUrl, { retrying });
+  else if (transient) {
+    message = unreachableMessage(serverUrl, {
+      blocked: error.errorCode === IP_ACL_BLOCKED,
+      retrying,
+    });
+  }
   const params = new URLSearchParams({ error: message, url: serverUrl });
   if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
   if (retrying) params.set("reconnect", "1");
