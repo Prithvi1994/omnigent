@@ -65,21 +65,19 @@ _ADVERTISED_MODELS = (
 )
 _SERVED_CODEX_MODEL = "system.ai.glm-5-2"
 _REPLY_TEXT = "AZURE_GATEWAY_REPLY_OK"
+_FIRST_MESSAGE = "hello?"
 
 _RIG_READY_TIMEOUT_S = 120.0
 _TURN_OUTCOME_TIMEOUT_S = 120.0
 _POLL_INTERVAL_S = 2.0
 
-# Loopback must bypass any forced egress proxy for this process (fixture
-# helpers use ambient httpx) and for the spawned server/runner/codex tree.
-for _var in ("NO_PROXY", "no_proxy"):
-    os.environ[_var] = ",".join(filter(None, [os.environ.get(_var, ""), "127.0.0.1,localhost"]))
-
-_client = httpx.Client(trust_env=False)
+# Loopback must bypass any forced egress proxy, both for this process (the
+# conftest session helpers use ambient httpx) and for the spawned
+# server/runner/codex tree, which inherits the environment.
+_LOOPBACK_NO_PROXY = "127.0.0.1,localhost"
 
 
 def _bare_model_id(model: str) -> str:
-    """Normalize a model id across catalog spellings for served-set membership."""
     lowered = model.strip().lower()
     for prefix in ("system.ai.", "databricks-"):
         if lowered.startswith(prefix):
@@ -93,7 +91,6 @@ def _is_served(model: str) -> bool:
 
 
 def _response_object() -> dict[str, Any]:
-    """A completed Responses-API response carrying the served model's reply."""
     message = {
         "id": "msg-1",
         "type": "message",
@@ -117,7 +114,6 @@ def _response_object() -> dict[str, Any]:
 
 
 def _sse_reply() -> bytes:
-    """Minimal Responses SSE stream: created -> assistant message -> completed."""
     completed = _response_object()
     events: list[tuple[str, dict[str, Any]]] = [
         ("response.created", {"response": {"id": completed["id"]}}),
@@ -212,8 +208,8 @@ class _AzureishWorkspaceHandler(http.server.BaseHTTPRequestHandler):
 
 
 def _stage_azure_profile(work: Path, host: str) -> tuple[Path, Path]:
-    """Stage the user's Databricks state: a profile for the workspace plus a
-    ``databricks`` CLI on PATH whose token mint always succeeds.
+    """Stage the user's Databricks state: an ``azure`` profile for the
+    workspace plus a ``databricks`` CLI on PATH whose token mint succeeds.
 
     :returns: ``(bin dir, home dir)`` for the spawned processes' env.
     """
@@ -232,28 +228,167 @@ def _stage_azure_profile(work: Path, host: str) -> tuple[Path, Path]:
     return bindir, home
 
 
+# Ambient runner/host/workspace state would re-route the spawned processes.
+_STRIPPED_ENV_PREFIXES = ("OMNIGENT_RUNNER_", "OMNIGENT_HOST_", "DATABRICKS_", "OMNIGENT_REPRO_")
+_STRIPPED_ENV_VARS = ("RUNNER_SERVER_URL", "OMNIGENT_REMOTE_AUTH_TOKEN", "OMNIGENT_CONFIG_HOME")
+
+
 @dataclass(frozen=True)
 class _AzureCodexRig:
-    """Live rig handles for one test run."""
+    """Live server + runner configured for the fake Azure-behaving workspace."""
 
     base_url: str
-    session_id: str
+    runner_id: str
     workspace: _AzureishWorkspace
+    client: httpx.Client
     server_log: Path
     runner_log: Path
 
 
+def _stop_processes(procs: list[subprocess.Popen[bytes]]) -> None:
+    for proc in procs:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+    for proc in procs:
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+@contextlib.contextmanager
+def _boot_rig(work: Path) -> Iterator[_AzureCodexRig]:
+    with contextlib.ExitStack() as stack:
+        workspace = _AzureishWorkspace()
+        stack.callback(workspace.server_close)
+        stack.callback(workspace.shutdown)
+        threading.Thread(target=workspace.serve_forever, daemon=True).start()
+        client = stack.enter_context(httpx.Client(trust_env=False))
+
+        bindir, home_dir = _stage_azure_profile(work, workspace.host)
+        config_home = work / "config-home"
+        source_codex_home = work / "source-codex-home"
+        state_dir = work / "codex-native-state"
+        artifacts = work / "artifacts"
+        for path in (config_home, source_codex_home, state_dir, artifacts):
+            path.mkdir(parents=True, exist_ok=True)
+        (config_home / "config.yaml").write_text(
+            "providers:\n"
+            "  azure-workspace:\n"
+            "    kind: databricks\n"
+            "    profile: azure\n"
+            "    default: openai\n",
+            encoding="utf-8",
+        )
+
+        from omnigent.runner.identity import token_bound_runner_id
+
+        port = _find_free_port()
+        base_url = f"http://127.0.0.1:{port}"
+        binding_token = secrets.token_urlsafe(32)
+        runner_id = token_bound_runner_id(binding_token)
+
+        shared_env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(_STRIPPED_ENV_PREFIXES) and key not in _STRIPPED_ENV_VARS
+        }
+        shared_env.update(
+            {
+                "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+                "OMNIGENT_CONFIG_HOME": str(config_home),
+                "OMNIGENT_CODEX_NATIVE_STATE_DIR": str(state_dir),
+                "CODEX_HOME": str(source_codex_home),
+                "HOME": str(home_dir),
+                "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}",
+            }
+        )
+        server_env = {**shared_env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token}
+        runner_env = {
+            **shared_env,
+            "OMNIGENT_RUNNER_ID": runner_id,
+            "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
+            "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
+            "RUNNER_SERVER_URL": base_url,
+        }
+
+        server_log = work / "server.log"
+        runner_log = work / "runner.log"
+        server_handle = stack.enter_context(server_log.open("w"))
+        runner_handle = stack.enter_context(runner_log.open("w"))
+        procs: list[subprocess.Popen[bytes]] = []
+        stack.callback(_stop_processes, procs)
+        procs.append(
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "omnigent.cli",
+                    "server",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                    "--database-uri",
+                    f"sqlite:///{work}/test.db",
+                    "--artifact-location",
+                    str(artifacts),
+                ],
+                env=server_env,
+                stdout=server_handle,
+                stderr=subprocess.STDOUT,
+                cwd=str(_REPO_ROOT),
+            )
+        )
+        procs.append(
+            subprocess.Popen(
+                [sys.executable, "-m", "omnigent.runner._entry"],
+                env=runner_env,
+                stdout=runner_handle,
+                stderr=subprocess.STDOUT,
+                cwd=str(_REPO_ROOT),
+            )
+        )
+
+        deadline = time.monotonic() + _RIG_READY_TIMEOUT_S
+        online = False
+        while time.monotonic() < deadline:
+            if any(proc.poll() is not None for proc in procs):
+                break
+            with contextlib.suppress(httpx.HTTPError):
+                if client.get(f"{base_url}/health", timeout=2).status_code == 200:
+                    status = client.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2)
+                    if status.status_code == 200 and status.json().get("online"):
+                        online = True
+                        break
+            time.sleep(0.5)
+        if not online:
+            raise RuntimeError(
+                "azure codex rig did not come online within "
+                f"{_RIG_READY_TIMEOUT_S:.0f}s.\nServer log:\n{server_log.read_text()[-3000:]}\n"
+                f"Runner log:\n{runner_log.read_text()[-3000:]}"
+            )
+        yield _AzureCodexRig(
+            base_url=base_url,
+            runner_id=runner_id,
+            workspace=workspace,
+            client=client,
+            server_log=server_log,
+            runner_log=runner_log,
+        )
+
+
 @pytest.fixture
-def azure_codex_databricks_session(
+def azure_codex_rig(
     built_spa: None,
     tmp_path_factory: pytest.TempPathFactory,
     request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[_AzureCodexRig]:
     """Server + runner configured with a Databricks profile for the fake
-    Azure-behaving workspace, and a codex-native session.
-
-    The session pins no model (the reported journey) unless the test
-    indirect-parametrizes one.
+    Azure-behaving workspace. Sessions are created by the test, so the fixture
+    itself never launches codex.
     """
     if request.config.getoption("--ui-base-url"):
         pytest.skip("this journey requires an isolated spawned server")
@@ -262,161 +397,42 @@ def azure_codex_databricks_session(
         pytest.skip("codex CLI is required for the Databricks codex launch journey")
     if not _codex_cli_supports_mocked_app_server(codex_path):
         pytest.skip("codex CLI >= 0.139.0 is required for mocked app-server e2e")
+    for var in ("NO_PROXY", "no_proxy"):
+        monkeypatch.setenv(
+            var, ",".join(filter(None, [os.environ.get(var, ""), _LOOPBACK_NO_PROXY]))
+        )
+    with _boot_rig(tmp_path_factory.mktemp("azure_codex_gateway")) as rig:
+        yield rig
 
-    workspace = _AzureishWorkspace()
-    threading.Thread(target=workspace.serve_forever, daemon=True).start()
 
-    work = tmp_path_factory.mktemp("azure_codex_gateway")
-    bindir, home_dir = _stage_azure_profile(work, workspace.host)
-    config_home = work / "config-home"
-    source_codex_home = work / "source-codex-home"
-    state_dir = work / "codex-native-state"
-    artifacts = work / "artifacts"
-    for path in (config_home, source_codex_home, state_dir, artifacts):
-        path.mkdir(parents=True, exist_ok=True)
-    (config_home / "config.yaml").write_text(
-        "providers:\n"
-        "  azure-workspace:\n"
-        "    kind: databricks\n"
-        "    profile: azure\n"
-        "    default: openai\n",
-        encoding="utf-8",
-    )
-
-    from omnigent.runner.identity import token_bound_runner_id
-
-    port = _find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    binding_token = secrets.token_urlsafe(32)
-    runner_id = token_bound_runner_id(binding_token)
-
-    shared_env = {
-        **os.environ,
-        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
-        "OMNIGENT_CONFIG_HOME": str(config_home),
-        "OMNIGENT_CODEX_NATIVE_STATE_DIR": str(state_dir),
-        "CODEX_HOME": str(source_codex_home),
-        "HOME": str(home_dir),
-        "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}",
-    }
-    # Ambient workspace credentials would override the staged profile.
-    for var in (
-        "DATABRICKS_HOST",
-        "DATABRICKS_TOKEN",
-        "DATABRICKS_BEARER",
-        "DATABRICKS_CONFIG_PROFILE",
-        "DATABRICKS_CONFIG_FILE",
-        "DATABRICKS_CLIENT_ID",
-        "DATABRICKS_CLIENT_SECRET",
-    ):
-        shared_env.pop(var, None)
-    server_env = {**shared_env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token}
-    runner_env = {
-        **shared_env,
-        "OMNIGENT_RUNNER_ID": runner_id,
-        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-        "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-        "RUNNER_SERVER_URL": base_url,
-    }
-
-    server_log = work / "server.log"
-    runner_log = work / "runner.log"
-    server_handle = server_log.open("w")
-    runner_handle = runner_log.open("w")
-    server_proc: subprocess.Popen[bytes] | None = None
-    runner_proc: subprocess.Popen[bytes] | None = None
-    session_id: str | None = None
+@contextlib.contextmanager
+def _codex_session(rig: _AzureCodexRig, *, model: str | None) -> Iterator[str]:
+    session_id = _create_native_codex_session(rig.base_url, rig.runner_id, model=model)
     try:
-        server_proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "omnigent.cli",
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--database-uri",
-                f"sqlite:///{work}/test.db",
-                "--artifact-location",
-                str(artifacts),
-            ],
-            env=server_env,
-            stdout=server_handle,
-            stderr=subprocess.STDOUT,
-            cwd=str(_REPO_ROOT),
-        )
-        runner_proc = subprocess.Popen(
-            [sys.executable, "-m", "omnigent.runner._entry"],
-            env=runner_env,
-            stdout=runner_handle,
-            stderr=subprocess.STDOUT,
-            cwd=str(_REPO_ROOT),
-        )
-
-        deadline = time.monotonic() + _RIG_READY_TIMEOUT_S
-        online = False
-        while time.monotonic() < deadline:
-            if server_proc.poll() is not None or runner_proc.poll() is not None:
-                break
-            try:
-                if _client.get(f"{base_url}/health", timeout=2).status_code == 200:
-                    status = _client.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2)
-                    if status.status_code == 200 and status.json().get("online"):
-                        online = True
-                        break
-            except httpx.HTTPError:
-                pass
-            time.sleep(0.5)
-        if not online:
-            raise RuntimeError(
-                "azure codex rig did not come online within "
-                f"{_RIG_READY_TIMEOUT_S:.0f}s.\nServer log:\n{server_log.read_text()[-3000:]}\n"
-                f"Runner log:\n{runner_log.read_text()[-3000:]}"
-            )
-
-        fixture_param = getattr(request, "param", None)
-        pinned_model = fixture_param if isinstance(fixture_param, str) else None
-        session_id = _create_native_codex_session(base_url, runner_id, model=pinned_model)
-        yield _AzureCodexRig(
-            base_url=base_url,
-            session_id=session_id,
-            workspace=workspace,
-            server_log=server_log,
-            runner_log=runner_log,
-        )
+        yield session_id
     finally:
-        if session_id is not None:
-            with contextlib.suppress(httpx.HTTPError):
-                _client.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
-        for proc in (runner_proc, server_proc):
-            if proc is not None and proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
-        for proc in (runner_proc, server_proc):
-            if proc is not None:
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=5)
-        server_handle.close()
-        runner_handle.close()
-        workspace.shutdown()
-        workspace.server_close()
+        with contextlib.suppress(httpx.HTTPError):
+            rig.client.delete(f"{rig.base_url}/v1/sessions/{session_id}", timeout=10.0)
 
 
-def _wait_turn_outcome(rig: _AzureCodexRig) -> tuple[list[str], bool]:
-    """Poll the transcript until the first turn reaches a terminal outcome.
+@dataclass(frozen=True)
+class _TurnOutcome:
+    errors: list[str]
+    assistant_replied: bool
+    responses_seen: list[tuple[str, int]]
+    #: The last non-200 answer from the items endpoint, for diagnostics.
+    items_failure: str = ""
 
-    :returns: ``(error item messages, assistant replied)``.
-    """
+
+def _wait_turn_outcome(rig: _AzureCodexRig, session_id: str) -> _TurnOutcome:
+    """Poll the transcript until the first turn reaches a terminal outcome."""
     errors: list[str] = []
     assistant_replied = False
+    items_failure = ""
     deadline = time.monotonic() + _TURN_OUTCOME_TIMEOUT_S
     while time.monotonic() < deadline:
-        items = _client.get(
-            f"{rig.base_url}/v1/sessions/{rig.session_id}/items?limit=50", timeout=10.0
+        items = rig.client.get(
+            f"{rig.base_url}/v1/sessions/{session_id}/items?limit=50", timeout=10.0
         )
         if items.status_code == 200:
             data = items.json()["data"]
@@ -424,50 +440,86 @@ def _wait_turn_outcome(rig: _AzureCodexRig) -> tuple[list[str], bool]:
             assistant_replied = any(
                 item.get("type") == "message" and item.get("role") == "assistant" for item in data
             )
-        if errors or assistant_replied:
-            break
+            if errors or assistant_replied:
+                break
+        else:
+            items_failure = f"GET /items answered {items.status_code}: {items.text[:300]}"
         time.sleep(_POLL_INTERVAL_S)
-    return errors, assistant_replied
+    return _TurnOutcome(
+        errors, assistant_replied, list(rig.workspace.responses_seen), items_failure
+    )
 
 
-@pytest.mark.timeout(600)
-def test_codex_databricks_default_model_survives_unserved_listing(
-    page: Page,
-    azure_codex_databricks_session: _AzureCodexRig,
-) -> None:
-    """The first message must complete on a served model, not die on the 404."""
-    rig = azure_codex_databricks_session
-    page.goto(f"{rig.base_url}/c/{rig.session_id}")
-
+def _drive_first_turn(page: Page, rig: _AzureCodexRig, session_id: str) -> _TurnOutcome:
+    """Open the session, wait for the live codex TUI, send the first message."""
+    page.goto(f"{rig.base_url}/c/{session_id}")
     _open_terminal_view(page)
     _wait_terminal_connected(page)
     _ensure_chat_view(page)
-
-    _send(page, "hello?")
-    errors, assistant_replied = _wait_turn_outcome(rig)
+    _send(page, _FIRST_MESSAGE)
+    outcome = _wait_turn_outcome(rig, session_id)
     # Show the TUI's outcome (where the ucode user sees the turn's fate)
     # before asserting, so a failure leaves the terminal state on screen.
     _open_terminal_view(page)
     page.wait_for_timeout(3_000)
+    return outcome
 
-    gateway_404_errors = [
-        message for message in errors if "RESOURCE_DOES_NOT_EXIST" in message or "404" in message
+
+def _gateway_404_errors(outcome: _TurnOutcome) -> list[str]:
+    return [
+        message
+        for message in outcome.errors
+        if "RESOURCE_DOES_NOT_EXIST" in message or "404" in message
     ]
-    assert not gateway_404_errors, (
-        "first codex turn died on the gateway's 404: the launch pinned a model the "
-        "workspace does not serve (models codex posted, with the status each got: "
-        f"{rig.workspace.responses_seen}); error item: {gateway_404_errors[0][:600]}"
-    )
-    assert assistant_replied, (
-        "first codex turn reached no assistant reply within "
-        f"{_TURN_OUTCOME_TIMEOUT_S:.0f}s (errors: {[e[:200] for e in errors]}; "
-        f"models codex posted: {rig.workspace.responses_seen})\n"
-        f"runner log tail:\n{rig.runner_log.read_text()[-1500:]}"
-    )
-    _ensure_chat_view(page)
-    expect(page.locator(_ASSISTANT, has_text=_REPLY_TEXT).first).to_be_visible(timeout=30_000)
-    served_posts = [model for model, status in rig.workspace.responses_seen if status == 200]
-    assert served_posts, (
-        "no codex request ever reached a model the workspace serves: "
-        f"{rig.workspace.responses_seen}"
-    )
+
+
+@pytest.mark.posix_only
+@pytest.mark.timeout(600)
+def test_codex_databricks_default_model_survives_unserved_listing(
+    azure_codex_rig: _AzureCodexRig,
+    page: Page,
+) -> None:
+    """The first message must complete on a served model, not die on the 404."""
+    rig = azure_codex_rig
+    with _codex_session(rig, model=None) as session_id:
+        outcome = _drive_first_turn(page, rig, session_id)
+
+        gateway_404_errors = _gateway_404_errors(outcome)
+        assert not gateway_404_errors, (
+            "first codex turn died on the gateway's 404: the launch pinned a model the "
+            "workspace does not serve (models codex posted, with the status each got: "
+            f"{outcome.responses_seen}); error item: {gateway_404_errors[0][:600]}"
+        )
+        assert outcome.assistant_replied, (
+            "first codex turn reached no assistant reply within "
+            f"{_TURN_OUTCOME_TIMEOUT_S:.0f}s (errors: {[e[:200] for e in outcome.errors]}; "
+            f"models codex posted: {outcome.responses_seen}; "
+            f"items endpoint: {outcome.items_failure or 'ok'})\n"
+            f"runner log tail:\n{rig.runner_log.read_text()[-1500:]}"
+        )
+        _ensure_chat_view(page)
+        expect(page.locator(_ASSISTANT, has_text=_REPLY_TEXT).first).to_be_visible(timeout=30_000)
+        served_posts = [model for model, status in outcome.responses_seen if status == 200]
+        assert served_posts, (
+            f"no codex request ever reached a model the workspace serves: {outcome.responses_seen}"
+        )
+
+
+@pytest.mark.posix_only
+@pytest.mark.timeout(600)
+def test_codex_databricks_served_model_completes_first_turn(
+    azure_codex_rig: _AzureCodexRig,
+    page: Page,
+) -> None:
+    """Rig control: an explicitly served model completes, so a default-model
+    failure is model selection, not a broken workspace/runner/codex stack."""
+    rig = azure_codex_rig
+    with _codex_session(rig, model=_SERVED_CODEX_MODEL) as session_id:
+        outcome = _drive_first_turn(page, rig, session_id)
+        assert not _gateway_404_errors(outcome), outcome
+        assert outcome.assistant_replied, (
+            f"control turn on {_SERVED_CODEX_MODEL!r} got no reply: {outcome}\n"
+            f"runner log tail:\n{rig.runner_log.read_text()[-1500:]}"
+        )
+        _ensure_chat_view(page)
+        expect(page.locator(_ASSISTANT, has_text=_REPLY_TEXT).first).to_be_visible(timeout=30_000)
