@@ -53,6 +53,54 @@ afterEach(() => {
 });
 
 describe("native side-chat first message", () => {
+  it("does not mistake a repeated follow-up for the missing first question", () => {
+    const ctx = {
+      agent: null,
+      depth: 0,
+      turn: 0,
+      timestamp: 0,
+      responseId: "turn_side",
+      itemId: "reply",
+    };
+    conversationRegistry.acquire(childId).setState({
+      blocks: [
+        { type: "text_done", ctx, fullText: "Hello Serena", hasCodeBlocks: false },
+        {
+          type: "user_message",
+          ctx: { ...ctx, itemId: "follow-up" },
+          content: [{ type: "input_text", text: "Hi" }],
+        },
+      ],
+    });
+    render(<SideChatPane childId={childId} initialMessage="Hi" />);
+    const questions = screen.getAllByText("Hi");
+    expect(questions).toHaveLength(2);
+    expect(
+      questions[0].compareDocumentPosition(screen.getByText("Hello Serena")) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      screen.getByText("Hello Serena").compareDocumentPosition(questions[1]) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("does not hide a failed child load behind the retained question", () => {
+    render(<SideChatPane childId={childId} initialMessage="Hi" />);
+    expect(screen.getByText("Hi")).toBeInTheDocument();
+    act(() =>
+      conversationRegistry.acquire(childId).setState({
+        conversationLoadError: new Error("Connection failed"),
+        sessionStatus: "idle",
+      }),
+    );
+    expect(screen.getByText("Couldn’t load this side chat")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    expect(screen.queryByText("Hi")).toBeNull();
+    act(() => conversationRegistry.acquire(childId).setState({ conversationLoadError: null }));
+    expect(screen.getByText("Hi")).toBeInTheDocument();
+  });
+
   it("keeps the first question ahead of the response and deduplicates persisted history", () => {
     const { rerender } = render(<SideChatPane childId={childId} initialMessage="Hi" />);
     expect(screen.getAllByText("Hi")).toHaveLength(1);

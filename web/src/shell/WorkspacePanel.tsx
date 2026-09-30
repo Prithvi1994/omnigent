@@ -879,6 +879,9 @@ function WorkspacePanelImpl({
   const closeSideChat = (childId: string) => {
     if (!childId.startsWith("pending:")) void stopSession(childId).catch(() => {});
     sideChats.close(childId);
+    setInitialSideChatMessages((messages) =>
+      Object.fromEntries(Object.entries(messages).filter(([id]) => id !== childId)),
+    );
   };
 
   // Memoized so FileViewer's Escape-to-close effect doesn't re-subscribe its

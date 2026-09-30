@@ -205,16 +205,15 @@ export function SideChatPane({
     );
     // The native fork can persist its first input before this pane subscribes.
     // Keep the submitted question visible until history supplies its user bubble.
-    const hasInitialMessage = committed.some(
-      (bubble) =>
-        bubble.kind === "user" &&
-        bubble.content
-          .filter((part) => part.type === "input_text")
-          .map((part) => part.text)
-          .join("\n") === initialMessage,
-    );
+    const firstBubble = committed[0];
+    const hasInitialMessage =
+      firstBubble?.kind === "user" &&
+      firstBubble.content
+        .filter((part) => part.type === "input_text")
+        .map((part) => part.text)
+        .join("\n") === initialMessage;
     const withInitialMessage: Bubble[] =
-      initialMessage && !hasInitialMessage
+      initialMessage && !hasInitialMessage && conversationLoadError === null
         ? [
             {
               kind: "user",
@@ -232,6 +231,7 @@ export function SideChatPane({
   }, [
     childId,
     initialMessage,
+    conversationLoadError,
     visibleBlocks,
     activeResponse,
     interruptedResponseIds,
