@@ -99,7 +99,8 @@
 }
 
 /* Each step mounts a fresh body child; fade it in rather than snapping. */
-.omnigent-card-body > * {
+.omnigent-card-body > *,
+.omnigent-card-steps > * {
   animation: omnigent-step-in 0.2s ease-out;
 }
 
@@ -115,7 +116,8 @@
     transition: none;
   }
 
-  .omnigent-card-body > * {
+  .omnigent-card-body > *,
+  .omnigent-card-steps > * {
     animation: none;
   }
 }

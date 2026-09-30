@@ -7,6 +7,8 @@
 
 import { type CSSProperties, useRef, useState } from "react";
 import { Settings } from "lucide-react";
+import { ConnectionStatus } from "./ConnectionStatus";
+import type { ConnectionProgress } from "./useServerConnection";
 import { AnimatedOmnigentPanel } from "@/components/onboarding/AnimatedOmnigentPanel";
 import {
   DropdownMenu,
@@ -34,11 +36,13 @@ import { SetupTerminalStep } from "@/pages/onboarding/SetupTerminalStep";
  * message should be shown; otherwise navigation is underway.
  */
 export interface ConnectResult {
+  cancelled?: boolean;
   error?: string;
 }
 
 /** Actions + data the Electron shell supplies to the flow. */
 export interface ServerSelectorV2Setup {
+  connection?: ConnectionProgress | null;
   /** Initial server URL to prefill (saved / failed / default). */
   initialUrl: string;
   /** Step to open on. "server" jumps straight to the server list ("Connect to
@@ -213,7 +217,10 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   // Connect from the terminal: success navigates away, a rejection shows there.
   const connectInTerminal = async (url: string) => {
     const result = await setup.onConnect(url);
-    return { ok: result.error === undefined, error: result.error };
+    return {
+      ok: !result.cancelled && result.error === undefined,
+      error: result.cancelled ? "Connection cancelled." : result.error,
+    };
   };
   // Checked at run time (Retry re-checks): a picked local install that's up opens
   // that exact URL; one that's down starts like "Get started locally".
@@ -272,6 +279,7 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
               type="button"
               className="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
               aria-label="Server selector settings"
+              disabled={setup.connection != null}
             >
               <Settings className="size-4" aria-hidden />
             </button>
@@ -311,80 +319,93 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
         bandContent={bandContent}
         contracted={step === "server" && !serverAddMode}
       >
-        {step === "landing" && (
-          <LandingStep
-            managedServers={setup.managedServers}
-            managedServerNames={setup.managedServerNames}
-            recentServers={setup.recentServers}
-            error={landingError}
-            onGetStarted={() => setStep("local")}
-            onJoinServer={() => setStep("server")}
-            onJoinManaged={joinFromLanding}
-            onJoinUrl={joinFromLanding}
+        {setup.connection && (
+          <ConnectionStatus
+            progress={setup.connection}
+            name={setup.managedServerNames?.[setup.connection.url]}
           />
         )}
-        {step === "local" && (
-          <LocalIntroStep
-            installed={setup.installed}
-            startsLocal={!setup.localServerRunning}
-            onBack={() => setStep("landing")}
-            onInstall={() => {
-              setTerminalTarget({ kind: "local", back: "local" });
-              setStep("terminal");
-            }}
-          />
-        )}
-        {step === "runner" && runnerTarget !== null && (
-          <RunnerStep
-            remoteAvailable={runnerTarget.remote}
-            installed={setup.installed}
-            error={runnerError}
-            onBack={() => setStep("landing")}
-            onInstall={async (runner) => {
-              if (!setup.onConnectRunner) {
-                setRunnerError(undefined);
-                const result = await connect(runnerTarget.url, "runner");
-                if (result.error) setRunnerError(result.error);
-                return;
-              }
-              // No local install for a remote runner, or when the host CLI is bundled.
-              setTerminalTarget({
-                kind: "connect",
-                back: "runner",
-                url: runnerTarget.url,
-                runner,
-                skipInstall: runner === "remote" || runnerTarget.bundledCli,
-              });
-              setStep("terminal");
-            }}
-          />
-        )}
-        {step === "terminal" && (
-          <SetupTerminalStep
-            onInstallCli={needsInstall && !skipInstall ? setup.onInstallCli : undefined}
-            onInstallLog={setup.onInstallLog}
-            onRun={runTerminal}
-            onSetupLog={terminalRunner ? setup.onRunnerLog : setup.onSetupLog}
-            onBack={() => setStep(terminalTarget.back)}
-            runningLabel={terminalCopy.label}
-            runningHint={terminalCopy.hint}
-          />
-        )}
-        {step === "server" && (
-          <ServerSelectStep
-            initialUrl={setup.initialUrl}
-            error={setup.error}
-            recentServers={setup.recentServers}
-            managedServers={setup.managedServers}
-            installed={setup.installed}
-            onBack={() => setStep("landing")}
-            onConnect={connect}
-            onRemove={setup.onRemoveServer}
-            onCopy={setup.onCopy}
-            onCheckServer={setup.onCheckServer}
-            onAddModeChange={setServerAddMode}
-          />
-        )}
+        {/* Keep the terminal mounted while its final navigation is pending. */}
+        <div
+          className="omnigent-card-steps"
+          style={{ display: setup.connection ? "none" : "contents" }}
+        >
+          {step === "landing" && (
+            <LandingStep
+              connecting={setup.connection != null}
+              managedServers={setup.managedServers}
+              managedServerNames={setup.managedServerNames}
+              recentServers={setup.recentServers}
+              error={landingError}
+              onGetStarted={() => setStep("local")}
+              onJoinServer={() => setStep("server")}
+              onJoinManaged={joinFromLanding}
+              onJoinUrl={joinFromLanding}
+            />
+          )}
+          {step === "local" && (
+            <LocalIntroStep
+              installed={setup.installed}
+              startsLocal={!setup.localServerRunning}
+              onBack={() => setStep("landing")}
+              onInstall={() => {
+                setTerminalTarget({ kind: "local", back: "local" });
+                setStep("terminal");
+              }}
+            />
+          )}
+          {step === "runner" && runnerTarget !== null && (
+            <RunnerStep
+              remoteAvailable={runnerTarget.remote}
+              installed={setup.installed}
+              error={runnerError}
+              onBack={() => setStep("landing")}
+              onInstall={async (runner) => {
+                if (!setup.onConnectRunner) {
+                  setRunnerError(undefined);
+                  const result = await connect(runnerTarget.url, "runner");
+                  if (result.error) setRunnerError(result.error);
+                  return;
+                }
+                // No local install for a remote runner, or when the host CLI is bundled.
+                setTerminalTarget({
+                  kind: "connect",
+                  back: "runner",
+                  url: runnerTarget.url,
+                  runner,
+                  skipInstall: runner === "remote" || runnerTarget.bundledCli,
+                });
+                setStep("terminal");
+              }}
+            />
+          )}
+          {step === "terminal" && (
+            <SetupTerminalStep
+              onInstallCli={needsInstall && !skipInstall ? setup.onInstallCli : undefined}
+              onInstallLog={setup.onInstallLog}
+              onRun={runTerminal}
+              onSetupLog={terminalRunner ? setup.onRunnerLog : setup.onSetupLog}
+              onBack={() => setStep(terminalTarget.back)}
+              runningLabel={terminalCopy.label}
+              runningHint={terminalCopy.hint}
+            />
+          )}
+          {step === "server" && (
+            <ServerSelectStep
+              initialUrl={setup.initialUrl}
+              error={setup.error}
+              recentServers={setup.recentServers}
+              managedServers={setup.managedServers}
+              installed={setup.installed}
+              onBack={() => setStep("landing")}
+              onConnect={connect}
+              onRemove={setup.onRemoveServer}
+              onCopy={setup.onCopy}
+              onCheckServer={setup.onCheckServer}
+              onAddModeChange={setServerAddMode}
+            />
+          )}
+        </div>
       </AnimatedOmnigentPanel>
 
       <LandingFooter />

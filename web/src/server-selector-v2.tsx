@@ -7,6 +7,10 @@
 
 import { type CSSProperties, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { AnimatedOmnigentPanel } from "./components/onboarding/AnimatedOmnigentPanel";
+import { Button } from "./components/ui/button";
+import { Spinner } from "./components/ui/spinner";
+import { useServerConnection, type ConnectionBridge } from "./pages/onboarding/useServerConnection";
 import type { Runner } from "./pages/onboarding/RunnerStep";
 import { ServerSelectorV2, type ServerSelectorV2Setup } from "./pages/onboarding/ServerSelectorV2";
 import { maybeMockSetup } from "./pages/onboarding/mockSetup";
@@ -16,9 +20,8 @@ const DEFAULT_URL = "http://localhost:6767";
 const CLOUD_DOCS_URL = "https://omnigent.ai/docs/deploy/overview";
 
 /** The `omnigentSetup` preload bridge (see electron/src/preload.js). */
-interface OmnigentSetup {
+export interface OmnigentSetup extends ConnectionBridge {
   getServerUrl: () => Promise<string | null>;
-  setServerUrl: (url: string) => Promise<unknown>;
   getManagedServers: () => Promise<string[]>;
   getManagedServerNames?: () => Promise<Record<string, string>>;
   getRecentServers: () => Promise<string[]>;
@@ -59,7 +62,9 @@ function SetupApp() {
   return <BridgeSetupApp />;
 }
 
-function BridgeSetupApp() {
+export function BridgeSetupApp() {
+  const bridge = setupBridge();
+  const { connect, progress } = useServerConnection(bridge);
   const params = new URLSearchParams(window.location.search);
   const failedUrl = params.get("url");
   const error = params.get("error") ?? undefined;
@@ -96,57 +101,59 @@ function BridgeSetupApp() {
   // the correct step (welcome vs server list) instead of flashing the wrong one.
   const [ready, setReady] = useState(false);
 
+  const [initializationAttempt, setInitializationAttempt] = useState(0);
+  const [slowInitialization, setSlowInitialization] = useState(false);
+
   useEffect(() => {
-    const bridge = setupBridge();
-    // No shell bridge (browser preview): nothing to probe, render immediately.
     if (!bridge) {
       setReady(true);
       return;
     }
-    // Load ALL setup data before the first paint — not just CLI status. The
-    // initial step depends on recents/managed too (a returning user starts on
-    // the server list), so mounting before those resolve would open the empty
-    // "add" view and never switch when the lists arrive. allSettled: a single
-    // failed probe degrades to its default, never blocks the wizard.
-    const savedUrl =
-      !failedUrl && !isEphemeral
-        ? bridge.getServerUrl().then((saved) => setInitialUrl(saved || DEFAULT_URL))
-        : Promise.resolve();
-    const recents = bridge.getRecentServers().then(setRecentServers);
-    const managed = bridge.getManagedServers().then(setManagedServers);
-    // Names are cosmetic: don't hold the first paint for them.
+    let cancelled = false;
+    setReady(false);
+    setSlowInitialization(false);
+    const timer = setTimeout(() => setSlowInitialization(true), 15_000);
     void bridge.getManagedServerNames?.().then(
-      (names) => setManagedServerNames(names ?? {}),
+      (names) => {
+        if (!cancelled) setManagedServerNames(names ?? {});
+      },
       () => {},
     );
-    const cli = bridge.getCliStatus().then((status) => {
-      setInstalled(status?.installed === true);
-      setInstallSupported(status?.installSupported === true);
-      setLocalServerRunning(status?.localServerRunning === true);
-    });
-    // Older shells omit getSetupCapabilities → leave the item enabled. Gate on
-    // it too, so the legacy item isn't shown enabled before v2Forced resolves.
-    const caps = bridge.getSetupCapabilities
-      ? bridge.getSetupCapabilities().then((c) => {
-          setV2Forced(c?.v2Forced === true);
-          setConnectedBefore(c?.connectedBefore === true);
-        })
-      : Promise.resolve();
-    // Seed the radio + `.dark` class from the shell's live theme so returning to
-    // setup after the app set Dark shows Dark, not the "system" default.
-    const theme = bridge.getColorScheme
-      ? bridge.getColorScheme().then((s) => {
-          if (!s) return;
-          setColorScheme(s.source === "light" || s.source === "dark" ? s.source : "system");
-          document.documentElement.classList.toggle("dark", s.effective === "dark");
-        })
-      : Promise.resolve();
-    Promise.allSettled([savedUrl, recents, managed, cli, caps, theme]).then(() => {
-      // A failed CLI probe means "not installed" rather than unknown.
-      setInstalled((prev) => prev ?? false);
+    // Decide the first step from one snapshot; late results from a retry are ignored.
+    void Promise.allSettled([
+      !failedUrl && !isEphemeral ? bridge.getServerUrl() : Promise.resolve(null),
+      bridge.getRecentServers(),
+      bridge.getManagedServers(),
+      bridge.getCliStatus(),
+      bridge.getSetupCapabilities?.(),
+      bridge.getColorScheme?.(),
+    ]).then(([saved, recents, managed, cli, caps, theme]) => {
+      if (cancelled) return;
+      clearTimeout(timer);
+      if (saved.status === "fulfilled" && saved.value) setInitialUrl(saved.value);
+      if (recents.status === "fulfilled") setRecentServers(recents.value);
+      if (managed.status === "fulfilled") setManagedServers(managed.value);
+      if (cli.status === "fulfilled") {
+        setInstalled(cli.value?.installed === true);
+        setInstallSupported(cli.value?.installSupported === true);
+        setLocalServerRunning(cli.value?.localServerRunning === true);
+      }
+      if (caps.status === "fulfilled") {
+        setV2Forced(caps.value?.v2Forced === true);
+        setConnectedBefore(caps.value?.connectedBefore === true);
+      }
+      if (theme.status === "fulfilled" && theme.value) {
+        const { source, effective } = theme.value;
+        setColorScheme(source === "light" || source === "dark" ? source : "system");
+        document.documentElement.classList.toggle("dark", effective === "dark");
+      }
       setReady(true);
     });
-  }, [failedUrl, isEphemeral]);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [bridge, failedUrl, isEphemeral, initializationAttempt]);
 
   // Sync the wizard's `.dark` class with the shell's effective theme: the dark
   // styles key off the class (index.css), not the OS media query. The shell
@@ -167,33 +174,22 @@ function BridgeSetupApp() {
     installed,
     connectedBefore,
     localServerRunning,
-    onConnect: async (url) => {
-      // setServerUrl persists the URL and navigates the window to it; on success
-      // the server's SPA takes over and this page goes away. A rejection (e.g.
-      // main-side normalizeUrl rejects an input the renderer accepted) is
-      // surfaced as {error} so the step can show it, rather than a click that
-      // silently does nothing.
-      const bridge = setupBridge();
-      if (!bridge) return { error: "The desktop shell is unavailable." };
-      try {
-        await bridge.setServerUrl(url);
-        return {};
-      } catch (e) {
-        return { error: e instanceof Error ? e.message : "Could not connect to that server." };
-      }
-    },
+    connection: progress,
+    onConnect: connect,
     onStartLocal: async () => {
       // Start (or reuse) the local server, then navigate to it. Resolves the
       // outcome so the terminal step can show ready/failed. On success the
       // setServerUrl navigation replaces this page, so this never resolves in
       // the happy path — the terminal stays on "Ready" until the window swaps.
-      const bridge = setupBridge();
       if (!bridge) return { ok: false, error: "The desktop shell is unavailable." };
       try {
         const result = await bridge.startLocalServer();
         if (result?.ok && result.url) {
-          await bridge.setServerUrl(result.url);
-          return { ok: true };
+          const connected = await connect(result.url);
+          return {
+            ok: !connected.cancelled && !connected.error,
+            error: connected.cancelled ? "Connection cancelled." : connected.error,
+          };
         }
         return { ok: false, error: result?.error ?? "Could not start the local server." };
       } catch (e) {
@@ -210,7 +206,6 @@ function BridgeSetupApp() {
     onInstallCli:
       installed === false && installSupported && setupBridge()?.installCli
         ? async () => {
-            const bridge = setupBridge();
             if (!bridge?.installCli) return { ok: false, error: "Install is unavailable." };
             try {
               const result = await bridge.installCli();
@@ -269,7 +264,6 @@ function BridgeSetupApp() {
     // Advisory reachability probe for a just-added server. Resolves a status;
     // never blocks Join. Absent bridge (browser preview) → treat as unreachable.
     onCheckServer: async (url) => {
-      const bridge = setupBridge();
       if (!bridge?.checkServer) return { status: "unreachable" as const };
       try {
         return await bridge.checkServer(url);
@@ -322,12 +316,32 @@ function BridgeSetupApp() {
       {ready ? (
         <ServerSelectorV2 setup={setup} />
       ) : (
-        // Hold on the wizard background until the CLI probe resolves, so the
-        // flow opens on the correct step rather than flashing the wrong one.
         <div
-          className="min-h-screen"
+          className="grid min-h-screen place-items-center p-6"
           style={{ background: "var(--onboarding-wizard-background)" }}
-        />
+        >
+          <AnimatedOmnigentPanel height={560} panelHeight={308}>
+            <div
+              className="flex flex-1 flex-col items-center justify-center gap-4 px-6 text-center"
+              aria-busy="true"
+            >
+              <Spinner className="size-6 motion-reduce:animate-none" aria-hidden="true" />
+              <p role="status" className="text-lg">
+                Loading your setup…
+              </p>
+              {slowInitialization && (
+                <>
+                  <p className="text-sm text-muted-foreground">
+                    Setup is taking longer than expected. You can retry.
+                  </p>
+                  <Button variant="outline" onClick={() => setInitializationAttempt((n) => n + 1)}>
+                    Retry loading setup
+                  </Button>
+                </>
+              )}
+            </div>
+          </AnimatedOmnigentPanel>
+        </div>
       )}
     </>
   );

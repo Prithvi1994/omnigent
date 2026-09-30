@@ -2,7 +2,7 @@
 // locally" / "Join your team". With presets: one "Join your team (<name>)" split
 // button; its dropdown lists other presets, recents, and a server URL field.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ArrowRight, ChevronDown, Laptop, Users } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -28,6 +28,7 @@ function displayUrl(url: string): string {
 }
 
 export function LandingStep({
+  connecting = false,
   managedServers,
   managedServerNames,
   recentServers,
@@ -37,6 +38,7 @@ export function LandingStep({
   onJoinManaged,
   onJoinUrl,
 }: {
+  connecting?: boolean;
   managedServers: string[];
   /** Display names for preset servers, server URL → name. */
   managedServerNames?: Record<string, string>;
@@ -51,6 +53,10 @@ export function LandingStep({
   /** Join a recent or typed server URL (preset dropdown). */
   onJoinUrl: (url: string) => void;
 }) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  useEffect(() => {
+    if (connecting) setMenuOpen(false);
+  }, [connecting]);
   const hasPresets = managedServers.length > 0;
   const [typedUrl, setTypedUrl] = useState("");
   const [invalid, setInvalid] = useState(false);
@@ -97,7 +103,7 @@ export function LandingStep({
               )
             </span>
           </Button>
-          <DropdownMenu>
+          <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
             <DropdownMenuTrigger asChild>
               <Button
                 className="py-5 rounded-tl-none rounded-bl-none border-0 border-l-[1px] border-muted-foreground"
