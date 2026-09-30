@@ -769,6 +769,23 @@ HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
 # their runners need; everything unnamed stays behind the allowlist.
 RUNNER_ENV_PASSTHROUGH_ENV_VAR: str = "OMNIGENT_RUNNER_ENV_PASSTHROUGH"
 
+
+def codex_config_declared_env_vars() -> frozenset[str]:
+    """Env var names Codex's own ``config.toml`` declares via ``env_key``.
+
+    A custom ``[model_providers.X]`` selected by the user's Codex config
+    authenticates from the variable it names. The runner forwards exactly that
+    variable to the Codex launch (see ``_clean_codex_env``), so it has to
+    survive the host→daemon→runner allowlists first or an ``omnigent codex``
+    session fails on a config a bare ``codex`` runs fine with.
+
+    :returns: The declared name, or an empty set when the config declares none.
+    """
+    from omnigent.inner.codex_executor import _codex_config_declared_env_key_allowance
+
+    return frozenset(_codex_config_declared_env_key_allowance())
+
+
 # HTTP statuses on the WebSocket upgrade that are worth retrying. Everything
 # else in the 4xx range is a permanent client error (auth, authorization,
 # wrong/old server) where reconnecting can never succeed — those fail loud.
@@ -836,9 +853,11 @@ def _build_runner_env(
 
     Harness credentials are the deliberate exception to the allowlist:
     the names in :data:`HARNESS_CREDENTIAL_ENV_VARS` (plus any extras
-    the host owner lists in :data:`RUNNER_ENV_PASSTHROUGH_ENV_VAR`)
-    forward when present, so runners can authenticate to LLM providers
-    with the credentials the host owner provisioned for them.
+    the host owner lists in :data:`RUNNER_ENV_PASSTHROUGH_ENV_VAR`, the
+    variables the providers config references, and the variable Codex's
+    own ``config.toml`` declares via ``env_key``) forward when present, so
+    runners can authenticate to LLM providers with the credentials the
+    host owner provisioned for them.
 
     :param base_env: Host process environment to filter, e.g.
         ``os.environ``.
@@ -886,7 +905,12 @@ def _build_runner_env(
         config_env_vars |= provider_credential_env_vars(
             inference_config, include_dollar_key_refs=True
         )
-    forwarded = HARNESS_CREDENTIAL_ENV_VARS | extra_names | config_env_vars
+    forwarded = (
+        HARNESS_CREDENTIAL_ENV_VARS
+        | extra_names
+        | config_env_vars
+        | codex_config_declared_env_vars()
+    )
     env = {
         key: value
         for key, value in base_env.items()
