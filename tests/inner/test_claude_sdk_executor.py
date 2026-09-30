@@ -81,6 +81,38 @@ class TestPromptExtraction(unittest.TestCase):
         # Prior turns are SDK-cached on resume — not replayed.
         self.assertNotIn("First question", prompt)
 
+    def test_resumed_session_compact_is_a_separate_prompt(self):
+        executor = self._make_executor()
+        for compact_content in (
+            "/compact",
+            [{"type": "text", "text": "/compact"}],
+            [{"type": "input_text", "text": "/compact"}],
+        ):
+            with self.subTest(content=compact_content):
+                # The runner dispatches pending input before the compact control.
+                messages = [
+                    {"role": "user", "content": "previous input"},
+                    {"role": "user", "content": compact_content},
+                ]
+                compact_prompt = executor._build_prompt(messages, resume_session=True)
+                self.assertEqual(compact_prompt, "/compact")
+                messages.extend(
+                    [
+                        {"role": "user", "content": "next input"},
+                        {"role": "user", "content": "another queued input"},
+                    ]
+                )
+                self.assertEqual(
+                    executor._build_prompt(messages, resume_session=True),
+                    "next input\n\nanother queued input",
+                )
+
+    def test_resumed_session_rejects_non_object_content_blocks(self):
+        with self.assertRaisesRegex(ValueError, "Anthropic content blocks must be objects"):
+            self._make_executor()._build_prompt(
+                [{"role": "user", "content": ["/compact"]}], resume_session=True
+            )
+
     def test_resumed_session_trailing_run_stops_at_assistant(self):
         """Only the trailing run of user messages (after the last non-user) is sent."""
         executor = self._make_executor()
@@ -764,6 +796,111 @@ class TestConstructor(unittest.TestCase):
             self.assertEqual(captured["model"], "system.ai.claude-opus-5")
 
         _run(_t())
+
+    def test_databricks_profile_model_resolution_cached_across_turns(self):
+        """The unpinned-session catalog resolution runs once per executor."""
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        from omnigent.inner.databricks_executor import DatabricksCredentials
+
+        async def _t():
+            with patch(
+                "omnigent.inner.databricks_executor._read_databrickscfg",
+                return_value=DatabricksCredentials(
+                    host="https://example.cloud.databricks.com",
+                    token="dapi_test_token",
+                ),
+            ):
+                executor = ClaudeSDKExecutor(gateway=True)
+
+            captured: list[str | None] = []
+            resolve_calls: list[str | None] = []
+
+            def fake_resolver(profile):
+                resolve_calls.append(profile)
+                return "system.ai.claude-opus-5"
+
+            async def fake_get_or_create_client(sdk, *, session_key, options, model):
+                captured.append(model)
+                raise RuntimeError("stop after model resolution")
+
+            with (
+                patch(
+                    "omnigent.inner.claude_sdk_executor._resolve_databricks_claude_model",
+                    side_effect=fake_resolver,
+                ),
+                patch.object(
+                    executor,
+                    "_get_or_create_client",
+                    side_effect=fake_get_or_create_client,
+                ),
+            ):
+                for _ in range(2):
+                    with self.assertRaises(RuntimeError):
+                        async for _ in executor.run_turn(
+                            [{"role": "user", "content": "hi"}], [], ""
+                        ):
+                            pass
+
+            self.assertEqual(captured, ["system.ai.claude-opus-5"] * 2)
+            self.assertEqual(len(resolve_calls), 1)
+
+        _run(_t())
+
+    def test_databricks_profile_model_substitution_warns(self):
+        """An unpinned session's silent model pick must emit a WARNING."""
+        from omnigent.inner.claude_sdk_executor import _resolve_databricks_claude_model
+
+        with (
+            patch(
+                "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+                return_value=SimpleNamespace(
+                    host="https://example.cloud.databricks.com", token="dapi_test_token"
+                ),
+            ),
+            patch(
+                "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
+                return_value=SimpleNamespace(
+                    families={
+                        "sonnet": "system.ai.claude-sonnet-5",
+                        "opus": "system.ai.claude-opus-5",
+                    }
+                ),
+            ),
+            self.assertLogs("omnigent.inner.claude_sdk_executor", level="WARNING") as logs,
+        ):
+            resolved = _resolve_databricks_claude_model("repro")
+
+        self.assertEqual(resolved, "system.ai.claude-opus-5")
+        self.assertTrue(
+            any("system.ai.claude-opus-5" in message for message in logs.output),
+            f"no WARNING names the substituted model: {logs.output}",
+        )
+
+    def test_databricks_catalog_fallback_substitution_warns(self):
+        """The bundled-catalog fallback is also a substitution; it must warn."""
+        from omnigent.inner.claude_sdk_executor import _resolve_databricks_claude_model
+
+        with (
+            patch(
+                "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
+                side_effect=RuntimeError("live listing unavailable"),
+            ),
+            patch(
+                "omnigent.models.model_catalog.resolve_catalog_model",
+                return_value=SimpleNamespace(model_id="databricks-claude-default"),
+            ),
+            self.assertLogs("omnigent.inner.claude_sdk_executor", level="WARNING") as logs,
+        ):
+            resolved = _resolve_databricks_claude_model("repro")
+
+        self.assertEqual(resolved, "databricks-claude-default")
+        self.assertTrue(
+            any(
+                "databricks-claude-default" in message and "bundled catalog" in message
+                for message in logs.output
+            ),
+            f"no WARNING names the catalog-fallback model: {logs.output}",
+        )
 
     def test_neutral_gateway_no_model_does_not_inject_databricks_default(self):
         """Neutral gateway (base URL supplied directly) + no model → ``None``.
