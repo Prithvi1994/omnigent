@@ -1232,16 +1232,16 @@ def _build_session_response(
     # usage. Shared by the cost indicator and the per-model breakdown so
     # both read the same numbers.
     display_usage = subtree_usage if subtree_usage is not None else (conv.session_usage or {})
-    # Native-terminal-wrapper sessions (claude-native-ui / codex-native-ui) are
-    # always terminal-first: the web UI's Chat/Terminal pill is gated on the
-    # ``omnigent.ui = "terminal"`` label. That flag is fully determined by the
-    # agent identity, so derive it here from ``agent_name`` rather than relying
-    # solely on the stored label — the pill then stays correct even if the
-    # stored value is missing or stale. Idempotent: a no-op when already present.
+    harness = _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
     # Collapse per-user pin keys to the canonical bare key for this viewer, so
     # the snapshot never carries another user's pin key (see _labels_for_viewer).
     labels = labels_with_closed_status(_labels_for_viewer(conv.labels, viewer_id), conv.title)
-    if agent_name in (_CLAUDE_NATIVE_MODEL, _CODEX_NATIVE_MODEL):
+    # Restore terminal access for older custom native sessions. Child mirrors
+    # can inherit the parent's harness without owning a terminal of their own.
+    if agent_name in (_CLAUDE_NATIVE_MODEL, _CODEX_NATIVE_MODEL) or (
+        conv.parent_conversation_id is None
+        and native_coding_agent_for_harness(harness) is not None
+    ):
         labels = {**labels, _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
     # A codex /side child whose ephemeral fork's runner is gone (parent resumed
     # onto a new runner) can never be sent to again. Surface it as closed so the
@@ -1273,11 +1273,7 @@ def _build_session_response(
         parent_session_id=conv.parent_conversation_id,
         root_conversation_id=conv.root_conversation_id,
         llm_model=llm_model,
-        harness=_resolve_harness(
-            conv,
-            agent_store=agent_store,
-            agent_cache=agent_cache,
-        ),
+        harness=harness,
         model_override=conv.model_override,
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,
@@ -3130,11 +3126,11 @@ async def _enrich_terminal_status_with_subagent_output(
     to the store, not runner memory, so the text is read here and forwarded
     with the terminal edge.
 
-    A ``failed`` edge is filled only when the forwarder attached no detail of
-    its own. A harness-reported ``failure_detail`` wins over the store; the
-    fallback must belong to the failed response, or (for older forwarders
-    without response ids) follow the latest user message. A failure before
-    any assistant output must not borrow an earlier turn's reply.
+    Failed or explicitly cancelled turns are filled only when the forwarder
+    attached no output of its own. A harness-reported ``failure_detail`` wins
+    over the store for failures; fallback text must belong to the current
+    response or follow the latest user message when no response id is present.
+    A turn stopped before any output must not borrow an earlier turn's reply.
 
     :param data: The ``external_session_status`` ``data`` to enrich, e.g.
         ``{"status": "idle"}``.
@@ -3147,21 +3143,22 @@ async def _enrich_terminal_status_with_subagent_output(
     """
     if status not in ("idle", "failed"):
         return data
+    current_turn_only = status == "failed" or data.get("turn_outcome") == "cancelled"
     existing = data.get("output")
-    if status == "failed" and isinstance(existing, str) and existing.strip():
+    if current_turn_only and isinstance(existing, str) and existing.strip():
         return data
     # The store's latest assistant text can be prose that preceded the error.
     failure_detail = data.get("failure_detail") if status == "failed" else None
     if isinstance(failure_detail, str) and failure_detail.strip():
         return {**data, "output": failure_detail.strip()}
-    raw_response_id = data.get("response_id") if status == "failed" else None
+    raw_response_id = data.get("response_id") if current_turn_only else None
     response_id = raw_response_id if isinstance(raw_response_id, str) and raw_response_id else None
     output = await asyncio.to_thread(
         _latest_assistant_text_from_store,
         conversation_store,
         session_id,
         response_id=response_id,
-        stop_at_user_message=status == "failed",
+        stop_at_user_message=current_turn_only,
     )
     if output is None:
         return data
@@ -9935,7 +9932,7 @@ async def _create_session_from_existing_agent(
                 git=body.git,
                 request=request,
             )
-            canonical_workspace = created_worktree.worktree_path
+            canonical_workspace = created_worktree.workspace or created_worktree.worktree_path
             git_branch = created_worktree.branch
             created_worktree_path = created_worktree.worktree_path
 
@@ -10034,6 +10031,13 @@ async def _create_session_from_existing_agent(
 
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
+    if created_worktree_path is not None:
+        from omnigent.server.routes._host_worktree import (
+            WORKTREE_ROOT_LABEL_KEY,
+            worktree_root_fingerprint,
+        )
+
+        initial_labels[WORKTREE_ROOT_LABEL_KEY] = worktree_root_fingerprint(created_worktree_path)
     if native_agent is not None:
         initial_labels.update(native_agent.presentation_labels)
     elif (
@@ -10043,6 +10047,14 @@ async def _create_session_from_existing_agent(
         and (_subagent_labels := _native_subagent_wrapper_labels_from_spec(sub_spec))
     ):
         initial_labels.update(_subagent_labels)
+    elif (
+        body.sub_agent_name is None
+        and native_coding_agent_for_harness(
+            await asyncio.to_thread(_create_resolved_harness, agent, harness_override, agent_cache)
+        )
+        is not None
+    ):
+        initial_labels[_CLAUDE_NATIVE_UI_LABEL_KEY] = _CLAUDE_NATIVE_UI_LABEL_VALUE
     elif body.sub_agent_name is None and body.host_id is not None:
         repl_labels = _repl_terminal_ui_labels(
             agent=agent,

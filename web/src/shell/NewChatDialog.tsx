@@ -113,6 +113,7 @@ import {
   harnessWarningBadgeText,
   isCodexHarness,
   isNativeCursorHarness,
+  skillInvocationPrefix,
 } from "@/lib/harnessSetup";
 
 // Re-exported for tests that import the readiness helpers from this module.
@@ -241,6 +242,7 @@ import {
 import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import { sandboxModelOptionsKey, useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
 import { useSkills } from "@/hooks/useSkills";
+import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
 import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
@@ -2385,6 +2387,10 @@ export function NewChatLandingScreen() {
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
   const [desktopHost, setDesktopHost] = useState<HostIdentity | null>(null);
+  // The runner picked during desktop onboarding, preselected once it's online.
+  const onboardingHost = useOnboardingRunnerHost(hosts);
+  // Applied (or given up) once, after the first prefill; later resets use the usual defaults.
+  const onboardingHostSettled = useRef(false);
   const [connectingThisMachine, setConnectingThisMachine] = useState(false);
   // Error surfaced when "Run on this machine" fails (sign-in needed, enrollment
   // declined, server unreachable). Rendered in the composer body with a retry,
@@ -2781,6 +2787,15 @@ export function NewChatLandingScreen() {
   // overridden. Holds off while a project prefill is deciding.
   useEffect(() => {
     if (!prefillSettled) return;
+    if (!onboardingHostSettled.current) {
+      if (onboardingHost.pending) return;
+      onboardingHostSettled.current = true;
+      if (onboardingHost.hostId && !sandboxSelected && selectedHostId === null) {
+        writeLastHostChoice(onboardingHost.hostId);
+        setSelectedHostId(onboardingHost.hostId);
+        return;
+      }
+    }
     if (sandboxSelected) return;
     if (selectedHostId !== null) return;
 
@@ -2830,6 +2845,8 @@ export function NewChatLandingScreen() {
     info,
     prefillSettled,
     defaultSandboxProvider,
+    onboardingHost.pending,
+    onboardingHost.hostId,
   ]);
 
   // Fall back to the host's home directory when it has no recorded recents, so
@@ -4602,7 +4619,7 @@ export function NewChatLandingScreen() {
 
   // Pre-session suggestions contain skills; built-ins such as /model need a live session.
   const [inputFocused, setInputFocused] = useState(false);
-  const skillPrefix = skillsHarness === "codex-native" ? "$" : "/";
+  const skillPrefix = skillInvocationPrefix(skillsHarness);
   const skillCommands = useMemo(
     () =>
       Object.fromEntries(
