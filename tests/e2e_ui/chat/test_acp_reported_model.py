@@ -114,14 +114,14 @@ def _builtin_agent_id(base_url: str, name: str) -> str:
     """Resolve a builtin agent's id by name from ``GET /v1/agents``."""
     resp = httpx.get(f"{base_url}/v1/agents?limit=100", timeout=10.0)
     resp.raise_for_status()
-    for agent in resp.json()["data"]:
-        if agent["name"] == name:
-            return str(agent["id"])
-    pytest.fail(
-        f"Builtin agent {name!r} not registered on {base_url}. The spawned "
-        f"live_server seeds it via OMNIGENT_BUILTIN_AGENT_DIRS; an external "
-        f"--ui-base-url server won't have it."
-    )
+    agent = next((a for a in resp.json()["data"] if a["name"] == name), None)
+    if agent is None:
+        pytest.fail(
+            f"Builtin agent {name!r} not registered on {base_url}. The spawned "
+            f"live_server seeds it via OMNIGENT_BUILTIN_AGENT_DIRS; an external "
+            f"--ui-base-url server won't have it."
+        )
+    return str(agent["id"])
 
 
 @pytest.fixture
