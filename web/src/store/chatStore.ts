@@ -4312,6 +4312,26 @@ function nextReconnectDelay(failedOpens: number): number {
  * ApprovalCard here would orphan the parked prompt until a full page
  * refresh.
  */
+function markLivePreviewsInterrupted(id: string, set: Setter): void {
+  set((state) => {
+    if (
+      state.conversationId !== id ||
+      state.sessionStatus === "failed" ||
+      state.activeResponse?.state === "failed" ||
+      state.activeResponse?.state === "cancelled" ||
+      !state.blocks.some(isLiveProvisionalBlock)
+    ) {
+      return {};
+    }
+    const blocks = state.blocks.map((block) =>
+      isLiveProvisionalBlock(block) && block.type === "text_done" && !block.previewInterrupted
+        ? { ...block, previewInterrupted: true }
+        : block,
+    );
+    return blocks.some((block, index) => block !== state.blocks[index]) ? { blocks } : {};
+  });
+}
+
 function dropEphemeralInFlightBlocks(
   id: string,
   set: Setter,
@@ -5216,6 +5236,9 @@ export async function startStreamPump(
         }
         // Only a transport drop is reconnectable; everything else ends the loop.
         if (reason !== "dropped") break;
+        if (!controller.signal.aborted && !isConversationDisposed(id)) {
+          markLivePreviewsInterrupted(id, set);
+        }
       } finally {
         controller.signal.removeEventListener("abort", onOuterAbort);
         presenceAttemptControllers.delete(attempt);
@@ -5393,7 +5416,12 @@ function withoutNativePreviews(blocks: AnyBlock[], messageIds: Set<string>): Any
  * :param responseId: the live turn's id, or `itemId` when none.
  * :returns: a `TextDone` block ready to push into `blocks`.
  */
-function makeLiveTextBlock(itemId: string, text: string, responseId: string): TextDone {
+function makeLiveTextBlock(
+  itemId: string,
+  text: string,
+  responseId: string,
+  streamIndex?: number,
+): TextDone {
   return {
     type: "text_done",
     // ``timestamp`` matches the reducer's monotonic source (not wall
@@ -5408,6 +5436,7 @@ function makeLiveTextBlock(itemId: string, text: string, responseId: string): Te
     },
     fullText: text,
     hasCodeBlocks: text.includes("```"),
+    ...(streamIndex !== undefined ? { streamIndex } : {}),
   };
 }
 
@@ -5427,7 +5456,7 @@ function makeLiveTextBlock(itemId: string, text: string, responseId: string): Te
  * :param delta: incremental text for this chunk, e.g. ``"Hello "``.
  * :returns: nothing; mutates `blocks` in the store.
  */
-function applyLiveDelta(set: Setter, messageId: string, delta: string): void {
+function applyLiveDelta(set: Setter, messageId: string, delta: string, index?: number): void {
   const itemId = LIVE_ITEM_PREFIX + messageId;
   set((s) => {
     const startupPatch =
@@ -5443,14 +5472,22 @@ function applyLiveDelta(set: Setter, messageId: string, delta: string): void {
       const responseId = live?.state === "streaming" ? live.responseId : itemId;
       return {
         ...startupPatch,
-        blocks: [...s.blocks, makeLiveTextBlock(itemId, delta, responseId)],
+        blocks: [...s.blocks, makeLiveTextBlock(itemId, delta, responseId, index)],
       };
     }
     const existing = s.blocks[at]!;
     if (existing.type !== "text_done") return {};
     const fullText = existing.fullText + delta;
     const next = s.blocks.slice();
-    next[at] = { ...existing, fullText, hasCodeBlocks: fullText.includes("```") };
+    const missedChunk =
+      index !== undefined && existing.streamIndex !== undefined && index > existing.streamIndex + 1;
+    next[at] = {
+      ...existing,
+      fullText,
+      hasCodeBlocks: fullText.includes("```"),
+      ...(index !== undefined ? { streamIndex: index } : {}),
+      ...(missedChunk ? { previewInterrupted: true } : {}),
+    };
     return { ...startupPatch, blocks: next };
   });
 }
@@ -5536,7 +5573,7 @@ async function* tapLiveDeltas(
           ignored.add(ev.messageId);
           continue;
         }
-        applyLiveDelta(set, ev.messageId, ev.delta);
+        applyLiveDelta(set, ev.messageId, ev.delta, ev.index);
       }
       continue;
     }
@@ -6569,6 +6606,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         } else if (event.status === "failed") {
           patch.backgroundTaskCount = 0;
           patch.backgroundTasks = [];
+        }
+        if (event.status === "failed" && s.blocks.some(isLiveProvisionalBlock)) {
+          patch.blocks = s.blocks.map((block) =>
+            isLiveProvisionalBlock(block) && block.type === "text_done" && block.previewInterrupted
+              ? { ...block, previewInterrupted: false }
+              : block,
+          );
         }
         if (event.responseId !== undefined && event.status === "running") {
           patch.status = "streaming";

@@ -10735,6 +10735,54 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("marks native preview interrupted during a dropped stream and clears after replay", async () => {
+    seedSession("conv_preview_notice", []);
+    const sinks: StreamSink[] = [];
+    let permitReconnect = false;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        if (sinks.length > 0 && !permitReconnect)
+          return mockResponse({}, { ok: false, status: 503 });
+        const sink = pushableStream();
+        sinks.push(sink);
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_preview_notice",
+      abortController: controller,
+      isNativeTerminalSession: true,
+    });
+    const loop = startStreamPump("conv_preview_notice", controller, setState, getState);
+    const preview = () =>
+      useChatStore
+        .getState()
+        .blocks.find((b): b is TextDone => b.type === "text_done" && b.ctx.itemId === "live:m1");
+    await vi.advanceTimersByTimeAsync(1);
+    sinks[0]!.push(sse("response.output_text.delta", { message_id: "m1", index: 0, delta: "Hi" }));
+    await vi.advanceTimersByTimeAsync(20);
+    expect(preview()?.previewInterrupted).toBeUndefined();
+
+    sinks[0]!.error();
+    await vi.advanceTimersByTimeAsync(20);
+    expect(preview()?.previewInterrupted).toBe(true);
+    permitReconnect = true;
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(sinks).toHaveLength(2);
+    sinks[1]!.push(sse("response.output_text.delta", { message_id: "m1", index: 0, delta: "Hi" }));
+    await vi.advanceTimersByTimeAsync(20);
+    expect(preview()?.previewInterrupted).toBeUndefined();
+
+    sinks[1]!.push("data: [DONE]\n\n");
+    sinks[1]!.close();
+    await vi.advanceTimersByTimeAsync(20);
+    controller.abort();
+    await loop;
+  });
+
   it("reopens after a clean server-shutdown EOF without [DONE]", async () => {
     seedSession("conv_server_restart", []);
     const sinks = routeStreamOpens();
@@ -12722,6 +12770,59 @@ describe("chatStore — live delta streaming (claude-native)", () => {
     expect(useChatStore.getState().blocks.filter((b) => b.type === "text_chunk")).toEqual([]);
 
     controller.abort();
+  });
+
+  it("marks a skipped native chunk until the authoritative message arrives", async () => {
+    useChatStore.setState({
+      conversationId: "conv_live_gap",
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+    const { sink, controller } = startPump("conv_live_gap");
+    sink.push(nativeDelta("m1", 0, "first ", false));
+    sink.push(nativeDelta("m1", 2, "third", true));
+    await tick();
+    expect(provisional()).toMatchObject({
+      fullText: "first third",
+      streamIndex: 2,
+      previewInterrupted: true,
+    });
+
+    sink.push(messageDone("ci_1", "resp_l", "first second third"));
+    await tick();
+    expect(provisional()).toBeUndefined();
+    expect(useChatStore.getState().blocks.some((b) => b.ctx.itemId === "ci_1")).toBe(true);
+    controller.abort();
+  });
+
+  it("removes the preview interruption notice when the session fails", () => {
+    const preview: TextDone = {
+      type: "text_done",
+      ctx: {
+        agent: null,
+        depth: 0,
+        turn: 0,
+        timestamp: 0,
+        responseId: "live:m1",
+        itemId: "live:m1",
+      },
+      fullText: "partial",
+      hasCodeBlocks: false,
+      previewInterrupted: true,
+    };
+    useChatStore.setState({
+      conversationId: "conv_preview_failed",
+      blocks: [preview],
+      isNativeTerminalSession: true,
+    });
+
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_preview_failed",
+      status: "failed",
+    });
+    const updated = useChatStore.getState().blocks[0] as TextDone;
+    expect(updated.previewInterrupted).toBe(false);
   });
 
   it("drops the first preview chunk when its authoritative item arrived first", async () => {
