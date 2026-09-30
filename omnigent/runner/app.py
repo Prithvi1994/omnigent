@@ -306,10 +306,13 @@ def _mirror_turn_error(session_id: str | None, sub_agent_name: str | None) -> Om
         sub_agent_name,
         extra={"session_id": session_id},
     )
+    mirrored = (
+        f"the native sub-agent {sub_agent_name!r}" if sub_agent_name else "a native sub-agent"
+    )
     return OmnigentError(
-        f"Session {session_id} mirrors the native sub-agent {sub_agent_name!r}, "
-        "which runs inside its parent's harness and cannot take turns of its "
-        "own; send the message to the parent session.",
+        f"Session {session_id} mirrors {mirrored}, which runs inside its parent's "
+        "harness and cannot take turns of its own; send the message to the "
+        "parent session.",
         code=ErrorCode.INVALID_INPUT,
     )
 
@@ -3801,21 +3804,18 @@ def create_runner_app(
             )
         return snapshot
 
-    def _reject_mirror_turn_without_child(session_id: str, spec_entry: _SpecEntry | None) -> None:
-        """Refuse a turn for a mirror whose display name is not a declared child.
+    async def _reject_mirror_turn(session_id: str) -> None:
+        """Refuse a turn addressed to a native sub-agent mirror.
 
-        Resolution hands a mirror its owner's spec for resources; a turn must not
-        run on it. A failed resolution is left to its own retryable error.
+        Resolution hands a mirror its owner's spec for resources and titles,
+        never for a turn of its own, whatever its display name. Unreadable
+        metadata is left to the resolution that follows.
         """
-        snapshot = _session_snapshot_cache.get(session_id)
+        snapshot = await _session_snapshot(session_id)
         if (
-            spec_entry is not None
-            and snapshot is not None
-            and snapshot.sub_agent_name
+            snapshot.ok
             and snapshot.parent_session_id
             and is_parent_owned_subagent_labels(snapshot.labels)
-            and _native_runtime._resolve_sub_agent_spec_entry(spec_entry, snapshot.sub_agent_name)
-            is None
         ):
             raise _mirror_turn_error(session_id, snapshot.sub_agent_name)
 
@@ -4295,6 +4295,15 @@ def create_runner_app(
             spec = _unwrap_spec_entry(spec_entry)
             raw_sub_agent_name = body.get("sub_agent_name")
             _sa_name_assign = cast(str | None, raw_sub_agent_name)
+            _init_snapshot = (
+                init_context.envelope.snapshot if init_context.envelope is not None else None
+            )
+            if (
+                _init_snapshot is not None
+                and _init_snapshot.parent_session_id
+                and is_parent_owned_subagent_labels(_init_snapshot.labels)
+            ):
+                raise _mirror_turn_error(session_id, _sa_name_assign)
             # A sub-agent's bundle assets live under its own directory; keeping
             # the parent's workdir would load the parent's skills and local
             # tools into the child.
@@ -4303,17 +4312,6 @@ def create_runner_app(
                     spec_entry, _sa_name_assign
                 )
                 if _sub_entry is None:
-                    _init_snapshot = (
-                        init_context.envelope.snapshot
-                        if init_context.envelope is not None
-                        else None
-                    )
-                    if (
-                        _init_snapshot is not None
-                        and _init_snapshot.parent_session_id
-                        and is_parent_owned_subagent_labels(_init_snapshot.labels)
-                    ):
-                        raise _mirror_turn_error(session_id, _sa_name_assign)
                     raise _unresolved_sub_agent_error(session_id, _sa_name_assign)
                 spec_entry = _sub_entry
                 spec = _unwrap_resolved_spec(_sub_entry)
@@ -8933,13 +8931,17 @@ def create_runner_app(
                 _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
                 raise
             except OmnigentError as exc:
-                # Lifecycle codes are expected and need no stack; anything else does.
+                # Lifecycle and input errors are expected and need no stack.
                 _logger.warning(
                     "turn setup failed for %s: %s",
                     conv,
                     exc,
                     exc_info=exc.code
-                    not in (ErrorCode.SUB_AGENT_UNRESOLVED, ErrorCode.SESSION_AGENT_MISSING),
+                    not in (
+                        ErrorCode.SUB_AGENT_UNRESOLVED,
+                        ErrorCode.SESSION_AGENT_MISSING,
+                        ErrorCode.INVALID_INPUT,
+                    ),
                     extra={"session_id": conv},
                 )
                 _on_proxy_stream_end(conv, error={"code": exc.code, "message": exc.message})
@@ -9027,6 +9029,10 @@ def create_runner_app(
                 # Cached entries already hold the child and must not be searched again.
                 if cached_spec_entry is not None:
                     snapshot = await _require_session_snapshot(conv)
+                    if snapshot.parent_session_id and is_parent_owned_subagent_labels(
+                        snapshot.labels
+                    ):
+                        raise _mirror_turn_error(conv, snapshot.sub_agent_name)
                     _sa_name = snapshot.sub_agent_name
                     if _sa_name:
                         _session_sub_agent_names[conv] = _sa_name
@@ -9034,13 +9040,10 @@ def create_runner_app(
                             cached_spec_entry, _sa_name
                         )
                         if sub_entry is None:
-                            if snapshot.parent_session_id and is_parent_owned_subagent_labels(
-                                snapshot.labels
-                            ):
-                                raise _mirror_turn_error(conv, _sa_name)
                             raise _unresolved_sub_agent_error(conv, _sa_name)
                         cached_spec_entry = sub_entry
             else:
+                await _reject_mirror_turn(conv)
                 try:
                     cached_spec_entry = await _resolve_session_spec_entry(conv)
                 except (OmnigentError, httpx.HTTPError, RuntimeError) as exc:
@@ -9055,7 +9058,6 @@ def create_runner_app(
                         exc_info=True,
                         extra={"session_id": conv},
                     )
-                _reject_mirror_turn_without_child(conv, cached_spec_entry)
             cached_spec = _unwrap_resolved_spec(cached_spec_entry)
 
         cached_spec_workdir = _resolved_spec_workdir(cached_spec_entry)
@@ -9464,19 +9466,13 @@ def create_runner_app(
         if dispatch is None:
             if spec_resolver is not None and _session_spec_cache.get(conv_id) is None:
                 await _require_session_snapshot(conv_id)
+            if spec_resolver is not None:
+                await _reject_mirror_turn(conv_id)
             try:
                 direct_spec_entry = await _resolve_session_spec_entry(conv_id)
             except (OmnigentError, httpx.HTTPError, RuntimeError, ValueError) as exc:
                 # A known harness cannot make an unresolved child safe to run.
                 if isinstance(exc, OmnigentError) and exc.code == ErrorCode.SUB_AGENT_UNRESOLVED:
-                    raise
-                mirror_snapshot = _session_snapshot_cache.get(conv_id)
-                if (
-                    mirror_snapshot is not None
-                    and mirror_snapshot.parent_session_id
-                    and is_parent_owned_subagent_labels(mirror_snapshot.labels)
-                ):
-                    # A mirror has no spec of its own to fall back to.
                     raise
                 _logger.warning(
                     "Session-aware spec resolution failed for %s; falling back to the "
@@ -9485,7 +9481,6 @@ def create_runner_app(
                     exc_info=True,
                     extra={"session_id": conv_id},
                 )
-            _reject_mirror_turn_without_child(conv_id, direct_spec_entry)
         startup_envelope = _fresh_session_init_envelope(conv_id)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
         if not harness_name:

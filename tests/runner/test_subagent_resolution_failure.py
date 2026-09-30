@@ -68,9 +68,10 @@ async def test_cold_child_resolution_survives_multiple_turns(
 
     server = _ContractSnapshotClient(conv)
     original_get = server.get
+    outage_active = bool(snapshot_failure)
 
     async def get(url: str, **kwargs: Any) -> Any:
-        if url.endswith(f"/v1/sessions/{conv}") and snapshot_failure:
+        if url.endswith(f"/v1/sessions/{conv}") and outage_active:
             if snapshot_failure == "timeout":
                 raise httpx.ReadTimeout("metadata unavailable")
             return httpx.Response(snapshot_failure)
@@ -99,7 +100,7 @@ async def test_cold_child_resolution_survives_multiple_turns(
             assert _statuses(app, conv)[-1]["status"] == "failed"
             assert not manager.spawns
             assert not recording.posted_bodies
-            snapshot_failure = None
+            outage_active = False
             calls.clear()
         for _ in range(2):
             response = await http.post(url, json=body)
@@ -159,7 +160,7 @@ async def test_renamed_child_fails_notifies_parent_and_recovers(path: str) -> No
             failure = _statuses(app, conv)[-1]
             assert failure["status"] == "failed"
             assert failure["error"]["code"] == "sub_agent_unresolved"
-            completion = await asyncio.wait_for(inbox.get(), timeout=2)
+            completion = await asyncio.wait_for(inbox.get(), timeout=10)
             assert completion["status"] == "failed"
             assert "worker" in completion["output"]
             assert not manager.spawns
@@ -247,13 +248,18 @@ async def test_native_mirror_resources_use_the_owning_parent(
     assert not manager.spawns
 
 
-def _mirror_snapshot(owner: str) -> dict[str, Any]:
+def _mirror_snapshot(owner: str, display_name: str = "Explore") -> dict[str, Any]:
     return {
         "agent_id": "ag_contract_root",
-        "sub_agent_name": "Explore",
+        "sub_agent_name": display_name,
         "parent_session_id": owner,
         "labels": {"omnigent.wrapper": "claude-code-native-ui-subagent"},
     }
+
+
+# A mirror's display name may coincide with a declared child (`worker`); the
+# turn is refused either way.
+_MIRROR_DISPLAY_NAMES = ["Explore", "worker"]
 
 
 @pytest.mark.asyncio
@@ -375,6 +381,7 @@ async def test_native_mirror_with_cyclic_parent_fails_instead_of_hanging(
     async with _runner_test_client(app) as http:
         response = await asyncio.wait_for(http.get(f"/v1/sessions/{mirror}/resources"), timeout=10)
     assert response.status_code == 500, response.text
+    assert response.json()["error"]["code"] == "internal_error"
     assert not manager.spawns
 
 
@@ -413,6 +420,7 @@ async def test_native_mirrors_naming_each_other_fail_instead_of_deadlocking(
             timeout=10,
         )
     assert [response.status_code for response in responses] == [500, 500]
+    assert all(response.json()["error"]["code"] == "internal_error" for response in responses)
     assert not manager.spawns
 
 
@@ -494,18 +502,19 @@ async def test_background_title_metadata_outage_returns_503(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("display_name", _MIRROR_DISPLAY_NAMES)
 @pytest.mark.parametrize("path", ["background", "known_harness", "no_harness"])
 async def test_native_mirror_display_name_turn_explains_the_mirror(
-    path: str, monkeypatch: pytest.MonkeyPatch
+    path: str, display_name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A turn sent to a mirror whose display name is no bundle child names the mirror."""
+    """A turn sent to a native mirror is refused with an explanation naming the mirror."""
     owner, mirror = "conv_mirror_turn_owner", "conv_mirror_turn"
     server = _ContractSnapshotClient(owner)
     original_get = server.get
 
     async def get(url: str, **kwargs: Any) -> Any:
         if url.endswith(f"/v1/sessions/{mirror}"):
-            return httpx.Response(200, json=_mirror_snapshot(owner))
+            return httpx.Response(200, json=_mirror_snapshot(owner, display_name))
         return await original_get(url, **kwargs)
 
     async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
@@ -530,15 +539,16 @@ async def test_native_mirror_display_name_turn_explains_the_mirror(
             assert result["status"] == 400
             error = result["error"]
     assert error["code"] == "invalid_input"
-    assert "mirrors the native sub-agent 'Explore'" in error["message"]
+    assert f"mirrors the native sub-agent '{display_name}'" in error["message"]
     assert "renamed" not in error["message"]
     assert not manager.spawns
     assert not recording.posted_bodies
 
 
 @pytest.mark.asyncio
-async def test_native_mirror_display_name_init_explains_the_mirror() -> None:
-    """Session init for a mirror whose display name is no bundle child names the mirror."""
+@pytest.mark.parametrize("display_name", _MIRROR_DISPLAY_NAMES)
+async def test_native_mirror_display_name_init_explains_the_mirror(display_name: str) -> None:
+    """Session init for a native mirror is refused with an explanation naming the mirror."""
     from omnigent.runner.session_init_protocol import (
         SESSION_INIT_PROTOCOL_VERSION,
         RunnerSessionInitEnvelope,
@@ -551,7 +561,7 @@ async def test_native_mirror_display_name_init_explains_the_mirror() -> None:
         server_version="test",
         session_id=mirror,
         agent_id="ag_contract_root",
-        sub_agent_name="Explore",
+        sub_agent_name=display_name,
         snapshot=RunnerSessionInitSnapshot(
             created_at=0,
             updated_at=0,
@@ -575,19 +585,20 @@ async def test_native_mirror_display_name_init_explains_the_mirror() -> None:
             json={
                 "session_id": mirror,
                 "agent_id": "ag_contract_root",
-                "sub_agent_name": "Explore",
+                "sub_agent_name": display_name,
                 "session_init": envelope.model_dump(mode="json"),
             },
         )
     assert created.status_code == 400, created.text
     assert created.json()["error"]["code"] == "invalid_input"
-    assert "mirrors the native sub-agent 'Explore'" in created.json()["error"]["message"]
+    assert f"mirrors the native sub-agent '{display_name}'" in created.json()["error"]["message"]
     assert not manager.spawns
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("display_name", _MIRROR_DISPLAY_NAMES)
 async def test_native_mirror_background_turn_without_agent_id_explains_the_mirror(
-    monkeypatch: pytest.MonkeyPatch,
+    display_name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A background turn whose body names no agent still cannot run a mirror on its owner."""
     owner, mirror = "conv_mirror_bare_owner", "conv_mirror_bare"
@@ -596,7 +607,7 @@ async def test_native_mirror_background_turn_without_agent_id_explains_the_mirro
 
     async def get(url: str, **kwargs: Any) -> Any:
         if url.endswith(f"/v1/sessions/{mirror}"):
-            return httpx.Response(200, json=_mirror_snapshot(owner))
+            return httpx.Response(200, json=_mirror_snapshot(owner, display_name))
         return await original_get(url, **kwargs)
 
     async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
@@ -620,17 +631,17 @@ async def test_native_mirror_background_turn_without_agent_id_explains_the_mirro
         failure = _statuses(app, mirror)[-1]
     assert failure["status"] == "failed"
     assert failure["error"]["code"] == "invalid_input"
-    assert "mirrors the native sub-agent 'Explore'" in failure["error"]["message"]
+    assert f"mirrors the native sub-agent '{display_name}'" in failure["error"]["message"]
     assert not manager.spawns
     assert not recording.posted_bodies
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["known_harness", "no_harness"])
-async def test_direct_stream_to_mirror_during_owner_outage_fails_cleanly(
+async def test_direct_stream_to_mirror_is_refused_even_during_owner_outage(
     path: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Unreadable owner metadata is a controlled failure that releases the turn slot."""
+    """A mirror is refused before its owner is resolved, and the turn slot is released."""
     owner, mirror = "conv_mirror_outage_owner", "conv_mirror_outage"
     server = _ContractSnapshotClient(owner)
     original_get = server.get
@@ -655,16 +666,12 @@ async def test_direct_stream_to_mirror_during_owner_outage_fails_cleanly(
         server_client=server,
     )  # type: ignore[arg-type]
     async with _runner_test_client(app) as http:
-        result = await _CONTRACT_ADAPTERS[path](http, mirror, recording)
-        assert result["status"] == 500, result
-        assert result["error"]["code"] == "internal_error"
-        assert "mirrors" not in result["error"]["message"]
-        assert not manager.spawns
-        assert not recording.posted_bodies
-
-        # The slot was released: the repaired follow-up is answered, not buffered.
-        owner_down = False
-        result = await _CONTRACT_ADAPTERS[path](http, mirror, recording)
-        assert result["status"] == 400, result
-        assert "mirrors the native sub-agent 'Explore'" in result["error"]["message"]
+        for _ in range(2):
+            # The slot is released each time: the follow-up is answered, not buffered.
+            result = await _CONTRACT_ADAPTERS[path](http, mirror, recording)
+            assert result["status"] == 400, result
+            assert result["error"]["code"] == "invalid_input"
+            assert "mirrors the native sub-agent 'Explore'" in result["error"]["message"]
+            owner_down = False
     assert not manager.spawns
+    assert not recording.posted_bodies

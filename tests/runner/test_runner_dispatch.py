@@ -11589,6 +11589,14 @@ def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:
             "known_harness",
             {
                 "status": 410,
+                "error": {
+                    "code": "sub_agent_unresolved",
+                    "message": (
+                        "Sub-agent 'worker' is not declared in this session's "
+                        "parent agent spec; it was renamed, removed, or never "
+                        "existed."
+                    ),
+                },
                 "instructions": None,
             },
             id="child_missing-known_harness-410",
