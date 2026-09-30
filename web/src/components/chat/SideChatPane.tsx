@@ -91,10 +91,13 @@ const EMPTY_STATE_BODY = "Ask a question here without affecting the main convers
 export function SideChatPane({
   childId,
   onStart,
+  initialMessage,
   readOnly = false,
 }: {
   childId: string;
   onStart?: (text: string) => Promise<void>;
+  /** First native-fork question, retained across the pending-to-child tab change. */
+  initialMessage?: string;
   /** A dead, restored Codex side chat: show the transcript but no composer, and
    *  stop its session. Defaults to false (a live, sendable side chat). */
   readOnly?: boolean;
@@ -200,12 +203,35 @@ export function SideChatPane({
       ),
       subagentRoutingOverride,
     );
-    if (pendingUserMessages.length === 0) return committed;
+    // The native fork can persist its first input before this pane subscribes.
+    // Keep the submitted question visible until history supplies its user bubble.
+    const hasInitialMessage = committed.some(
+      (bubble) =>
+        bubble.kind === "user" &&
+        bubble.content
+          .filter((part) => part.type === "input_text")
+          .map((part) => part.text)
+          .join("\n") === initialMessage,
+    );
+    const withInitialMessage: Bubble[] =
+      initialMessage && !hasInitialMessage
+        ? [
+            {
+              kind: "user",
+              itemId: `side-chat-first:${childId}`,
+              content: [{ type: "input_text", text: initialMessage }],
+            },
+            ...committed,
+          ]
+        : committed;
+    if (pendingUserMessages.length === 0) return withInitialMessage;
     return mergePendingBubbles(
-      committed,
+      withInitialMessage,
       buildPendingBubbles(pendingUserMessages, getCurrentAuthorId()),
     );
   }, [
+    childId,
+    initialMessage,
     visibleBlocks,
     activeResponse,
     interruptedResponseIds,

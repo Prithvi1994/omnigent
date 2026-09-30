@@ -780,7 +780,10 @@ function WorkspacePanelImpl({
   // pair on, so a signal rekeys the OLDEST awaiting tab (FIFO). A single ref
   // would cross-assign when two launches overlap; the generic path skips the
   // queue entirely and rekeys its own tab directly (see startPendingSideChat).
-  const awaitingPendingIdsRef = useRef<string[]>([]);
+  const awaitingPendingIdsRef = useRef<{ id: string; text: string }[]>([]);
+  const [initialSideChatMessages, setInitialSideChatMessages] = useState<Record<string, string>>(
+    {},
+  );
   // A side chat the server just created (Codex's native fork, or the generic
   // fork) announces itself via `sideChatToOpen`. If a pending tab is awaiting,
   // rekey it in place; otherwise open a fresh tab. AppShell reveals the rail.
@@ -796,7 +799,8 @@ function WorkspacePanelImpl({
     sideChatsStartedThisSession.add(childId);
     const awaiting = awaitingPendingIdsRef.current.shift();
     if (awaiting !== undefined) {
-      sideChats.rekey(awaiting, childId);
+      sideChats.rekey(awaiting.id, childId);
+      setInitialSideChatMessages((messages) => ({ ...messages, [childId]: awaiting.text }));
     } else {
       // Generic already rekeyed its own tab; this just re-selects it (idempotent).
       sideChats.open(childId);
@@ -836,7 +840,7 @@ function WorkspacePanelImpl({
       // old to fork — the server refuses) has set `sendFailed` by the time the
       // await returns; reject then so the pending pane resets and drop the
       // queued tab so it never waits for a child that isn't coming.
-      awaitingPendingIdsRef.current.push(pendingId);
+      awaitingPendingIdsRef.current.push({ id: pendingId, text });
       let sendFailed = false;
       return useChatStore
         .getState()
@@ -845,7 +849,7 @@ function WorkspacePanelImpl({
           onError: (message) => {
             sendFailed = true;
             awaitingPendingIdsRef.current = awaitingPendingIdsRef.current.filter(
-              (id) => id !== pendingId,
+              (entry) => entry.id !== pendingId,
             );
             toast.error(message);
           },
@@ -1311,6 +1315,7 @@ function WorkspacePanelImpl({
             <SideChatPane
               key={sideChats.selected}
               childId={sideChats.selected}
+              initialMessage={initialSideChatMessages[sideChats.selected]}
               onStart={(text) => startPendingSideChat(sideChats.selected!, text)}
               // A Codex side chat restored after a restart is a dead ephemeral
               // fork — show it read-only (and kill it) rather than let the user

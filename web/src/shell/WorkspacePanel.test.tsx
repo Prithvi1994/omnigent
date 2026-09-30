@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -9,6 +9,7 @@ import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
 import { writeDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
+import { useChatStore } from "@/store/chatStore";
 import { WorkspacePanel } from "./WorkspacePanel";
 
 // The rail's content children are exercised by their own suites; stub them so
@@ -17,6 +18,24 @@ import { WorkspacePanel } from "./WorkspacePanel";
 // Each stub renders a testid (plus, for FileViewer, the path it was asked to
 // show) so we can prove which child mounted without dragging in Monaco / hook
 // stacks / xterm.
+vi.mock("@/components/chat/SideChatPane", () => ({
+  SideChatPane: ({
+    childId,
+    initialMessage,
+    onStart,
+  }: {
+    childId: string;
+    initialMessage?: string;
+    onStart: (text: string) => Promise<void>;
+  }) => (
+    <div data-testid="side-chat-pane" data-child={childId}>
+      {initialMessage}
+      <button type="button" onClick={() => void onStart("First question")}>
+        Send first question
+      </button>
+    </div>
+  ),
+}));
 vi.mock("./FileViewer", () => ({
   FileViewer: ({ path }: { path: string }) => <div data-testid="file-viewer-stub">{path}</div>,
 }));
@@ -863,4 +882,33 @@ describe("WorkspacePanel browser tab", () => {
       expect(toast.error).toHaveBeenCalledWith("Couldn't close browser tab. Try again."),
     );
   });
+});
+
+it("transfers the first question when a pending native side-chat tab becomes a child", async () => {
+  const original = useChatStore.getState();
+  const sendSide = vi.fn().mockResolvedValue(undefined);
+  useChatStore.setState({
+    conversationId: "conv_ws",
+    sessionHarness: "codex-native",
+    boundAgentId: "agent",
+    send: sendSide,
+  });
+  try {
+    renderWorkspace({ rightRailTab: "sidechat" });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Side chat" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Send first question" }));
+    expect(sendSide).toHaveBeenCalledTimes(1);
+    act(() =>
+      useChatStore.setState({ sideChatToOpen: { parentId: "conv_ws", childId: "conv_new_side" } }),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("side-chat-pane")).toHaveAttribute("data-child", "conv_new_side"),
+    );
+    expect(screen.getByTestId("side-chat-pane")).toHaveTextContent("First question");
+    expect(sendSide).toHaveBeenCalledTimes(1);
+  } finally {
+    cleanup();
+    useChatStore.setState(original);
+  }
 });
