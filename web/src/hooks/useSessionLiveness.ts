@@ -181,9 +181,10 @@ function isOwner(conv: Pick<Conversation, "permission_level"> | null | undefined
  * | 6 | false         | undefined   | set     | (any)      | unknown (host unseen)|
  * | 7 | false         | null/false  | null    | (any)      | local_stranded       |
  *
- * `†stopped` = a confirmed stop marker: a fresh marker also outranks a
- * stale-online poll; a dead host or just-sent turn takes precedence.
- * A later online read clears the marker after the poll grace.
+ * `†stopped` = a confirmed stop marker. A fresh marker outranks a
+ * stale-online poll (row 1) and the startup/host-switch grace (rows 2/2');
+ * a dead host (row 3) and a just-sent turn (relaunch) still take precedence.
+ * A later genuine-online read clears the marker after the poll grace.
  *
  * `*fresh` = `created_at` is within {@link STARTING_GRACE_S} of now AND
  * the runner tunnel has never been observed online (initial cold boot).
@@ -281,19 +282,25 @@ function useSessionLivenessRaw(
   const stopMarkerFresh =
     typeof stoppedAtMs === "number" &&
     Date.now() - stoppedAtMs < STOPPED_STALE_ONLINE_GRACE_S * 1000;
-  // Clear after a real relaunch, in an effect because the store is shared.
+  // Clear only once the runner is genuinely online again past the stale-poll
+  // grace (a real relaunch). A fresh marker is NOT cleared by a turn in
+  // flight: the turn a user stops is itself `streaming`, so treating
+  // `turnActive` as a relaunch would erase the marker of the very stop it is
+  // meant to acknowledge, before the open view could render it.
   const clearStaleStop =
     sessionId !== undefined &&
     runnerOnline === true &&
     typeof stoppedAtMs === "number" &&
-    (!stopMarkerFresh || opts?.turnActive === true);
+    !stopMarkerFresh;
   useEffect(() => {
     if (clearStaleStop && sessionId !== undefined) clearSessionStopped(sessionId);
   }, [clearStaleStop, sessionId]);
 
-  // 1. A new turn makes an online read a relaunch, not stale poll data.
+  // 1. A fresh stop marker outranks a stale-online poll read; once the poll
+  // reads genuinely online past the grace, the marker is cleared above and we
+  // fall through to `online`.
   if (runnerOnline === true) {
-    return stopMarkerFresh && !opts?.turnActive ? { kind: "stopped" } : { kind: "online" };
+    return stopMarkerFresh ? { kind: "stopped" } : { kind: "online" };
   }
 
   const hostId = conv?.host_id ?? null;
@@ -307,8 +314,13 @@ function useSessionLivenessRaw(
   // session whose host hasn't registered yet doesn't flash "host offline"
   // either. `created_at` is Unix seconds; a missing/zero value (older
   // snapshot) yields a large delta and harmlessly skips the grace.
+  // A confirmed stop takes precedence over the cold-boot grace: an explicitly
+  // stopped session must say "stopped", not flash "Connecting…" for the rest of
+  // the window (e.g. a just-created session stopped, or reopened on a remount
+  // that reset the ever-online ref).
   const createdAt = conv?.created_at;
   if (
+    typeof stoppedAtMs !== "number" &&
     !runnerEverOnline &&
     !conv?.imported &&
     typeof createdAt === "number" &&
@@ -324,7 +336,11 @@ function useSessionLivenessRaw(
   // WAS online and is now gone, so the session genuinely re-enters cold
   // boot. Epoch ms, unlike `created_at`.
   const launchedAt = opts?.launchedAt;
-  if (typeof launchedAt === "number" && Date.now() - launchedAt < STARTING_GRACE_S * 1000) {
+  if (
+    typeof stoppedAtMs !== "number" &&
+    typeof launchedAt === "number" &&
+    Date.now() - launchedAt < STARTING_GRACE_S * 1000
+  ) {
     return { kind: "starting" };
   }
 

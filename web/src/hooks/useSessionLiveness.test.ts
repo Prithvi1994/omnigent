@@ -350,6 +350,44 @@ describe("useSessionLiveness — derivation truth table", () => {
       markSessionStopped("some-other-session");
       expect(derive(false, true, conv({ host_id: "h1" }))).toEqual({ kind: "runner_asleep" });
     });
+
+    it("a fresh stop stays visible while its own turn is still streaming (turnActive does not clear it)", () => {
+      // The turn a user stops is itself `streaming`, so `turnActive` is true at
+      // the instant of the stop and the poll can still read stale-online. That
+      // must not be mistaken for a relaunch and erase the marker before the
+      // stopped banner renders.
+      markSessionStopped(SID);
+      expect(derive(true, true, conv({ host_id: "h1" }), { turnActive: true })).toEqual({
+        kind: "stopped",
+      });
+      expect(useStoppedSessions.getState().stoppedAt[SID]).toBeDefined();
+    });
+
+    it("a just-created session that was stopped reads stopped, not the cold-boot grace", () => {
+      markSessionStopped(SID);
+      expect(derive(false, true, conv({ host_id: "h1", created_at: freshCreatedAt() }))).toEqual({
+        kind: "stopped",
+      });
+    });
+
+    it("the cold-boot grace still applies to a fresh session with no stop marker", () => {
+      expect(derive(false, true, conv({ host_id: "h1", created_at: freshCreatedAt() }))).toEqual({
+        kind: "starting",
+      });
+    });
+
+    it("a stop marker outranks the host-switch launch grace", () => {
+      markSessionStopped(SID);
+      expect(derive(false, true, conv({ host_id: "h1" }), { launchedAt: Date.now() })).toEqual({
+        kind: "stopped",
+      });
+    });
+
+    it("the host-switch launch grace still applies with no stop marker", () => {
+      expect(derive(false, true, conv({ host_id: "h1" }), { launchedAt: Date.now() })).toEqual({
+        kind: "starting",
+      });
+    });
   });
 
   it("unknown when there is no open session", () => {
