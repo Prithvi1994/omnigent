@@ -14,6 +14,8 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -74,6 +76,7 @@ PR_KEYS = {
 }
 LEGACY_KEYS = {"gh_available", "authenticated", "accounts", "selected_account"}
 NO_CHECKS = {"passing": 0, "failing": 0, "pending": 0, "total": 0, "runs": []}
+NO_DIFF = {"object": "session.github.pr_diff", "patch": ""}
 
 
 @pytest.fixture(autouse=True)
@@ -197,6 +200,42 @@ def fetches(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, float]]:
 
     monkeypatch.setattr(azure_devops_facet, "_git", recording_git)
     return recorded
+
+
+@dataclass(frozen=True)
+class HeldFetch:
+    """Holds every ``git fetch`` the facet runs until :attr:`release` is set.
+
+    :ivar finished: Set when a released fetch has run.
+    :ivar refs: The ref of each fetch, in the order they started.
+    """
+
+    release: threading.Event
+    finished: threading.Event
+    refs: list[str]
+
+
+@pytest.fixture
+def held_fetch(monkeypatch: pytest.MonkeyPatch) -> Iterator[HeldFetch]:
+    """Make every fetch wait for the test, like a fetch of a large repository."""
+    held = HeldFetch(threading.Event(), threading.Event(), [])
+    real_git = azure_devops_facet._git
+
+    def holding_git(
+        root: str, *args: str, **kwargs: Any
+    ) -> subprocess.CompletedProcess[bytes] | None:
+        if args[0] != "fetch":
+            return real_git(root, *args, **kwargs)
+        held.refs.append(args[-1])
+        held.release.wait(budget(10))
+        try:
+            return real_git(root, *args, **kwargs)
+        finally:
+            held.finished.set()
+
+    monkeypatch.setattr(azure_devops_facet, "_git", holding_git)
+    yield held
+    held.release.set()
 
 
 def pull_request(
@@ -845,6 +884,36 @@ def test_changed_files_without_a_branch_pr_are_empty(
     }
 
 
+def test_changed_files_cut_short_by_the_budget_keep_the_pages_read(
+    facet: AzureDevOpsPullRequests,
+    tmp_path: Path,
+    ado_transport: RecordingTransport,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seconds = budget(0.5)
+    monkeypatch.setattr(azure_devops_facet, "_REQUEST_BUDGET_SECONDS", seconds)
+    ado_transport.route("GET", f"{PULL}/iterations", json={"value": [{"id": 1}]})
+    first_page = [
+        {"changeType": "edit", "item": {"path": f"/src/f{n}.py", "gitObjectType": "blob"}}
+        for n in range(100)
+    ]
+
+    def pages(request: httpx.Request) -> httpx.Response:
+        if dict(request_query(request))["$skip"] == "0":
+            return httpx.Response(200, json={"changeEntries": first_page})
+        return never_answers(request)
+
+    ado_transport.route("GET", f"{PULL}/iterations/1/changes", handler=pages)
+
+    result = facet.changed_files(str(tmp_path), reference())
+
+    assert result["has_more"] is True
+    assert [file["path"] for file in result["data"]] == [f"src/f{n}.py" for n in range(100)]
+    second_page = ado_transport.requests[-1]
+    assert dict(request_query(second_page))["$skip"] == "100"
+    assert 0 < second_page.extensions["timeout"]["read"] <= seconds
+
+
 def test_pr_diff_fetches_the_pr_and_diffs_it_from_the_merge_base(
     facet: AzureDevOpsPullRequests,
     forge: Forge,
@@ -890,8 +959,8 @@ def test_pr_diff_of_a_pr_whose_source_branch_is_gone_reads_the_merge_ref(
     assert again == first
     # The base is local, the source branch fetch fails, and the local commits end the fetching.
     assert [ref for ref, _ in fetches] == ["refs/heads/feature", "refs/pull/7/merge"]
-    budget_seconds = azure_devops_facet._REQUEST_BUDGET_SECONDS
-    assert all(0 < timeout <= budget_seconds for _, timeout in fetches)
+    fetch_seconds = azure_devops_facet._FETCH_TIMEOUT_SECONDS
+    assert all(0 < timeout <= fetch_seconds for _, timeout in fetches)
 
 
 def test_pr_diff_fetches_the_target_and_the_source_separately(
@@ -938,6 +1007,71 @@ def test_pr_diff_does_not_fetch_a_pr_again_for_a_minute_after_fetches_fail(
     monkeypatch.setattr(azure_devops_facet, "_FETCH_RETRY_SECONDS", 0.0)
     assert facet.pr_diff(str(forge.workspace), reference()) == unavailable
     assert len(fetches) == 4
+
+
+def test_a_fetch_that_did_not_finish_is_tried_again_by_the_next_request(
+    facet: AzureDevOpsPullRequests,
+    forge: Forge,
+    ado_transport: RecordingTransport,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ado_transport.route("GET", PULL, json=pull_request(head=forge.head_sha, base=forge.base_sha))
+    refs: list[str] = []
+    real_git = azure_devops_facet._git
+
+    def git_whose_fetches_time_out(
+        root: str, *args: str, **kwargs: Any
+    ) -> subprocess.CompletedProcess[bytes] | None:
+        if args[0] != "fetch":
+            return real_git(root, *args, **kwargs)
+        refs.append(args[-1])
+        return None
+
+    monkeypatch.setattr(azure_devops_facet, "_git", git_whose_fetches_time_out)
+
+    assert facet.pr_diff(str(forge.workspace), reference()) == NO_DIFF
+    assert facet.pr_diff(str(forge.workspace), reference()) == NO_DIFF
+    assert refs == ["refs/heads/feature", "refs/pull/7/merge"] * 2
+
+
+def test_a_fetch_that_outlasts_the_request_budget_lands_its_commits_for_the_next_request(
+    facet: AzureDevOpsPullRequests,
+    forge: Forge,
+    ado_transport: RecordingTransport,
+    held_fetch: HeldFetch,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(azure_devops_facet, "_REQUEST_BUDGET_SECONDS", budget(0.5))
+    ado_transport.route("GET", PULL, json=pull_request(head=forge.head_sha, base=forge.base_sha))
+
+    assert facet.pr_diff(str(forge.workspace), reference()) == NO_DIFF
+    held_fetch.release.set()
+    assert held_fetch.finished.wait(budget(10))
+    result = facet.pr_diff(str(forge.workspace), reference())
+
+    assert diffed_files(result["patch"]) == 4
+    assert held_fetch.refs == ["refs/heads/feature"]
+
+
+def test_concurrent_requests_for_a_pr_start_one_fetch(
+    facet: AzureDevOpsPullRequests,
+    forge: Forge,
+    ado_transport: RecordingTransport,
+    held_fetch: HeldFetch,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(azure_devops_facet, "_REQUEST_BUDGET_SECONDS", budget(0.5))
+    ado_transport.route("GET", PULL, json=pull_request(head=forge.head_sha, base=forge.base_sha))
+    root, pr = str(forge.workspace), reference()
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(lambda _: facet.pr_diff(root, pr), range(3)))
+    held_fetch.release.set()
+    assert held_fetch.finished.wait(budget(10))
+
+    assert results == [NO_DIFF] * 3
+    assert held_fetch.refs == ["refs/heads/feature"]
+    assert diffed_files(facet.pr_diff(root, pr)["patch"]) == 4
 
 
 def test_pr_diff_for_a_pr_outside_the_workspace_remote(
@@ -1020,6 +1154,39 @@ def test_file_diff_reads_remote_revisions_through_the_api(
         ("/src/old.py", MERGE_BASE),
         ("/src/app.py", HEAD),
     ]
+
+
+def test_file_diff_reads_no_revision_after_the_budget_runs_out(
+    facet: AzureDevOpsPullRequests,
+    tmp_path: Path,
+    ado_transport: RecordingTransport,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(azure_devops_facet, "_REQUEST_BUDGET_SECONDS", budget(0.5))
+    ado_transport.route("GET", PULL, json=pull_request())
+    iterations = {"value": [{"id": 1, "commonRefCommit": {"commitId": MERGE_BASE}}]}
+
+    def late_iterations(request: httpx.Request) -> httpx.Response:
+        # The answer arrives just after the time left runs out.
+        time.sleep(request.extensions["timeout"]["read"] + 0.05)
+        return httpx.Response(200, json=iterations)
+
+    ado_transport.route("GET", f"{PULL}/iterations", handler=late_iterations)
+    ado_transport.route("GET", f"{REPO_API}/items", json={"content": "text\n"})
+
+    with pytest.raises(ValueError) as excinfo:
+        facet.file_diff(
+            str(tmp_path),
+            reference(),
+            "src/app.py",
+            base="",
+            previous_path=None,
+            head_sha=HEAD,
+            base_sha=BASE,
+        )
+
+    assert str(excinfo.value) == "Azure DevOps could not load the selected file revision"
+    assert f"{REPO_API}/items" not in [request_path(request) for request in ado_transport.requests]
 
 
 def test_file_diff_refuses_a_pr_that_moved(

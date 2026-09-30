@@ -713,6 +713,20 @@ def test_iteration_changes_stops_when_every_page_is_full(
     assert len(changes) == 100 * azure_devops_client._MAX_CHANGE_PAGES
 
 
+def test_iteration_change_pages_are_requested_one_at_a_time(
+    client: AzureDevOpsClient, ado_transport: RecordingTransport
+) -> None:
+    ado_transport.route("GET", CHANGES, handler=changes_pages(205))
+
+    pages = client.iteration_change_pages("Proj", "repo", 42, 3)
+
+    assert ado_transport.requests == []
+    assert len(next(pages)) == 100
+    assert len(ado_transport.requests) == 1
+    assert [len(page) for page in pages] == [100, 5]
+    assert len(ado_transport.requests) == 3
+
+
 @pytest.mark.parametrize(
     "organization_url",
     [

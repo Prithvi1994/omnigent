@@ -66,9 +66,11 @@ _UNEXPECTED_RESPONSE = "Azure DevOps returned an unexpected file response"
 _REVISION_LOAD_FAILED = "Azure DevOps could not load the selected file revision"
 _NO_CONTEXT = "Expanded context is unavailable for this file"
 _GIT_TIMEOUT_SECONDS = 30.0
-# One info or diff request's time budget, under the runner proxy's ten-second limit.
+# One panel request's time budget, under the runner proxy's ten-second limit.
 _REQUEST_BUDGET_SECONDS = 8.0
-# Fetches that did not bring a PR's commits are not repeated for this long.
+# A PR's fetch runs in the background for up to this long, past the request that started it.
+_FETCH_TIMEOUT_SECONDS = 120.0
+# A PR whose fetch failed is not fetched again for this long.
 _FETCH_RETRY_SECONDS = 60.0
 # The GitHub panel's caps; the check counts stay exact.
 _MAX_CHECK_RUNS = 300
@@ -164,47 +166,101 @@ def _merge_base(root: str, base: str, head: str) -> str | None:
     return (out or "").strip() or None
 
 
-def _fetch(root: str, remote: str, ref: str, deadline: float) -> bool:
-    """Fetch one ref from ``remote`` in the time left before ``deadline``; failures are logged.
+def _fetch(root: str, remote: str, ref: str, deadline: float) -> int | None:
+    """Fetch one ref from ``remote`` before ``deadline``; a failure is logged.
 
-    :returns: Whether the fetch ran. It does not run once ``deadline`` has passed.
+    :returns: git's exit status, or ``None`` when the fetch did not start or did not finish.
     """
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        return False
-    timeout = min(_GIT_TIMEOUT_SECONDS, remaining)
-    result = _git(root, "fetch", "--no-tags", "--quiet", remote, ref, timeout=timeout)
+        return None
+    result = _git(root, "fetch", "--no-tags", "--quiet", remote, ref, timeout=remaining)
     if result is None or result.returncode != 0:
         _logger.info("azure_devops: could not fetch %s from %s", ref, remote)
-    return True
+    return None if result is None else result.returncode
 
 
-class _FailedFetches:
-    """PRs whose fetches did not bring their commits, by ``(workspace, remote, PR id)``.
+def _fetch_pr(
+    root: str, remote: str, number: int, pr: dict[str, Any], head: str, base: str
+) -> bool:
+    """Fetch the PR's target branch, source branch, and merge ref, each while a commit is missing.
 
-    An entry lasts :data:`_FETCH_RETRY_SECONDS`. Safe to use from several threads.
+    :returns: Whether the fetch failed: a fetch exited non-zero and a commit is still missing.
+    """
+    deadline = time.monotonic() + _FETCH_TIMEOUT_SECONDS
+    statuses: list[int | None] = []
+    target = _branch_ref(pr, "targetRefName")
+    if target is not None and not _has_commits(root, base):
+        statuses.append(_fetch(root, remote, target, deadline))
+    source = _branch_ref(pr, "sourceRefName")
+    if source is not None and not _has_commits(root, head):
+        statuses.append(_fetch(root, remote, source, deadline))
+    if not _has_commits(root, head, base):
+        # Completing a PR often deletes its source branch. Azure Repos keeps a merge ref
+        # while the PR exists, whose parents are the PR's target and source commits.
+        statuses.append(_fetch(root, remote, f"refs/pull/{number}/merge", deadline))
+    exited_non_zero = any(status not in (None, 0) for status in statuses)
+    return exited_non_zero and not _has_commits(root, head, base)
+
+
+_FetchKey = tuple[str, str, int]
+
+
+class _PrFetches:
+    """Background fetches of PR commits, one at a time per ``(workspace, remote, PR id)``.
+
+    A request waits for its PR's fetch only while its own budget lasts, and the fetch runs on
+    so that a later request finds the commits. After a failed fetch, the PR is not fetched
+    again for :data:`_FETCH_RETRY_SECONDS`. Safe to use from several threads.
     """
 
     def __init__(self) -> None:
-        self._failed_at: dict[tuple[str, str, int], float] = {}
         self._lock = threading.Lock()
+        self._running: dict[_FetchKey, threading.Event] = {}
+        self._failed_at: dict[_FetchKey, float] = {}
 
-    def recent(self, key: tuple[str, str, int]) -> bool:
-        """Return whether the fetches for ``key`` failed less than the retry interval ago."""
+    def wait(self, key: _FetchKey, fetch: Callable[[], bool], deadline: float) -> bool:
+        """Start ``fetch`` for ``key`` unless one is running or failed recently, and wait for it.
+
+        :param fetch: Fetches the PR's commits and returns whether the fetch failed.
+        :param deadline: A ``time.monotonic()`` value that ends the wait, not the fetch.
+        :returns: Whether a fetch for ``key`` finished before ``deadline``.
+        """
+        starter: threading.Thread | None = None
         with self._lock:
             failed_at = self._failed_at.get(key)
-        return failed_at is not None and time.monotonic() - failed_at < _FETCH_RETRY_SECONDS
+            if failed_at is not None and time.monotonic() - failed_at < _FETCH_RETRY_SECONDS:
+                return False
+            done = self._running.get(key)
+            if done is None:
+                done = self._running[key] = threading.Event()
+                starter = threading.Thread(
+                    target=self._run,
+                    args=(key, fetch, done),
+                    name="azure-devops-fetch",
+                    daemon=True,
+                )
+        if starter is not None:
+            starter.start()
+        return done.wait(max(deadline - time.monotonic(), 0.0))
 
-    def add(self, key: tuple[str, str, int]) -> None:
-        """Remember that the fetches for ``key`` failed, and forget entries that lapsed."""
-        now = time.monotonic()
-        with self._lock:
-            self._failed_at = {
-                other: failed_at
-                for other, failed_at in self._failed_at.items()
-                if now - failed_at < _FETCH_RETRY_SECONDS
-            }
-            self._failed_at[key] = now
+    def _run(self, key: _FetchKey, fetch: Callable[[], bool], done: threading.Event) -> None:
+        """Run ``fetch``, record whether it failed, and wake the requests waiting for it."""
+        failed = False
+        try:
+            failed = fetch()
+        finally:
+            now = time.monotonic()
+            with self._lock:
+                del self._running[key]
+                self._failed_at = {
+                    other: failed_at
+                    for other, failed_at in self._failed_at.items()
+                    if now - failed_at < _FETCH_RETRY_SECONDS
+                }
+                if failed:
+                    self._failed_at[key] = now
+            done.set()
 
 
 def _read_blob(root: str, ref: str, path: str) -> bytes | None:
@@ -690,7 +746,7 @@ class AzureDevOpsPullRequests:
 
     def __init__(self, *, transport: httpx.BaseTransport | None = None) -> None:
         self._transport = transport
-        self._failed_fetches = _FailedFetches()
+        self._fetches = _PrFetches()
 
     @property
     def capabilities(self) -> ProviderCapabilities:
@@ -824,14 +880,21 @@ class AzureDevOpsPullRequests:
         """Do nothing: Azure DevOps has no per-PR preference to copy."""
 
     def changed_files(self, root: str, reference: PullRequestRef | None) -> dict[str, Any]:
-        """List the files of the PR's latest iteration, compared with the merge base."""
+        """List the files of the PR's latest iteration, compared with the merge base.
+
+        When a page of changes cannot be read, such as when the request budget runs out,
+        the files already read come back with ``has_more`` set.
+        """
+        deadline = time.monotonic() + _REQUEST_BUDGET_SECONDS
         empty: dict[str, Any] = {"object": "list", "data": [], "has_more": False}
         repo = _target_repo(root, reference)
         token = _token() if repo is not None else None
         if repo is None or token is None:
             return empty
+        changes: list[dict[str, Any]] = []
+        complete = True
         try:
-            with self._client(repo.org, token) as client:
+            with self._client(repo.org, token, deadline=deadline) as client:
                 number = _pr_number(client, root, repo, reference)
                 if number is None:
                     return empty
@@ -839,18 +902,17 @@ class AzureDevOpsPullRequests:
                 latest = _latest_iteration(iterations)
                 if latest is None:
                     return empty
-                changes = _call(
-                    client.iteration_changes,
-                    repo.project,
-                    repo.repo,
-                    number,
-                    latest["id"],
-                    compare_to=0,
+                pages = client.iteration_change_pages(
+                    repo.project, repo.repo, number, latest["id"], compare_to=0
                 )
+                while (page := _call(lambda: next(pages, None))) is not None:
+                    changes.extend(page)
         except _RestFailure:
-            return empty
+            if not changes:
+                return empty
+            complete = False
         files = [shaped for change in changes if (shaped := _changed_file(change)) is not None]
-        return {"object": "list", "data": files, "has_more": False}
+        return {"object": "list", "data": files, "has_more": not complete}
 
     def pr_diff(self, root: str, reference: PullRequestRef | None) -> dict[str, Any]:
         """Diff the PR's head against its merge base in the workspace, fetching missing commits."""
@@ -913,33 +975,18 @@ class AzureDevOpsPullRequests:
     ) -> bool:
         """Return whether the PR's ``(head, base)`` commits are local, fetching missing ones.
 
-        Fetches the target branch, the source branch, and then the PR's merge ref, each only
-        while a commit is still missing and time is left before ``deadline``. When fetches ran
-        and the commits are still missing, the PR is not fetched again for
-        :data:`_FETCH_RETRY_SECONDS`.
+        The fetch runs in the background and is waited for until ``deadline``. A fetch that
+        outlasts the wait keeps running, so a later request finds the commits.
         """
         head, base = commits
         if _has_commits(root, head, base):
             return True
-        key = (root, remote, number)
-        if self._failed_fetches.recent(key):
-            return False
-        fetched = False
-        target = _branch_ref(pr, "targetRefName")
-        if target is not None and not _has_commits(root, base):
-            fetched |= _fetch(root, remote, target, deadline)
-        source = _branch_ref(pr, "sourceRefName")
-        if source is not None and not _has_commits(root, head):
-            fetched |= _fetch(root, remote, source, deadline)
-        if not _has_commits(root, head, base):
-            # Completing a PR often deletes its source branch. Azure Repos keeps a merge ref
-            # while the PR exists, whose parents are the PR's target and source commits.
-            fetched |= _fetch(root, remote, f"refs/pull/{number}/merge", deadline)
-        if _has_commits(root, head, base):
-            return True
-        if fetched:
-            self._failed_fetches.add(key)
-        return False
+        finished = self._fetches.wait(
+            (root, remote, number),
+            lambda: _fetch_pr(root, remote, number, pr, head, base),
+            deadline,
+        )
+        return finished and _has_commits(root, head, base)
 
     def file_diff(
         self,
@@ -958,10 +1005,11 @@ class AzureDevOpsPullRequests:
         ``reference``, diffs the local checkout against ``base``.
 
         :raises ValueError: When the path is invalid, the PR moved past the shown
-            revisions, or the content cannot be read.
+            revisions, or the content cannot be read within the request budget.
         """
+        deadline = time.monotonic() + _REQUEST_BUDGET_SECONDS
         if reference is None:
-            return self._checkout_file_diff(root, base, path)
+            return self._checkout_file_diff(root, base, path, deadline)
         old_path = previous_path or path
         for candidate in (path, old_path):
             if candidate.startswith("/") or any(
@@ -972,7 +1020,7 @@ class AzureDevOpsPullRequests:
         token = _token() if repo is not None else None
         if repo is None or token is None:
             raise ValueError(_PR_LOAD_FAILED)
-        with self._client(repo.org, token) as client:
+        with self._client(repo.org, token, deadline=deadline) as client:
             try:
                 pr = _call(client.get_pull_request, repo.project, repo.repo, reference.number)
             except _RestFailure as exc:
@@ -1019,9 +1067,11 @@ class AzureDevOpsPullRequests:
                 "after": contents(current_head, path),
             }
 
-    def _checkout_file_diff(self, root: str, base: str, path: str) -> dict[str, Any]:
+    def _checkout_file_diff(
+        self, root: str, base: str, path: str, deadline: float
+    ) -> dict[str, Any]:
         """Diff one file of the local checkout: HEAD against its merge base with ``base``."""
-        resolved = base or self._branch_base(root)
+        resolved = base or self._branch_base(root, deadline)
         diff_base = _resolve_diff_base(root, resolved) if resolved else None
         return {
             "object": FILE_DIFF_OBJECT,
@@ -1030,14 +1080,14 @@ class AzureDevOpsPullRequests:
             "after": _checkout_text(root, "HEAD", path),
         }
 
-    def _branch_base(self, root: str) -> str | None:
+    def _branch_base(self, root: str, deadline: float) -> str | None:
         """Return the target branch of the checked-out branch's PR, or ``None``."""
         repo = _target_repo(root, None)
         token = _token() if repo is not None else None
         if repo is None or token is None:
             return None
         try:
-            with self._client(repo.org, token) as client:
+            with self._client(repo.org, token, deadline=deadline) as client:
                 listed = _branch_pr(client, repo, _branch(root))
         except _RestFailure:
             return None

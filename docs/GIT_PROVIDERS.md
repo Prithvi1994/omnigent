@@ -304,6 +304,8 @@ and will be removed in 0.19.0, together with `legacyPullRequestAuth` in
 `web/src/hooks/usePullRequests.ts`. Other providers omit them.
 
 `changed_files` returns `{"object": "list", "data": [...], "has_more": false}`.
+`has_more` is true when the list is incomplete, as when the Azure DevOps facet
+runs out of time between pages of changes.
 Each item is a `session.github.changed_file` with `path`, `name`, `status`
 (`created`, `modified`, `deleted`, or `renamed`), `lines_added`, and
 `lines_removed`. The two counts are null for a provider without `line_counts`.

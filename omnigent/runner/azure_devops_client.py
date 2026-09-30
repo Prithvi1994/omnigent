@@ -24,7 +24,7 @@ import shutil
 import subprocess
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -436,13 +436,26 @@ class AzureDevOpsClient:
         :param compare_to: The iteration to compare against, or ``0`` for the merge base.
         :raises AzureDevOpsError: On a non-2xx response.
         """
+        pages = self.iteration_change_pages(project, repo, pr_id, iteration, compare_to)
+        return [entry for page in pages for entry in page]
+
+    def iteration_change_pages(
+        self, project: str, repo: str, pr_id: int, iteration: int, compare_to: int = 0
+    ) -> Iterator[list[dict[str, Any]]]:
+        """Yield the change entries of a pull request iteration, one page of 100 at a time.
+
+        Each page is requested when the previous one has been consumed.
+
+        :param iteration: The iteration id.
+        :param compare_to: The iteration to compare against, or ``0`` for the merge base.
+        :raises AzureDevOpsError: On a non-2xx response.
+        """
         segments = [
             *_pull_request_segments(project, repo, pr_id),
             "iterations",
             iteration,
             "changes",
         ]
-        entries: list[dict[str, Any]] = []
         for page in range(_MAX_CHANGE_PAGES):
             payload = self._get_json(
                 segments,
@@ -453,15 +466,14 @@ class AzureDevOpsClient:
                 ],
             )
             batch = _list_field(payload, "changeEntries")
-            entries.extend(batch)
+            yield batch
             if len(batch) < _PAGE_SIZE:
-                return entries
+                return
         _logger.warning(
             "azure_devops: stopped after %d change pages for pull request %s",
             _MAX_CHANGE_PAGES,
             pr_id,
         )
-        return entries
 
     def statuses(self, project: str, repo: str, pr_id: int) -> list[dict[str, Any]]:
         """List the statuses posted to a pull request.

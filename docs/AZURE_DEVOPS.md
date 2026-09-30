@@ -27,7 +27,9 @@ The host looks for `az` on `PATH`, then at `/opt/homebrew/bin/az` and
 often run without Homebrew on `PATH`.
 
 Requests and the `az` call time out after 15 seconds. Set
-`OMNIGENT_AZURE_DEVOPS_TIMEOUT_SECONDS` to change that.
+`OMNIGENT_AZURE_DEVOPS_TIMEOUT_SECONDS` to change that. One panel request also
+stops its REST calls after 8 seconds in total, under the server's 10-second
+limit for runner reads, and shows what it read in that time.
 
 ## Remotes and pull request URLs
 
@@ -68,8 +70,12 @@ or `az repos`.
 - **No diff for a pull request outside the workspace's remote.** The whole-PR
   diff comes from local git. The panel shows it only when the pull request's
   repository is one of the workspace's remotes. When the commits are missing,
-  it runs `git fetch <remote> refs/heads/<source> refs/heads/<target>` without
-  credential prompts.
+  it fetches the target branch, the source branch, and then
+  `refs/pull/<id>/merge` from that remote, each only while a commit is still
+  missing, without credential prompts. The fetch runs in the background for up
+  to two minutes, so a fetch that outlasts one request lands for a later one.
+  After a fetch fails, the panel does not fetch that pull request again for a
+  minute.
 - **No line counts.** Azure DevOps does not return added and removed line
   counts for changed files.
 - **Azure DevOps Services only.** Azure DevOps Server (on premises) is not
