@@ -35,7 +35,6 @@ from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_AUTH_EXPIRED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
-    HostAuthStatusFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -5219,28 +5218,6 @@ async def test_handle_launch_refuses_while_host_credential_is_refused(
     assert result.error_code == HOST_AUTH_EXPIRED_ERROR_CODE
     assert "omnigent login http://localhost:8000" in (result.error or "")
     assert host._runners == {}
-
-
-async def test_host_auth_status_is_reported_once_per_change(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The host tells the server when runners can no longer authenticate, and when they can."""
-    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
-    host = _make_host_process()
-    ws = SimpleNamespace(send=AsyncMock())
-    host._ws = ws
-
-    host._note_auth_rejected("stale-token", source="runner_tunnel")
-    await host._sync_auth_status()
-    await host._sync_auth_status()
-    host._clear_auth_expired()
-    await host._sync_auth_status()
-
-    sent = [decode_host_frame(call.args[0]) for call in ws.send.await_args_list]
-    assert sent == [
-        HostAuthStatusFrame(code=HOST_AUTH_EXPIRED_ERROR_CODE),
-        HostAuthStatusFrame(code=None),
-    ]
 
 
 def test_build_connect_headers_slice_key_only_on_workspace_host(

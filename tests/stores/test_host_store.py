@@ -213,22 +213,6 @@ def test_upsert_reconnect_overwrites_and_nulls_configured_harnesses(
     assert fetched.configured_harnesses is None
 
 
-def test_auth_status_is_stored_and_cleared_on_reconnect(host_store: HostStore) -> None:
-    """A reported sign-in failure persists until the host's next accepted connect."""
-    host_id = "7e97ff655f2e6c8179bd67f6a38b6c6d"
-    host_store.upsert_on_connect(host_id=host_id, name="laptop-auth", user_id="alice@example.com")
-
-    host_store.update_auth_status(host_id, "host_auth_expired")
-    fetched = host_store.get_host(host_id)
-    assert fetched is not None
-    assert fetched.auth_error_code == "host_auth_expired"
-
-    host_store.upsert_on_connect(host_id=host_id, name="laptop-auth", user_id="alice@example.com")
-    fetched = host_store.get_host(host_id)
-    assert fetched is not None
-    assert fetched.auth_error_code is None
-
-
 def test_update_harness_readiness_replaces_live_map(host_store: HostStore) -> None:
     """A live tunnel refresh replaces readiness without reconnecting."""
     host_id = "6d86ee544f1d5b7068ac56f5927a5b5c"

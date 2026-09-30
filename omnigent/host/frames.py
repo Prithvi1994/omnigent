@@ -45,8 +45,7 @@ WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 
 # when the host refuses a launch because its own sign-in to the server was
 # rejected or cannot be renewed: a spawned runner would inherit the dead
-# credential and be refused too. Also the ``code`` of a non-ok
-# :class:`HostAuthStatusFrame`. The server maps it to
+# credential and be refused too. The server maps it to
 # ``ErrorCode.HOST_AUTH_EXPIRED``.
 HOST_AUTH_EXPIRED_ERROR_CODE = "host_auth_expired"
 
@@ -120,7 +119,6 @@ class HostFrameKind(str, Enum):
     HELLO = "host.hello"
     CONNECTION_ERROR = "host.connection_error"
     HARNESS_READINESS = "host.harness_readiness"
-    AUTH_STATUS = "host.auth_status"
     LAUNCH_RUNNER = "host.launch_runner"
     LAUNCH_RUNNER_RESULT = "host.launch_runner_result"
     STOP_RUNNER = "host.stop_runner"
@@ -242,21 +240,6 @@ class HostHarnessReadinessFrame:
 
     configured_harnesses: dict[str, HarnessAvailability]
     gateway_inference: dict[str, bool] | None = None
-
-
-@dataclass
-class HostAuthStatusFrame:
-    """Host → server: the host's own sign-in stopped (or resumed) working.
-
-    Sent over the still-open tunnel, which outlives the credential that
-    authenticated its upgrade, so the server can tell the user before the
-    next reconnect locks the host out. Sent only when the state changes.
-
-    :param code: :data:`HOST_AUTH_EXPIRED_ERROR_CODE` when runners can no
-        longer authenticate, or ``None`` once a working credential is back.
-    """
-
-    code: str | None = None
 
 
 @dataclass
@@ -1184,7 +1167,6 @@ HostFrame = (
     HostHelloFrame
     | HostConnectionErrorFrame
     | HostHarnessReadinessFrame
-    | HostAuthStatusFrame
     | HostLaunchRunnerFrame
     | HostLaunchRunnerResultFrame
     | HostStopRunnerFrame
@@ -1296,8 +1278,6 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "gateway_inference": frame.gateway_inference,
             }
         )
-    if isinstance(frame, HostAuthStatusFrame):
-        return _encode_payload({"kind": HostFrameKind.AUTH_STATUS.value, "code": frame.code})
     if isinstance(frame, HostLaunchRunnerFrame):
         return _encode_payload(
             {
@@ -1936,8 +1916,6 @@ def _decode_known_host_frame(
             )
         case HostFrameKind.HARNESS_READINESS:
             return _decode_harness_readiness(msg)
-        case HostFrameKind.AUTH_STATUS:
-            return HostAuthStatusFrame(code=_optional_nullable_str(msg, "code"))
         case HostFrameKind.LAUNCH_RUNNER:
             return _decode_launch_runner(msg)
         case HostFrameKind.LAUNCH_RUNNER_RESULT:

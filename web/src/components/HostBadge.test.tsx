@@ -65,17 +65,6 @@ describe("resolveHostBadge", () => {
       status: "unknown",
     });
   });
-
-  it("reports an expired host sign-in whether or not the host is connected", () => {
-    const expired = host({ auth_error_code: "host_auth_expired" });
-    expect(resolveHostBadge({ hostId: "host_a1b2", host: expired, online: true })).toEqual({
-      label: "mac-laptop",
-      status: "auth_expired",
-    });
-    expect(resolveHostBadge({ hostId: "host_a1b2", host: expired, online: false })).toMatchObject({
-      status: "auth_expired",
-    });
-  });
 });
 
 // Stub the data hooks so the component test drives label/status purely

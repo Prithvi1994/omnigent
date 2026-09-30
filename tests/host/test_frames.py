@@ -10,7 +10,6 @@ from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_AUTH_EXPIRED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
-    HostAuthStatusFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -876,13 +875,6 @@ def test_harness_readiness_frame_round_trip() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHarnessReadinessFrame)
     assert decoded.configured_harnesses == {"pi": True, "codex": "needs-auth"}
-
-
-@pytest.mark.parametrize("code", [HOST_AUTH_EXPIRED_ERROR_CODE, None])
-def test_auth_status_frame_round_trip(code: str | None) -> None:
-    """Both the expired report and the recovered report survive encode and decode."""
-    original = HostAuthStatusFrame(code=code)
-    assert decode_host_frame(encode_host_frame(original)) == original
 
 
 def test_hello_frame_gateway_inference_round_trip() -> None:

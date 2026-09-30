@@ -88,8 +88,6 @@ class Host:
         ``{"claude-sdk": True, "codex": False}``. ``None`` when the
         host has never reported it (older host build) — unknown, not
         "nothing configured".
-    :param auth_error_code: Why the host's own sign-in stopped working, e.g.
-        ``"host_auth_expired"``; ``None`` when healthy or never reported.
     """
 
     host_id: str
@@ -104,7 +102,6 @@ class Host:
     terminating_sandbox_id: str | None = None
     deleted_at: int | None = None
     account_generation: str | None = None
-    auth_error_code: str | None = None
 
 
 ManagedSandboxScanCursor = tuple[str, int, str]
@@ -180,7 +177,6 @@ def _row_to_host(row: SqlHost) -> Host:
         deleted_at=row.deleted_at,
         account_generation=row.account_generation,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
-        auth_error_code=row.auth_error_code,
     )
 
 
@@ -342,7 +338,6 @@ class HostStore:
                             status=encode_host_status("online"),
                             updated_at=now,
                             configured_harnesses=harnesses_json,
-                            auth_error_code=None,
                         )
                     ),
                 )
@@ -375,8 +370,6 @@ class HostStore:
                 row.status = encode_host_status("online")
                 row.updated_at = now
                 row.configured_harnesses = harnesses_json
-                # An accepted upgrade proves the host's credential works.
-                row.auth_error_code = None
                 return _row_to_host(row)
 
             # host_id is new — check whether (workspace_id, user_id, name)
@@ -597,7 +590,6 @@ class HostStore:
                 status=encode_host_status("online"),
                 updated_at=now,
                 configured_harnesses=configured_harnesses_json,
-                auth_error_code=None,
             )
         )
         return Host(
@@ -667,27 +659,6 @@ class HostStore:
             )
 
         run_write_transaction(self._session_immediate, "update_harness_readiness", write)
-
-    def update_auth_status(self, host_id: str, auth_error_code: str | None) -> None:
-        """Record why a connected host's own sign-in stopped working.
-
-        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
-        :param auth_error_code: Reported cause, e.g. ``"host_auth_expired"``,
-            or ``None`` once the host's credential works again.
-        """
-
-        def write(session: Session) -> None:
-            session.execute(
-                update(SqlHost)
-                .where(
-                    SqlHost.workspace_id == current_workspace_id(),
-                    SqlHost.host_id == host_id,
-                    SqlHost.deleted_at.is_(None),
-                )
-                .values(auth_error_code=auth_error_code)
-            )
-
-        run_write_transaction(self._session_immediate, "update_host_auth_status", write)
 
     def heartbeat(self, host_id: str) -> None:
         """

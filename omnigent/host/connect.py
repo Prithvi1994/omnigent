@@ -63,7 +63,6 @@ from omnigent.host.frames import (
     HOST_AUTH_EXPIRED_ERROR_CODE,
     HOST_CAPABILITIES,
     WORKSPACE_MISSING_ERROR_CODE,
-    HostAuthStatusFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -1165,8 +1164,6 @@ class HostProcess:
         self._last_connect_auth_token: str | None = None
         self._auth_retry_after = 0.0
         self._auth_cache_stamp: tuple[float | None, ...] = ()
-        # Last auth state reported to the server; ``None`` is healthy.
-        self._reported_auth_code: str | None = None
         # This host's owning user, resolved once after the first accepted tunnel
         # upgrade (GET /v1/me). Injected into every runner it spawns and published
         # to OMNIGENT_USER_ID so host/runner debug-log rows carry it. None until
@@ -1882,7 +1879,6 @@ class HostProcess:
 
         runner_id = token_bound_runner_id(frame.binding_token)
         initial_auth_token, auth_usable = await asyncio.to_thread(self._launch_auth_token)
-        await self._sync_auth_status()
         if not auth_usable:
             # The runner would inherit the refused credential and die on its
             # tunnel upgrade; say so instead of spawning it.
@@ -2448,7 +2444,6 @@ class HostProcess:
         )
         if auth_rejected:
             self._note_auth_rejected(handle.bootstrap_token, source="runner_tunnel")
-            await self._sync_auth_status()
         await self._report_runner_exit(runner_id, error)
 
     async def _watch_runner_connect(
@@ -4303,10 +4298,8 @@ class HostProcess:
         self._ever_connected = True
         self._login_redirect_streak = 0
         self._auth_retry_streak = 0
-        # The accepted upgrade proves the credential works; the server clears
-        # its stored auth status for this host on connect.
+        # The accepted upgrade proves the credential works.
         self._clear_auth_expired()
-        self._reported_auth_code = None
         self._refused_streak = 0
         self._transient_404_streak = 0
         self._conn_upgrade_accepted = True
@@ -4561,23 +4554,6 @@ class HostProcess:
             f"start agents. Run `{cli_invocation()} login {self._login_hint_url()}` on "
             "the host machine, then send your message again."
         )
-
-    async def _sync_auth_status(self) -> None:
-        """Tell the server when the host's credential state changed.
-
-        Best effort: an unsent report is retried on the next state check, and
-        the server clears the stored state itself when the host reconnects.
-        """
-        code = HOST_AUTH_EXPIRED_ERROR_CODE if self._auth_expired else None
-        ws = self._ws
-        if code == self._reported_auth_code or ws is None:
-            return
-        try:
-            await ws.send(encode_host_frame(HostAuthStatusFrame(code=code)))
-        except Exception:  # noqa: BLE001 — a lost report is resent on the next check
-            _logger.debug("Could not send host auth status", exc_info=True)
-            return
-        self._reported_auth_code = code
 
     async def _serve_frames(self, ws: websockets.asyncio.client.ClientConnection) -> None:
         """Wait for bounded startup discovery, register, then service the connection."""
