@@ -3522,7 +3522,6 @@ def create_app(
             _session_sandbox_status_cache,
         )
         from omnigent.server.routes.sessions import (
-            _backfill_runner_items_on_reconnect,
             _ensure_runner_relay,
             _publish_runner_recovered_status,
             _publish_sandbox_status,
@@ -3603,12 +3602,6 @@ def create_app(
                     runner_id,
                     routed.client,
                     conversation_store,
-                )
-                # Backfill items from the runner that may have been emitted during
-                # a server downtime, so the relay subscription missed them. Runs
-                # in the background; a failure here does not interrupt reconnect.
-                _backfill_task = asyncio.create_task(  # noqa: RUF006
-                    _backfill_runner_items_on_reconnect(conv.id, routed.client, conversation_store)
                 )
                 # The session's terminal exists as of the handshake above, so its
                 # model catalogs are answerable now. Warming them here is what

@@ -23,7 +23,7 @@ import urllib.parse
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, MutableMapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast
 
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -165,6 +165,13 @@ def _publish_tmux_target_for_bridge(
 # forwarder on terminal re-create (else both mirror, double-posting items).
 _AUTO_FORWARDER_TASKS: dict[str, asyncio.Task[object]] = {}
 
+# Params needed to re-forward a claude-native session's transcript items on a
+# server reconnect (see ``reforward_transcript_items_on_reconnect``). Captured
+# at the forwarder launch below and evicted alongside ``_AUTO_FORWARDER_TASKS``.
+# Keyed by session id; only claude-native sessions are recorded, so membership
+# here is what scopes the reconnect re-forward to claude-native.
+_CLAUDE_REFORWARD_PARAMS: dict[str, dict[str, object]] = {}
+
 # Include the child's 10-second termination grace and forced-exit cleanup.
 _AUTO_FORWARDER_CANCEL_TIMEOUT_S = 15.0
 
@@ -192,6 +199,7 @@ async def _cancel_auto_forwarder_task(session_id: str) -> None:
     :returns: None.
     """
     task = _AUTO_FORWARDER_TASKS.pop(session_id, None)
+    _CLAUDE_REFORWARD_PARAMS.pop(session_id, None)
     if task is None or task.done():
         return
     task.cancel()
@@ -299,6 +307,7 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
         """Drop the registry entry unless a successor already replaced it; log the exit."""
         if _AUTO_FORWARDER_TASKS.get(session_id) is done_task:
             del _AUTO_FORWARDER_TASKS[session_id]
+            _CLAUDE_REFORWARD_PARAMS.pop(session_id, None)
         # Obituary: a stopped forwarder takes mirroring, status and the busy
         # signal with it, so no exit path may be silent. ``exception()`` also
         # retrieves the failure (no "Task exception was never retrieved").
@@ -327,6 +336,44 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
             )
 
     task.add_done_callback(_evict)
+
+
+async def reforward_claude_native_on_reconnect(session_id: str) -> int:
+    """
+    Re-deliver a claude-native session's transcript items after a server reconnect.
+
+    Called from the runner's reconnect catch-up. A no-op (returns 0) for any
+    session without captured forward params — that is, every non-claude-native
+    session and any claude-native session whose forwarder has been torn down.
+    Best-effort: never raises.
+
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :returns: Count of items re-POSTed (0 when there is nothing to do).
+    """
+    params = _CLAUDE_REFORWARD_PARAMS.get(session_id)
+    if params is None:
+        return 0
+    from omnigent.harnesses.claude_native.forwarder import (
+        reforward_transcript_items_on_reconnect,
+    )
+
+    try:
+        return await reforward_transcript_items_on_reconnect(
+            base_url=cast(str, params["base_url"]),
+            headers=cast("dict[str, str]", params["headers"]),
+            session_id=session_id,
+            bridge_dir=cast(Path, params["bridge_dir"]),
+            agent_name=cast(str, params["agent_name"]),
+            start_at_offset=cast("int | None", params["start_at_offset"]),
+            auth=cast("httpx.Auth | None", params["auth"]),
+        )
+    except Exception:  # noqa: BLE001 — best-effort; never block reconnect catch-up
+        _logger.warning(
+            "Claude-native reconnect re-forward failed for session=%s",
+            session_id,
+            exc_info=True,
+        )
+        return 0
 
 
 # Background tasks that re-pop a still-pending cost-budget approval on a
@@ -8921,6 +8968,17 @@ async def _auto_create_claude_terminal(
             await _shutdown_session_router_async(session_id, _subagent_router)
             await _shutdown_session_turn_router_async(session_id, _claude_turn_router)
 
+    # Record the params for a reconnect re-forward: a mid-turn server restart
+    # drops the live forwarder's in-flight POSTs, and _catch_up_scan replays
+    # these to recover the gap (source_id dedup makes it idempotent).
+    _CLAUDE_REFORWARD_PARAMS[session_id] = {
+        "base_url": server_url,
+        "headers": dict(_runner_headers),
+        "bridge_dir": bridge_dir,
+        "agent_name": "claude-native-ui",
+        "start_at_offset": resume_prefix_bytes,
+        "auth": _runner_auth,
+    }
     _forwarder_task = asyncio.create_task(
         _supervise_bridge(),
         name=f"claude-forwarder-{session_id}",

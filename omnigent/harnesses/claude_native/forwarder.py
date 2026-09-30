@@ -3003,6 +3003,113 @@ def _supervisor_monotonic() -> float:
     return time.monotonic()
 
 
+async def reforward_transcript_items_on_reconnect(
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    session_id: str,
+    bridge_dir: Path,
+    agent_name: str,
+    start_at_offset: int | None,
+    auth: httpx.Auth | None = None,
+) -> int:
+    """
+    One-shot re-delivery of transcript items after a server reconnect.
+
+    A mid-turn server restart drops the live forwarder's in-flight POSTs; its
+    poll loop advances past them and never retries, so those items land in the
+    terminal transcript but not the chat view (the reported bug). On reconnect
+    this re-reads the transcript from ``start_at_offset`` and re-POSTs each item
+    under its original ``source_id``. The server derives each item's id from
+    that source id (``_new_external_conversation_item`` ->
+    ``uuid5(...source_id)``) and the append is idempotent, so items already
+    persisted before the outage come back deduplicated (no-ops) and only the
+    gap items are inserted — no duplicates.
+
+    Starts at ``start_at_offset`` (the resume-prefix boundary), never 0: a cold
+    ``--resume`` synthesizes a transcript prefix whose source_ids differ from
+    the originally-committed items, so re-posting that prefix WOULD duplicate.
+    ``None``/0 means a fresh (non-resumed) session whose whole transcript is
+    live-portion and safe to re-scan. Does not touch the live forwarder's
+    durable cursor or seen-set — both post under source_id, and the server
+    dedups.
+
+    Best-effort: never raises; a read or POST failure is logged and skipped.
+
+    :param base_url: Omnigent server base URL.
+    :param headers: Static HTTP headers for Omnigent requests.
+    :param session_id: Omnigent session/conversation id.
+    :param bridge_dir: Native Claude bridge directory.
+    :param agent_name: Agent/model name stamped on mirrored items.
+    :param start_at_offset: Byte offset of the live-portion boundary
+        (resume-prefix length), or ``None``/0 for a fresh session.
+    :param auth: Optional httpx Auth minting a fresh bearer per request.
+    :returns: Count of items re-POSTed (before server-side dedup).
+    """
+    from omnigent.cli_auth import open_server_client
+    from omnigent.harnesses.claude_native.bridge import (
+        read_transcript_items_from_offset,
+        read_transcript_path,
+    )
+
+    try:
+        transcript_path = read_transcript_path(bridge_dir)
+    except OSError:
+        transcript_path = None
+    if transcript_path is None or not transcript_path.exists():
+        return 0
+    try:
+        result = read_transcript_items_from_offset(
+            transcript_path,
+            start_at_offset or 0,
+            start_line=0,
+            agent_name=agent_name,
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        _logger.warning(
+            "reforward: failed to read transcript for session=%s; skipping",
+            session_id,
+            exc_info=True,
+        )
+        return 0
+    if not result.items:
+        return 0
+
+    delivered = 0
+    timeout = httpx.Timeout(_POST_TIMEOUT_S)
+    try:
+        async with open_server_client(
+            base_url, headers=headers, auth=auth, timeout=timeout
+        ) as client:
+            for item in result.items:
+                try:
+                    await _post_external_conversation_item(
+                        client, session_id=session_id, item=item
+                    )
+                    delivered += 1
+                except httpx.HTTPError:
+                    _logger.warning(
+                        "reforward: re-POST failed for session=%s; continuing",
+                        session_id,
+                        exc_info=True,
+                    )
+    except Exception:  # noqa: BLE001 — best-effort recovery, never block reconnect
+        _logger.warning(
+            "reforward: client error for session=%s; aborting re-forward",
+            session_id,
+            exc_info=True,
+        )
+        return delivered
+    _logger.info(
+        "reforward: re-delivered %d transcript item(s) for session=%s on reconnect "
+        "(start_offset=%s); server dedups already-persisted items",
+        delivered,
+        session_id,
+        start_at_offset,
+    )
+    return delivered
+
+
 async def supervise_forwarder(
     *,
     base_url: str,

@@ -5021,10 +5021,6 @@ def create_runner_app(
                     ),
                 },
             )
-        # Return authoritative items from the runner's session history for
-        # post-crash item recovery: the server's relay may have missed events
-        # emitted during a server outage, so it can backfill them on reconnect.
-        items = _session_histories.get(session_id, [])
         return JSONResponse(
             status_code=200,
             content={
@@ -5036,7 +5032,7 @@ def create_runner_app(
                 "labels": {},
                 "runner_id": None,
                 "reasoning_effort": None,
-                "items": items,
+                "items": [],
                 "permission_level": None,
             },
         )
@@ -13671,6 +13667,28 @@ def create_runner_app(
         _retry_stranded_wakes()
         for session_id in list(_session_histories):
             if _is_native_harness(session_id):
+                # Native sessions don't mirror through the item scan below
+                # (their transcripts come from the underlying CLI). But a
+                # mid-turn server restart drops the claude-native forwarder's
+                # in-flight POSTs, leaving the turn in the terminal transcript
+                # but not the chat view. Re-forward the transcript items the
+                # server missed; source_id dedup makes already-persisted items
+                # no-ops. A no-op for sessions without captured params (codex-
+                # native — TODO: it has its own dead-letter replay at forwarder
+                # startup; a reconnect re-scan of its rollout is a follow-up).
+                from omnigent.runner.native.orchestration import (
+                    reforward_claude_native_on_reconnect,
+                )
+
+                try:
+                    await reforward_claude_native_on_reconnect(session_id)
+                except Exception:  # noqa: BLE001 — best-effort; never block catch-up
+                    _logger.warning(
+                        "Native reconnect re-forward failed for session=%s",
+                        session_id,
+                        exc_info=True,
+                        extra={"session_id": session_id},
+                    )
                 continue
             try:
                 after_id = _last_server_item_id.get(session_id)
