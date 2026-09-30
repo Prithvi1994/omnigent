@@ -47,6 +47,7 @@ import { useSideChats } from "@/hooks/useSideChats";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { useChatStore } from "@/store/chatStore";
 import { SIDE_CHAT_COMMAND_PREFIX, supportsSideChat, usesNativeSideChatFork } from "@/lib/sideChat";
+import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { createSideChat, stopSession } from "@/lib/sessionsApi";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
@@ -780,7 +781,7 @@ function WorkspacePanelImpl({
   // pair on, so a signal rekeys the OLDEST awaiting tab (FIFO). A single ref
   // would cross-assign when two launches overlap; the generic path skips the
   // queue entirely and rekeys its own tab directly (see startPendingSideChat).
-  const awaitingPendingIdsRef = useRef<{ id: string; text: string }[]>([]);
+  const awaitingPendingIdsRef = useRef<{ id: string; text: string; parentId: string }[]>([]);
   const [initialSideChatMessages, setInitialSideChatMessages] = useState<Record<string, string>>(
     {},
   );
@@ -795,10 +796,15 @@ function WorkspacePanelImpl({
     // screen now.
     if (sideChatToOpen.parentId !== conversationId) return;
     const { childId } = sideChatToOpen;
-    const awaiting = awaitingPendingIdsRef.current.shift();
+    const queue = awaitingPendingIdsRef.current;
+    const index = queue.findIndex((entry) => entry.parentId === conversationId);
+    const awaiting = index === -1 ? undefined : queue.splice(index, 1)[0];
     // Keep closed launches in FIFO order until their child arrives, so the
     // next open tab cannot accidentally inherit the cancelled fork's question.
-    if (awaiting !== undefined && !sideChats.tabs.includes(awaiting.id)) {
+    if (
+      awaiting !== undefined &&
+      !readSessionWorkspaceState(conversationId).openSideChats?.includes(awaiting.id)
+    ) {
       void stopSession(childId).catch(() => {});
       clearSideChatToOpen();
       return;
@@ -847,7 +853,7 @@ function WorkspacePanelImpl({
       // old to fork — the server refuses) has set `sendFailed` by the time the
       // await returns; reject then so the pending pane resets and drop the
       // queued tab so it never waits for a child that isn't coming.
-      awaitingPendingIdsRef.current.push({ id: pendingId, text });
+      awaitingPendingIdsRef.current.push({ id: pendingId, text, parentId: conversationId });
       let sendFailed = false;
       return useChatStore
         .getState()

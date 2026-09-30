@@ -129,10 +129,10 @@ function renderWorkspace(
   const openTerminalTab = vi.fn();
   const onCloseTerminal = vi.fn();
   const onToggleMaximized = vi.fn();
-  const view = render(
+  const panel = (conversationId: string) => (
     <TooltipProvider delayDuration={0}>
       <WorkspacePanel
-        conversationId="conv_ws"
+        conversationId={conversationId}
         width={360}
         open={overrides.open}
         resizing={overrides.resizing}
@@ -173,9 +173,11 @@ function renderWorkspace(
         liveness={overrides.liveness}
         pending={overrides.pending}
       />
-    </TooltipProvider>,
+    </TooltipProvider>
   );
+  const view = render(panel("conv_ws"));
   return {
+    switchConversation: (id: string) => view.rerender(panel(id)),
     openFileViewer,
     onCloseFile,
     onRightRailTabChange,
@@ -889,14 +891,14 @@ describe("WorkspacePanel browser tab", () => {
   });
 });
 
-it.each(["single", "overlapping", "closed-first"])(
+it.each(["single", "overlapping", "closed-first", "switched-parent"])(
   "transfers each pending question to its own child (%s)",
   async (scenario) => {
     const overlapping = scenario !== "single";
     const stop = vi.spyOn(sessionsApi, "stopSession").mockResolvedValue({ queued: false });
+    const original = useChatStore.getState();
     conversationRegistry.clear();
     useChatStore.setState({ conversationId: null });
-    const original = useChatStore.getState();
     const sendSide = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({
       conversationId: "conv_ws",
@@ -905,15 +907,49 @@ it.each(["single", "overlapping", "closed-first"])(
       send: sendSide,
     });
     try {
-      renderWorkspace({ rightRailTab: "sidechat" });
+      const { switchConversation } = renderWorkspace({ rightRailTab: "sidechat" });
       fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
       fireEvent.click(await screen.findByRole("menuitem", { name: "Side chat" }));
       fireEvent.click(await screen.findByRole("button", { name: "Send first question" }));
       expect(sendSide).toHaveBeenCalledTimes(1);
+      if (scenario === "switched-parent") switchConversation("conv_other");
       if (overlapping) {
         fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
         fireEvent.click(await screen.findByRole("menuitem", { name: "Side chat" }));
         fireEvent.click(await screen.findByRole("button", { name: "Send second question" }));
+      }
+      if (scenario === "switched-parent") {
+        act(() =>
+          useChatStore.setState({
+            sideChatToOpen: { parentId: "conv_other", childId: "conv_other_child" },
+          }),
+        );
+        expect(screen.getByTestId("side-chat-pane")).toHaveAttribute(
+          "data-child",
+          "conv_other_child",
+        );
+        expect(screen.getByTestId("side-chat-pane")).toHaveAttribute(
+          "data-initial-message",
+          "Second question",
+        );
+        // The first parent's signal can already be waiting when we navigate back.
+        act(() =>
+          useChatStore.setState({
+            sideChatToOpen: { parentId: "conv_ws", childId: "conv_first_child" },
+          }),
+        );
+        switchConversation("conv_ws");
+        expect(screen.getByTestId("side-chat-pane")).toHaveAttribute(
+          "data-child",
+          "conv_first_child",
+        );
+        expect(screen.getByTestId("side-chat-pane")).toHaveAttribute(
+          "data-initial-message",
+          "First question",
+        );
+        expect(stop).not.toHaveBeenCalled();
+        expect(sendSide).toHaveBeenCalledTimes(2);
+        return;
       }
       if (scenario === "closed-first") {
         fireEvent.click(screen.getByRole("button", { name: "Close Side chat 1" }));
@@ -965,6 +1001,7 @@ it.each(["single", "overlapping", "closed-first"])(
     } finally {
       cleanup();
       stop.mockRestore();
+      conversationRegistry.clear();
       useChatStore.setState(original);
     }
   },
