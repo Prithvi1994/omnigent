@@ -4728,6 +4728,7 @@ async def _forward_available_items(
                     session_id=session_id,
                     event_type="external_conversation_item",
                     payload={
+                        "source_id": item.source_id,
                         "item_type": item.item_type,
                         "item_data": item.data,
                         "response_id": item.response_id,
