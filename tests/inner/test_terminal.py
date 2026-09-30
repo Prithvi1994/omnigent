@@ -826,6 +826,93 @@ def test_threaded_idle_watcher_exits_when_tmux_confirms_no_server(
     assert instance.running is False
 
 
+@pytest.mark.parametrize("blocked_probe", ["capture", "session", "pane", "exit_snapshot"])
+def test_replaced_threaded_watcher_discards_probe_that_outlived_its_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_probe: str,
+) -> None:
+    """A tmux command still in flight past the bounded join must not report to the old owner."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    monkeypatch.setattr(terminal_mod, "_IDLE_WATCHER_JOIN_TIMEOUT_S", 0.01)
+    entered = threading.Event()
+    release = threading.Event()
+    old_ticked = threading.Event()
+    old_exited = threading.Event()
+    new_ticked = threading.Event()
+    original: threading.Thread | None = None
+    missing_session_answers = 0
+
+    def _park() -> None:
+        entered.set()
+        assert release.wait(timeout=5.0)
+
+    def _is_original() -> bool:
+        nonlocal original
+        if original is None:
+            original = threading.current_thread()
+        return threading.current_thread() is original
+
+    def _capture() -> str | None:
+        if not _is_original():
+            return "healthy replacement"
+        if blocked_probe == "capture":
+            _park()
+            return "late snapshot"
+        return None if blocked_probe == "session" else "old snapshot"
+
+    def _session_exists() -> bool:
+        nonlocal missing_session_answers
+        missing_session_answers += 1
+        if missing_session_answers == terminal_mod._IDLE_EXIT_FAILURE_THRESHOLD:
+            _park()
+        return False
+
+    def _pane_is_dead() -> bool:
+        if not _is_original() or blocked_probe not in ("pane", "exit_snapshot"):
+            return False
+        if blocked_probe == "pane":
+            _park()
+        return True
+
+    def _capture_exit_snapshot() -> None:
+        if blocked_probe == "exit_snapshot":
+            _park()
+
+    instance._capture_pane_for_idle_or_none = _capture  # type: ignore[method-assign]
+    instance._tmux_session_exists_sync = _session_exists  # type: ignore[method-assign]
+    instance._pane_is_dead = _pane_is_dead  # type: ignore[method-assign]
+    instance._capture_exit_snapshot_sync = _capture_exit_snapshot  # type: ignore[method-assign]
+
+    instance.start_idle_watcher_thread(
+        on_exit=old_exited.set, on_tick=old_ticked.set, poll_interval_s=0.001
+    )
+    try:
+        assert entered.wait(timeout=2.0)
+        assert original is not None
+        instance.start_idle_watcher_thread(
+            on_exit=lambda: None, on_tick=new_ticked.set, poll_interval_s=0.001, replace=True
+        )
+        assert original.is_alive(), "bounded join should have expired with the probe parked"
+        assert new_ticked.wait(timeout=2.0)
+
+        release.set()
+        original.join(timeout=2.0)
+        assert not original.is_alive()
+        assert instance.running, "the replaced watcher marked the healthy terminal not running"
+        assert not old_exited.is_set(), "the replaced watcher fired its old owner's exit callback"
+        assert not old_ticked.is_set(), "the replaced watcher fired its old owner's tick callback"
+    finally:
+        release.set()
+        instance._stop_idle_watcher_thread()
+
+
 @pytest.mark.asyncio
 async def test_async_idle_watcher_treats_probe_start_failure_as_unknown(
     tmp_path: Path,
