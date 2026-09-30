@@ -1566,7 +1566,7 @@ class AcpExecutor(Executor):
         """
         if not isinstance(options, list):
             return None
-        model_value: str | None = None
+        model_option: _AcpJsonObject | None = None
         for opt in options:
             if not isinstance(opt, dict):
                 continue
@@ -1574,13 +1574,20 @@ class AcpExecutor(Executor):
             if not isinstance(opt_id, str):
                 continue
             self._config_option_ids.add(opt_id)
-            if opt.get("category") == _CONFIG_OPTION_MODEL or opt_id == _CONFIG_OPTION_MODEL:
-                self._model_config_option_id = opt_id
-                current = opt.get("currentValue")
-                if isinstance(current, str) and current:
-                    self._active_model = current
-                    model_value = current
-        return model_value
+            # An option literally named ``model`` wins; otherwise the first one
+            # in the model category, so several matches resolve deterministically.
+            if opt_id == _CONFIG_OPTION_MODEL or (
+                model_option is None and opt.get("category") == _CONFIG_OPTION_MODEL
+            ):
+                model_option = opt
+        if model_option is None:
+            return None
+        self._model_config_option_id = model_option["id"]
+        current = model_option.get("currentValue")
+        if not isinstance(current, str) or not current:
+            return None
+        self._active_model = current
+        return current
 
     async def _apply_model_override(self, session_id: str, model: str | None) -> None:
         """Warm-switch the agent's model via ACP ``session/set_config_option``.
@@ -1725,6 +1732,31 @@ class AcpExecutor(Executor):
             _AGENT_METHOD_SET_MODEL,
         )
 
+    async def _drain_stale_queue(self) -> None:
+        """Drain items queued before the next prompt without losing what they carry.
+
+        Leftover agent requests are answered; a queued ``config_option_update``
+        (agents often report their model right after ``session/new``) is noted
+        rather than lost, so the model it names and its option id are current.
+        """
+        while not self._queue.empty():
+            try:
+                stale = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not isinstance(stale, dict):
+                continue
+            if stale.get("method") == _CLIENT_NOTIFICATION_SESSION_UPDATE:
+                params = stale.get("params")
+                update = params.get("update") if isinstance(params, dict) else None
+                if (
+                    isinstance(update, dict)
+                    and update.get("sessionUpdate") == _UPDATE_CONFIG_OPTION
+                ):
+                    self._note_config_options(update.get("configOptions"))
+            elif stale.get("id") is not None and stale.get("method"):
+                await self._respond_to_agent_request(stale)
+
     async def run_turn(
         self,
         messages: list[Message],
@@ -1758,8 +1790,10 @@ class AcpExecutor(Executor):
             return
 
         # Apply a ``/model`` pick to the live session before prompting, so the
-        # switch takes effect on this turn with the transcript intact.
+        # switch takes effect on this turn with the transcript intact. Drain first:
+        # a report queued behind ``session/new`` names the option id to target.
         requested_model = config.model if config is not None else None
+        await self._drain_stale_queue()
         try:
             await self._apply_model_override(session_id, requested_model)
         except Exception as exc:  # noqa: BLE001
@@ -1830,25 +1864,8 @@ class AcpExecutor(Executor):
             prompt_blocks.append({"type": "text", "text": user_text})
         prompt_blocks.extend(image_blocks)
 
-        # Drain stale items from a prior turn; answer any leftover server request.
-        while not self._queue.empty():
-            try:
-                stale = self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if not isinstance(stale, dict):
-                continue
-            if stale.get("method") == _CLIENT_NOTIFICATION_SESSION_UPDATE:
-                # A pre-prompt model report (e.g. sent right after session/new)
-                # must not be lost to the drain: note it before discarding.
-                update = (stale.get("params") or {}).get("update")
-                if (
-                    isinstance(update, dict)
-                    and update.get("sessionUpdate") == _UPDATE_CONFIG_OPTION
-                ):
-                    self._note_config_options(update.get("configOptions"))
-            elif stale.get("id") is not None and stale.get("method"):
-                await self._respond_to_agent_request(stale)
+        # Drain stale items from a prior turn, plus anything the switch above queued.
+        await self._drain_stale_queue()
 
         self._rpc_id += 1
         req_id = self._rpc_id
