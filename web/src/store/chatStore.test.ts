@@ -11046,6 +11046,77 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     }
   });
 
+  it("removes a Claude preview finalized during restart without a stream message id", async () => {
+    seedSession("conv_claude_gap", []);
+    const sinks = routeStreamOpens(["old-server", "new-server"]);
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_claude_gap",
+      abortController: controller,
+      blocks: [],
+      isNativeTerminalSession: true,
+    });
+
+    const loop = startStreamPump("conv_claude_gap", controller, setState, getState);
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      sinks[0]!.push(
+        sse("response.output_text.delta", {
+          message_id: "m1",
+          index: 0,
+          delta: "first answer",
+          final: true,
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      expect(useChatStore.getState().blocks.some((b) => b.ctx.itemId === "live:m1")).toBe(true);
+
+      // Claude's transcript item has no message_id, unlike the synthetic
+      // completed items in the native snapshot tests.
+      seedSessionItems("conv_claude_gap", [assistantMessage("resp_first", "first answer")]);
+      sinks[0]!.close();
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(sinks).toHaveLength(2);
+      expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
+        "msg_resp_first_asst",
+      ]);
+
+      sinks[1]!.push(
+        sse("response.output_text.delta", { message_id: "m2", index: 0, delta: "second part" }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      const done = (itemId: string, responseId: string, text: string) =>
+        sse("response.output_item.done", {
+          item: {
+            id: itemId,
+            response_id: responseId,
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text }],
+          },
+        });
+      // A late copy of the first item must not remove m2's preview.
+      sinks[1]!.push(done("msg_resp_first_asst", "resp_first", "first answer"));
+      await vi.advanceTimersByTimeAsync(20);
+      expect(useChatStore.getState().blocks.some((b) => b.ctx.itemId === "live:m2")).toBe(true);
+      sinks[1]!.push(done("msg_resp_second_asst", "resp_second", "second part"));
+      await vi.advanceTimersByTimeAsync(20);
+      expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
+        "msg_resp_first_asst",
+        "msg_resp_second_asst",
+      ]);
+    } finally {
+      controller.abort();
+      const last = sinks[sinks.length - 1];
+      if (last) {
+        last.push("data: [DONE]\n\n");
+        last.close();
+      }
+      await vi.advanceTimersByTimeAsync(20);
+      await loop;
+    }
+  });
+
   it("suppresses delayed previews after snapshot-only completion recovery", async () => {
     seedSession("conv_native_tombstone", []);
     const sinks = routeStreamOpens();

@@ -140,7 +140,6 @@ def test_numbered_output_recovers_across_stream_stages(
                         "item_data": {
                             "role": "assistant",
                             "agent": "claude-native-ui",
-                            "stream_message_id": _MESSAGE_ID,
                             "content": [{"type": "output_text", "text": output}],
                         },
                     },
@@ -205,6 +204,15 @@ def test_numbered_output_recovers_across_stream_stages(
         assert stored_texts.count(output) == 1
         expect(
             page.locator('[data-testid="assistant-text-section"]', has_text=output)
+        ).to_have_count(1, timeout=_TIMEOUT_MS)
+
+        before_reload = len(epochs)
+        page.reload()
+        expect(page.get_by_placeholder("Send a message…")).to_be_visible(timeout=_TIMEOUT_MS)
+        assert _wait_for_stream(page, epochs, before_reload + 1) == epochs[1]
+        # The restarted server must not replay its completed suffix as a ghost preview.
+        expect(
+            page.locator('[data-testid="assistant-text-section"]', has_text="899 900 ")
         ).to_have_count(1, timeout=_TIMEOUT_MS)
     finally:
         page.remove_listener("response", observe_stream)

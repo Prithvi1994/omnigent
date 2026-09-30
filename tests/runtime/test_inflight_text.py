@@ -497,6 +497,24 @@ def test_native_done_supersedes_stranded_older_message() -> None:
     assert inflight_text.snapshot_for(cid) == []
 
 
+def test_native_done_drops_suffix_replayed_only_after_server_restart() -> None:
+    cid = "conv_native_restart_suffix"
+    inflight_text.record_publish(cid, _native_delta("m1", 42, "resumed suffix", final=True))
+    inflight_text.record_publish(cid, _message_done("ci_1", text="old prefix resumed suffix"))
+
+    assert inflight_text.snapshot_for(cid) == []
+
+
+def test_native_done_keeps_unfinished_suffix_after_server_restart() -> None:
+    cid = "conv_native_restart_unfinished"
+    inflight_text.record_publish(cid, _native_delta("m1", 42, "resumed suffix"))
+    inflight_text.record_publish(cid, _message_done("ci_1", text="old prefix resumed suffix"))
+
+    assert [
+        (event["message_id"], event["delta"]) for event in inflight_text.snapshot_for(cid)
+    ] == [("m1", "resumed suffix")]
+
+
 def test_stranded_commit_supersedes_older_but_keeps_tail() -> None:
     """A commit matching no aggregate evicts older ones, sparing the tail.
 

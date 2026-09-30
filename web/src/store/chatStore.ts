@@ -4869,6 +4869,11 @@ async function reconcileOnReconnect(
       currentBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
     const unseen = snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
+    const reconciledBlocks = withoutFinalizedNativePreviews(
+      currentBlocks,
+      unseen,
+      ignoredNativeMessageIds,
+    );
     const patch: Partial<ChatState> = reconnectStatusPatch(session, s, launchBeforeFetch);
     // `session.input.consumed` is not replayed, so recovered user blocks are
     // the durable equivalent of its FIFO acknowledgement.
@@ -4878,7 +4883,7 @@ async function reconcileOnReconnect(
     if (recoveredUserInputs > 0) {
       patch.pendingUserMessages = s.pendingUserMessages.slice(recoveredUserInputs);
     }
-    let nextBlocks = currentBlocks;
+    let nextBlocks = reconciledBlocks;
     if (unseen.length > 0) {
       // Splice the gap's committed items ahead of the active turn's
       // replayed in-flight region (its itemId-less blocks, rebuilt by the
@@ -4889,7 +4894,7 @@ async function reconcileOnReconnect(
       const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
       // A card answered before the gap whose call the gap persisted comes
       // back rebuilt in `unseen` — drop the live copy before anchoring.
-      const kept = withoutRebuiltUserInputCards(currentBlocks, unseen);
+      const kept = withoutRebuiltUserInputCards(reconciledBlocks, unseen);
       let at = -1;
       if (rid) {
         at = kept.findIndex((b) => b.ctx.responseId === rid && !b.ctx.itemId);
@@ -5336,6 +5341,18 @@ function isLiveProvisionalBlock(b: AnyBlock): boolean {
   return b.ctx.itemId?.startsWith(LIVE_ITEM_PREFIX) ?? false;
 }
 
+/** Match a completed item to a provisional preview when no vendor message id is available. */
+function matchesFinalizedNativePreview(candidate: AnyBlock, completed: TextDone): boolean {
+  return (
+    candidate.type === "text_done" &&
+    isLiveProvisionalBlock(candidate) &&
+    candidate.fullText.length > 0 &&
+    completed.fullText.startsWith(candidate.fullText) &&
+    (candidate.ctx.responseId === completed.ctx.responseId ||
+      candidate.ctx.responseId === candidate.ctx.itemId)
+  );
+}
+
 /** Suppress future chunks for a provisional preview that is no longer valid. */
 function ignoreLivePreview(block: AnyBlock | undefined, ignoredMessageIds: Set<string>): void {
   const itemId = block?.ctx.itemId;
@@ -5368,6 +5385,31 @@ function withoutNativePreviews(blocks: AnyBlock[], messageIds: Set<string>): Any
       !messageIds.has(itemId.slice(LIVE_ITEM_PREFIX.length))
     );
   });
+}
+
+/** Claude transcript items lack the live message id; reconcile new items by text in order. */
+function withoutFinalizedNativePreviews(
+  blocks: AnyBlock[],
+  committed: AnyBlock[],
+  ignoredMessages: Set<string>,
+): AnyBlock[] {
+  const previews = blocks.filter(
+    (block): block is TextDone => block.type === "text_done" && isLiveProvisionalBlock(block),
+  );
+  const finalized = new Set<string>();
+  for (const item of committed) {
+    if (item.type !== "text_done" || !item.ctx.itemId) continue;
+    const index = previews.findIndex((preview) => matchesFinalizedNativePreview(preview, item));
+    if (index === -1) continue;
+    const [preview] = previews.splice(index, 1);
+    const previewId = preview?.ctx.itemId;
+    if (!previewId) continue;
+    finalized.add(previewId);
+    ignoredMessages.add(previewId.slice(LIVE_ITEM_PREFIX.length));
+  }
+  return finalized.size === 0
+    ? blocks
+    : blocks.filter((block) => !block.ctx.itemId || !finalized.has(block.ctx.itemId));
 }
 
 /**
@@ -5780,12 +5822,16 @@ export async function pumpStreamEvents(
         (seenItemIds.has(block.ctx.itemId) ||
           get().blocks.some((b) => b.ctx.itemId === block.ctx.itemId))
       ) {
-        const provIdx = get().blocks.findIndex(isLiveProvisionalBlock);
+        const provIdx = get().blocks.findIndex((candidate) =>
+          matchesFinalizedNativePreview(candidate, block),
+        );
         if (provIdx !== -1) {
           ignoreLivePreview(get().blocks[provIdx], ignoredMessages);
           flush();
           set((s) => {
-            const at = s.blocks.findIndex(isLiveProvisionalBlock);
+            const at = s.blocks.findIndex((candidate) =>
+              matchesFinalizedNativePreview(candidate, block),
+            );
             if (at === -1) return {};
             const next = s.blocks.slice();
             next.splice(at, 1);

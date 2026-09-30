@@ -171,6 +171,8 @@ class _NativeMessage:
     same per-message in-flight previews it would have streamed live.
 
     :param text: Aggregate delta text, e.g. ``"Let me check that."``.
+    :param first_index: First chunk index seen by this server. A value above
+        zero means the prefix was lost before this process began forwarding.
     :param last_index: Highest chunk ``index`` accumulated so far, e.g.
         ``4``. Used to reject repeated chunks and included in reconnect
         replay events for wire-shape fidelity.
@@ -183,6 +185,7 @@ class _NativeMessage:
     """
 
     text: str = ""
+    first_index: int = -1
     last_index: int = -1
     forwarded: bool = False
     final_seen: bool = False
@@ -373,7 +376,10 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> dict[str, Any
                         if not messages:
                             _native_inflight.pop(conversation_id, None)
                         return None
-                    message = _NativeMessage()
+                    first_index = (
+                        index if isinstance(index, int) and not isinstance(index, bool) else -1
+                    )
+                    message = _NativeMessage(first_index=first_index)
                     messages[message_id] = message
                 if isinstance(index, int) and not isinstance(index, bool):
                     if index <= message.last_index:
@@ -466,11 +472,25 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> dict[str, Any
                             claimed.claimed = True
                             claimed.forwarded = False
                         else:
-                            # The commit matched no tracked aggregate (its
-                            # own deltas were lost or mismatched). Everything
-                            # but the tail — which may still be streaming —
-                            # is superseded and safe to evict.
-                            _supersede_older_native(conversation_id, None)
+                            # After a server restart this process may know only
+                            # the message's final suffix, not its original prefix.
+                            suffix_id = next(
+                                (
+                                    message_id
+                                    for message_id, message in reversed(list(messages.items()))
+                                    if message.first_index > 0
+                                    and message.final_seen
+                                    and message.text
+                                    and text.endswith(message.text)
+                                ),
+                                None,
+                            )
+                            if suffix_id is not None:
+                                _supersede_older_native(conversation_id, suffix_id)
+                                _drop_native_message(conversation_id, suffix_id)
+                            else:
+                                # Keep an unmatched tail that may still stream.
+                                _supersede_older_native(conversation_id, None)
                     recent = _native_recent_committed.setdefault(
                         conversation_id, deque(maxlen=_RECENT_NATIVE_MESSAGES)
                     )
