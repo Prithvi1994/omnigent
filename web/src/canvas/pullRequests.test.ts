@@ -3,7 +3,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createElement, type ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
-import type { PullRequestChecks, PullRequestInfo } from "@/hooks/usePullRequests";
+import type {
+  PullRequestAssociation,
+  PullRequestChecks,
+  PullRequestInfo,
+} from "@/hooks/usePullRequests";
 import * as pullRequestHooks from "@/hooks/usePullRequests";
 import {
   PULL_REQUEST_CONCURRENCY,
@@ -38,8 +42,35 @@ function session(id: string, gitBranch: string | null): Conversation {
 
 const NO_CHECKS: PullRequestChecks = { passing: 0, failing: 0, pending: 0, total: 0, runs: [] };
 
-function info(pr: PullRequestInfo["pr"]): PullRequestInfo {
-  return { object: "session.github.info", available: true, pr };
+function info(pr: PullRequestInfo["pr"], extra: Partial<PullRequestInfo> = {}): PullRequestInfo {
+  return { object: "session.github.info", available: true, pr, ...extra };
+}
+
+const ADO_URL = "https://dev.azure.com/acme/proj/_git/repo/pullrequest/7";
+
+function openPr(url: string): NonNullable<PullRequestInfo["pr"]> {
+  return {
+    number: 7,
+    title: "Ship it",
+    state: "OPEN",
+    url,
+    is_draft: false,
+    author: null,
+    base_ref: null,
+    head_ref: null,
+    checks: NO_CHECKS,
+  };
+}
+
+function association(overrides: Partial<PullRequestAssociation> = {}): PullRequestAssociation {
+  return {
+    url: ADO_URL,
+    host: "dev.azure.com",
+    repository: "acme/proj/repo",
+    number: 7,
+    relationship: "created",
+    ...overrides,
+  };
 }
 
 describe("PullRequestQueue", () => {
@@ -186,5 +217,62 @@ describe("usePullRequests", () => {
     );
     const { result } = renderHook(() => usePullRequests([session("s", "main")]), { wrapper });
     await waitFor(() => expect(result.current.s).toBeNull());
+  });
+
+  interface ProviderCase {
+    name: string;
+    prs?: PullRequestAssociation[];
+    provider?: string | null;
+    expected: string | null | undefined;
+  }
+
+  it.each<ProviderCase>([
+    {
+      name: "the PR's own provider over the session's",
+      prs: [association({ provider: "azure_devops" })],
+      provider: "github",
+      expected: "azure_devops",
+    },
+    {
+      name: "the PR's own GitHub provider over an Azure DevOps session",
+      prs: [association({ provider: "github" })],
+      provider: "azure_devops",
+      expected: "github",
+    },
+    {
+      name: "the session's provider when the PR names none",
+      prs: [association()],
+      provider: "azure_devops",
+      expected: "azure_devops",
+    },
+    {
+      name: "the session's provider for an untracked PR",
+      provider: "azure_devops",
+      expected: "azure_devops",
+    },
+    { name: "no provider when the host names none", provider: null, expected: null },
+    { name: "no provider from a host that predates the field", expected: undefined },
+  ])("carries the provider through: $name", async ({ prs, provider, expected }) => {
+    vi.mocked(pullRequestHooks.fetchPullRequestInfo).mockResolvedValue(
+      info(openPr(ADO_URL), { prs, provider }),
+    );
+    const { result } = renderHook(() => usePullRequests([session("s", "main")]), { wrapper });
+    await waitFor(() => expect(result.current.s).toMatchObject({ number: 7 }));
+    expect(result.current.s?.provider).toBe(expected);
+  });
+
+  it("updates the card when a refresh changes only the provider", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.mocked(pullRequestHooks.fetchPullRequestInfo)
+      .mockResolvedValueOnce(info(openPr(ADO_URL), { provider: "github" }))
+      .mockResolvedValue(info(openPr(ADO_URL), { provider: "azure_devops" }));
+    const { result } = renderHook(() => usePullRequests([session("s", "main")]), { wrapper });
+    await waitFor(() => expect(result.current.s?.provider).toBe("github"));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(PULL_REQUEST_REFRESH_MS + PULL_REQUEST_RETRY_MS + 50);
+    });
+    await waitFor(() => expect(result.current.s?.provider).toBe("azure_devops"));
+    vi.useRealTimers();
   });
 });

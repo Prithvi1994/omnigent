@@ -20,6 +20,8 @@ export interface CanvasPullRequest {
   /** "OPEN" | "MERGED" | "CLOSED" as reported by gh. */
   state: string;
   url: string;
+  /** Git provider id, which picks the number prefix: `!` for Azure DevOps, else `#`. */
+  provider?: string | null;
 }
 
 export type CanvasPullRequests = Record<string, CanvasPullRequest | null>;
@@ -78,7 +80,8 @@ function samePullRequest(
     left.number === right.number &&
     left.title === right.title &&
     left.state === right.state &&
-    left.url === right.url
+    left.url === right.url &&
+    left.provider === right.provider
   );
 }
 
@@ -140,7 +143,14 @@ export function usePullRequests(sessions: readonly Conversation[]): CanvasPullRe
           const pr = info.available ? info.pr : null;
           const next: CanvasPullRequest | null =
             pr && /^https:\/\//.test(pr.url)
-              ? { number: pr.number, title: pr.title, state: pr.state, url: pr.url }
+              ? {
+                  number: pr.number,
+                  title: pr.title,
+                  state: pr.state,
+                  url: pr.url,
+                  // The PR's own provider wins over the session's, as in the composer chip.
+                  provider: info.prs?.[0]?.provider ?? info.provider,
+                }
               : null;
           setPullRequests((current) =>
             samePullRequest(current[session.id], next)
