@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 import warnings
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -26,9 +27,13 @@ _MAX_PAGES = 100
 _HTTP_TIMEOUT_S = 10.0
 # Servability probes bound launch latency: unserved ids are rejected at the
 # gateway's routing layer (fast 404s), so a handful of probes is cheap, while
-# an uncapped walk of a large listing could stall the launch.
+# an uncapped walk of a large listing or a slow gateway could stall the launch.
 _CODEX_PROBE_MAX_MODELS = 5
 _CODEX_PROBE_TIMEOUT_S = 5.0
+_CODEX_PROBE_BUDGET_S = 10.0
+# Enough of an error body to recognize the gateway's not-found code.
+_CODEX_PROBE_BODY_PEEK_BYTES = 4096
+_CODEX_MODEL_NOT_FOUND_CODE = b"RESOURCE_DOES_NOT_EXIST"
 
 
 #: Catalog spellings the same endpoint can be served under. Ordered by
@@ -427,50 +432,76 @@ def first_served_codex_model(
     *,
     transport: httpx.BaseTransport | None = None,
 ) -> str | None:
-    """Pick the first candidate the workspace's codex route actually serves.
+    """Pick the first candidate the workspace's codex route confirms it serves.
 
     The Unity Catalog listing reports what a workspace *advertises*, and on
     some workspaces (Azure) that includes GPT models the Codex Responses
     route rejects with ``404 RESOURCE_DOES_NOT_EXIST`` — so a launch default
     taken from the listing alone can die on the user's first turn. The route
     itself is the only servability oracle: each candidate gets a minimal
-    probe request, in rank order, and the first one the route affirmatively
-    serves wins.
+    probe request, in rank order, and the first one the route confirms wins.
 
-    Only affirmative answers count as served: a success, or a validation
-    ``400``/``422`` for the deliberately minimal probe body, proves the model
-    resource exists. A ``404`` rejects the candidate, and any other answer
-    (``5xx``, ``429``, auth errors) proves nothing about the model, so the
-    walk skips it rather than pinning a candidate on a transient error.
-    Fail-open by design: an unreachable route — or a walk with no affirmative
-    answer — returns ``None`` so the caller keeps its ranked default; a
-    transient failure must never silently downgrade the launch.
+    A success, or a validation ``400``/``422`` for the deliberately minimal
+    probe body, confirms the model resource exists — unless that body names
+    the gateway's not-found code, which some gateways report as a validation
+    error. A ``404`` rejects the candidate. Anything else (``5xx``, ``429``,
+    auth errors, a per-request timeout) leaves the candidate unconfirmed and
+    the walk moves on: a confirmed lower-ranked model is a better launch
+    default than an unconfirmed higher-ranked one. When nothing is confirmed
+    — the route is unreachable, every candidate was rejected, or the probe
+    budget ran out — the result is ``None`` and the caller keeps its ranked
+    default, so the probe can never leave the launch without a model.
 
     :param workspace_url: Workspace origin, e.g. ``"https://example.com"``.
     :param token: Workspace bearer token.
     :param candidates: Codex-servable ids, best first, e.g. the result of
         :func:`discover_databricks_codex_models`. Probing stops after
-        ``_CODEX_PROBE_MAX_MODELS`` ids so a large listing cannot stall the
-        launch.
-    :returns: The first served id, or ``None`` when no probed candidate
-        answered affirmatively or the route cannot be reached.
+        ``_CODEX_PROBE_MAX_MODELS`` ids or ``_CODEX_PROBE_BUDGET_S`` seconds
+        so a large listing or a slow gateway cannot stall the launch.
+    :param transport: Optional HTTP transport used by tests.
+    :returns: The first confirmed id, or ``None`` when no probed candidate
+        was confirmed.
     """
     url = f"{workspace_url.rstrip('/')}{_CODEX_RESPONSES_PATH}"
     headers = {"Authorization": f"Bearer {token}"}
-    with httpx.Client(transport=transport, timeout=_CODEX_PROBE_TIMEOUT_S) as client:
+    deadline = time.monotonic() + _CODEX_PROBE_BUDGET_S
+    with httpx.Client(transport=transport) as client:
         for model_id in candidates[:_CODEX_PROBE_MAX_MODELS]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             try:
-                response = client.post(url, headers=headers, json={"model": model_id})
-            except httpx.HTTPError:
-                # The route is unreachable, so the probe cannot discriminate;
-                # let the caller keep its ranked default.
+                with client.stream(
+                    "POST",
+                    url,
+                    headers=headers,
+                    json={"model": model_id},
+                    timeout=min(_CODEX_PROBE_TIMEOUT_S, remaining),
+                ) as response:
+                    confirmed = _codex_probe_confirms_model(response)
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                # The route itself is unreachable, so no candidate can answer.
                 return None
-            # The gateway's RESOURCE_DOES_NOT_EXIST rejection is model-level:
-            # a served model answers the minimal body with a success or a
-            # validation 400/422, never a 404.
-            if response.is_success or response.status_code in (400, 422):
+            except httpx.HTTPError:
+                # One slow or dropped answer says nothing about the others.
+                continue
+            if confirmed:
                 return model_id
     return None
+
+
+def _codex_probe_confirms_model(response: httpx.Response) -> bool:
+    """Whether a streamed probe answer confirms the model resource exists.
+
+    Reads at most the head of the body, so a gateway that starts a real
+    completion for the minimal probe cannot hold the launch on its stream.
+    """
+    if response.is_success:
+        return True
+    if response.status_code not in (400, 422):
+        return False
+    head = next(response.iter_bytes(_CODEX_PROBE_BODY_PEEK_BYTES), b"")
+    return _CODEX_MODEL_NOT_FOUND_CODE not in head
 
 
 def select_servable_model(requested: str, servable: Iterable[str]) -> str | None:

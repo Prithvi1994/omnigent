@@ -3000,10 +3000,10 @@ def _resolve_databricks_codex_model(
     route itself: some workspaces (Azure) advertise GPT models in the listing
     that the route rejects with ``404 RESOURCE_DOES_NOT_EXIST``, so trusting
     the listing alone pins a model whose first turn dies at the gateway. The
-    ranked candidates are probed in order and the first one the route serves
-    wins; when the probe cannot discriminate (route unreachable, or every
-    candidate rejected) the ranked default stands, so a transient probe
-    failure never downgrades the launch.
+    ranked candidates are probed in order and the first one the route
+    confirms wins, ahead of any higher-ranked candidate the route rejected or
+    left unconfirmed; when nothing is confirmed (route unreachable, every
+    candidate rejected, probe budget spent) the ranked default stands.
 
     :param host: Workspace origin, e.g. ``"https://example.com"``.
     :param profile: Databricks CLI profile backing the launch.
@@ -3084,8 +3084,8 @@ def _resolve_databricks_codex_model(
                 served = None
             if served is not None and served != servable[0]:
                 _logger.warning(
-                    "native-codex: listing advertises %r but the codex route "
-                    "does not serve it; launching on %r instead",
+                    "native-codex: listing ranks %r first but the codex route "
+                    "did not confirm it; launching on %r instead",
                     servable[0],
                     served,
                 )
