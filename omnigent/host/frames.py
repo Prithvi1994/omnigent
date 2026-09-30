@@ -43,10 +43,8 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 
-# when the host refuses a launch because its own sign-in to the server was
-# rejected or cannot be renewed: a spawned runner would inherit the dead
-# credential and be refused too. The server maps it to
-# ``ErrorCode.HOST_AUTH_EXPIRED``.
+# when the host refuses a launch because the server rejected its own sign-in:
+# a spawned runner would inherit the dead credential and be refused too.
 HOST_AUTH_EXPIRED_ERROR_CODE = "host_auth_expired"
 
 # Capability tokens a host advertises in ``HostHelloFrame.capabilities``. A token

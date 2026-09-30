@@ -1164,6 +1164,8 @@ class HostProcess:
         self._last_connect_auth_token: str | None = None
         self._auth_retry_after = 0.0
         self._auth_cache_stamp: tuple[float | None, ...] = ()
+        # Launches (worker threads) and reconnects can re-resolve at once.
+        self._auth_reresolve_lock = threading.Lock()
         # This host's owning user, resolved once after the first accepted tunnel
         # upgrade (GET /v1/me). Injected into every runner it spawns and published
         # to OMNIGENT_USER_ID so host/runner debug-log rows carry it. None until
@@ -4518,14 +4520,27 @@ class HostProcess:
 
         :returns: The freshly resolved bearer, or ``None``.
         """
-        self._auth_token_factory = None
-        self._auth_token_factory_resolved = False
-        token = self._current_auth_token()
-        # Stamp after resolving: the resolution itself may rewrite a cache,
-        # which must not look like a new login on the next check.
-        self._auth_retry_after = time.monotonic() + _AUTH_RECOVERY_RETRY_S
-        self._auth_cache_stamp = _credential_cache_stamp()
-        return token
+        with self._auth_reresolve_lock:
+            if not self._auth_recovery_due():
+                # Another thread re-resolved while this one waited.
+                return self._current_auth_token(initialize=False)
+            token: str | None = None
+            try:
+                from omnigent.runner._entry import _make_auth_token_factory
+
+                factory = _make_auth_token_factory(server_url=self._server_url)
+                # Swap in whole so a concurrent reader never sees an empty context.
+                self._auth_token_factory = factory
+                self._auth_token_factory_resolved = factory is not None
+                if factory is not None:
+                    token = factory()
+            except Exception:  # noqa: BLE001
+                _logger.debug("Could not re-resolve auth token", exc_info=True)
+            # Stamp after resolving: the resolution itself may rewrite a cache,
+            # which must not look like a new login on the next check.
+            self._auth_retry_after = time.monotonic() + _AUTH_RECOVERY_RETRY_S
+            self._auth_cache_stamp = _credential_cache_stamp()
+            return token
 
     def _launch_auth_token(self) -> tuple[str | None, bool]:
         """Resolve the bearer to hand a new runner; blocking, so call off-loop.

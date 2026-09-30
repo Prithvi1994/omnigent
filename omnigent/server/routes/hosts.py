@@ -1114,7 +1114,8 @@ def create_hosts_router(
             if refusal_code == HOST_AUTH_EXPIRED_ERROR_CODE:
                 # The host's own sign-in was refused; its text is the remedy.
                 raise OmnigentError(
-                    f"host failed to launch runner: {result.get('error')}",
+                    "host failed to launch runner: "
+                    f"{result.get('error') or 'host sign-in expired'}",
                     code=ErrorCode.HOST_AUTH_EXPIRED,
                 )
             raise HTTPException(

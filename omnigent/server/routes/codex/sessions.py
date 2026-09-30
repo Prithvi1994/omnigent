@@ -233,7 +233,8 @@ async def _start_codex_goal_runner_on_bound_host(
     :returns: Runner id expected to connect, or ``None`` if no launch was
         possible.
     :raises OmnigentError: If the host reports a non-retryable harness
-        configuration failure or the session disappears.
+        configuration failure or an expired host sign-in, or the session
+        disappears.
     """
     host_registry = getattr(app_state, "host_registry", None)
     if host_registry is None:

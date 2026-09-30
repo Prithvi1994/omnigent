@@ -4189,7 +4189,10 @@ async def ensure_runner_connected(
                 _refusal_message = launch_attempt.error or ""
             if _refusal_code is not None and raise_host_refusal:
                 raise OmnigentError(
-                    _refusal_message or _HOST_REFUSAL_FALLBACK_MESSAGES[_refusal_code],
+                    _refusal_message
+                    or _HOST_REFUSAL_FALLBACK_MESSAGES.get(
+                        _refusal_code, "The host refused to launch the runner."
+                    ),
                     # The wire refusal codes equal their ErrorCode strings.
                     code=_refusal_code,
                 )
