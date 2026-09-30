@@ -15,7 +15,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
-export type HostBadgeStatus = "online" | "offline" | "unknown";
+export type HostBadgeStatus = "online" | "offline" | "unknown" | "auth_expired";
 
 export interface HostBadgeInfo {
   label: string;
@@ -34,6 +34,9 @@ export interface HostBadgeInfo {
  * `online` is tri-stated: `true`/`false` map to online/offline; `null`
  * (not-host-bound signal) and `undefined` (not yet observed) both map to
  * "unknown" so the circle never flashes red before liveness settles.
+ * A host that reported its sign-in expired is "auth_expired" whether or not
+ * it is still connected: the stored report explains why it went offline, and
+ * reconnecting cannot help until the user signs in again there.
  */
 export function resolveHostBadge(args: {
   hostId: string | null | undefined;
@@ -48,7 +51,13 @@ export function resolveHostBadge(args: {
       : host.name
     : hostId;
   const status: HostBadgeStatus =
-    online === true ? "online" : online === false ? "offline" : "unknown";
+    host?.auth_error_code === "host_auth_expired"
+      ? "auth_expired"
+      : online === true
+        ? "online"
+        : online === false
+          ? "offline"
+          : "unknown";
   return { label, status };
 }
 
@@ -57,12 +66,14 @@ const STATUS_DOT_CLASS: Record<HostBadgeStatus, string> = {
   offline: "bg-destructive",
   // Neutral while liveness is still settling — avoids a red flash.
   unknown: "bg-muted-foreground/50",
+  auth_expired: "bg-warning",
 };
 
 const STATUS_WORD: Record<HostBadgeStatus, string> = {
   online: "online",
   offline: "offline",
   unknown: "status unknown",
+  auth_expired: "sign-in expired — run `omni login` on that machine to sign in again",
 };
 
 const RECONNECT_WORD = "offline — click to reconnect";

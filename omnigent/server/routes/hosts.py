@@ -38,6 +38,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_AUTH_EXPIRED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostCreateDirFrame,
     HostDetectCredentialsFrame,
@@ -622,8 +623,9 @@ def create_hosts_router(
         :param request: The incoming request (for auth).
         :returns: ``{"hosts": [...]}`` with host details — ``host_id``,
             ``name``, ``owner``, ``status``, ``sandbox_provider``,
-            ``configured_harnesses``, and ``gateway_inference`` (``None`` when
-            no connected host has reported it to this replica).
+            ``configured_harnesses``, ``gateway_inference`` (``None`` when
+            no connected host has reported it to this replica), and
+            ``auth_error_code`` (``None`` when the host's sign-in works).
         """
         # require_user: unauthenticated callers 401. user_id is None
         # only when auth is disabled entirely — there the single-user
@@ -667,6 +669,9 @@ def create_hosts_router(
                     # gateway-backed".
                     "gateway_inference": host_registry.gateway_inference(host.host_id),
                     "interactive_shells": host_registry.interactive_shells(host.host_id),
+                    # Why the host's own sign-in stopped working (e.g.
+                    # "host_auth_expired"), or None when healthy.
+                    "auth_error_code": host.auth_error_code,
                 }
             )
         return {"hosts": result}
@@ -710,6 +715,7 @@ def create_hosts_router(
             # memory, so ``None`` is "no report on this replica yet".
             "gateway_inference": host_registry.gateway_inference(host.host_id),
             "interactive_shells": host_registry.interactive_shells(host.host_id),
+            "auth_error_code": host.auth_error_code,
             "runners": [],
         }
 
@@ -1109,6 +1115,12 @@ def create_hosts_router(
                 raise OmnigentError(
                     f"host failed to launch runner: {workspace_missing_message(workspace)}",
                     code=ErrorCode.WORKSPACE_MISSING,
+                )
+            if refusal_code == HOST_AUTH_EXPIRED_ERROR_CODE:
+                # The host's own sign-in was refused; its text is the remedy.
+                raise OmnigentError(
+                    f"host failed to launch runner: {result.get('error')}",
+                    code=ErrorCode.HOST_AUTH_EXPIRED,
                 )
             raise HTTPException(
                 status_code=502,

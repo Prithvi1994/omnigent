@@ -31,7 +31,9 @@ from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
+    HOST_AUTH_EXPIRED_ERROR_CODE,
     IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
+    HostAuthStatusFrame,
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
@@ -613,6 +615,27 @@ async def _receive_loop(
                 dict(frame.gateway_inference) if frame.gateway_inference is not None else None
             )
             host_registry.record_gateway_inference(host_id, frame.gateway_inference)
+            if on_host_update is not None:
+                try:
+                    await on_host_update(host_id, conn.owner)
+                except Exception:
+                    _logger.exception("on_host_update callback failed for %s", host_id)
+            continue
+
+        if isinstance(frame, HostAuthStatusFrame):
+            # Only known codes are stored; the web renders its own copy for them.
+            code = frame.code if frame.code == HOST_AUTH_EXPIRED_ERROR_CODE else None
+            _logger.info(
+                "Host %s reported auth status: %s",
+                host_id,
+                code or "ok",
+                extra=debug_event(
+                    "host_auth_status",
+                    stage="host_tunnel",
+                    error_code=code,
+                ),
+            )
+            await asyncio.to_thread(host_store.update_auth_status, host_id, code)
             if on_host_update is not None:
                 try:
                     await on_host_update(host_id, conn.owner)

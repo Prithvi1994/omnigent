@@ -35,6 +35,11 @@ export interface Host {
    * or server — and must not gate anything away; only an explicit `false` does.
    */
   gateway_inference?: Record<string, boolean> | null;
+  /**
+   * Why the host's own sign-in to the server stopped working, e.g.
+   * `"host_auth_expired"`. `null`/absent when healthy or from older servers.
+   */
+  auth_error_code?: string | null;
 }
 
 interface HostsResponse {

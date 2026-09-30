@@ -13,6 +13,8 @@ from sqlalchemy.orm import Session
 from omnigent.db.db_models import SqlHost
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
+    HOST_AUTH_EXPIRED_ERROR_CODE,
+    HostAuthStatusFrame,
     HostConnectionErrorFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
@@ -442,6 +444,36 @@ async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
     assert conn is not None
     assert conn.hello.configured_harnesses == {"pi": True}
     assert updates == [_HOST_ID]
+
+
+async def test_host_tunnel_stores_reported_auth_status(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """A host's sign-in report is stored for the UI; unknown codes are not."""
+    app, registry, store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    async def _wait_for(code: str | None) -> None:
+        while True:
+            host = store.get_host(_HOST_ID)
+            if host is not None and host.auth_error_code == code:
+                return
+            await asyncio.sleep(0.01)
+
+    for sent, stored in [
+        (HOST_AUTH_EXPIRED_ERROR_CODE, HOST_AUTH_EXPIRED_ERROR_CODE),
+        (None, None),
+        (HOST_AUTH_EXPIRED_ERROR_CODE, HOST_AUTH_EXPIRED_ERROR_CODE),
+        ("some_future_code", None),
+    ]:
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(HostAuthStatusFrame(code=sent)),
+            }
+        )
+        await asyncio.wait_for(_wait_for(stored), timeout=budget(0.5))
 
 
 async def test_host_tunnel_sets_offline_on_disconnect(

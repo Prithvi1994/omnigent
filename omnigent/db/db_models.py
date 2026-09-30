@@ -1382,6 +1382,10 @@ class SqlHost(OmnigentBase):
         host has never reported it (older host build) — unknown, not
         "nothing configured". Surfaced via ``GET /v1/hosts`` so the web
         agent picker can warn about unconfigured harnesses.
+    :param auth_error_code: Why the host's own sign-in stopped working, as
+        last reported in a ``host.auth_status`` frame, e.g.
+        ``"host_auth_expired"``. ``NULL`` when healthy; cleared when the host
+        reconnects, since an accepted upgrade proves its credential works.
     """
 
     __tablename__ = "hosts"
@@ -1414,6 +1418,7 @@ class SqlHost(OmnigentBase):
     deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    auth_error_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     __table_args__ = (
         CheckConstraint(

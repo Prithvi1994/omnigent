@@ -87,7 +87,7 @@ export const ComposerHostTrigger = forwardRef<
   HTMLButtonElement,
   ComponentPropsWithoutRef<"button"> & {
     label: string;
-    status: "online" | "offline" | "unknown";
+    status: "online" | "offline" | "unknown" | "auth_expired";
     cloud?: boolean;
     testIdPrefix?: string;
   }
@@ -114,7 +114,11 @@ export const ComposerHostTrigger = forwardRef<
             aria-hidden
             className={cn(
               "size-2 rounded-full",
-              status === "online" ? "bg-success" : "border-[1.5px] border-muted-foreground",
+              status === "online"
+                ? "bg-success"
+                : status === "auth_expired"
+                  ? "bg-warning"
+                  : "border-[1.5px] border-muted-foreground",
             )}
             data-testid={`${testIdPrefix}-host-status`}
           />

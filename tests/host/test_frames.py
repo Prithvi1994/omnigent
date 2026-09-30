@@ -8,7 +8,9 @@ import pytest
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_AUTH_EXPIRED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostAuthStatusFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -874,6 +876,13 @@ def test_harness_readiness_frame_round_trip() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHarnessReadinessFrame)
     assert decoded.configured_harnesses == {"pi": True, "codex": "needs-auth"}
+
+
+@pytest.mark.parametrize("code", [HOST_AUTH_EXPIRED_ERROR_CODE, None])
+def test_auth_status_frame_round_trip(code: str | None) -> None:
+    """Both the expired report and the recovered report survive encode and decode."""
+    original = HostAuthStatusFrame(code=code)
+    assert decode_host_frame(encode_host_frame(original)) == original
 
 
 def test_hello_frame_gateway_inference_round_trip() -> None:
@@ -2238,6 +2247,7 @@ def test_fs_result_null_payload_round_trip() -> None:
     [
         (HARNESS_NOT_CONFIGURED_ERROR_CODE, "any text", HARNESS_NOT_CONFIGURED_ERROR_CODE),
         (WORKSPACE_MISSING_ERROR_CODE, "any text", WORKSPACE_MISSING_ERROR_CODE),
+        (HOST_AUTH_EXPIRED_ERROR_CODE, "any text", HOST_AUTH_EXPIRED_ERROR_CODE),
         # Rolling upgrade: an older host sends the reason with no code.
         (None, "workspace path does not exist: /w", WORKSPACE_MISSING_ERROR_CODE),
         # Uncategorized failures stay generic, however they are worded.
@@ -2250,7 +2260,7 @@ def test_fs_result_null_payload_round_trip() -> None:
 def test_classify_launch_refusal(
     error_code: str | None, error: str | None, expected: str | None
 ) -> None:
-    """Only the two categorical refusals classify; everything else is generic."""
+    """Only the categorical refusals classify; everything else is generic."""
     assert classify_launch_refusal(error_code, error, "/w") == expected
 
 
