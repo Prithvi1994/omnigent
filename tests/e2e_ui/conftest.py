@@ -3549,3 +3549,79 @@ def native_cursor_approval_session(
             except subprocess.TimeoutExpired:
                 respawned.kill()
                 respawned.wait(timeout=5)
+
+
+def _create_native_pi_session(base_url: str, runner_id: str) -> str:
+    """Launch the same terminal-first Pi wrapper as `omnigent pi`."""
+    import tempfile
+
+    from omnigent._wrapper_labels import (
+        PI_NATIVE_WRAPPER_VALUE,
+        UI_MODE_LABEL_KEY,
+        UI_MODE_TERMINAL_VALUE,
+        WRAPPER_LABEL_KEY,
+    )
+    from omnigent.harnesses.pi_native.main import _materialize_pi_agent_spec
+
+    with tempfile.TemporaryDirectory() as directory:
+        data = _materialize_pi_agent_spec(Path(directory)).read_bytes()
+    bundle = io.BytesIO()
+    with tarfile.open(fileobj=bundle, mode="w:gz") as archive:
+        info = tarfile.TarInfo("pi-native-ui.yaml")
+        info.size = len(data)
+        archive.addfile(info, io.BytesIO(data))
+    response = httpx.post(
+        f"{base_url}/v1/sessions",
+        data={
+            "metadata": json.dumps(
+                {
+                    "labels": {
+                        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
+                        WRAPPER_LABEL_KEY: PI_NATIVE_WRAPPER_VALUE,
+                    },
+                    "workspace": str(_REPO_ROOT),
+                }
+            )
+        },
+        files={"bundle": ("pi-native-ui.tar.gz", bundle.getvalue(), "application/gzip")},
+        timeout=30,
+    )
+    response.raise_for_status()
+    session_id = str(response.json()["session_id"])
+    try:
+        _bind_session_runner(base_url, session_id, runner_id)
+    except BaseException:
+        httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10)
+        raise
+    return session_id
+
+
+@pytest.fixture
+def native_pi_mock_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """Real Pi CLI and extension, with only model responses scripted locally.
+
+    The prepared environment already supplies an Anthropic mock provider.
+    Standalone runs use the same provider config as the Claude mock fixture.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    try:
+        with _temp_omnigent_mock_config(
+            mock_llm_server_url, "claude", workflow_owned=bool(_server_state.get("workflow_owned"))
+        ):
+            session_id = _create_native_pi_session(live_server, str(_server_state["runner_id"]))
+            try:
+                yield live_server, session_id
+            finally:
+                httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10)
+    finally:
+        if respawned is not None:
+            respawned.terminate()
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)

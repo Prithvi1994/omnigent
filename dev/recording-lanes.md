@@ -201,6 +201,37 @@ tests skip when the harness CLI isn't installed; if the one your bug needs is
 unavailable here, keep `recordings: []` and name the missing CLI in your evidence
 (a real environment limit, not a `not_reproduced`).
 
+### Pi native: real CLI with a scripted model
+
+`tests/e2e_ui/messages/test_native_pi_render_parity.py` uses
+`native_pi_mock_session` to launch the installed `pi` CLI and its real extension
+through the same terminal-first wrapper as `omnigent pi`. Only the model replies
+are scripted. It drives a web-composer turn, types a second turn in Terminal,
+waits for the reply on the terminal stream, and checks both replies in Chat and
+the canonical transcript. This covers native delivery/rendering; adapt the
+journey for queueing, steering, or timing bugs instead of claiming this smoke
+journey reproduces those behaviors.
+
+Build the SPA and clear inherited runner variables as above. This test uses the
+**synchronous pytest `page` fixture**, so enable its recorder with `--video on`
+(the current `OMNIGENT_E2E_RECORD_DIR` hook only instruments async browsers):
+
+```bash
+pytest tests/e2e_ui/messages/test_native_pi_render_parity.py \
+  --video on --screenshot on --output recordings/pi
+```
+
+In the workflow-owned environment, run the same command through
+`python -m dev.repro_env exec -- ...`; the fixture reuses its server, runner and
+mock provider. Standalone runs temporarily use the Anthropic mock provider,
+restoring the original config on exit. No Pi login or live model is required.
+A missing/unrunnable `pi` or missing `tmux` produces an explicit skip; launch,
+delivery, and recorder failures are not successful Pi coverage. Move the emitted
+`video.webm` to a stable name after inspecting it. Declare `capture_mode:
+playwright`, surface `terminal` or `web` as appropriate, and disclose the scripted
+model in the caption. Never present this as a live-model capture or a simulated
+Pi implementation.
+
 ## `cli` facets
 
 Author/replay a VHS tape (`recordings/<slug>/journey.tape`) that replays the SAME
