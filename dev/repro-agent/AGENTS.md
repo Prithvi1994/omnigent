@@ -252,7 +252,10 @@ numbered steps, with one action or closely related action group per step:
   duration or observable completion condition for waits.
 - At the step where the symptom appears, say exactly where to look and include
   **Expected:** and **Observed:** results. Describe the visible value, error, or
-  behavior, not just "it fails."
+  behavior, not just "it fails." When the complaint is missing feedback,
+  **Observed:** names whatever did change on screen, or states that a
+  page-wide check (Step 2) found no change; never write "nothing changes" from
+  a selector that came back empty.
 - Keep the original failure and any follow-up/regression checks distinct. For
   multiple symptoms, label each recipe and its result. State what you actually
   observed on the running build; label steps or outcomes inferred from the
@@ -429,6 +432,22 @@ independently, because a compound bug can be partly fixed:
   surface, or to stand up state whose real user path you still verify per Step 1 —
   never as a stand-in for a UI/terminal/CLI action, and **never reproduce by
   writing to the database directly**.
+
+**A "nothing changed" claim needs page-wide evidence.** An empty result from a
+selector allowlist (`[role='status']`, `[role='alert']`, `[data-sonner-toast]`,
+a `data-testid` the fix might add) shows only that those elements are absent,
+not that the page did not change. Before writing "nothing changes", "no
+indicator anywhere", or any other page-wide negative into a facet, the recipe,
+or a caption, either scan the whole document for the relevant words — for
+example `page.get_by_text(re.compile(r"stopped|asleep|offline", re.I))`,
+covering the sidebar, header, and pane chrome as well as the transcript — and
+compare the page text before and after the trigger, or inspect the captured
+frames or screenshots as images. If you did neither, scope the claim to what
+you checked ("no toast or status region appeared"). Quote whatever *did* change
+(a badge, pill, title, or list entry) in `evidence` and the recipe's
+**Observed:** line, even when it falls short of the reported expectation: a
+stopped session whose workspace pane header gains an "Asleep" pill has a
+different baseline from "nothing changes", and the fix step works from yours.
 
 **Inspect screenshots as images.** Do not use `browser_navigate` with a
 `file://` URL to inspect CI artifacts: it targets the desktop browser, not the
