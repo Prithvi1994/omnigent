@@ -12485,3 +12485,34 @@ async def test_session_initialization_preserves_missing_spec_errors(
     if operation == "rebind":
         restored = await client.get(f"/v1/sessions/{sid}")
         assert restored.json()["runner_id"] == "runner_previous"
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        {"omnigent.acp.subagent_id": "forged"},
+        {"omnigent.wrapper": "claude-code-native-ui-subagent"},
+        {"omnigent.wrapper": "antigravity-native-ui-subagent"},
+    ],
+)
+async def test_mirror_identity_labels_are_rejected_from_clients(
+    client: httpx.AsyncClient, labels: dict[str, str]
+) -> None:
+    """Only the server's sub-agent handlers may mark a session as a native mirror."""
+    agent = await create_test_agent(client)
+    created = await client.post("/v1/sessions", json={"agent_id": agent["id"], "labels": labels})
+    assert created.status_code == 400, created.text
+    assert "server-internal" in created.json()["error"]["message"]
+
+    session = await _create_session(client, agent["id"])
+    patched = await client.patch(f"/v1/sessions/{session['id']}", json={"labels": labels})
+    assert patched.status_code == 400, patched.text
+    unchanged = await client.get(f"/v1/sessions/{session['id']}")
+    assert all(unchanged.json()["labels"].get(key) != value for key, value in labels.items())
+
+    # A top-level wrapper value is still the CLI's to write.
+    top_level = await client.patch(
+        f"/v1/sessions/{session['id']}",
+        json={"labels": {"omnigent.wrapper": "claude-code-native-ui"}},
+    )
+    assert top_level.status_code == 200, top_level.text

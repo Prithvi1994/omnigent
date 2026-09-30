@@ -9793,10 +9793,9 @@ async def _ensure_native_terminal(
                 ErrorCode.SESSION_AGENT_MISSING,
                 ErrorCode.SUB_AGENT_UNRESOLVED,
             ):
-                # Expected lifecycle event (agent deleted/rebound, or the
-                # dispatched sub-agent undeclared), not an ensure defect: log
-                # without a stack so it stays out of the terminal-startup
-                # error signal.
+                # Expected lifecycle condition (agent deleted/rebound or child
+                # undeclared), not an ensure defect: log without a stack to keep
+                # it out of the terminal-startup error signal.
                 _logger.warning(
                     "%s terminal ensure skipped; session %s has no spec to run: %s",
                     agent.display_name,

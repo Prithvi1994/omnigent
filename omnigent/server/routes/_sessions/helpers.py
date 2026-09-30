@@ -64,6 +64,7 @@ from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
 from omnigent.harness_plugins import (
     NativeCodingAgent,
+    is_parent_owned_subagent_labels,
 )
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.native_coding_agents import (
@@ -9555,21 +9556,10 @@ def _require_declared_subagent(
     """
     Reject a ``sub_agent_name`` the parent's spec does not declare.
 
-    ``POST /v1/sessions`` persists ``sub_agent_name`` verbatim. The
-    downstream spec-swap sites now fail an unresolvable one with
-    ``SUB_AGENT_UNRESOLVED`` rather than running the session against the
-    parent spec, but that failure arrives once the row exists and the caller
-    is gone. This gate rejects the name up front instead, before anything is
-    persisted, mirroring normal dispatch (``tool_dispatch`` rejects an
-    undeclared ``agent``) and the ``AGENTSPEC.md`` contract that unlisted
-    names are rejected.
-
-    It narrows, but does not bound, what reaches the downstream failure. The
-    check runs only when the bundle LOADS and the name is positively absent:
-    with no agent cache, or on any load failure, it returns without
-    adjudicating, so a never-declared name still reaches a swap site by
-    either route. What the gate guarantees is one direction only: a name this
-    check REJECTED never gets persisted.
+    ``POST /v1/sessions`` persists ``sub_agent_name`` verbatim, so reject an
+    undeclared name before the row exists, while the caller is still here.
+    The check runs only when the bundle loads; otherwise it defers the
+    missing-child rejection to the runner.
 
     :param agent: The parent agent row whose bundle declares the
         sub-agents.
@@ -9949,6 +9939,13 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     if ARCHIVED_AT_LABEL_KEY in labels:
         raise OmnigentError(
             f"label {ARCHIVED_AT_LABEL_KEY!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # Mirror identity is stamped only by the server's native/ACP sub-agent
+    # handlers; the runner trusts it to route a mirror to its parent's spec.
+    if is_parent_owned_subagent_labels(labels):
+        raise OmnigentError(
+            "native sub-agent mirror labels are server-internal and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
     # Pins are per-user: the client may only write the bare canonical

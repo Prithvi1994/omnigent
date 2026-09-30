@@ -4014,6 +4014,25 @@ def create_runner_app(
         sub_agent_name = body.sub_agent_name or await _recover_sub_agent_name(conversation_id)
         resolver_agent_id = body.agent_id or _session_agent_ids.get(conversation_id)
         resolver_cwd = await _session_runtime_cwd(conversation_id)
+        # Session-aware resolution keeps native mirrors on their parent's spec
+        # and rejects a stale child before any title harness is chosen.
+        title_spec_entry: _SpecEntry | None = None
+        if spec_resolver is not None:
+            try:
+                title_spec_entry = await _resolve_session_spec_entry(conversation_id)
+            except (OmnigentError, httpx.HTTPError, RuntimeError, ValueError) as exc:
+                if isinstance(exc, OmnigentError) and exc.code == ErrorCode.SUB_AGENT_UNRESOLVED:
+                    return JSONResponse(
+                        status_code=exc.http_status,
+                        content={"error": exc.code, "detail": exc.message},
+                    )
+                _logger.warning(
+                    "Session-aware spec resolution failed for %s title; falling back "
+                    "to the request's agent_id",
+                    conversation_id,
+                    exc_info=True,
+                    extra={"session_id": conversation_id},
+                )
         try:
             effective_harness, spawn_env = await _resolve_harness_config(
                 resource_registry=resource_registry,
@@ -4023,6 +4042,7 @@ def create_runner_app(
                 model_override=body.model_override,
                 harness_override=body.harness_override,
                 sub_agent_name=sub_agent_name,
+                selected_spec_entry=title_spec_entry,
                 cwd=resolver_cwd,
             )
             generator_spec = generator_spec_for_harness(effective_harness)
@@ -4038,10 +4058,18 @@ def create_runner_app(
                     model_override=body.model_override,
                     harness_override=resolver_harness,
                     sub_agent_name=sub_agent_name,
+                    selected_spec_entry=title_spec_entry,
                     cwd=resolver_cwd,
                 )
                 if resolved_harness != resolver_harness:
                     return BackgroundSessionTitleResponse(status="unsupported")
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.SUB_AGENT_UNRESOLVED:
+                raise
+            return JSONResponse(
+                status_code=exc.http_status,
+                content={"error": exc.code, "detail": exc.message},
+            )
         except (httpx.HTTPError, RuntimeError) as exc:
             return JSONResponse(
                 status_code=503,
@@ -8943,6 +8971,7 @@ def create_runner_app(
                     )
                 # Select the child before publishing anything to the session cache.
                 # Cached entries already hold the child and must not be searched again.
+                # Mirrors take no turns here; a display name that misses fails too.
                 snapshot = await _require_session_snapshot(conv)
                 _sa_name = snapshot.sub_agent_name
                 if _sa_name:
@@ -9383,6 +9412,13 @@ def create_runner_app(
                 # A known harness cannot make an unresolved child safe to run.
                 if isinstance(exc, OmnigentError) and exc.code == ErrorCode.SUB_AGENT_UNRESOLVED:
                     raise
+                _logger.warning(
+                    "Session-aware spec resolution failed for %s; falling back to the "
+                    "turn's agent_id",
+                    conv_id,
+                    exc_info=True,
+                    extra={"session_id": conv_id},
+                )
         startup_envelope = _fresh_session_init_envelope(conv_id)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
         if not harness_name:
@@ -12376,7 +12412,15 @@ def create_runner_app(
         if snapshot.ok:
             _session_workspace_cache[session_id] = snapshot.workspace
 
-    async def _resolve_session_spec_entry(session_id: str) -> _SpecEntry | None:
+    async def _resolve_session_spec_entry(
+        session_id: str, *, _resolving: frozenset[str] = frozenset()
+    ) -> _SpecEntry | None:
+        if session_id in _resolving:
+            # A mirror whose parent chain loops back would re-enter its own lock.
+            raise OmnigentError(
+                f"session spec resolver: cyclic parent chain at session {session_id!r}",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
         if session_id in _session_spec_cache:
             return _session_spec_cache[session_id]
         if spec_resolver is None:
@@ -12390,7 +12434,9 @@ def create_runner_app(
             snapshot = await _require_session_snapshot(session_id)
             if snapshot.parent_session_id and is_parent_owned_subagent_labels(snapshot.labels):
                 # Native display identities refer to the runtime-owning parent's spec.
-                return await _resolve_session_spec_entry(snapshot.parent_session_id)
+                return await _resolve_session_spec_entry(
+                    snapshot.parent_session_id, _resolving=_resolving | {session_id}
+                )
             agent_id = snapshot.agent_id
             if not agent_id:
                 raise OmnigentError(

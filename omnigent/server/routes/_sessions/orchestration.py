@@ -9658,11 +9658,8 @@ async def _create_session_from_existing_agent(
             conversation_store,
         )
 
-    # Reject an undeclared sub-agent before persisting the row. Downstream
-    # spec swaps fail the dispatch on a miss, so nothing boots as a parent
-    # clone either way, but that failure surfaces later and leaves a session
-    # row behind for a request that was already wrong when it arrived.
-    # Reject it while the caller is still here to be told.
+    # Reject an undeclared sub-agent before persisting: the downstream swap
+    # sites fail the dispatch only after the row exists and the caller is gone.
     if body.sub_agent_name:
         await asyncio.to_thread(
             _require_declared_subagent,

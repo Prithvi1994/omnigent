@@ -439,10 +439,8 @@ def register_resources_routes(
             payload = None
         if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
             raise HTTPException(status_code=502, detail="runner download failed")
-        # Re-derive the typed session-lifecycle 410 (agent deleted or
-        # rebound, or the dispatched sub-agent undeclared) with its
-        # client-safe message instead of forwarding the runner's raw
-        # resolver text verbatim.
+        # Re-derive the typed session-lifecycle 410 with its client-safe
+        # message instead of forwarding the runner's raw resolver text.
         _raise_if_session_spec_unavailable_payload(payload)
         return JSONResponse(status_code=resp.status_code, content=payload)
 
@@ -497,9 +495,8 @@ def register_resources_routes(
                 code=ErrorCode.NOT_FOUND,
             )
         if resp.status_code != 200:
-            # Re-derive the typed session-lifecycle 410 (agent deleted or
-            # rebound, or the dispatched sub-agent undeclared) instead of
-            # flattening it to a generic 502.
+            # Re-derive the typed session-lifecycle 410 instead of flattening
+            # it to a generic 502.
             _raise_if_runner_session_spec_unavailable(resp)
             if isinstance(response_payload, dict):
                 error = response_payload.get("error", {})
@@ -2218,10 +2215,8 @@ def register_resources_routes(
             raise HTTPException(status_code=405)
 
         if status >= 400:
-            # Re-derive the typed session-lifecycle 410 (agent deleted or
-            # rebound, or the dispatched sub-agent undeclared) with its
-            # client-safe message instead of forwarding the runner's raw
-            # resolver text verbatim.
+            # Re-derive the typed session-lifecycle 410 with its client-safe
+            # message instead of forwarding the runner's raw resolver text.
             _raise_if_session_spec_unavailable_payload(payload)
             error = payload.get("error", {})
             message = error.get("message", "filesystem operation failed")

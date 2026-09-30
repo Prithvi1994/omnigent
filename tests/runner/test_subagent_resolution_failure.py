@@ -120,14 +120,12 @@ async def test_renamed_child_fails_notifies_parent_and_recovers(path: str) -> No
     spec = _contract_root_spec(with_child=True)
     recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
     manager = _RecordingManager(recording)
-    mcp = _FakeMcpManager(tool_name="jira__search_issues")
 
     async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         return spec
 
     app = create_runner_app(
         process_manager=manager,  # type: ignore[arg-type]
-        mcp_manager=mcp,  # type: ignore[arg-type]
         spec_resolver=resolver,
         server_client=_ContractSnapshotClient(conv),  # type: ignore[arg-type]
     )
@@ -166,15 +164,6 @@ async def test_renamed_child_fails_notifies_parent_and_recovers(path: str) -> No
             assert "worker" in completion["output"]
             assert not manager.spawns
             assert not recording.posted_bodies
-            for method in ("tools/list", "tools/call"):
-                response = await http.post(
-                    f"/v1/sessions/{conv}/mcp/execute",
-                    json={"method": method, "params": {"name": "jira__search_issues"}},
-                )
-                assert response.status_code == 200
-                assert response.json()["error"]["code"] == -32000
-                assert "No spec available" in response.json()["error"]["message"]
-            assert not mcp.call_tool_invocations
 
             # Rejected lookups must not leave the parent cached or the turn active.
             resources = await http.get(f"/v1/sessions/{conv}/resources")
@@ -255,4 +244,135 @@ async def test_native_mirror_resources_use_the_owning_parent(
             assert response.status_code == 200, response.text
             assert calls == [owner]
             await http.post(f"/v1/sessions/{mirror}/agent-cache/reset", json={})
+    assert not manager.spawns
+
+
+def _mirror_snapshot(owner: str) -> dict[str, Any]:
+    return {
+        "agent_id": "ag_contract_root",
+        "sub_agent_name": "Explore",
+        "parent_session_id": owner,
+        "labels": {"omnigent.wrapper": "claude-code-native-ui-subagent"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_missing_child_mcp_requests_return_json_rpc_errors() -> None:
+    """MCP requests for a missing child keep their JSON-RPC error response."""
+    conv = "conv_missing_child_mcp"
+    mcp = _FakeMcpManager(tool_name="jira__search_issues")
+    manager = _RecordingManager(_RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS))
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return _contract_root_spec(with_child=False)
+
+    app = create_runner_app(
+        process_manager=manager,  # type: ignore[arg-type]
+        mcp_manager=mcp,  # type: ignore[arg-type]
+        spec_resolver=resolver,
+        server_client=_ContractSnapshotClient(conv),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        for method in ("tools/list", "tools/call"):
+            response = await http.post(
+                f"/v1/sessions/{conv}/mcp/execute",
+                json={"method": method, "params": {"name": "jira__search_issues"}},
+            )
+            assert response.status_code == 200
+            assert response.json()["error"]["code"] == -32000
+            assert "No spec available" in response.json()["error"]["message"]
+    assert not mcp.call_tool_invocations
+    assert not manager.spawns
+
+
+@pytest.mark.asyncio
+async def test_background_title_for_missing_child_returns_typed_error() -> None:
+    """A stale child's title request fails with the typed code, not an unhandled error."""
+    conv = "conv_missing_child_title"
+    manager = _RecordingManager(_RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS))
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return _contract_root_spec(with_child=False)
+
+    app = create_runner_app(
+        process_manager=manager,  # type: ignore[arg-type]
+        spec_resolver=resolver,
+        server_client=_ContractSnapshotClient(conv),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            f"/v1/sessions/{conv}/background-title",
+            json={"prompt": "summarize this", "agent_id": "ag_contract_root"},
+        )
+    assert response.status_code == 410, response.text
+    assert response.json()["error"] == "sub_agent_unresolved"
+    assert "worker" in response.json()["detail"]
+    assert not manager.spawns
+
+
+@pytest.mark.asyncio
+async def test_background_title_for_native_mirror_uses_owning_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mirror's display name is not a bundle child; its summary resolves via the parent."""
+    owner, mirror = "conv_title_owner", "conv_title_mirror"
+    server = _ContractSnapshotClient(owner)
+    original_get = server.get
+    calls = []
+
+    async def get(url: str, **kwargs: Any) -> Any:
+        if url.endswith(f"/v1/sessions/{mirror}"):
+            return httpx.Response(200, json=_mirror_snapshot(owner))
+        return await original_get(url, **kwargs)
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        calls.append(session_id)
+        return _contract_root_spec(with_child=True)
+
+    monkeypatch.setattr(server, "get", get)
+    monkeypatch.setattr(runner_app, "generator_spec_for_harness", lambda harness: None)
+    manager = _RecordingManager(_RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS))
+    app = create_runner_app(
+        process_manager=manager,
+        spec_resolver=resolver,
+        server_client=server,
+    )  # type: ignore[arg-type]
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            f"/v1/sessions/{mirror}/background-title",
+            json={"prompt": "summarize this", "agent_id": "ag_contract_root"},
+        )
+    assert response.status_code == 200, response.text
+    assert response.json() == {"status": "unsupported", "title": None}
+    assert calls == [owner]
+    assert not manager.spawns
+
+
+@pytest.mark.asyncio
+async def test_native_mirror_with_cyclic_parent_fails_instead_of_hanging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Corrupt metadata naming a mirror as its own parent must not re-enter its lock."""
+    mirror = "conv_cyclic_mirror"
+    server = _ContractSnapshotClient(mirror)
+    original_get = server.get
+
+    async def get(url: str, **kwargs: Any) -> Any:
+        if url.endswith(f"/v1/sessions/{mirror}"):
+            return httpx.Response(200, json=_mirror_snapshot(mirror))
+        return await original_get(url, **kwargs)
+
+    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        return _contract_root_spec(with_child=True)
+
+    monkeypatch.setattr(server, "get", get)
+    manager = _RecordingManager(_RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS))
+    app = create_runner_app(
+        process_manager=manager,
+        spec_resolver=resolver,
+        server_client=server,
+    )  # type: ignore[arg-type]
+    async with _runner_test_client(app) as http:
+        response = await asyncio.wait_for(http.get(f"/v1/sessions/{mirror}/resources"), timeout=10)
+    assert response.status_code == 500, response.text
     assert not manager.spawns
