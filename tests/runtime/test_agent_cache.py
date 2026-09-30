@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import errno
+import gc
 import io
 import logging
 import tarfile
@@ -14,6 +15,7 @@ import pytest
 import yaml
 
 import omnigent.runtime.agent_cache as agent_cache_module
+from omnigent.entities import LoadedAgent
 from omnigent.errors import OmnigentError
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.spec import AgentSpec
@@ -115,6 +117,24 @@ def _pause_next_extraction(
 
     monkeypatch.setattr(agent_cache_module, "load_spec", gated_load_spec)
     return extraction_started, release_extraction
+
+
+def _start_load(
+    pool: concurrent.futures.ThreadPoolExecutor,
+    cache: AgentCache,
+    agent_id: str,
+    bundle_location: str,
+) -> concurrent.futures.Future[LoadedAgent]:
+    """Submit a load and return once its worker thread is running it."""
+    started = threading.Event()
+
+    def run() -> LoadedAgent:
+        started.set()
+        return cache.load(agent_id, bundle_location)
+
+    future = pool.submit(run)
+    assert started.wait(timeout=5)
+    return future
 
 
 def test_load_cache_miss_downloads_and_extracts(
@@ -315,6 +335,7 @@ def test_load_missing_agent_raises_key_error(
 
     _store_bundle(artifact_store, "nonexistent/abc123")
     assert agent_cache.load("nonexistent", "nonexistent/abc123").spec.name == "test-agent"
+    gc.collect()  # idle-lock cleanup is weakref-based; non-refcounting runtimes collect lazily
     assert not agent_cache._agent_locks
 
 
@@ -676,7 +697,7 @@ def test_concurrent_cold_loads_never_read_an_unpublished_directory(
     monkeypatch: pytest.MonkeyPatch,
     separate_instances: bool,
 ) -> None:
-    """Both loaders see one complete published bundle, including with separate caches."""
+    """Both loaders see one complete published bundle, and one instance extracts it once."""
     bundle_location = "agent-shared/abc123"
     _store_bundle(artifact_store, bundle_location)
     winner_location = "agent-shared/def456"
@@ -692,15 +713,29 @@ def test_concurrent_cold_loads_never_read_an_unpublished_directory(
         else first_cache
     )
     extraction_started, release_extraction = _pause_next_extraction(monkeypatch)
+    downloads = 0
+    real_get = artifact_store.get
+
+    def counting_get(key: str) -> bytes:
+        nonlocal downloads
+        downloads += 1
+        return real_get(key)
+
+    monkeypatch.setattr(artifact_store, "get", counting_get)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(first_cache.load, "agent-shared", bundle_location)
         assert extraction_started.wait(timeout=5)
-        second = pool.submit(second_cache.load, "agent-shared", winner_location)
+        second = _start_load(pool, second_cache, "agent-shared", winner_location)
         try:
             if separate_instances:
                 # Only another instance can publish while this one's extraction is paused.
                 second.result(timeout=5)
+            else:
+                done, _ = concurrent.futures.wait([second], timeout=1)
+                assert not done, (
+                    "second load() ran during the paused extraction instead of waiting"
+                )
         finally:
             release_extraction.set()
         first_loaded = first.result(timeout=5)
@@ -709,6 +744,7 @@ def test_concurrent_cold_loads_never_read_an_unpublished_directory(
     # The same instance serializes the second miss behind the first extraction;
     # a separate instance publishes the winner bundle first and the first adopts it.
     expected = "winner" if separate_instances else "test-agent"
+    assert downloads == (2 if separate_instances else 1)
     assert first_loaded.spec.name == second_loaded.spec.name == expected
     assert first_loaded.workdir == second_loaded.workdir == cache_dir / "agent-shared"
     assert yaml.safe_load((first_loaded.workdir / "config.yaml").read_text())["name"] == expected
@@ -750,16 +786,12 @@ def test_load_during_replace_waits_for_complete_workdir(
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         replacing = pool.submit(agent_cache.replace, "agent-swap", location_v2, new_bundle)
         assert swap_started.wait(timeout=10)
-        reading = pool.submit(agent_cache.load, "agent-swap", location_v2)
+        reading = _start_load(pool, agent_cache, "agent-swap", location_v2)
         other = pool.submit(agent_cache.load, "agent-other", "agent-other/v1")
         try:
             assert (other.result(timeout=5).workdir / "config.yaml").is_file()
             done, _ = concurrent.futures.wait([reading], timeout=1)
-            if done:
-                early = reading.result()
-                assert (early.workdir / "config.yaml").is_file(), (
-                    "load() returned during replace() with an incomplete workdir"
-                )
+            assert not done, "load() returned during replace() instead of waiting for the swap"
         finally:
             release_swap.set()
         replacing.result(timeout=10)
@@ -792,10 +824,10 @@ def test_load_during_evict_never_caches_a_removed_workdir(
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         evicting = pool.submit(agent_cache.evict, "agent-gone")
         assert removal_started.wait(timeout=10)
-        reading = pool.submit(agent_cache.load, "agent-gone", location)
+        reading = _start_load(pool, agent_cache, "agent-gone", location)
         try:
-            # Hold the removal open long enough for the overlapping load to run against it.
-            concurrent.futures.wait([reading], timeout=1)
+            done, _ = concurrent.futures.wait([reading], timeout=1)
+            assert not done, "load() returned during evict() instead of waiting for the removal"
         finally:
             release_removal.set()
         evicting.result(timeout=10)
@@ -803,43 +835,6 @@ def test_load_during_evict_never_caches_a_removed_workdir(
 
     assert (loaded.workdir / "config.yaml").is_file()
     assert (agent_cache.load("agent-gone", location).workdir / "config.yaml").is_file()
-
-
-def test_concurrent_cold_loads_extract_once(
-    artifact_store: LocalArtifactStore,
-    cache_dir: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A second miss for the same agent waits for the first extraction instead of repeating it."""
-    location = "agent-cold/v1"
-    _store_bundle(artifact_store, location)
-    cache = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
-    extraction_started, release_extraction = _pause_next_extraction(monkeypatch)
-    downloads = 0
-    real_get = artifact_store.get
-
-    def counting_get(key: str) -> bytes:
-        nonlocal downloads
-        downloads += 1
-        return real_get(key)
-
-    monkeypatch.setattr(artifact_store, "get", counting_get)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        first = pool.submit(cache.load, "agent-cold", location)
-        assert extraction_started.wait(timeout=10)
-        second = pool.submit(cache.load, "agent-cold", location)
-        try:
-            # Hold the first extraction open long enough for the second miss to run against it.
-            concurrent.futures.wait([second], timeout=1)
-        finally:
-            release_extraction.set()
-        first_loaded = first.result(timeout=10)
-        second_loaded = second.result(timeout=10)
-
-    assert downloads == 1
-    assert first_loaded.spec.name == second_loaded.spec.name == "test-agent"
-    assert (first_loaded.workdir / "config.yaml").is_file()
-    assert (second_loaded.workdir / "config.yaml").is_file()
 
 
 def test_load_failure_cleans_unpublished_extraction(

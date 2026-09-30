@@ -124,7 +124,9 @@ class AgentCache:
         :param agent_id: Unique agent identifier,
             e.g. ``"ag_abc123"``.
         :param bundle_location: Artifact store key for the bundle,
-            e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
+            e.g. ``"ag_abc123/a1b2c3d4e5f6..."``. Read only on a cache
+            miss: a cached agent is returned regardless of the requested
+            location, and :meth:`replace` publishes a new bundle version.
         :param expand_env: Whether to expand ``${VAR}`` references in
             the spec against the server process environment. Defaults
             to ``False`` and MUST stay ``False`` for tenant-supplied
