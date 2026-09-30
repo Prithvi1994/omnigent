@@ -121,19 +121,23 @@ def _pause_next_extraction(
 
 def _start_load(
     pool: concurrent.futures.ThreadPoolExecutor,
+    monkeypatch: pytest.MonkeyPatch,
     cache: AgentCache,
     agent_id: str,
     bundle_location: str,
 ) -> concurrent.futures.Future[LoadedAgent]:
-    """Submit a load and return once its worker thread is running it."""
-    started = threading.Event()
+    """Submit a load and return once it has requested the agent's lock."""
+    requested_lock = threading.Event()
+    real_agent_lock = cache._agent_lock
 
-    def run() -> LoadedAgent:
-        started.set()
-        return cache.load(agent_id, bundle_location)
+    def observing_agent_lock(requested_id: str) -> threading.Lock:
+        if requested_id == agent_id:
+            requested_lock.set()
+        return real_agent_lock(requested_id)
 
-    future = pool.submit(run)
-    assert started.wait(timeout=5)
+    monkeypatch.setattr(cache, "_agent_lock", observing_agent_lock)
+    future = pool.submit(cache.load, agent_id, bundle_location)
+    assert requested_lock.wait(timeout=5)
     return future
 
 
@@ -713,12 +717,11 @@ def test_concurrent_cold_loads_never_read_an_unpublished_directory(
         else first_cache
     )
     extraction_started, release_extraction = _pause_next_extraction(monkeypatch)
-    downloads = 0
+    downloads: list[str] = []
     real_get = artifact_store.get
 
     def counting_get(key: str) -> bytes:
-        nonlocal downloads
-        downloads += 1
+        downloads.append(key)
         return real_get(key)
 
     monkeypatch.setattr(artifact_store, "get", counting_get)
@@ -726,7 +729,7 @@ def test_concurrent_cold_loads_never_read_an_unpublished_directory(
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(first_cache.load, "agent-shared", bundle_location)
         assert extraction_started.wait(timeout=5)
-        second = _start_load(pool, second_cache, "agent-shared", winner_location)
+        second = _start_load(pool, monkeypatch, second_cache, "agent-shared", winner_location)
         try:
             if separate_instances:
                 # Only another instance can publish while this one's extraction is paused.
@@ -744,7 +747,7 @@ def test_concurrent_cold_loads_never_read_an_unpublished_directory(
     # The same instance serializes the second miss behind the first extraction;
     # a separate instance publishes the winner bundle first and the first adopts it.
     expected = "winner" if separate_instances else "test-agent"
-    assert downloads == (2 if separate_instances else 1)
+    assert len(downloads) == (2 if separate_instances else 1)
     assert first_loaded.spec.name == second_loaded.spec.name == expected
     assert first_loaded.workdir == second_loaded.workdir == cache_dir / "agent-shared"
     assert yaml.safe_load((first_loaded.workdir / "config.yaml").read_text())["name"] == expected
@@ -786,7 +789,7 @@ def test_load_during_replace_waits_for_complete_workdir(
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         replacing = pool.submit(agent_cache.replace, "agent-swap", location_v2, new_bundle)
         assert swap_started.wait(timeout=10)
-        reading = _start_load(pool, agent_cache, "agent-swap", location_v2)
+        reading = _start_load(pool, monkeypatch, agent_cache, "agent-swap", location_v2)
         other = pool.submit(agent_cache.load, "agent-other", "agent-other/v1")
         try:
             assert (other.result(timeout=5).workdir / "config.yaml").is_file()
@@ -824,7 +827,7 @@ def test_load_during_evict_never_caches_a_removed_workdir(
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         evicting = pool.submit(agent_cache.evict, "agent-gone")
         assert removal_started.wait(timeout=10)
-        reading = _start_load(pool, agent_cache, "agent-gone", location)
+        reading = _start_load(pool, monkeypatch, agent_cache, "agent-gone", location)
         try:
             done, _ = concurrent.futures.wait([reading], timeout=1)
             assert not done, "load() returned during evict() instead of waiting for the removal"
