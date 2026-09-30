@@ -1,12 +1,16 @@
 """Tests for the claude-native reconnect transcript re-forward.
 
-A mid-turn server restart drops the live forwarder's in-flight POSTs; its poll
-loop advances past them and never retries, so those items land in the terminal
-transcript but not the chat view. ``reforward_transcript_items_on_reconnect``
-re-reads the transcript from the live-portion boundary and re-POSTs each item
-under its original ``source_id``; the server derives the item id from that
-source id and the append is idempotent, so already-persisted items come back
-deduplicated (no-ops) and only the gap items are inserted — no duplicates.
+A mid-turn server restart drops the live forwarder's in-flight POSTs; transient
+failures retain the cursor and retry with capped backoff (so items reappear only
+once that backoff fires) and permanent-failure exhaustion drops them, leaving the
+response in the terminal transcript but missing from chat for a window.
+``reforward_transcript_items_on_reconnect`` re-reads the transcript from the
+live-portion boundary and re-POSTs each item under its original ``source_id`` for
+immediate recovery; the server derives the item id from that source id and the
+append is idempotent, so already-persisted items come back deduplicated (no-ops)
+and only the gap items are inserted — no duplicates. Compaction summaries are
+skipped and the durable forward state's response ids drive grouping, matching the
+live forwarder.
 """
 
 from __future__ import annotations
@@ -87,15 +91,20 @@ def _bridge_with_transcript(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
 class _FakeServer:
     """Simulates the server's source_id->stable_id dedup on POST /events."""
 
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, fail_first: int = 0) -> None:
         self.store: dict[str, dict[str, Any]] = {}
         self.posted_source_ids: list[str] = []
         self.insert_count = 0
         self.fail = fail
+        # Number of leading POSTs to reject with 500 before succeeding, to
+        # prove later items are still attempted after an early failure.
+        self.fail_first = fail_first
+        self.attempts = 0
 
     def transport(self) -> httpx.MockTransport:
         def handler(request: httpx.Request) -> httpx.Response:
-            if self.fail:
+            self.attempts += 1
+            if self.fail or self.attempts <= self.fail_first:
                 return httpx.Response(500, json={"error": "server down"})
             body = json.loads(request.content.decode("utf-8"))
             assert body["type"] == "external_conversation_item"
@@ -253,6 +262,145 @@ async def test_reforward_best_effort_on_server_error(
 
 
 @pytest.mark.asyncio
+async def test_reforward_continues_after_a_failed_post(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An early POST failure does not abort the batch — later items are still
+    attempted and delivered."""
+    bridge_dir = _bridge_with_transcript(monkeypatch, tmp_path)
+    source_ids = _expected_source_ids(bridge_dir)
+    assert len(source_ids) >= 2
+    server = _FakeServer(fail_first=1)  # reject only the first POST
+    _patch_open_client(monkeypatch, server)
+
+    delivered = await reforward_transcript_items_on_reconnect(
+        base_url="http://ap",
+        headers={},
+        session_id=_SESSION,
+        bridge_dir=bridge_dir,
+        agent_name=_AGENT,
+        start_at_offset=None,
+        auth=None,
+    )
+    assert server.attempts == len(source_ids), "every item is attempted despite the first failure"
+    assert delivered == len(source_ids) - 1, "the items after the failed one are delivered"
+
+
+@pytest.mark.asyncio
+async def test_reforward_skips_compaction_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ``isCompactSummary`` record must NOT be posted as a user message — the
+    normal path persists it as a compaction boundary, and its source_id was
+    never persisted so server dedup can't catch a spurious re-post."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
+    bridge_dir = prepare_bridge_dir(_SESSION, bridge_id="bridge_compact", workspace=tmp_path)
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-1",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "before compaction"}],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "compact-1",
+                        "isCompactSummary": True,
+                        "message": {"role": "user", "content": "internal continuation summary"},
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "claude-uuid-compact",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    all_ids = _expected_source_ids(bridge_dir)
+    compact_ids = [sid for sid in all_ids if "compact_summary" in sid]
+    assert compact_ids, "transcript should parse an isCompactSummary item"
+
+    server = _FakeServer()
+    _patch_open_client(monkeypatch, server)
+    await reforward_transcript_items_on_reconnect(
+        base_url="http://ap",
+        headers={},
+        session_id=_SESSION,
+        bridge_dir=bridge_dir,
+        agent_name=_AGENT,
+        start_at_offset=None,
+        auth=None,
+    )
+    for compact_sid in compact_ids:
+        assert compact_sid not in server.posted_source_ids, "compaction summary must not be posted"
+    assert server.posted_source_ids, "the ordinary assistant item is still re-forwarded"
+
+
+@pytest.mark.asyncio
+async def test_reforward_feeds_response_state_for_grouping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The parser is given the durable forward state's current/settled response
+    ids so replay reproduces normal response grouping + scheduled-wake markers,
+    rather than parsing the suffix as one undifferentiated turn."""
+    bridge_dir = _bridge_with_transcript(monkeypatch, tmp_path)
+    transcript_path = tmp_path / "session.jsonl"
+    # Seed a durable forward state carrying an ended turn's settle latch.
+    (bridge_dir / "transcript_forwarder.json").write_text(
+        json.dumps(
+            {
+                "transcript_path": str(transcript_path),
+                "line_cursor": 0,
+                "byte_offset": 0,
+                "current_response_id": "resp_current",
+                "settled_response_id": "resp_settled",
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, Any] = {}
+    real_reader = read_transcript_items_from_offset
+
+    def _spy(path: Path, offset: int, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return real_reader(path, offset, **kwargs)
+
+    # The re-forward imports the reader from the bridge module at call time, so
+    # patch the source rather than the forwarder namespace.
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.read_transcript_items_from_offset", _spy
+    )
+    server = _FakeServer()
+    _patch_open_client(monkeypatch, server)
+    await reforward_transcript_items_on_reconnect(
+        base_url="http://ap",
+        headers={},
+        session_id=_SESSION,
+        bridge_dir=bridge_dir,
+        agent_name=_AGENT,
+        start_at_offset=None,
+        auth=None,
+    )
+    assert captured.get("current_response_id") == "resp_current"
+    assert captured.get("settled_response_id") == "resp_settled"
+
+
+@pytest.mark.asyncio
 async def test_reforward_no_transcript_is_noop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -260,6 +408,17 @@ async def test_reforward_no_transcript_is_noop(
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
     bridge_dir = prepare_bridge_dir(_SESSION, bridge_id="bridge_empty", workspace=tmp_path)
+
+    opened = False
+
+    @asynccontextmanager
+    async def _fail_if_opened(*args: Any, **kwargs: Any) -> Any:
+        nonlocal opened
+        opened = True
+        raise AssertionError("no HTTP client should be opened when there is no transcript")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr("omnigent.cli_auth.open_server_client", _fail_if_opened)
 
     delivered = await reforward_transcript_items_on_reconnect(
         base_url="http://ap",
@@ -271,3 +430,4 @@ async def test_reforward_no_transcript_is_noop(
         auth=None,
     )
     assert delivered == 0
+    assert not opened, "no client opened on the empty-transcript path"

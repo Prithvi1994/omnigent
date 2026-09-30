@@ -133,6 +133,11 @@ _MAX_SEEN_BTW_KEYS = 64
 # progress rather than that a healthy backlog drain simply took a long time.
 _FORWARD_LOOP_STALL_DEADLINE_S = 300.0
 _POST_TIMEOUT_S = 10.0
+# Bounds on the one-shot reconnect re-forward so a long transcript can't stall
+# other sessions' catch-up: stop after this many items or once the wall-clock
+# budget is spent (the normal poll + retries recover any remainder).
+_REFORWARD_MAX_ITEMS = 2000
+_REFORWARD_DEADLINE_S = 30.0
 _MAX_SEEN_SOURCE_IDS = 2000
 _SUBAGENT_FORWARD_CONCURRENCY = 8
 _SUBAGENT_ITEM_MAX_TRANSIENT_ATTEMPTS = 12
@@ -3016,15 +3021,27 @@ async def reforward_transcript_items_on_reconnect(
     """
     One-shot re-delivery of transcript items after a server reconnect.
 
-    A mid-turn server restart drops the live forwarder's in-flight POSTs; its
-    poll loop advances past them and never retries, so those items land in the
-    terminal transcript but not the chat view (the reported bug). On reconnect
-    this re-reads the transcript from ``start_at_offset`` and re-POSTs each item
-    under its original ``source_id``. The server derives each item's id from
+    A mid-turn server restart drops the live forwarder's in-flight POSTs.
+    Transient failures retain the cursor and retry with exponential backoff
+    (capped), so after a long outage the items reappear only once that backoff
+    timer fires; permanent-failure exhaustion drops them outright. Either way
+    the response sits in the terminal transcript but missing from the chat view
+    for a window (the reported bug). On reconnect this re-reads the transcript
+    from ``start_at_offset`` and re-POSTs each item under its original
+    ``source_id`` for immediate recovery. The server derives each item's id from
     that source id (``_new_external_conversation_item`` ->
     ``uuid5(...source_id)``) and the append is idempotent, so items already
     persisted before the outage come back deduplicated (no-ops) and only the
     gap items are inserted — no duplicates.
+
+    Classification matches the live forwarder rather than posting raw parser
+    output: ``isCompactSummary`` records are skipped (never posted as user
+    bubbles — the normal path persists them as a compaction boundary instead),
+    and the durable forward state's ``current_response_id`` /
+    ``settled_response_id`` are fed to the parser so response grouping and
+    scheduled-wake markers reproduce the normal boundaries. Bounded by
+    :data:`_REFORWARD_MAX_ITEMS` / :data:`_REFORWARD_DEADLINE_S` so a long
+    transcript cannot stall other sessions' catch-up.
 
     Starts at ``start_at_offset`` (the resume-prefix boundary), never 0: a cold
     ``--resume`` synthesizes a transcript prefix whose source_ids differ from
@@ -3058,12 +3075,21 @@ async def reforward_transcript_items_on_reconnect(
         transcript_path = None
     if transcript_path is None or not transcript_path.exists():
         return 0
+    # Feed the durable forward state's response ids to the parser so replay
+    # reproduces the live path's response grouping and scheduled-wake markers
+    # (assistant output inheriting a settled id opens a new marked turn). Absent
+    # state parses as a fresh turn.
+    forward_state = _read_forward_state(bridge_dir)
+    current_response_id = forward_state.current_response_id if forward_state else None
+    settled_response_id = forward_state.settled_response_id if forward_state else None
     try:
         result = read_transcript_items_from_offset(
             transcript_path,
             start_at_offset or 0,
             start_line=0,
             agent_name=agent_name,
+            current_response_id=current_response_id,
+            settled_response_id=settled_response_id,
         )
     except (OSError, ValueError, json.JSONDecodeError):
         _logger.warning(
@@ -3076,18 +3102,37 @@ async def reforward_transcript_items_on_reconnect(
         return 0
 
     delivered = 0
+    skipped = 0
+    deadline = time.monotonic() + _REFORWARD_DEADLINE_S
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     try:
         async with open_server_client(
             base_url, headers=headers, auth=auth, timeout=timeout
         ) as client:
             for item in result.items:
+                # Compaction summaries are an internal continuation boundary,
+                # not chat content — the live path persists a compaction card
+                # and never posts them as a user bubble. Posting one here would
+                # insert it as a user message (its source_id was never persisted,
+                # so dedup can't catch it) and could be consumed as a pending
+                # user input. Skip, matching _forward_available_items.
+                if item.is_compact_summary:
+                    continue
+                if delivered + skipped >= _REFORWARD_MAX_ITEMS or time.monotonic() >= deadline:
+                    _logger.warning(
+                        "reforward: hit bound for session=%s after %d item(s); "
+                        "leaving the remainder to the normal poll/retry",
+                        session_id,
+                        delivered,
+                    )
+                    break
                 try:
                     await _post_external_conversation_item(
                         client, session_id=session_id, item=item
                     )
                     delivered += 1
                 except httpx.HTTPError:
+                    skipped += 1
                     _logger.warning(
                         "reforward: re-POST failed for session=%s; continuing",
                         session_id,

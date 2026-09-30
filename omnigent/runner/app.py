@@ -13667,15 +13667,11 @@ def create_runner_app(
         _retry_stranded_wakes()
         for session_id in list(_session_histories):
             if _is_native_harness(session_id):
-                # Native sessions don't mirror through the item scan below
-                # (their transcripts come from the underlying CLI). But a
-                # mid-turn server restart drops the claude-native forwarder's
-                # in-flight POSTs, leaving the turn in the terminal transcript
-                # but not the chat view. Re-forward the transcript items the
-                # server missed; source_id dedup makes already-persisted items
-                # no-ops. A no-op for sessions without captured params (codex-
-                # native — TODO: it has its own dead-letter replay at forwarder
-                # startup; a reconnect re-scan of its rollout is a follow-up).
+                # Native transcripts come from the CLI, not the item scan below.
+                # Replay the safe transcript suffix using stable source IDs so a
+                # mid-turn server restart's missed items reach chat immediately.
+                # No-op without captured params (codex-native — TODO: it has its
+                # own dead-letter replay; a reconnect rollout re-scan is a follow-up).
                 from omnigent.runner.native.orchestration import (
                     reforward_claude_native_on_reconnect,
                 )
