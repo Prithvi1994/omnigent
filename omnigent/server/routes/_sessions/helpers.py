@@ -6174,12 +6174,15 @@ def _raise_if_runner_session_spec_unavailable(resp: httpx.Response) -> None:
 
     Response-level wrapper over
     :func:`_raise_if_session_spec_unavailable_payload` for proxies that hold
-    the raw ``httpx.Response``. No-op for a non-JSON payload.
+    the raw ``httpx.Response``. No-op for a success status or a non-JSON
+    payload.
 
-    :param resp: Runner HTTP response with a non-2xx status.
+    :param resp: Runner HTTP response; only a non-2xx status is inspected.
     :raises OmnigentError: Typed ``session_agent_missing`` or
         ``sub_agent_unresolved`` (HTTP 410).
     """
+    if resp.status_code < 400:
+        return
     try:
         payload: object = resp.json()
     except ValueError:
