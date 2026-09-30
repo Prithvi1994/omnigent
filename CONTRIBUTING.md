@@ -301,36 +301,6 @@ Notes:
   approval flows, provider-backed sessions, or agent execution. Use the full
   local development flow above when working on those areas.
 
-### Diagnosing native Claude API failures
-
-Native Claude launches enable a private, per-launch structured diagnostics file.
-The independent collector emits `claude_native_stream_failure` warnings through
-the standard process logger and configured log sync, even before transcript
-discovery or while transcript delivery is stalled. The event preserves the CLI's
-error class/type, connection code, watchdog flag, HTTP status, stream event counts,
-and timing. This helps distinguish server-class API errors, connection failures,
-and timeouts; it does not assign fault to a gateway or provider. These are failed
-stream attempts and may include recovered retries or internal subagent requests;
-they are not a count of failed user turns.
-
-The collector exports only allowlisted fields from `cli_stream_failed` records.
-It never exports raw headers, bodies, or arbitrary diagnostic events. Local files
-live in the owner-only bridge directory, are created with mode `0600`, and rotate
-after 4 MiB with one predecessor retained. Reads and record sizes are bounded;
-`claude_native_diagnostics_omitted` reports drops. Rotation is best-effort during
-writer bursts. Set `OMNIGENT_CLAUDE_STREAM_DIAGNOSTICS_ENABLED=0` to disable capture.
-An explicit `CLAUDE_CODE_DIAGNOSTICS_FILE` is preserved and never ingested. This is
-independent of the existing opt-in for raw harness stderr/debug logging. CLI
-versions that do not support structured diagnostics simply produce no records.
-
-Filter synced logs by `session_id` and `claude_native_stream_failure`.
-`claude_request_id` is included only when supplied in the structured failure's
-response metadata; `claude_request_id_status` makes absence explicit. It is
-distinct from the sink's `request_id`, which identifies an Omnigent RPC, and is
-not a verified gateway inference ID. The inspected Claude Code 2.1.284 diagnostic
-schema limits response IDs to its accepted provider-ID format. Other CLI versions
-may differ. Missing IDs still require server-side or timestamp correlation.
-
 ## Tests
 
 A change that alters behaviour under `omnigent/` should ship with a test, and a
