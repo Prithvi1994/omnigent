@@ -4523,6 +4523,17 @@ async function reconcileActiveSessionStatus(
   }
   set((s) => reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch));
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
+  const ignored = nativePreviewTombstonesByController.get(controller);
+  if (
+    ignored &&
+    get().blocks.some(
+      (block) =>
+        isLiveProvisionalBlock(block) && block.type === "text_done" && block.previewInterrupted,
+    )
+  ) {
+    // Retry a missed final-item backfill on the existing status-reconcile cadence.
+    await reconcileOnReconnect(id, set, get, ignored);
+  }
 }
 
 /**
@@ -4889,6 +4900,10 @@ async function reconcileOnReconnect(
       currentBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
     const unseen = snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
+    const reconciledBlocks =
+      s.isNativeTerminalSession && unseen.some((b) => b.type === "text_done" && b.ctx.itemId)
+        ? withoutInterruptedNativePreviews(currentBlocks, ignoredNativeMessageIds)
+        : currentBlocks;
     const patch: Partial<ChatState> = reconnectStatusPatch(session, s, launchBeforeFetch);
     // `session.input.consumed` is not replayed, so recovered user blocks are
     // the durable equivalent of its FIFO acknowledgement.
@@ -4898,7 +4913,7 @@ async function reconcileOnReconnect(
     if (recoveredUserInputs > 0) {
       patch.pendingUserMessages = s.pendingUserMessages.slice(recoveredUserInputs);
     }
-    let nextBlocks = currentBlocks;
+    let nextBlocks = reconciledBlocks;
     if (unseen.length > 0) {
       // Splice the gap's committed items ahead of the active turn's
       // replayed in-flight region (its itemId-less blocks, rebuilt by the
@@ -4909,7 +4924,7 @@ async function reconcileOnReconnect(
       const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
       // A card answered before the gap whose call the gap persisted comes
       // back rebuilt in `unseen` — drop the live copy before anchoring.
-      const kept = withoutRebuiltUserInputCards(currentBlocks, unseen);
+      const kept = withoutRebuiltUserInputCards(reconciledBlocks, unseen);
       let at = -1;
       if (rid) {
         at = kept.findIndex((b) => b.ctx.responseId === rid && !b.ctx.itemId);
@@ -5393,6 +5408,25 @@ function withoutNativePreviews(blocks: AnyBlock[], messageIds: Set<string>): Any
   });
 }
 
+/** A completed item supersedes interrupted previews; never guess by text. */
+function withoutInterruptedNativePreviews(
+  blocks: AnyBlock[],
+  ignoredMessages: Set<string>,
+): AnyBlock[] {
+  if (
+    !blocks.some(
+      (block) =>
+        isLiveProvisionalBlock(block) && block.type === "text_done" && block.previewInterrupted,
+    )
+  ) {
+    return blocks;
+  }
+  for (const block of blocks) {
+    if (isLiveProvisionalBlock(block)) ignoreLivePreview(block, ignoredMessages);
+  }
+  return blocks.filter((block) => !isLiveProvisionalBlock(block));
+}
+
 /**
  * Build a provisional in-flight assistant-text block for live streaming.
  *
@@ -5801,6 +5835,28 @@ export async function pumpStreamEvents(
           status: "streaming",
         });
         continue;
+      }
+
+      if (
+        block.type === "text_done" &&
+        block.ctx.itemId &&
+        !isLiveProvisionalBlock(block) &&
+        get().isNativeTerminalSession &&
+        get().blocks.some(
+          (candidate) =>
+            isLiveProvisionalBlock(candidate) &&
+            candidate.type === "text_done" &&
+            candidate.previewInterrupted,
+        )
+      ) {
+        flush();
+        set((s) => {
+          const blocks = withoutInterruptedNativePreviews(s.blocks, ignoredMessages);
+          return blocks === s.blocks ? {} : { blocks };
+        });
+        // The in-band item is already authoritative; also reconcile any
+        // other persisted items whose live event was missed in the gap.
+        void reconcileOnReconnect(id, set, get, ignoredMessages);
       }
 
       // Native preview cleanup must run before the generic dedup below:
