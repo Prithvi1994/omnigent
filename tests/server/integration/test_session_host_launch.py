@@ -951,6 +951,7 @@ async def test_message_relaunch_deterministic_failure_persists_error_turn(
     expected_category = {
         HARNESS_NOT_CONFIGURED_ERROR_CODE: "config",
         WORKSPACE_MISSING_ERROR_CODE: "user",
+        HOST_AUTH_EXPIRED_ERROR_CODE: "config",
     }.get(launch_error_code or "")
     assert refusal.attributes.get("error_category") == expected_category
     assert refusal.attributes["error_impact"] == "blocking"
