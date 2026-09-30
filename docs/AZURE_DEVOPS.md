@@ -4,6 +4,8 @@ The session pull request panel works with repositories on Azure DevOps Services
 as well as GitHub. The workspace's git remote selects the provider. This page
 covers what the host needs and what the first version does not do.
 
+For how providers are built and extended, see [Git providers](GIT_PROVIDERS.md).
+
 ## Sign in on the host
 
 The panel calls the Azure DevOps REST API with the host's own credential. It
@@ -78,3 +80,8 @@ For Azure DevOps, it finds them in two places:
 
 `az repos pr set-vote` and the `reviewer`, `work-item`, and `policy` commands
 print no pull request, so they do not record one.
+
+When one shell command runs an `az repos pr` write together with a PR read such
+as `show` or `list`, the observer cannot tell which output belongs to the write,
+and because a write rarely names its PR in its arguments, it usually records no
+PR.
