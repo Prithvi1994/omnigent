@@ -8267,6 +8267,129 @@ async def _ensure_runner_relay_ready_impl(
     return handle
 
 
+async def _backfill_runner_items_on_reconnect(
+    session_id: str,
+    runner_client: httpx.AsyncClient,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Fetch authoritative items from the runner and backfill any missing to the store.
+
+    When the server crashes mid-turn, the relay subscription may have missed SSE
+    events emitted while the server was down. On relay re-establishment, reconcile
+    the conversation store with the runner's authoritative session history to ensure
+    items from the completed turn are persisted.
+
+    Items are deduplicated by id: existing items in the store are not overwritten.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param runner_client: HTTP client pointed at the runner.
+    :param conversation_store: Store for persisting items.
+    :returns: None. Errors are logged but do not raise (best-effort recovery).
+    """
+    try:
+        resp = await runner_client.get(
+            f"/v1/sessions/{session_id}",
+            timeout=5.0,
+        )
+        if resp.status_code != 200:
+            _logger.warning(
+                "Failed to fetch runner items for session=%s on reconnect: HTTP %s",
+                session_id,
+                resp.status_code,
+                extra={"session_id": session_id},
+            )
+            return
+        data = resp.json()
+        runner_items = data.get("items", [])
+        if not runner_items:
+            # No items to backfill
+            return
+        # Fetch the store's existing items to deduplicate
+        try:
+            existing_page = await asyncio.to_thread(
+                conversation_store.list_items,
+                conversation_id=session_id,
+                limit=100,
+                order="desc",
+            )
+            existing_ids = {item.id for item in existing_page.data if item.id}
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "Failed to fetch existing items for session=%s during backfill; "
+                "skipping reconciliation",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            return
+        # Filter runner items that aren't already in the store
+        items_to_append = []
+        for runner_item in runner_items:
+            item_id = runner_item.get("id")
+            if item_id and item_id in existing_ids:
+                # Already persisted; skip
+                continue
+            # Convert runner item to NewConversationItem for idempotent append.
+            # Use the runner's item id as stable_id so duplicate appends are
+            # deduplicated rather than re-inserted.
+            try:
+                from omnigent.entities.conversation import NewConversationItem
+
+                # Extract fields needed for NewConversationItem; omit id/status/created_at
+                # which are store-managed. Use runner's id as stable_id for deduplication.
+                new_item = NewConversationItem(
+                    type=runner_item["type"],
+                    response_id=runner_item["response_id"],
+                    data=runner_item["data"],
+                    created_by=runner_item.get("created_by"),
+                    stable_id=item_id if isinstance(item_id, str) else None,
+                )
+                items_to_append.append(new_item)
+            except Exception:  # noqa: BLE001
+                _logger.warning(
+                    "Failed to deserialize runner item for session=%s: %r",
+                    session_id,
+                    runner_item,
+                    extra={"session_id": session_id},
+                )
+                continue
+        if not items_to_append:
+            # All runner items already in store
+            return
+        # Append backfilled items to the store
+        try:
+            await asyncio.to_thread(
+                conversation_store.append,
+                session_id,
+                items_to_append,
+            )
+            _logger.info(
+                "Backfilled %d items to store for session=%s on reconnect",
+                len(items_to_append),
+                session_id,
+                extra=debug_event(
+                    "relay_reconnect_item_backfill",
+                    session_id=session_id,
+                    count=len(items_to_append),
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "Failed to append backfilled items for session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "Item backfill for session=%s failed",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+
+
 async def _register_policy_elicitation(
     session_id: str,
     result: PolicyResult,

@@ -5021,6 +5021,10 @@ def create_runner_app(
                     ),
                 },
             )
+        # Return authoritative items from the runner's session history for
+        # post-crash item recovery: the server's relay may have missed events
+        # emitted during a server outage, so it can backfill them on reconnect.
+        items = _session_histories.get(session_id, [])
         return JSONResponse(
             status_code=200,
             content={
@@ -5032,7 +5036,7 @@ def create_runner_app(
                 "labels": {},
                 "runner_id": None,
                 "reasoning_effort": None,
-                "items": [],
+                "items": items,
                 "permission_level": None,
             },
         )
