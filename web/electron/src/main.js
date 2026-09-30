@@ -659,7 +659,6 @@ const UNREACHABLE_NET_ERRORS = new Set([
 
 // Pending silent reconnects from the setup page: win → { serverUrl, returnUrl, attempt, timer }.
 const reconnects = new WeakMap();
-const RETRYING_SUFFIX = " Retrying automatically…";
 
 function cancelReconnect(win) {
   clearTimeout(reconnects.get(win)?.timer);
@@ -741,6 +740,29 @@ function scheduleReconnect(win, serverUrl, returnUrl, reason) {
   return true;
 }
 
+/**
+ * On Databricks-managed devices, internal workspaces are usually reachable only
+ * over the corporate VPN, so an unreachable Databricks server gets a VPN hint.
+ */
+function asksAboutVpn(serverUrl) {
+  return databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl);
+}
+
+/**
+ * The connect-page message for an unreachable Databricks workspace.
+ *
+ * @param {string | null | undefined} serverUrl
+ * @param {{ retrying?: boolean }} [options] Whether a silent reconnect is pending.
+ * @returns {string}
+ */
+function unreachableMessage(serverUrl, { retrying = false } = {}) {
+  const problem = retrying ? "Can't reach Databricks." : "Couldn't reach Databricks.";
+  const hint = asksAboutVpn(serverUrl)
+    ? "Check that you're connected to the VPN"
+    : "Check your network connection";
+  return `${problem} ${hint}${retrying ? ". Retrying automatically…" : ", then click Connect."}`;
+}
+
 function showDatabricksAuthRequired(win, serverUrl, error, { returnUrl } = {}) {
   if (win.isDestroyed()) return;
   console.warn("[omnigent] databricks auth: connection requires sign-in", {
@@ -753,17 +775,14 @@ function showDatabricksAuthRequired(win, serverUrl, error, { returnUrl } = {}) {
   if (error.errorCode === SESSION_REJECTED)
     databricksBrowserSignInRequired.add(originOf(serverUrl));
   const expired = error.errorCode === "NO_REFRESH_TOKEN" || error.errorCode === "invalid_grant";
-  const message = expired
-    ? "Session expired. Connect to sign in again."
-    : "Couldn't sign in to Databricks. Please try again.";
+  const transient = isTransientRenewalError(error);
   const retrying =
-    isTransientRenewalError(error) &&
-    scheduleReconnect(win, serverUrl, returnUrl, renewalErrorKind(error));
+    transient && scheduleReconnect(win, serverUrl, returnUrl, renewalErrorKind(error));
   if (!retrying) cancelReconnect(win);
-  const params = new URLSearchParams({
-    error: retrying ? message + RETRYING_SUFFIX : message,
-    url: serverUrl,
-  });
+  let message = "Couldn't sign in to Databricks. Please try again.";
+  if (expired) message = "Session expired. Connect to sign in again.";
+  else if (transient) message = unreachableMessage(serverUrl, { retrying });
+  const params = new URLSearchParams({ error: message, url: serverUrl });
   if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
   if (retrying) params.set("reconnect", "1");
   // A failed background reconnect keeps the unchanged page, so the form isn't reset.
@@ -1633,17 +1652,24 @@ function registerNavigationFallbacks(win) {
       // not yank the window off its new destination.
       const failedOrigin = originOf(validatedURL ?? "");
       if (failedOrigin !== windows.get(win)?.origin) return;
-      const message = `${errorDescription || "load failed"} (${errorCode})`;
+      const failure = `${errorDescription || "load failed"} (${errorCode})`;
+      const unreachable = UNREACHABLE_NET_ERRORS.has(errorCode);
+      const browserAuth = usesBrowserAuth(pinnedOrigin(win));
       // DNS/VPN may still be reconnecting right after wake: keep retrying from setup.
       const serverUrl = windows.get(win)?.serverUrl;
       const retrying =
         Boolean(serverUrl) &&
-        usesBrowserAuth(pinnedOrigin(win)) &&
-        UNREACHABLE_NET_ERRORS.has(errorCode) &&
-        scheduleReconnect(win, serverUrl, validatedURL, message);
+        browserAuth &&
+        unreachable &&
+        scheduleReconnect(win, serverUrl, validatedURL, failure);
       if (!retrying) cancelReconnect(win);
+      let message = failure;
+      if (unreachable && browserAuth) message = unreachableMessage(validatedURL, { retrying });
+      else if (unreachable && asksAboutVpn(validatedURL)) {
+        message += " Check that you're connected to the VPN, then click Connect.";
+      }
       const params = new URLSearchParams({
-        error: retrying ? message + RETRYING_SUFFIX : message,
+        error: message,
         // The failure often happens on a deep SPA route (e.g. /chat/…);
         // prefill the setup form with just the server origin — that's what
         // the user connects to — not the full path that happened to fail.

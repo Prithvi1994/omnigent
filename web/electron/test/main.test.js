@@ -43,6 +43,7 @@ function loadNavigationHarness({
   expandWorkspace = async (url) => url,
   realBrowserRegistry = false,
   loadURL = async () => {},
+  internalFeatures = false,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -200,7 +201,9 @@ function loadNavigationHarness({
     screen: {},
     session: { defaultSession },
     shell: {},
-    systemPreferences: {},
+    systemPreferences: internalFeatures
+      ? { getUserDefault: (key) => key === "databricksInternalFeaturesEnabled" }
+      : {},
   };
 
   const localRequires = {
@@ -316,7 +319,11 @@ function loadNavigationHarness({
     clearTimeout,
     console,
     module,
-    process: { ...process, env: { ...process.env } },
+    process: {
+      ...process,
+      platform: internalFeatures ? "darwin" : process.platform,
+      env: { ...process.env },
+    },
     require: (specifier) => {
       if (specifier === "electron") return electron;
       if (specifier === "electron-updater") return { autoUpdater: {} };
@@ -427,6 +434,87 @@ describe("Databricks auth mode wiring", () => {
       h.calls.auth.map((call) => call[2].useStoredCredentials),
       [true, false, true],
     );
+  });
+
+  const vpnRetrying = "Check that you're connected to the VPN. Retrying automatically…";
+  const vpnFinal = "Check that you're connected to the VPN, then click Connect.";
+  for (const [label, internalFeatures, failure, retryingMessage, finalMessage] of [
+    [
+      "asks about the VPN on a Databricks-managed device when the workspace is unreachable",
+      true,
+      () => new TypeError("fetch failed"),
+      `Can't reach Databricks. ${vpnRetrying}`,
+      `Couldn't reach Databricks. ${vpnFinal}`,
+    ],
+    [
+      "suggests checking the network elsewhere when the workspace is unreachable",
+      false,
+      () => new TypeError("fetch failed"),
+      "Can't reach Databricks. Check your network connection. Retrying automatically…",
+      "Couldn't reach Databricks. Check your network connection, then click Connect.",
+    ],
+  ]) {
+    it(label, async (t) => {
+      const messages = [];
+      for (const retries of [[20], []]) {
+        const h = loadNavigationHarness({
+          serverUrl: workspace,
+          databricksMode: "browser",
+          internalFeatures,
+          ensureSession: async () => {
+            throw failure();
+          },
+        });
+        t.after(h.cleanup);
+        h.api.setReconnectDelaysMs(retries);
+        // oxlint-disable-next-line no-await-in-loop
+        await assert.rejects(
+          h.api.loadServerUrl(h.win, workspace, undefined, { interactive: true }),
+        );
+        // oxlint-disable-next-line no-await-in-loop
+        await tick();
+        const params = new URLSearchParams(h.calls.loadFile[0][1].search);
+        messages.push([params.get("error"), params.get("reconnect")]);
+        // Leaving the retrying page stops the pending reconnect.
+        h.setUrl("about:blank");
+      }
+      assert.deepEqual(messages, [
+        [retryingMessage, "1"],
+        [finalMessage, null],
+      ]);
+    });
+  }
+
+  it("adds the VPN hint to unreachable Databricks page loads on managed devices", async (t) => {
+    const errors = await Promise.all(
+      [
+        [true, -105],
+        [false, -105],
+        [true, -310],
+        [true, -105, "browser", [20]],
+        [false, -105, "browser", [20]],
+        // An empty schedule means retries ran out.
+        [true, -105, "browser"],
+        [false, -105, "browser"],
+      ].map(async ([internalFeatures, code, databricksMode, retries = []]) => {
+        const h = loadNavigationHarness({ serverUrl: workspace, internalFeatures, databricksMode });
+        t.after(h.cleanup);
+        h.api.setReconnectDelaysMs(retries);
+        h.emit("did-fail-load", code, "ERR", `${workspace}/c/1`, true);
+        await tick();
+        h.setUrl("about:blank");
+        return new URLSearchParams(h.calls.loadFile[0][1].search).get("error");
+      }),
+    );
+    assert.deepEqual(errors, [
+      `ERR (-105) ${vpnFinal}`,
+      "ERR (-105)",
+      "ERR (-310)",
+      `Can't reach Databricks. ${vpnRetrying}`,
+      "Can't reach Databricks. Check your network connection. Retrying automatically…",
+      `Couldn't reach Databricks. ${vpnFinal}`,
+      "Couldn't reach Databricks. Check your network connection, then click Connect.",
+    ]);
   });
 
   it("prepares stored credentials on saved-server launch and deep-link loads", async (t) => {
@@ -1522,8 +1610,9 @@ describe("Databricks reconnect from setup (src/main.js)", () => {
   const workspace = "https://workspace.cloud.databricks.com/omnigent";
   const origin = new URL(workspace).origin;
   const page = `${workspace}/c/conv_1?tab=chat`;
-  const retrying = " Retrying automatically…";
-  const signInFailed = "Couldn't sign in to Databricks. Please try again.";
+  const retrying = "Can't reach Databricks. Check your network connection. Retrying automatically…";
+  const unreachable =
+    "Couldn't reach Databricks. Check your network connection, then click Connect.";
   const offline = () => new TypeError("fetch failed");
   const wait = (ms = 10) =>
     new Promise((resolve) => {
@@ -1565,7 +1654,7 @@ describe("Databricks reconnect from setup (src/main.js)", () => {
     await wait(10);
     assert.equal(h.api.windows.get(h.win).origin, null);
     assert.deepEqual(setupParams(h), {
-      error: signInFailed + retrying,
+      error: retrying,
       url: workspace,
       reconnect: "1",
     });
@@ -1582,7 +1671,7 @@ describe("Databricks reconnect from setup (src/main.js)", () => {
     failLoad(h);
     await wait(10);
     assert.deepEqual(setupParams(h), {
-      error: `ERR_NAME_NOT_RESOLVED (-105)${retrying}`,
+      error: retrying,
       url: `${origin}/`,
       reconnect: "1",
     });
@@ -1607,7 +1696,7 @@ describe("Databricks reconnect from setup (src/main.js)", () => {
     assert.deepEqual(h.calls.loadURL, [[page], [page]]);
     assert.equal(h.calls.loadFile.length, 3);
     assert.equal(setupParams(h, 1).reconnect, "1");
-    assert.deepEqual(setupParams(h), { error: "ERR_NAME_NOT_RESOLVED (-105)", url: `${origin}/` });
+    assert.deepEqual(setupParams(h), { error: unreachable, url: `${origin}/` });
     await wait(20);
     assert.equal(h.calls.loadURL.length, 2);
   });
@@ -1624,11 +1713,11 @@ describe("Databricks reconnect from setup (src/main.js)", () => {
     assert.ok(h.calls.auth.every((call) => call[2].interactive === false));
     assert.equal(h.calls.loadFile.length, 2);
     assert.deepEqual(setupParams(h, 0), {
-      error: signInFailed + retrying,
+      error: retrying,
       url: workspace,
       reconnect: "1",
     });
-    assert.deepEqual(setupParams(h), { error: signInFailed, url: workspace });
+    assert.deepEqual(setupParams(h), { error: unreachable, url: workspace });
     assert.deepEqual(h.calls.loadURL, []);
   });
 
