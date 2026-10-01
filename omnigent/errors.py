@@ -602,6 +602,12 @@ _TRANSPORT_EXC_NAMES = frozenset(
 )
 
 
+# grpc-core's status message when a server cancels its in-flight calls on
+# shutdown (grpc_server_cancel_all_calls); unchanged through the grpc 1.x
+# series, observed with grpcio 1.83.
+_GOAWAY_CANCELLED_DETAILS = "Cancelling all calls"
+
+
 def is_cancelled_rpc_error(exc: BaseException) -> bool:
     """Whether *exc* is a gRPC call cancelled by its peer or endpoint teardown.
 
@@ -636,7 +642,7 @@ def is_cancelled_rpc_error(exc: BaseException) -> bool:
         text = details()
     except Exception:  # noqa: BLE001 — a details reader that itself fails is not a cancellation
         return False
-    return isinstance(text, str) and "Cancelling all calls" in text
+    return isinstance(text, str) and _GOAWAY_CANCELLED_DETAILS in text
 
 
 # EDQUOT is POSIX-only; Windows reports a full disk as ENOSPC.

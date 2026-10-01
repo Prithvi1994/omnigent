@@ -562,16 +562,7 @@ def test_lease_release_answers_499_and_books_no_unhandled_errors(
     leased_grpc_backend: _LeasedBackend,
 ) -> None:
     """
-    Tearing the leased endpoint down answers the coded 499 and books no UNKNOWN error.
-
-    Every call held on the channel (the cancelling client's own and the other
-    clients') is cancelled by the teardown with ``UNAVAILABLE`` / ``Cancelling
-    all calls``, an expected upstream condition rather than a server fault. The
-    still-connected clients must receive the same typed ``499
-    upstream_cancelled`` a peer-CANCELLED call gets, never the catch-all's
-    ``500 internal_error``, and no call may reach ``_handle_unhandled_exception``
-    as an ERROR-level ``Unhandled exception`` with category UNKNOWN. Each is
-    booked instead as a WARNING upstream cancellation.
+    Endpoint teardown answers connected callers with the typed 499 and books no unhandled error.
 
     :param leased_embedded_server: Base URL of the running server plus the
         records captured from the ``omnigent.server.app`` logger.
@@ -596,9 +587,9 @@ def test_lease_release_answers_499_and_books_no_unhandled_errors(
         + "\n".join(_describe_booking(record) for record in unhandled)
     )
 
-    # One booking per cancelled call: the still-connected clients' calls are
-    # always in the handler when the teardown lands; the cancelling client's
-    # own call may already be gone.
+    # Two or three cancellation bookings, depending on whether the cancelling
+    # client's own call is still in the handler when the teardown lands; the
+    # handler unit test pins exactly one booking per cancelled request.
     cancelled = _upstream_cancelled_records(records, "UNAVAILABLE")
     assert len(outcomes) <= len(cancelled) <= _LEASED_CLIENTS, (
         "expected one WARNING upstream-cancellation booking per cancelled call, "
