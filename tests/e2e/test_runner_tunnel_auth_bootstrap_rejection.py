@@ -167,21 +167,21 @@ def _run_runner(
     if with_stored_login:
         _write_expired_stored_login(state_dir, server_url)
     env = _runner_env(server_url, state_dir, workspace, log_file)
-    proc = subprocess.Popen(
+    with subprocess.Popen(
         [sys.executable, "-m", "omnigent.runner._entry"],
         cwd=str(workspace),
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-    )
-    try:
-        _out, err = proc.communicate(timeout=_RUN_TIMEOUT_S)
-        rc: int | None = proc.returncode
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        _out, err = proc.communicate()
-        rc = None
+    ) as proc:
+        try:
+            _out, err = proc.communicate(timeout=_RUN_TIMEOUT_S)
+            rc: int | None = proc.returncode
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _out, err = proc.communicate()
+            rc = None
     log_text = log_file.read_text() if log_file.exists() else ""
     combined = _ANSI.sub("", f"{err}\n{log_text}")
     return rc, combined

@@ -864,6 +864,12 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
     return _DatabricksBearerAuth(host_cfg, failure_message=host_failure), host
 
 
+# Cap distinct resolution-failure reasons remembered for log de-duplication;
+# SDK messages can embed variable detail, so a never-recovering process must
+# not accumulate them without bound.
+_MAX_LOGGED_FAILURES = 32
+
+
 class _ReusedDatabricksTokenSource:
     """Reuse SDK auth, re-resolving it after a token mint fails."""
 
@@ -893,6 +899,8 @@ class _ReusedDatabricksTokenSource:
             # report each distinct reason once rather than on every attempt.
             reason = str(exc)
             if reason not in self._logged_failures:
+                if len(self._logged_failures) >= _MAX_LOGGED_FAILURES:
+                    self._logged_failures.clear()
                 self._logged_failures.add(reason)
                 logger.info("Databricks SDK credential resolution failed: %s", reason)
             return None

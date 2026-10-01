@@ -508,6 +508,9 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
         and isinstance(expires_at, (int, float))
         and expires_at - time.time() > REFRESH_MIN_REMAINING_SECONDS
     ):
+        # A valid token (another process renewed) proves the login can renew,
+        # so drop any stale refusal before handing it back.
+        _renewal_refusals.pop(normalized, None)
         return token
     refresh_token = entry.get("refresh_token")
     if not isinstance(refresh_token, str) or not refresh_token:
@@ -547,10 +550,9 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
             )
         return None
     if resp.status_code != 200:
-        # 401/403 are definitive credential rejections. A 400 counts only when
-        # the body names an unrenewable grant (``invalid_grant`` or an aged-out
-        # ``expired_token``); other 400s (malformed request or an incompatible
-        # server) are not the stored login's fault.
+        # 401/403 are definitive rejections; a 400 counts only when the body
+        # names an unrenewable grant (invalid_grant / expired_token). Other
+        # 400s (malformed request, incompatible server) are not the login's fault.
         definitive = resp.status_code in (401, 403)
         if resp.status_code == 400:
             with contextlib.suppress(ValueError):
