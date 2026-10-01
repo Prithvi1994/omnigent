@@ -596,17 +596,22 @@ class McpServerConnection:
         opened them — required by anyio's cancel-scope identity
         check.
 
+        Serialized with :meth:`close` and :meth:`_reconnect` on
+        ``_reconnect_lock`` so a concurrent close cannot orphan the
+        lifecycle task created here.
+
         :returns: List of MCP tool definitions exposed by this
             server (cached or freshly discovered).
         :raises Exception: Any failure during transport open,
             session initialize, or tool discovery is propagated
             here via the ready future.
         """
-        loop = asyncio.get_running_loop()
-        self._ready_future = loop.create_future()
-        self._close_event = asyncio.Event()
-        self._lifecycle_task = asyncio.create_task(self._run_lifecycle())
-        return await self._ready_future
+        async with self._reconnect_lock:
+            loop = asyncio.get_running_loop()
+            self._ready_future = loop.create_future()
+            self._close_event = asyncio.Event()
+            self._lifecycle_task = asyncio.create_task(self._run_lifecycle())
+            return await self._ready_future
 
     async def call_tool(
         self,
@@ -693,6 +698,8 @@ class McpServerConnection:
             session this attempt ran against, captured under
             ``_call_lock`` so the retry loop can mark exactly it dead.
         :returns: The formatted tool result string.
+        :raises ConnectionError: When the session died before this
+            attempt was sent; the reconnect-retry loop rebuilds it.
         :raises McpElicitationRequired: When the MCP server returns
             an ``InputRequiredResult`` requiring user input before
             the tool can execute.

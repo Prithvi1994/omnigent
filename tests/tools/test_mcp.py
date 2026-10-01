@@ -608,8 +608,38 @@ async def test_call_tool_reconnect_failure_after_session_death_propagates() -> N
                 with pytest.raises(httpx.ReadError, match="connection refused"):
                     await conn.call_tool("test_tool", {"query": "hi"})
 
-        # Retried rather than raising the None-session guard once.
-        assert mock_reconnect.await_count >= 2
+        # Retried rather than raising the None-session guard once:
+        # one initial rebuild plus max_retries=1.
+        assert mock_reconnect.await_count == 2
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_reconnect_with_stale_token_keeps_the_replacement_session() -> None:
+    """
+    ``_reconnect`` told about a session another caller already
+    replaced returns without tearing the replacement down or
+    starting a new lifecycle.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as old_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+        lifecycle_task = conn._lifecycle_task
+
+        # A concurrent caller rebuilt the session while this one was failing.
+        replacement = AsyncMock()
+        conn._session = replacement
+
+        with patch.object(conn, "_run_lifecycle") as mock_lifecycle:
+            await conn._reconnect(dead_session=old_session)
+
+        mock_lifecycle.assert_not_called()
+        assert conn._session is replacement
+        assert conn._lifecycle_task is lifecycle_task
+        assert conn._connected is True
 
     await conn.close()
 
