@@ -2092,6 +2092,64 @@ async def test_peer_cancelled_rpc_is_booked_upstream_while_real_faults_stay_unha
     assert unhandled.getMessage().startswith("Unhandled exception:")
 
 
+@pytest.mark.asyncio
+async def test_endpoint_teardown_rpc_is_booked_once_as_transient_upstream(
+    app: FastAPI,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A teardown-cancelled backing RPC books exactly one transient WARNING and a 499.
+
+    An endpoint going away under an in-flight call (``UNAVAILABLE`` with the
+    GOAWAY details ``Cancelling all calls``) is the same expected condition as
+    a peer cancel: one connected request yields one coded ``upstream_cancelled``
+    response and one WARNING booking attributed upstream/transient, never an
+    ERROR-level ``Unhandled exception`` and never a duplicate record.
+
+    :param app: The real application, for its registered handlers.
+    :param caplog: Pytest log capture fixture.
+    :returns: None.
+    """
+    import json
+
+    class _Status:
+        name = "UNAVAILABLE"
+
+    class RpcError(Exception):
+        def code(self) -> object:
+            return _Status()
+
+        def details(self) -> str:
+            return "Cancelling all calls"
+
+    handler = app.exception_handlers[Exception]
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/v1/mas/workspace-tree/children",
+            "raw_path": b"/v1/mas/workspace-tree/children",
+            "query_string": b"",
+            "headers": [],
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
+        response = await handler(request, RpcError("RPC terminated with UNAVAILABLE"))
+
+    assert response.status_code == 499
+    assert json.loads(response.body)["error"]["code"] == "upstream_cancelled"
+
+    records = [r for r in caplog.records if r.name == "omnigent.server.app"]
+    assert len(records) == 1, f"expected exactly one booking, got {records}"
+    (booked,) = records
+    assert booked.levelno == logging.WARNING
+    assert booked.getMessage().startswith("Upstream call cancelled by its peer:")
+    attributes = getattr(booked, "attributes", None) or {}
+    assert attributes.get("error_category") == "upstream"
+    assert attributes.get("error_impact") == "transient"
+
+
 async def test_missing_conversation_is_a_404_not_an_unhandled_error(
     app: FastAPI,
     caplog: pytest.LogCaptureFixture,

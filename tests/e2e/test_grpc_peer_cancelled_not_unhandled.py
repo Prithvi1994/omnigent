@@ -46,7 +46,7 @@ import threading
 import time
 from collections.abc import Iterator
 from concurrent import futures
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -178,10 +178,8 @@ class _LeasedBackend:
         grpc delivers that to the clients as ``UNAVAILABLE`` / ``Cancelling all
         calls``.
         """
-        stopper = threading.Thread(target=self.server.stop, args=(None,), daemon=True)
-        stopper.start()
-        stopper.join(timeout=20.0)
-        assert not stopper.is_alive(), (
+        stopped = self.server.stop(grace=None)
+        assert stopped.wait(timeout=20.0), (
             "backing gRPC server did not stop after cancelling its calls"
         )
 
@@ -205,7 +203,7 @@ def leased_grpc_backend() -> Iterator[_LeasedBackend]:
 
         :param request: Raw request payload (unused).
         :param context: Servicer context, polled so a cancelled call returns.
-        :returns: An empty listing if the call survives (it should not).
+        :returns: An empty listing, discarded because the call was already cancelled.
         """
         del request
         assert backend is not None
@@ -214,6 +212,8 @@ def leased_grpc_backend() -> Iterator[_LeasedBackend]:
         deadline = time.monotonic() + 60.0
         while context.is_active() and time.monotonic() < deadline:
             time.sleep(0.05)
+        if context.is_active():
+            context.abort(grpc.StatusCode.DEADLINE_EXCEEDED, "teardown never cancelled the call")
         return b""
 
     server, target = _serve_grpc(_hold)
@@ -536,15 +536,16 @@ def _drive_lease_release(base_url: str, backend: _LeasedBackend) -> list[_Client
         outcome.status_code = response.status_code
         outcome.body = response.text
 
-    cancelling_client = _open_cancellable_request(base_url)
     threads = [
         threading.Thread(target=_request, args=(outcome,), daemon=True) for outcome in outcomes
     ]
-    for thread in threads:
-        thread.start()
-    backend.wait_for_inflight(_LEASED_CLIENTS)
-
-    cancelling_client.close()
+    with closing(_open_cancellable_request(base_url)):
+        for thread in threads:
+            thread.start()
+        backend.wait_for_inflight(_LEASED_CLIENTS)
+    # Leaving the block drops client A's connection while all three calls are
+    # held. The pause is best-effort ordering only: nothing observable confirms
+    # the server saw the disconnect first, and the assertions hold either way.
     time.sleep(0.2)
     backend.release_lease()
 
@@ -556,43 +557,19 @@ def _drive_lease_release(base_url: str, backend: _LeasedBackend) -> list[_Client
     return outcomes
 
 
-def test_lease_release_answers_other_clients_with_upstream_cancelled(
+def test_lease_release_answers_499_and_books_no_unhandled_errors(
     leased_embedded_server: tuple[str, list[logging.LogRecord]],
     leased_grpc_backend: _LeasedBackend,
 ) -> None:
     """
-    Tearing the leased endpoint down must answer the other clients with the coded 499.
-
-    The still-connected clients' calls were cancelled by the endpoint teardown
-    (``UNAVAILABLE`` / ``Cancelling all calls``), an expected upstream
-    condition: each must get the same typed ``499 upstream_cancelled`` a
-    peer-CANCELLED call gets, never the catch-all's ``500 internal_error``.
-
-    :param leased_embedded_server: Base URL of the running server plus the
-        records captured from the ``omnigent.server.app`` logger.
-    :param leased_grpc_backend: The leased backend whose teardown is driven.
-    """
-    base_url, _records = leased_embedded_server
-
-    outcomes = _drive_lease_release(base_url, leased_grpc_backend)
-
-    received = [(outcome.status_code, outcome.error_code()) for outcome in outcomes]
-    assert received == [(499, "upstream_cancelled")] * len(outcomes), (
-        "lease release did not answer still-connected clients with upstream_cancelled:\n"
-        + "\n".join(outcome.describe() for outcome in outcomes)
-    )
-
-
-def test_lease_release_is_not_booked_as_unhandled_errors_per_request(
-    leased_embedded_server: tuple[str, list[logging.LogRecord]],
-    leased_grpc_backend: _LeasedBackend,
-) -> None:
-    """
-    Tearing the leased endpoint down must not book one UNKNOWN error per call.
+    Tearing the leased endpoint down answers the coded 499 and books no UNKNOWN error.
 
     Every call held on the channel (the cancelling client's own and the other
-    clients') escapes as ``UNAVAILABLE`` / ``Cancelling all calls``; none of
-    them is a server fault, so none may reach ``_handle_unhandled_exception``
+    clients') is cancelled by the teardown with ``UNAVAILABLE`` / ``Cancelling
+    all calls``, an expected upstream condition rather than a server fault. The
+    still-connected clients must receive the same typed ``499
+    upstream_cancelled`` a peer-CANCELLED call gets, never the catch-all's
+    ``500 internal_error``, and no call may reach ``_handle_unhandled_exception``
     as an ERROR-level ``Unhandled exception`` with category UNKNOWN. Each is
     booked instead as a WARNING upstream cancellation.
 
@@ -604,6 +581,14 @@ def test_lease_release_is_not_booked_as_unhandled_errors_per_request(
 
     outcomes = _drive_lease_release(base_url, leased_grpc_backend)
 
+    # Responses: the still-connected clients get the coded, retryable 499.
+    received = [(outcome.status_code, outcome.error_code()) for outcome in outcomes]
+    assert received == [(499, "upstream_cancelled")] * len(outcomes), (
+        "lease release did not answer still-connected clients with upstream_cancelled:\n"
+        + "\n".join(outcome.describe() for outcome in outcomes)
+    )
+
+    # Bookings: nothing reaches the catch-all as an unhandled error.
     unhandled = _unhandled_records(records, "UNAVAILABLE")
     assert not unhandled, (
         f"lease release booked {len(unhandled)} unhandled session error(s) "
@@ -611,11 +596,12 @@ def test_lease_release_is_not_booked_as_unhandled_errors_per_request(
         + "\n".join(_describe_booking(record) for record in unhandled)
     )
 
-    # The still-connected clients' calls are always in the handler when the
-    # teardown lands; the cancelling client's own call may already be gone.
+    # One booking per cancelled call: the still-connected clients' calls are
+    # always in the handler when the teardown lands; the cancelling client's
+    # own call may already be gone.
     cancelled = _upstream_cancelled_records(records, "UNAVAILABLE")
-    assert len(cancelled) >= len(outcomes), (
-        "expected a WARNING upstream-cancellation booking per still-connected client, "
+    assert len(outcomes) <= len(cancelled) <= _LEASED_CLIENTS, (
+        "expected one WARNING upstream-cancellation booking per cancelled call, "
         f"got {len(cancelled)}:\n"
         + "\n".join(
             _describe_booking(record) for record in records if record.levelno >= logging.WARNING
