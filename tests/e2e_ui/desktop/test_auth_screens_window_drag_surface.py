@@ -2,13 +2,15 @@
 
 On macOS the Electron shell hides the native title bar (``titleBarStyle:
 "hiddenInset"``), so the page is the window's only drag surface: a screen with
-no visible ``-webkit-app-region: drag`` element leaves the window impossible to
-move. The signed-in AppShell renders ``.electron-drag-strip``; ``/login``,
-``/register`` and ``/approve`` mount outside it (``web/src/App.tsx``).
+no visible ``-webkit-app-region: drag`` element under the top band leaves the
+window impossible to move. The signed-in AppShell renders ``.electron-drag-strip``;
+``/login``, ``/register`` and ``/approve`` mount outside it (``web/src/App.tsx``).
 
 The frameless window itself needs macOS, so these tests pin the observable
-invariant behind the symptom against a real accounts-mode server, presenting
-as the mac shell through the two signals ``isMacElectronShell()`` sniffs.
+invariants behind the symptom against a real accounts-mode server, presenting
+as the mac shell through the two signals ``isMacElectronShell()`` sniffs: a
+visible drag region covers the grab point in the top band, and every
+interactive control keeps the ``no-drag`` counter-region so it stays clickable.
 """
 
 from __future__ import annotations
@@ -51,15 +53,35 @@ _APP_REGION_JS = """
 }
 """
 
-# Zero-sized drag regions are excluded: a collapsed strip cannot be grabbed.
-_VISIBLE_DRAG_REGIONS_JS = f"""
-() => Array.from(document.querySelectorAll("*"))
-  .filter((el) => ({_APP_REGION_JS})(el) === "drag")
-  .filter((el) => {{ const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }})
-  .map((el) => `${{el.tagName.toLowerCase()}}.${{el.className}}`)
+# Where a user grabs the window: inside the 2.25rem title-bar band, clear of the
+# traffic lights. The strip has pointer-events: none, so elementFromPoint would
+# skip it; drag regions are matched by geometry instead.
+_GRAB_POINT = (400, 10)
+
+# The first visible drag region whose box covers the point, or null.
+_DRAG_REGION_AT_JS = f"""
+([x, y]) => {{
+  const regionOf = {_APP_REGION_JS};
+  for (const el of document.querySelectorAll("*")) {{
+    if (regionOf(el) !== "drag") continue;
+    const r = el.getBoundingClientRect();
+    const covers = r.left <= x && x <= r.right && r.top <= y && y <= r.bottom;
+    if (r.width > 0 && r.height > 0 && covers) {{
+      const size = `${{Math.round(r.width)}}x${{Math.round(r.height)}}`;
+      return `${{el.tagName.toLowerCase()}}.${{el.className}} ${{size}}`;
+    }}
+  }}
+  return null;
+}}
 """
 
-_GRAB_POINT = (400, 10)
+# Interactive controls missing the no-drag counter-region (they would move the
+# window instead of taking the click wherever they overlap a drag region).
+_DRAGGABLE_CONTROLS_JS = f"""
+() => Array.from(document.querySelectorAll('a, button, input, textarea, [role="button"]'))
+  .filter((el) => ({_APP_REGION_JS})(el) !== "no-drag")
+  .map((el) => el.tagName.toLowerCase() + (el.id ? `#${{el.id}}` : ""))
+"""
 
 
 @pytest.fixture(scope="module")
@@ -91,26 +113,12 @@ def mac_desktop_page(browser: Browser, browser_context_args: dict[str, Any]) -> 
     context.close()
 
 
-def _visible_drag_regions(page: Page) -> list[str]:
-    return page.evaluate(_VISIBLE_DRAG_REGIONS_JS)
+def _drag_region_at(page: Page, point: tuple[int, int]) -> str | None:
+    return page.evaluate(_DRAG_REGION_AT_JS, list(point))
 
 
-def _attempt_window_drag(page: Page) -> str:
-    """Grab the window's top band and pull, paced like a real gesture.
-
-    :returns: The computed app-region under the grab point.
-    """
-    x, y = _GRAB_POINT
-    page.mouse.move(x, y)
-    page.mouse.down()
-    for step in range(x + 20, 700, 40):
-        page.mouse.move(step, y + 4)
-        page.wait_for_timeout(80)
-    page.mouse.up()
-    page.wait_for_timeout(1_200)
-    return page.evaluate(
-        f"() => ({_APP_REGION_JS})(document.elementFromPoint({x}, {y}) || document.body)"
-    )
+def _draggable_controls(page: Page) -> list[str]:
+    return page.evaluate(_DRAGGABLE_CONTROLS_JS)
 
 
 def _snapshot(page: Page, name: str) -> None:
@@ -128,15 +136,24 @@ def _sign_in(page: Page, server: AccountsServer) -> None:
     expect(page).not_to_have_url(re.compile(r"/login"), timeout=30_000)
 
 
-def _assert_drag_surface(page: Page, screen: str) -> None:
-    grab_region = _attempt_window_drag(page)
-    regions = _visible_drag_regions(page)
-    _snapshot(page, f"{screen}-after-drag")
-    assert regions, (
-        f"{screen} renders no visible `-webkit-app-region: drag` element "
-        f"(app-region under the grab point: {grab_region!r}); with the native title "
-        "bar hidden on the macOS shell the window cannot be moved from this screen."
+def _assert_drag_surface(page: Page, screen: str) -> str:
+    """Assert the screen is draggable by its top band without trapping its controls.
+
+    :returns: A description of the drag region covering the grab point.
+    """
+    region = _drag_region_at(page, _GRAB_POINT)
+    _snapshot(page, screen)
+    assert region, (
+        f"{screen} renders no visible `-webkit-app-region: drag` element covering the "
+        f"top band at {_GRAB_POINT}; with the native title bar hidden on the macOS shell "
+        "the window cannot be moved from this screen."
     )
+    draggable_controls = _draggable_controls(page)
+    assert not draggable_controls, (
+        f"{screen}: these interactive controls lack the no-drag counter-region, so they "
+        f"would move the window instead of taking clicks: {draggable_controls}"
+    )
+    return region
 
 
 def test_sign_in_screen_offers_window_drag_surface(
@@ -160,6 +177,7 @@ def test_register_screen_offers_window_drag_surface(
 def test_approve_screen_offers_window_drag_surface(
     accounts_server: AccountsServer, mac_desktop_page: Page
 ) -> None:
+    """Signing in first also exercises the form's controls under the sign-in strip."""
     page = mac_desktop_page
     _sign_in(page, accounts_server)
     page.goto(f"{accounts_server.public_url}/approve/no-such-session/no-such-elicitation")
@@ -170,11 +188,9 @@ def test_approve_screen_offers_window_drag_surface(
 def test_signed_in_shell_offers_window_drag_surface(
     accounts_server: AccountsServer, mac_desktop_page: Page
 ) -> None:
-    """Control: the AppShell's own strip is detected by the same probe."""
+    """Control: the AppShell's own strip satisfies the same probe."""
     page = mac_desktop_page
     _sign_in(page, accounts_server)
     page.wait_for_selector(".electron-drag-strip", state="attached", timeout=30_000)
-    _attempt_window_drag(page)
-    regions = _visible_drag_regions(page)
-    _snapshot(page, "signed-in-shell-after-drag")
-    assert any("electron-drag-strip" in region for region in regions), regions
+    region = _assert_drag_surface(page, "signed-in-shell")
+    assert "electron-drag-strip" in region, region

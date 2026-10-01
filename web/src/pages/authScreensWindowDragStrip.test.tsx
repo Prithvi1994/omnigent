@@ -1,10 +1,6 @@
-// Wiring tests: every page mounted OUTSIDE the AppShell (login, register,
-// first-run setup, approve — plus the shared v2 AuthCardShell) must render
-// the ElectronWindowDragStrip on the macOS Electron desktop shell. There the
-// native title bar is hidden (titleBarStyle "hiddenInset"), so a screen
-// without a `-webkit-app-region: drag` element leaves the desktop window
-// impossible to move at all — the AppShell's own strip never mounts on these
-// screens, so each must carry its own.
+// Wiring tests: every page mounted outside the AppShell (login, register, first-run
+// setup, approve, the shared v2 AuthCardShell) must render ElectronWindowDragStrip on
+// the mac Electron shell — the AppShell's own strip never mounts on these screens.
 
 import { cleanup, render } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";

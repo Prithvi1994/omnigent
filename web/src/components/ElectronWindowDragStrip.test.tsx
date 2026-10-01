@@ -1,13 +1,6 @@
-// Unit tests for ElectronWindowDragStrip — the window-drag surface pages
-// mounted OUTSIDE the AppShell render so the frameless macOS desktop window
-// stays movable (the shell hides the native title bar, so a screen without a
-// `-webkit-app-region: drag` element leaves the window impossible to move).
-//
-// Detection goes through isMacElectronShell(): the `window.omnigentDesktop`
-// preload bridge (kind "electron") plus a Macintosh user agent. Each case
-// installs/clears those two signals and asserts the strip renders exactly on
-// the mac desktop shell — a plain browser, a non-mac Electron shell, and a
-// mac Safari page must all get nothing.
+// ElectronWindowDragStrip must render only on the macOS Electron shell. Detection needs
+// both signals isMacElectronShell() sniffs — the `window.omnigentDesktop` preload bridge
+// and a Macintosh user agent — so each case installs or clears them and checks the strip.
 
 import { cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";

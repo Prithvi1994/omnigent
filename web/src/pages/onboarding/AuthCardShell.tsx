@@ -1,7 +1,6 @@
-// Card shell for the v2 auth pages: the onboarding AnimatedOmnigentPanel.
-// Desktop shows the animated card; mobile (<md) drops the chrome and animation
-// and lets the content flow. On the macOS Electron shell the strip keeps the
-// frameless window draggable (this shell is the page's only chrome).
+// Card shell for the v2 auth pages: the onboarding AnimatedOmnigentPanel. Desktop shows
+// the animated card; mobile (<md) drops the chrome and animation and lets the content
+// flow. On the macOS Electron shell the drag strip keeps the frameless window movable.
 
 import type { CSSProperties, ReactNode } from "react";
 import { ElectronWindowDragStrip } from "@/components/ElectronWindowDragStrip";

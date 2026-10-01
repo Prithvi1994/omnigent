@@ -836,12 +836,9 @@ aside[aria-label="Workspace"][data-maximized] {
   height: 2.25rem;
   -webkit-app-region: drag;
 }
-/* Screens mounted OUTSIDE the AppShell (login / register / first-run setup /
- * approve) carry no chrome, so on the macOS desktop shell — native title bar
- * hidden, the page is the window's only drag surface — they render this strip
- * (ElectronWindowDragStrip, only on that shell). Fixed so it rides the window
- * rather than the page scroll; spans edge to edge since these screens keep no
- * action cluster in the title-bar band (unlike the AppShell strip above). */
+/* Screens mounted outside the AppShell (login / register / setup / approve) render
+ * this strip (ElectronWindowDragStrip, mac shell only) so the frameless window stays
+ * draggable. Fixed so it rides the window; edge to edge, no title-bar cluster here. */
 .electron-standalone-drag-strip {
   position: fixed;
   inset: 0 0 auto 0;
@@ -851,10 +848,9 @@ aside[aria-label="Workspace"][data-maximized] {
    * strip from swallowing DOM clicks on anything that lands in its band. */
   pointer-events: none;
 }
-/* Drag regions are geometric (see the [data-electron-mac] counter-rule above):
- * a tall auth card scrolled up under the strip would lose clicks on whatever
- * lands in that band. These pages don't set data-electron-mac, so scope the
- * same interactive-elements counter-rule to the strip's presence. */
+/* Drag regions are geometric, so content scrolled under the strip would lose clicks.
+ * These pages don't set data-electron-mac, so scope the interactive-elements no-drag
+ * counter-rule to the strip's presence instead. */
 body:has(.electron-standalone-drag-strip) :is(a, button, input, textarea, [role="button"]) {
   -webkit-app-region: no-drag;
 }
