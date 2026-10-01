@@ -124,7 +124,7 @@ export function useResizableCommentsPanel() {
   // the sibling code/diff viewer so the panel can't swallow the whole row.
   const clampWidth = useCallback((candidate: number): number => {
     const parent = containerRef.current?.parentElement;
-    const parentWidth = parent?.getBoundingClientRect().width ?? window.innerWidth;
+    const parentWidth = parent?.getBoundingClientRect().width || window.innerWidth;
     const max = Math.max(MIN_WIDTH_PX, Math.min(MAX_WIDTH_PX, parentWidth - MIN_VIEWER_PX));
     return Math.max(MIN_WIDTH_PX, Math.min(candidate, max));
   }, []);
@@ -136,10 +136,7 @@ export function useResizableCommentsPanel() {
     const update = () => {
       setSideBySide(row.getBoundingClientRect().width >= SIDE_BY_SIDE_MIN_PX);
       // Restore the preferred width as space returns.
-      setStoredWidth((prev) => {
-        const base = preferredWidth ?? prev;
-        return base !== null ? clampWidth(base) : prev;
-      });
+      setStoredWidth(clampWidth(preferredWidth ?? DEFAULT_WIDTH_PX));
     };
     update();
     if (typeof ResizeObserver === "undefined") return;
@@ -210,17 +207,14 @@ export function useResizableCommentsPanel() {
     function onResize() {
       // Re-derive the effective width from the persisted preference so the
       // panel widens back to the user's choice when the row regains space.
-      setStoredWidth((prev) => {
-        const base = preferredWidth ?? prev;
-        return base !== null ? clampWidth(base) : prev;
-      });
+      setStoredWidth(clampWidth(preferredWidth ?? DEFAULT_WIDTH_PX));
     }
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, [clampWidth]);
 
   return {
-    /** Pixel width to apply as an inline style while side-by-side. */
+    /** Side-by-side width in px; the panel applies it only beside the viewer. */
     width,
     /** Attach to the panel root to anchor drag math and the dynamic max. */
     containerRef,

@@ -442,20 +442,29 @@ function renderPanelInRow(rowWidth: number) {
 }
 
 describe("CommentsPanel resize affordance", () => {
-  it("renders a resize handle and applies an inline width beside a wide viewer row", () => {
+  it("renders a resize handle and exposes the side-by-side width beside a wide viewer row", () => {
     renderPanelInRow(800);
 
     // The separator is the drag handle; its parent is the panel root, which
-    // gets an explicit pixel width (default 240px) so it can be dragged wider.
+    // carries the side-by-side width (default 240px) as a CSS variable that
+    // the container query applies only beside the viewer.
     const handle = screen.getByRole("separator", { name: "Resize comments panel" });
-    expect((handle.parentElement as HTMLElement).style.width).toBe("240px");
+    const panel = handle.parentElement as HTMLElement;
+    expect(panel.style.getPropertyValue("--comments-panel-width")).toBe("240px");
+    expect(panel.style.width).toBe("");
   });
 
-  it("omits the handle and inline width when the viewer row is too narrow", () => {
+  it("shrinks the default width so a tight viewer row keeps 240px for the viewer", () => {
+    // 472px row - 240px viewer minimum = 232px for the panel.
+    renderPanelInRow(472);
+    const handle = screen.getByRole("separator", { name: "Resize comments panel" });
+    const panel = handle.parentElement as HTMLElement;
+    expect(panel.style.getPropertyValue("--comments-panel-width")).toBe("232px");
+  });
+
+  it("omits the handle when the viewer row is too narrow", () => {
     renderPanelInRow(220);
     expect(screen.queryByRole("separator", { name: "Resize comments panel" })).toBeNull();
-    const panel = screen.getByText("Comments").closest("div")?.parentElement as HTMLElement;
-    expect(panel.style.width).toBe("");
   });
 });
 

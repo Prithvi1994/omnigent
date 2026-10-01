@@ -164,8 +164,11 @@ export function CommentsPanel({
   return (
     <div
       ref={containerRef}
-      style={sideBySide ? { width } : undefined}
-      className="relative flex shrink-0 flex-col overflow-hidden border-border w-full h-64 border-t @md/viewer:h-auto @md/viewer:border-t-0 @md/viewer:border-l"
+      data-testid="comments-panel"
+      // The `@md/viewer` class applies this width only beside the viewer, so
+      // the stacked layout never inherits a side-by-side width.
+      style={{ "--comments-panel-width": `${width}px` } as React.CSSProperties}
+      className="relative flex shrink-0 flex-col overflow-hidden border-border w-full h-64 border-t @md/viewer:h-auto @md/viewer:w-(--comments-panel-width) @md/viewer:border-t-0 @md/viewer:border-l"
     >
       {/* Resize handle appears only beside the viewer. */}
       {sideBySide && (
