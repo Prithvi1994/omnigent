@@ -873,6 +873,7 @@ class _ReusedDatabricksTokenSource:
         self._server_url = server_url
         self._host = host
         self._auth: _DatabricksBearerAuth | None = None
+        self._last_failure: str | None = None
 
     def _resolve(self) -> _DatabricksBearerAuth | None:
         """Resolve fresh SDK auth, returning ``None`` on credential failure."""
@@ -887,7 +888,13 @@ class _ReusedDatabricksTokenSource:
             if workspace_host is not None:
                 return _resolve_databricks_auth(host=workspace_host)[0]
             return _resolve_databricks_auth()[0]
-        except (DatabricksAuthError, ImportError, ValueError):
+        except (DatabricksAuthError, ImportError, ValueError) as exc:
+            # Resolution is retried on every mint while no auth is cached, so
+            # report each distinct reason once rather than on every attempt.
+            reason = str(exc)
+            if reason != self._last_failure:
+                self._last_failure = reason
+                logger.info("Databricks SDK credential resolution failed: %s", reason)
             return None
 
     def current_token(self) -> str | None:
@@ -902,6 +909,7 @@ class _ReusedDatabricksTokenSource:
         if auth is None:
             return None
         self._auth = auth
+        self._last_failure = None
         try:
             return auth.current_token()
         except DatabricksAuthError:

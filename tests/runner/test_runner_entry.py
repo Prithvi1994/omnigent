@@ -512,7 +512,7 @@ def test_sdk_credential_resolution_failure_reason_is_logged(
         "omnigent.inner.databricks_executor._resolve_databricks_auth", _no_sdk_auth
     )
 
-    with caplog.at_level(logging.INFO, logger="omnigent.runner._entry"):
+    with caplog.at_level(logging.INFO, logger="omnigent.inner.databricks_executor"):
         assert _make_auth_token_factory() is None
 
     assert any(
