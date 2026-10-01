@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from omnigent.errors import ErrorCategory
 from omnigent.runner.launch_failure import (
     FailureDiagnosis,
     classify_native_turn_error,
@@ -33,7 +34,7 @@ def test_classifies_root_permission_failure() -> None:
 
 def test_root_failure_survives_mid_word_truncation() -> None:
     # The pane snapshot may be clipped to "...for secuRITY REASONS" — the
-    # matcher keys on "security reasons", which line-boundary trimming keeps.
+    # matcher keys on "security reasons", which tail trimming keeps.
     diagnosis = classify_terminal_failure(
         command="claude",
         exit_status=1,
@@ -41,6 +42,26 @@ def test_root_failure_survives_mid_word_truncation() -> None:
     )
     assert diagnosis is not None
     assert diagnosis.title == "Claude Code can't run as root"
+
+
+@pytest.mark.parametrize(
+    ("command", "exit_status", "output"),
+    [
+        (
+            "env",
+            0,
+            "'--background' is disabled by CLAUDE_CODE_DISABLE_AGENT_VIEW.\n"
+            "Claude Code exited with code 1",
+        ),
+        ("env", 0, "error: unknown option '--codex' (did you mean --model?)"),
+        ("codex", 2, "error: unexpected argument '--foo' found\n\nUsage: codex [OPTIONS]"),
+    ],
+)
+def test_classifies_rejected_arguments(command: str, exit_status: int, output: str) -> None:
+    diagnosis = classify_terminal_failure(command=command, exit_status=exit_status, output=output)
+    assert diagnosis is not None
+    assert diagnosis.title == "Agent CLI rejected its launch arguments"
+    assert diagnosis.category is ErrorCategory.CONFIG
 
 
 @pytest.mark.parametrize(
@@ -164,9 +185,55 @@ def test_preserves_other_native_turn_errors(message: str) -> None:
     assert classify_native_turn_error("native_turn_error", message) == "native_turn_error"
 
 
-@pytest.mark.parametrize("code", ["codex_reauth_required", "workspace_missing", "invalid_input"])
+@pytest.mark.parametrize("code", ["workspace_missing", "invalid_input"])
 def test_rate_limit_text_does_not_override_specific_failure_codes(code: str) -> None:
     assert classify_native_turn_error(code, "HTTP 429: rate limit exceeded") == code
+
+
+@pytest.mark.parametrize(
+    "code",
+    # Budget detection runs before the early-return guard, so it applies to
+    # codex_reauth_required (old runners) as well as the two generic codes.
+    ["native_turn_error", "codex_turn_error", "codex_reauth_required"],
+)
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Realistic AI-gateway budget exhaustion message (budget name/id synthetic).
+        (
+            'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED","message":'
+            '"Budget \\"test-budget\\" (00000000-0000-0000-0000-000000000001) has reached'
+            " its limit of $100. To continue, contact an admin to increase the budget or"
+            ' use a different budget."}'
+        ),
+        # Realistic budget message with the old re-auth hint appended by older runners.
+        (
+            'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED","message":'
+            '"Budget \\"test-budget\\" (00000000-0000-0000-0000-000000000001) has reached'
+            " its limit of $100. To continue, contact an admin to increase the budget or"
+            ' use a different budget."}\n\n'
+            "If this looks like an auth issue, running `codex login` may help."
+        ),
+        # Minimal form — just the key phrase.
+        "Budget X has reached its limit of $0.",
+        # Disabled per-user rate limit (rate limit is set to 0).
+        (
+            'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED",'
+            '"message":"rate limit is set to 0 for user test@example.com"}'
+        ),
+    ],
+)
+def test_classifies_budget_exhausted(code: str, message: str) -> None:
+    assert classify_native_turn_error(code, message) == "budget_exhausted"
+
+
+def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
+    """A real auth failure under codex_reauth_required must not be reclassified."""
+    message = (
+        "401 Unauthorized: your login has expired.\n\n"
+        "If this looks like an auth issue, running `codex login` may help."
+    )
+    assert classify_native_turn_error("codex_reauth_required", message) == "codex_reauth_required"
 
 
 @pytest.mark.parametrize(
@@ -179,6 +246,10 @@ def test_rate_limit_text_does_not_override_specific_failure_codes(code: str) -> 
         ("connection_error", "connection"),
         ("context_length_exceeded", "context window"),
         ("rate_limit_exceeded", "You can retry this turn"),
+        ("budget_exhausted", "budget"),
+        ("databricks_sign_in_pending", "Databricks sign-in"),
+        ("agent_startup_pending", "still starting"),
+        ("codex_thread_not_started", "never ran"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:
