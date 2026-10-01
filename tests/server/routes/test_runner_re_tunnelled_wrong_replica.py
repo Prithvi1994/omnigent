@@ -36,9 +36,11 @@ def _conv(runner_id, runner_last_seen):
     )
 
 
-async def _run(conv, store, monkeypatch, own_stamp):
+async def _run(fresh_conv, monkeypatch, *, classified_runner_id, own_stamp):
     monkeypatch.setattr(routes_events, "last_liveness_stamp", lambda _rid: own_stamp)
-    await routes_events._raise_if_runner_re_tunnelled_to_another_replica("conv_1", conv, store)
+    await routes_events._raise_if_runner_re_tunnelled_to_another_replica(
+        "conv_1", classified_runner_id, _Store(fresh_conv)
+    )
 
 
 @pytest.mark.asyncio
@@ -46,7 +48,7 @@ async def test_fresh_sibling_stamp_raises_wrong_replica(monkeypatch):
     """A fresh stamp this process never wrote is a live sibling → WRONG_REPLICA."""
     conv = _conv("runner_abc", int(time.time()))
     with pytest.raises(OmnigentError) as exc:
-        await _run(conv, _Store(conv), monkeypatch, own_stamp=None)
+        await _run(conv, monkeypatch, classified_runner_id="runner_abc", own_stamp=None)
     assert exc.value.code == ErrorCode.WRONG_REPLICA
 
 
@@ -56,25 +58,33 @@ async def test_own_stamp_does_not_raise(monkeypatch):
     now = int(time.time())
     conv = _conv("runner_abc", now)
     # Our own last stamp is at least as new as the row's → not a sibling.
-    await _run(conv, _Store(conv), monkeypatch, own_stamp=now)
+    await _run(conv, monkeypatch, classified_runner_id="runner_abc", own_stamp=now)
 
 
 @pytest.mark.asyncio
 async def test_stale_stamp_does_not_raise(monkeypatch):
     """A stamp past the liveness TTL is not a live runner anywhere."""
     conv = _conv("runner_abc", int(time.time()) - 10_000)
-    await _run(conv, _Store(conv), monkeypatch, own_stamp=None)
+    await _run(conv, monkeypatch, classified_runner_id="runner_abc", own_stamp=None)
 
 
 @pytest.mark.asyncio
 async def test_no_runner_id_does_not_raise(monkeypatch):
     """A session with no bound runner has nothing to re-address."""
     conv = _conv(None, int(time.time()))
-    await _run(conv, _Store(conv), monkeypatch, own_stamp=None)
+    await _run(conv, monkeypatch, classified_runner_id=None, own_stamp=None)
+
+
+@pytest.mark.asyncio
+async def test_rebound_runner_does_not_raise(monkeypatch):
+    """A concurrent relaunch rebound the row to a new runner; the old runner's
+    retained stamp must not be read as the old runner being live elsewhere."""
+    # Row now bound to runner_new (fresh stamp), but we are classifying runner_old.
+    conv = _conv("runner_new", int(time.time()))
+    await _run(conv, monkeypatch, classified_runner_id="runner_old", own_stamp=None)
 
 
 @pytest.mark.asyncio
 async def test_missing_row_does_not_raise(monkeypatch):
     """A row that can't be re-read yields no false WRONG_REPLICA."""
-    conv = _conv("runner_abc", int(time.time()))
-    await _run(conv, _Store(None), monkeypatch, own_stamp=None)
+    await _run(None, monkeypatch, classified_runner_id="runner_abc", own_stamp=None)

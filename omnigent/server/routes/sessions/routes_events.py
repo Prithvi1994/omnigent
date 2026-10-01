@@ -422,7 +422,7 @@ async def _raise_if_runner_on_another_replica(
 
 async def _raise_if_runner_re_tunnelled_to_another_replica(
     session_id: str,
-    conv: Conversation,
+    runner_id: str | None,
     conversation_store: ConversationStore,
 ) -> None:
     """
@@ -442,17 +442,30 @@ async def _raise_if_runner_re_tunnelled_to_another_replica(
     window because the host's own liveness has not re-settled when the message
     lands; the runner stamp settles first.
 
+    The re-read confirms the row is still bound to *runner_id* before trusting
+    its stamp: a concurrent relaunch can rebind the row to a new runner without
+    clearing the old stamp, and that retained stamp must not be read as the old
+    runner being live elsewhere (mirrors the ``runner_id`` guard in
+    :func:`_runner_live_on_another_replica_from_conversations`).
+
+    Bounded worst case: if the replica that held the tunnel died ungracefully
+    (no ``clear_runner_liveness``) and the runner did not reconnect anywhere,
+    the stale stamp stays fresh for up to ``RUNNER_LIVENESS_TTL_S``; callers
+    retry on ``WRONG_REPLICA`` for that window before the real failure surfaces.
+
     :param session_id: Session/conversation identifier.
-    :param conv: Session row whose runner client could not be resolved here.
+    :param runner_id: Runner id being classified (captured before the wait).
     :param conversation_store: Store used to re-read the fresh runner stamp.
     :raises OmnigentError: ``WRONG_REPLICA`` when the bound runner's liveness
         stamp is fresh evidence written by another replica.
     """
-    runner_id = conv.runner_id
     if runner_id is None:
         return
     fresh = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-    stamp = fresh.runner_last_seen if fresh is not None else None
+    if fresh is None or fresh.runner_id != runner_id:
+        # The row was rebound (or is gone); its stamp is not this runner's.
+        return
+    stamp = fresh.runner_last_seen
     if stamp is None or not runner_seen_is_fresh(stamp):
         return
     own_stamp = last_liveness_stamp(runner_id)
@@ -2367,12 +2380,15 @@ def register_events_routes(
             # this pod has no local tunnel: fail retryably (WRONG_REPLICA) so the
             # client re-addresses, rather than recording a spurious
             # runner_failed_to_start against a runner that just re-tunnelled
-            # elsewhere. The stamp this check reads settles before the host's
-            # own liveness does, so it catches the window the host-level guard
-            # above misses.
-            await _raise_if_runner_re_tunnelled_to_another_replica(
-                session_id, conv, conversation_store
-            )
+            # elsewhere. The runner stamp settles before the host's own liveness
+            # does, so this catches the window the host-level guard above misses.
+            # Skipped when the host definitively refused to launch ("no runner is
+            # coming"): that is an authoritative local answer, so surface it
+            # below instead of converting it into a retry.
+            if not relaunched_launch_refused:
+                await _raise_if_runner_re_tunnelled_to_another_replica(
+                    session_id, conv.runner_id, conversation_store
+                )
             # A native terminal-session message must NOT be silently
             # dropped when no runner is reachable — the runner crashed
             # before connecting (the daemon couldn't bring it up). Persist
