@@ -4343,8 +4343,7 @@ async function reconcileInitialHistory(
       if (stale()) return;
       failures += 1;
       console.warn(`Session ${id}: initial history catch-up failed (attempt ${failures})`, error);
-      if (failures >= 2) return;
-      await abortableDelay(250, controller.signal);
+      await abortableDelay(nextReconnectDelay(failures), controller.signal);
       continue;
     }
     if (stale()) return;
@@ -4371,16 +4370,16 @@ async function reconcileInitialHistory(
           isLiveProvisionalBlock(b) ||
           (!b.ctx.itemId && b.ctx.responseId === state.activeResponse?.responseId),
       );
-      let insertAt =
-        anchorId === null
-          ? 0
-          : anchor !== undefined
-            ? anchor + 1
-            : successor?.ctx.itemId
-              ? firstIndex.get(successor.ctx.itemId)!
-              : liveStart >= 0
-                ? liveStart
-                : kept.length;
+      let insertAt = kept.length;
+      if (anchorId === null) insertAt = 0;
+      else if (anchor !== undefined) insertAt = anchor + 1;
+      else {
+        const successorAt = successor?.ctx.itemId
+          ? firstIndex.get(successor.ctx.itemId)
+          : undefined;
+        if (successorAt !== undefined) insertAt = successorAt;
+        else if (liveStart >= 0) insertAt = liveStart;
+      }
       const additions = new Map<number, AnyBlock[]>();
       for (const block of recovered) {
         if (block.ctx.itemId && seen.has(block.ctx.itemId)) {
@@ -4390,19 +4389,25 @@ async function reconcileInitialHistory(
           const bucket = additions.get(insertAt) ?? [];
           bucket.push(block);
           additions.set(insertAt, bucket);
-          if (block.type === "user_message") recoveredInputs.add(block.ctx.itemId);
         }
       }
       const blocks = kept.flatMap((block, i) => [...(additions.get(i) ?? []), block]);
       blocks.push(...(additions.get(kept.length) ?? []));
-      const acknowledged = unseen.filter(
+      const recoveredUserInputs = unseen.filter(
         (b) => b.type === "user_message" && !isSystemUserContent(b.content),
-      ).length;
-      let remaining = acknowledged;
+      );
+      let acknowledged = 0;
       const pendingUserMessages = state.pendingUserMessages.filter((p) => {
-        if (remaining === 0 || p.initialDraft || !pendingAtConnect.has(p.tempId)) return true;
+        if (
+          acknowledged === recoveredUserInputs.length ||
+          p.initialDraft ||
+          !pendingAtConnect.has(p.tempId)
+        )
+          return true;
+        const itemId = recoveredUserInputs[acknowledged]?.ctx.itemId;
+        if (itemId) recoveredInputs.add(itemId);
         pendingAtConnect.delete(p.tempId);
-        remaining -= 1;
+        acknowledged += 1;
         return false;
       });
       return { blocks, pendingUserMessages };
@@ -5456,7 +5461,9 @@ export async function startStreamPump(
         if (reconnecting) {
           await reconcileOnReconnect(id, set, get, ignoredNativeMessageIds);
         } else {
-          await onInitialConnect?.();
+          void onInitialConnect?.().catch((error) => {
+            console.warn(`Session ${id}: initial history catch-up crashed`, error);
+          });
         }
         let reason = await pumpPromise;
 
@@ -7106,11 +7113,6 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       //      client).
       applyToConversation((s) => {
         if (hasCommittedItem(s.blocks, event.itemId)) {
-          if (
-            s.abortController &&
-            recoveredInputsByController.get(s.abortController)?.has(event.itemId)
-          )
-            return {};
           // The committed copy is already in `blocks` — the forwarder-mirrored
           // item beat this event through the stream, or a snapshot merge
           // inserted it. Still ack the optimistic bubble: returning without
@@ -7127,6 +7129,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               ],
             };
           }
+          if (
+            s.abortController &&
+            recoveredInputsByController.get(s.abortController)?.has(event.itemId)
+          )
+            return {};
           // FIFO-head fallback — same marker guard as the promote path below. A
           // mirrored system marker (the vendor CLI's own `[Request interrupted
           // by user]` record) is synthesized by the CLI, owns no pending entry,

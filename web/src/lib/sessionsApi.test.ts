@@ -1357,6 +1357,32 @@ describe("exportSessionTranscript", () => {
 });
 
 describe("fetchSessionItemsPage", () => {
+  it.each([null, "msg_0"])("preserves forward order from cursor %s", async (newerThan) => {
+    const items = ["msg_1", "msg_2"].map((id) => ({
+      id,
+      response_id: "turn",
+      type: "message",
+      role: "user",
+      status: "completed",
+      content: [{ type: "input_text", text: id }],
+    }));
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ data: items, has_more: true }));
+    const page = await fetchSessionItemsPage("conv_abc", { newerThan });
+    expect(page.items.map((item) => item.id)).toEqual(["msg_1", "msg_2"]);
+    expect(page.hasMore).toBe(true);
+    const params = new URL(String(fetchMock.mock.calls[0]![0]), "https://example.test")
+      .searchParams;
+    expect(params.get("order")).toBe("asc");
+    expect(params.get("after")).toBe(newerThan);
+  });
+
+  it("rejects conflicting pagination directions before making a request", async () => {
+    await expect(
+      fetchSessionItemsPage("conv_abc", { newerThan: null, olderThan: "msg_1" }),
+    ).rejects.toThrow("Pass either olderThan or newerThan");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("requests the newest page (order=desc) and returns items oldest-to-newest", async () => {
     // Server returns newest-first; the helper must reverse to chronological
     // so history renders in the same order the live stream appends.

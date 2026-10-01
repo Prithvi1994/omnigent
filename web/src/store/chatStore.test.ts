@@ -1107,6 +1107,8 @@ describe("chatStore — switchTo", () => {
       { name: "background", background: true },
       { name: "paged-gap", paged: true },
       { name: "pending-inputs", pending: true },
+      { name: "named-receipt", named: true },
+      { name: "late-local-receipt", late: true },
       { name: "transient-failure", retry: true },
       { name: "removed-anchor", missingAnchor: true },
     ].map((scenario) => ({
@@ -1120,7 +1122,7 @@ describe("chatStore — switchTo", () => {
     })),
   )(
     "recovers a side-chat question committed before subscription ($name)",
-    async ({ streamFirst, background, paged, pending, retry, missingAnchor }) => {
+    async ({ streamFirst, background, paged, pending, named, late, retry, missingAnchor }) => {
       const id = "conv_side_initial_gap";
       const before = userMessage("before_side", "Earlier question");
       const hidden: ConversationItem = { ...userMessage("hidden", "internal"), is_meta: true };
@@ -1150,6 +1152,7 @@ describe("chatStore — switchTo", () => {
           itemFetches += 1;
           if (itemFetches === 1) return initialItems;
           if (itemFetches === 2) return backfill;
+          if (retry && itemFetches === 3) return mockResponse({}, { ok: false, status: 503 });
         }
         return defaultFetchHandler(input, init);
       });
@@ -1171,7 +1174,7 @@ describe("chatStore — switchTo", () => {
       }
       if (!streamFirst) openStream(mockResponse(null, { bodyStream: sink.stream }));
       await vi.waitFor(() => expect(itemFetches).toBe(2));
-      if (pending) {
+      if (pending || named || late) {
         useChatStore.setState({
           pendingUserMessages: [
             ...useChatStore.getState().pendingUserMessages,
@@ -1224,6 +1227,7 @@ describe("chatStore — switchTo", () => {
         sse("session.input.consumed", {
           data: {
             item_id: question.id,
+            ...(named ? { cleared_pending_id: "later" } : {}),
             type: "message",
             data: { role: "user", content: [{ type: "input_text", text: "Hi" }] },
           },
@@ -1240,6 +1244,7 @@ describe("chatStore — switchTo", () => {
           "replay processed",
         ),
       );
+      if (named) expect(conversationRegistry.peek(id)!.getState().pendingUserMessages).toEqual([]);
       if (pending)
         expect(
           conversationRegistry
@@ -1258,6 +1263,41 @@ describe("chatStore — switchTo", () => {
       sink.close();
     },
   );
+
+  it("keeps streaming when catch-up receives a malformed item page", async () => {
+    const id = "conv_bad_catchup";
+    seedSession(id, []);
+    const sink = pushableStream();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    onTestFinished(() => warn.mockRestore());
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === `/v1/sessions/${id}/stream`)
+        return mockResponse(null, { bodyStream: sink.stream });
+      if (url.includes(`/v1/sessions/${id}/items`) && url.includes("order=asc")) {
+        return mockResponse({ data: null, has_more: false });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().switchTo(id);
+    await vi.waitFor(() =>
+      expect(warn).toHaveBeenCalledWith(
+        `Session ${id}: initial history catch-up crashed`,
+        expect.any(Error),
+      ),
+    );
+    sink.push(
+      sse("session.todos", {
+        conversation_id: id,
+        todos: [{ content: "stream survived", status: "completed", activeForm: "checking" }],
+      }),
+    );
+    await vi.waitFor(() =>
+      expect(useChatStore.getState().todos[0]?.content).toBe("stream survived"),
+    );
+    sink.push("data: [DONE]\n\n");
+    sink.close();
+  });
 
   it("hydrates blocks from the session snapshot when switching to a real conv id", async () => {
     const items: ConversationItem[] = [
@@ -2080,16 +2120,12 @@ describe("chatStore — switchTo", () => {
     // Older items remain, so scroll-up loading is armed. `false` here
     // would strand the user with no way to reach earlier turns.
     expect(state.hasMoreHistory).toBe(true);
-    // Catch-up only asks for NEWER items; older history remains user-paged.
-    await vi.waitFor(() => {
-      const itemFetches = fetchMock.mock.calls.filter(([u]) =>
-        String(u).startsWith("/v1/sessions/conv_big/items"),
-      );
-      expect(itemFetches).toHaveLength(2);
-      expect(String(itemFetches[0]![0])).toContain("order=desc");
-      expect(String(itemFetches[1]![0])).toContain("order=asc");
-      expect(String(itemFetches[1]![0])).toContain(`after=${fullItems.at(-1)!.id}`);
-    });
+    // Catch-up never pages backwards through history the reader did not request.
+    const historyFetches = fetchMock.mock.calls.filter(
+      ([u]) =>
+        String(u).startsWith("/v1/sessions/conv_big/items") && String(u).includes("order=desc"),
+    );
+    expect(historyFetches).toHaveLength(1);
   });
 
   it("loadMoreHistory prepends the page of items immediately older than the window", async () => {
