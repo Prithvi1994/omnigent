@@ -1099,6 +1099,171 @@ describe("chatStore — lazy subtree usage", () => {
   );
 });
 
+describe("chatStore — initial catch-up reconciliation", () => {
+  it("keeps an unrelated follow-up queued before delayed stream connection", async () => {
+    const id = "conv_review_pending";
+    seedSession(id, []);
+    const sink = pushableStream();
+    let openStream!: (response: Response) => void;
+    const stream = new Promise<Response>((resolve) => {
+      openStream = resolve;
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === `/v1/sessions/${id}/stream`) return stream;
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().switchTo(id);
+    const original = userMessage("original", "First question from the side-chat launch");
+    seedSessionItems(id, [original]);
+    // The launch question has no optimistic bubble in the child; this is a new send.
+    await useChatStore.getState().send("A different follow-up still queued", "agent_xyz");
+    const pendingIds = useChatStore.getState().pendingUserMessages.map((p) => p.tempId);
+    expect(pendingIds).toHaveLength(1);
+    openStream(mockResponse(null, { bodyStream: sink.stream }));
+    await vi.waitFor(() =>
+      expect(useChatStore.getState().blocks.some((b) => b.ctx.itemId === original.id)).toBe(true),
+    );
+    sink.push(
+      sse("session.input.consumed", {
+        data: {
+          item_id: original.id,
+          type: "message",
+          data: {
+            role: "user",
+            content: [{ type: "input_text", text: "First question from the side-chat launch" }],
+          },
+        },
+      }),
+    );
+    sink.push(
+      sse("session.todos", {
+        conversation_id: id,
+        todos: [{ content: "receipt processed", status: "completed", activeForm: "checking" }],
+      }),
+    );
+    await vi.waitFor(() =>
+      expect(useChatStore.getState().todos[0]?.content).toBe("receipt processed"),
+    );
+    sink.push("data: [DONE]\n\n");
+    sink.close();
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(pendingIds);
+  });
+
+  it.each([
+    { name: "flushed", buffered: false, repeated: false },
+    { name: "buffered", buffered: true, repeated: false },
+    { name: "repeated segments", buffered: false, repeated: true },
+  ])(
+    "reconciles $name assistant text when catch-up wins the persisted event race",
+    async ({ buffered, repeated }) => {
+      if (buffered)
+        vi.stubGlobal(
+          "requestAnimationFrame",
+          vi.fn(() => 1),
+        );
+      const id = "conv_review_duplicate";
+      seedSession(id, []);
+      const sink = pushableStream();
+      let finishBackfill!: (response: Response) => void;
+      const backfill = new Promise<Response>((resolve) => {
+        finishBackfill = resolve;
+      });
+      let catchupStarted = false;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url === `/v1/sessions/${id}/stream`)
+          return mockResponse(null, { bodyStream: sink.stream });
+        if (url.includes(`/v1/sessions/${id}/items`) && url.includes("order=asc")) {
+          catchupStarted = true;
+          return backfill;
+        }
+        return defaultFetchHandler(input, init);
+      });
+      await useChatStore.getState().switchTo(id);
+      await vi.waitFor(() => expect(catchupStarted).toBe(true));
+      const reply = assistantMessage("review_turn", "Checking the repository now.");
+      sink.push(sse("response.created", { id: "review_turn", status: "in_progress", output: [] }));
+      sink.push(sse("response.output_text.delta", { delta: "Checking the repository now." }));
+      sink.push(
+        sse("response.output_item.done", {
+          item: {
+            type: "function_call",
+            id: "review_tool",
+            call_id: "review_call",
+            name: "sys_os_shell",
+            arguments: "{}",
+            response_id: "review_turn",
+          },
+        }),
+      );
+      if (buffered) {
+        sink.push(
+          sse("session.todos", {
+            conversation_id: id,
+            todos: [{ content: "text buffered", status: "completed", activeForm: "checking" }],
+          }),
+        );
+        await vi.waitFor(() =>
+          expect(useChatStore.getState().todos[0]?.content).toBe("text buffered"),
+        );
+        expect(useChatStore.getState().blocks.some((b) => b.type === "text_done")).toBe(false);
+      } else {
+        await vi.waitFor(() =>
+          expect(
+            useChatStore.getState().blocks.some((b) => b.type === "text_done" && !b.ctx.itemId),
+          ).toBe(true),
+        );
+      }
+      const secondReply = { ...reply, id: "msg_repeated_segment" };
+      if (repeated) {
+        sink.push(sse("response.output_text.delta", { delta: "Checking the repository now." }));
+        sink.push(
+          sse("response.output_item.done", {
+            item: {
+              type: "function_call",
+              id: "review_tool_2",
+              call_id: "review_call_2",
+              name: "sys_os_shell",
+              arguments: "{}",
+              response_id: "review_turn",
+            },
+          }),
+        );
+        await vi.waitFor(() =>
+          expect(useChatStore.getState().blocks.filter((b) => b.type === "text_done")).toHaveLength(
+            2,
+          ),
+        );
+      }
+      finishBackfill(
+        mockResponse({ data: repeated ? [reply, secondReply] : [reply], has_more: false }),
+      );
+      await vi.waitFor(() =>
+        expect(useChatStore.getState().blocks.some((b) => b.ctx.itemId === reply.id)).toBe(true),
+      );
+      sink.push(sse("response.output_item.done", { item: reply }));
+      if (repeated) sink.push(sse("response.output_item.done", { item: secondReply }));
+      sink.push(
+        sse("session.todos", {
+          conversation_id: id,
+          todos: [{ content: "after receipt", status: "completed", activeForm: "checking" }],
+        }),
+      );
+      await vi.waitFor(() =>
+        expect(useChatStore.getState().todos[0]?.content).toBe("after receipt"),
+      );
+      sink.push("data: [DONE]\n\n");
+      sink.close();
+      expect(
+        useChatStore
+          .getState()
+          .blocks.filter((b) => b.type === "text_done")
+          .map((b) => b.ctx.itemId),
+      ).toEqual(repeated ? [reply.id, secondReply.id] : [reply.id]);
+    },
+  );
+});
+
 describe("chatStore — switchTo", () => {
   it.each(
     [
@@ -1244,7 +1409,8 @@ describe("chatStore — switchTo", () => {
           "replay processed",
         ),
       );
-      if (named) expect(conversationRegistry.peek(id)!.getState().pendingUserMessages).toEqual([]);
+      if (named || late)
+        expect(conversationRegistry.peek(id)!.getState().pendingUserMessages).toEqual([]);
       if (pending)
         expect(
           conversationRegistry

@@ -1274,8 +1274,9 @@ const sessionUsageRevisions = new WeakMap<ConversationEntry, { cost: number; mod
 // Snapshot reconciliation must teach the already-running stream pump which
 // native preview messages have finalized, including warm session revisits.
 const nativePreviewTombstonesByController = new WeakMap<AbortController, Set<string>>();
-// Catch-up already acknowledged these inputs; a delayed receipt must not pop another send.
-const recoveredInputsByController = new WeakMap<AbortController, Set<string>>();
+// Track whether catch-up acknowledged each input before its delayed receipt.
+const recoveredInputsByController = new WeakMap<AbortController, Map<string, boolean>>();
+const flushStreamByController = new WeakMap<AbortController, () => void>();
 
 /**
  * Evict a conversation from the live registry.
@@ -4310,6 +4311,46 @@ async function bindStream(
   }
 }
 
+/** Give already-streamed text its persisted identity without moving or repeating it. */
+function stampStreamedAssistantText(blocks: AnyBlock[], persisted: AnyBlock[]): AnyBlock[] {
+  let result = blocks;
+  const seen = new Set(blocks.map((b) => b.ctx.itemId).filter(Boolean));
+  for (const item of persisted) {
+    if (item.type !== "text_done" || !item.ctx.itemId || seen.has(item.ctx.itemId)) continue;
+    const at = result.findIndex(
+      (b) =>
+        b.type === "text_done" &&
+        !b.ctx.itemId &&
+        b.ctx.responseId === item.ctx.responseId &&
+        b.fullText === item.fullText,
+    );
+    if (at < 0) continue;
+    if (result === blocks) result = blocks.slice();
+    const streamed = result[at]!;
+    result[at] = { ...streamed, ctx: { ...streamed.ctx, itemId: item.ctx.itemId } };
+    seen.add(item.ctx.itemId);
+  }
+  return result;
+}
+
+/** Native transcripts may prefix the posted text, but attachments must still match. */
+function matchesRecoveredInput(
+  pending: PendingUserMessage,
+  content: MessageContentBlock[],
+  native: boolean,
+): boolean {
+  if (contentKeyOf(pending.content) === contentKeyOf(content)) return true;
+  if (!native) return false;
+  const text = messageContentText(pending.content);
+  const attachments = (parts: MessageContentBlock[]) =>
+    parts.filter((p) => p.type !== "input_text" && p.type !== "output_text");
+  return (
+    text.length > 0 &&
+    messageContentText(content).endsWith(text) &&
+    contentKeyOf(attachments(pending.content)) === contentKeyOf(attachments(content))
+  );
+}
+
 /** Recover items committed between the eager snapshot and the first SSE subscription. */
 async function reconcileInitialHistory(
   id: string,
@@ -4327,7 +4368,7 @@ async function reconcileInitialHistory(
     get().abortController !== controller ||
     get().historyGeneration !== generation;
   const pendingAtConnect = new Set(get().pendingUserMessages.map((p) => p.tempId));
-  const recoveredInputs = new Set<string>();
+  const recoveredInputs = new Map<string, boolean>();
   recoveredInputsByController.set(controller, recoveredInputs);
   let failures = 0;
   let cursor = lastItemId;
@@ -4350,8 +4391,12 @@ async function reconcileInitialHistory(
     const nativeIds = nativeCompletedMessageIds(page.items);
     nativeIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
     const recovered = itemsToBlocks(page.items);
+    flushStreamByController.get(controller)?.();
     set((state) => {
-      const current = withoutNativePreviews(state.blocks, nativeIds);
+      const current = stampStreamedAssistantText(
+        withoutNativePreviews(state.blocks, nativeIds),
+        recovered,
+      );
       const seen = new Set(current.map((b) => b.ctx.itemId).filter(Boolean));
       const unseen = recovered.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
       if (unseen.length === 0) return current === state.blocks ? {} : { blocks: current };
@@ -4394,22 +4439,24 @@ async function reconcileInitialHistory(
       const blocks = kept.flatMap((block, i) => [...(additions.get(i) ?? []), block]);
       blocks.push(...(additions.get(kept.length) ?? []));
       const recoveredUserInputs = unseen.filter(
-        (b) => b.type === "user_message" && !isSystemUserContent(b.content),
+        (b): b is UserMessageBlock => b.type === "user_message" && !isSystemUserContent(b.content),
       );
-      let acknowledged = 0;
-      const pendingUserMessages = state.pendingUserMessages.filter((p) => {
-        if (
-          acknowledged === recoveredUserInputs.length ||
-          p.initialDraft ||
-          !pendingAtConnect.has(p.tempId)
-        )
-          return true;
-        const itemId = recoveredUserInputs[acknowledged]?.ctx.itemId;
-        if (itemId) recoveredInputs.add(itemId);
-        pendingAtConnect.delete(p.tempId);
-        acknowledged += 1;
-        return false;
-      });
+      let pendingUserMessages = state.pendingUserMessages;
+      for (const input of recoveredUserInputs) {
+        const at = pendingUserMessages.findIndex(
+          (p) =>
+            !p.initialDraft &&
+            pendingAtConnect.has(p.tempId) &&
+            matchesRecoveredInput(p, input.content, state.isNativeTerminalSession),
+        );
+        if (input.ctx.itemId) recoveredInputs.set(input.ctx.itemId, at >= 0);
+        if (at < 0) continue;
+        pendingAtConnect.delete(pendingUserMessages[at]!.tempId);
+        pendingUserMessages = [
+          ...pendingUserMessages.slice(0, at),
+          ...pendingUserMessages.slice(at + 1),
+        ];
+      }
       return { blocks, pendingUserMessages };
     });
     const nextCursor = page.items.at(-1)?.id;
@@ -6042,6 +6089,7 @@ export async function pumpStreamEvents(
     });
   };
 
+  flushStreamByController.set(controller, flush);
   try {
     for await (const block of stream.reduce(events)) {
       if (controller.signal.aborted) return "aborted";
@@ -6288,6 +6336,8 @@ export async function pumpStreamEvents(
     // not here — it must survive across reconnect attempts.
     scheduler.cancel();
     buffer.length = 0;
+    if (flushStreamByController.get(controller) === flush)
+      flushStreamByController.delete(controller);
   }
 }
 
@@ -7119,9 +7169,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // dropping it strands a duplicate user bubble at the transcript tail.
           // Same precision order as below (named entry, then FIFO head), minus
           // the append.
+          const recoveredInputs = s.abortController
+            ? recoveredInputsByController.get(s.abortController)
+            : undefined;
           const cleared = event.clearedPendingId;
           const at = cleared ? s.pendingUserMessages.findIndex((p) => p.tempId === cleared) : -1;
           if (at >= 0) {
+            if (recoveredInputs?.has(event.itemId)) recoveredInputs.set(event.itemId, true);
             return {
               pendingUserMessages: [
                 ...s.pendingUserMessages.slice(0, at),
@@ -7129,11 +7183,27 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               ],
             };
           }
-          if (
-            s.abortController &&
-            recoveredInputsByController.get(s.abortController)?.has(event.itemId)
-          )
-            return {};
+          if (recoveredInputs?.has(event.itemId)) {
+            if (recoveredInputs.get(event.itemId)) return {};
+            const content = userContentFromEvent(event);
+            const matchedAt =
+              content === null
+                ? -1
+                : s.pendingUserMessages.findIndex(
+                    (p) =>
+                      !p.initialDraft &&
+                      matchesRecoveredInput(p, content, s.isNativeTerminalSession),
+                  );
+            recoveredInputs.set(event.itemId, true);
+            return matchedAt < 0
+              ? {}
+              : {
+                  pendingUserMessages: [
+                    ...s.pendingUserMessages.slice(0, matchedAt),
+                    ...s.pendingUserMessages.slice(matchedAt + 1),
+                  ],
+                };
+          }
           // FIFO-head fallback — same marker guard as the promote path below. A
           // mirrored system marker (the vendor CLI's own `[Request interrupted
           // by user]` record) is synthesized by the CLI, owns no pending entry,
