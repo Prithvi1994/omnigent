@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 import uuid
 from collections.abc import Mapping
@@ -3430,7 +3431,9 @@ async def test_events_stop_session_closes_terminal_and_publishes_deleted(
 
 
 @pytest.mark.asyncio
-async def test_required_terminal_exit_publishes_deleted_and_failed(tmp_path: Path) -> None:
+async def test_required_terminal_exit_publishes_deleted_and_failed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """
     A required terminal disappearing fails the owning session.
 
@@ -3440,7 +3443,9 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(tmp_path: Pat
     failed`` when its watcher reports that tmux disappeared.
 
     :param tmp_path: Temporary directory for fake terminal paths.
+    :param caplog: Captures the attributed failure log row.
     """
+    caplog.set_level(logging.ERROR, logger="omnigent.runner.app")
     from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
     from tests.runner.helpers import make_test_terminal_instance
@@ -3545,6 +3550,15 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(tmp_path: Pat
     assert len(failed_events) == 1, f"expected one failed status, got {queued_events!r}"
     assert failed_events[0]["error"]["code"] == "required_terminal_exited"
     assert "Required terminal exited unexpectedly" in failed_events[0]["error"]["message"]
+    [exit_record] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "required_terminal_exited"
+    ]
+    # Unrecognized output: the harness CLI died under the runner.
+    assert exit_record.attributes["error_category"] == "runner"
+    assert exit_record.attributes["error_impact"] == "blocking"
+    assert exit_record.attributes["error_code"] == "required_terminal_exited"
     assert parent_events == [
         {
             "type": "session.child_session.updated",
