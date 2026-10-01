@@ -117,15 +117,22 @@ class _ConversationStore:
         self,
         conversations: dict[str, Conversation],
         items_by_conv: dict[str, list[ConversationItem]] | None = None,
+        compaction_stats: CompactionStats | None = None,
     ) -> None:
         """
         Initialize the stub.
 
         :param conversations: Map from conversation ID to Conversation.
         :param items_by_conv: Map from conversation ID to items.
+        :param compaction_stats: Aggregate ``get_compaction_stats`` returns
+            for any conversation; the empty aggregate when omitted.
         """
         self._convs = conversations
         self._items = items_by_conv or {}
+        self.compaction_stats = compaction_stats or CompactionStats(
+            count=0, last_compaction_at=None
+        )
+        self.compaction_stats_calls: list[str] = []
         self.fork_calls: list[dict[str, Any]] = []
         self.label_writes: list[tuple[str, dict[str, str]]] = []
 
@@ -163,12 +170,13 @@ class _ConversationStore:
 
     def get_compaction_stats(self, conversation_id: str) -> CompactionStats:
         """
-        Return the empty compaction aggregate.
+        Return the configured compaction aggregate and record the lookup.
 
         :param conversation_id: Conversation ID to aggregate.
-        :returns: ``count=0`` — these tests persist no compaction items.
+        :returns: The ``compaction_stats`` given at construction.
         """
-        return CompactionStats(count=0, last_compaction_at=None)
+        self.compaction_stats_calls.append(conversation_id)
+        return self.compaction_stats
 
     def fork_conversation(
         self,
@@ -629,6 +637,7 @@ async def test_fork_session_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     conv_store = _ConversationStore(
         conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
         items_by_conv={"e9f8f58523cec9a57d3bdf93be543e8c": items},
+        compaction_stats=CompactionStats(count=2, last_compaction_at=1700000041),
     )
     agent_store = _AgentStore(
         agents={
@@ -681,6 +690,10 @@ async def test_fork_session_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
         f"Copied items should preserve content and order, got {item_texts}"
     )
     assert body["title"] == "My Fork"
+    # The fork's snapshot carries the aggregate computed for the new conversation.
+    assert body["compaction_count"] == 2
+    assert body["last_compaction_at"] == 1700000041
+    assert conv_store.compaction_stats_calls == [body["id"]]
     assert chokepoint_calls == 1
 
     # The agent clone is created INSIDE fork_conversation (atomically), not
@@ -938,6 +951,7 @@ async def test_fork_session_up_to_response_id_passes_through_and_truncates() -> 
     conv_store = _ConversationStore(
         conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
         items_by_conv={"e9f8f58523cec9a57d3bdf93be543e8c": items},
+        compaction_stats=CompactionStats(count=1, last_compaction_at=1700000010),
     )
     client = TestClient(_build_app(conv_store))
 
@@ -956,6 +970,11 @@ async def test_fork_session_up_to_response_id_passes_through_and_truncates() -> 
     assert [item["response_id"] for item in body["items"]] == ["resp_001", "resp_001"], (
         f"Fork should contain only resp_001 items, got {body['items']!r}"
     )
+    # The aggregate is asked of the forked conversation, so a partial fork
+    # reports only the compactions it actually copied.
+    assert conv_store.compaction_stats_calls == [body["id"]]
+    assert body["compaction_count"] == 1
+    assert body["last_compaction_at"] == 1700000010
 
 
 @pytest.mark.asyncio

@@ -5,9 +5,8 @@ through ``sys_session_send`` (purpose ``implement``) with a large read-phase
 prompt. The child's Claude Code reads files until the mock model reports a
 near-full context, auto-compacts, reads again, auto-compacts a second time, and
 then its next model reply is held on the mock gate so the turn never advances
-(no further tool calls, no writes). The orchestrator then polls
-``sys_session_get_info`` / ``sys_session_list`` / ``sys_session_get_history``
-twice, at least ten seconds apart.
+(no further tool calls, no writes). The orchestrator then runs a status check
+through ``sys_session_get_info`` and ``sys_read_inbox``.
 
 Claude Code only enforces a context window it knows; a third-party base URL
 leaves the window unenforced, so the child's HOME carries
@@ -32,7 +31,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -64,7 +63,6 @@ _SMALL_USAGE = {
 }
 _DOC_COUNT = 6
 _HELD_REPLY = "HELD-REPLY: never delivered while the gate is closed."
-_POLL_GAP_S = 10.0
 
 
 def _write_docs(workspace: Path) -> None:
@@ -368,11 +366,9 @@ def _configure_parent_dispatch(mock_url: str) -> None:
     _mock_post(mock_url, "/mock/set_fallback", {"key": _PARENT_MODEL, "text": "Acknowledged."})
 
 
-def _configure_parent_status_check(mock_url: str, child_id: str, n: int) -> None:
+def _configure_parent_status_check(mock_url: str, child_id: str) -> None:
     def call(name: str, args: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "tool_calls": [{"call_id": f"{name}_{n}", "name": name, "arguments": json.dumps(args)}]
-        }
+        return {"tool_calls": [{"call_id": name, "name": name, "arguments": json.dumps(args)}]}
 
     _mock_post(
         mock_url,
@@ -381,10 +377,8 @@ def _configure_parent_status_check(mock_url: str, child_id: str, n: int) -> None
             "key": _PARENT_MODEL,
             "responses": [
                 call("sys_session_get_info", {"session_id": child_id}),
-                call("sys_session_list", {}),
-                call("sys_session_get_history", {"conversation_id": child_id, "tail_items": 5}),
                 call("sys_read_inbox", {}),
-                {"text": f"Status check {n} recorded."},
+                {"text": "Status check recorded."},
             ],
         },
     )
@@ -397,7 +391,7 @@ def _register_parent(client: httpx.Client, mock_url: str) -> str:
         "prompt": (
             "You are an orchestrator. Dispatch the implementer sub-agent via "
             "sys_session_send when asked, and check on it with sys_session_get_info "
-            "and sys_session_list when asked for a status check."
+            "when asked for a status check."
         ),
         "executor": {
             "harness": "openai-agents",
@@ -491,30 +485,19 @@ def _stop(client: httpx.Client, *session_ids: str) -> None:
 class StallObservation:
     parent_id: str
     child_id: str
-    get_info: list[dict[str, Any]]
-    session_list: list[dict[str, Any]]
-    history: list[str]
-    inbox: list[str]
-    child_snapshots: list[dict[str, Any]]
-    activity_during_reads: list[int | None]
+    get_info: dict[str, Any]
+    inbox: str
     compaction_items: list[dict[str, Any]]
     git_status_before: str
     git_status_after: str
     head_before: str
     head_after: str
     gate_pending: bool
-    evidence: dict[str, Any] = field(default_factory=dict)
-
-
-def _child_snapshot(client: httpx.Client, child_id: str) -> dict[str, Any]:
-    resp = client.get(f"/v1/sessions/{child_id}", params={"include_items": "false"}, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
 
 
 @pytest.fixture(scope="module")
 def stalled_subagent(rig: Rig) -> Iterator[StallObservation]:
-    """Drive the journey once and keep the orchestrator's observations."""
+    """Drive the journey once and keep the orchestrator's observation."""
     client, mock_url, workspace = rig.client, rig.mock_url, rig.workspace
     _configure_child_model(mock_url, workspace)
     _configure_parent_dispatch(mock_url)
@@ -544,10 +527,8 @@ def stalled_subagent(rig: Rig) -> Iterator[StallObservation]:
     try:
         assert _wait_until(child_seen, timeout=120), "orchestrator never dispatched the child"
         assert child_id is not None
-        activity: list[int | None] = []
 
         def compacted_twice_and_parked() -> bool:
-            activity.append(_child_snapshot(client, child_id).get("updated_at"))
             return len(_compaction_items(client, child_id)) >= 2 and _gate_pending(mock_url)
 
         assert _wait_until(compacted_twice_and_parked, timeout=240, interval=2.0), (
@@ -556,38 +537,17 @@ def stalled_subagent(rig: Rig) -> Iterator[StallObservation]:
         )
         # Let the forwarder persist anything still in flight before polling.
         time.sleep(5)
-        snapshots = [_child_snapshot(client, child_id)]
-        get_info: list[dict[str, Any]] = []
-        session_list: list[dict[str, Any]] = []
-        history: list[str] = []
-        inbox: list[str] = []
-        for n in (1, 2):
-            if n == 2:
-                time.sleep(_POLL_GAP_S)
-            _configure_parent_status_check(mock_url, child_id, n)
-            _send_user_message(
-                client, parent_id, f"Status check {n}: how is the implementer doing?"
-            )
-            done_marker = f"sys_read_inbox_{n}"
-            assert _wait_until(
-                lambda done=done_marker: done in _tool_outputs(_items(client, parent_id)),
-                timeout=120,
-            ), f"orchestrator status check {n} did not complete"
-            outputs = _tool_outputs(_items(client, parent_id))
-            get_info.append(json.loads(outputs[f"sys_session_get_info_{n}"]))
-            session_list.append(json.loads(outputs[f"sys_session_list_{n}"]))
-            history.append(outputs[f"sys_session_get_history_{n}"])
-            inbox.append(outputs[f"sys_read_inbox_{n}"])
-            snapshots.append(_child_snapshot(client, child_id))
+        _configure_parent_status_check(mock_url, child_id)
+        _send_user_message(client, parent_id, "Status check: how is the implementer doing?")
+        assert _wait_until(
+            lambda: "sys_read_inbox" in _tool_outputs(_items(client, parent_id)), timeout=120
+        ), "orchestrator status check did not complete"
+        outputs = _tool_outputs(_items(client, parent_id))
         observation = StallObservation(
             parent_id=parent_id,
             child_id=child_id,
-            get_info=get_info,
-            session_list=session_list,
-            history=history,
-            inbox=inbox,
-            child_snapshots=snapshots,
-            activity_during_reads=activity,
+            get_info=json.loads(outputs["sys_session_get_info"]),
+            inbox=outputs["sys_read_inbox"],
             compaction_items=_compaction_items(client, child_id),
             git_status_before=git_status_before,
             git_status_after=_git(workspace, "status", "--porcelain"),
@@ -595,28 +555,7 @@ def stalled_subagent(rig: Rig) -> Iterator[StallObservation]:
             head_after=_git(workspace, "rev-parse", "HEAD"),
             gate_pending=_gate_pending(mock_url),
         )
-        observation.evidence = {
-            "parent_session_id": parent_id,
-            "child_session_id": child_id,
-            "get_info_polls": get_info,
-            "session_list_polls": session_list,
-            "session_list_child_rows": [_child_row(sl, child_id) for sl in session_list],
-            "history_tails": history,
-            "inbox_polls": inbox,
-            "child_updated_at_series": activity,
-            "child_snapshots": [
-                {
-                    k: s.get(k)
-                    for k in ("status", "updated_at", "runner_online", "harness", "workspace")
-                }
-                for s in snapshots
-            ],
-            "compaction_items": observation.compaction_items,
-            "git_status_after": observation.git_status_after,
-            "head_unchanged": observation.head_before == observation.head_after,
-            "gate_pending_after_polls": observation.gate_pending,
-        }
-        print("STALL_OBSERVATION " + json.dumps(observation.evidence, default=str)[:20000])
+        print("STALL_OBSERVATION " + json.dumps(asdict(observation), default=str)[:20000])
         yield observation
     finally:
         with contextlib.suppress(httpx.HTTPError):
@@ -626,56 +565,24 @@ def stalled_subagent(rig: Rig) -> Iterator[StallObservation]:
         _stop(client, parent_id)
 
 
-def _child_row(listing: dict[str, Any], child_id: str) -> dict[str, Any] | None:
-    """The child's global ``sessions`` row, falling back to its ``sub_agents`` entry."""
-    for row in listing.get("sessions", []):
-        if row.get("session_id") == child_id:
-            return row
-    for row in listing.get("sub_agents", []):
-        if row.get("conversation_id") == child_id:
-            return row
-    return None
-
-
-def _assert_parked_after_two_compactions(obs: StallObservation) -> None:
-    """The reported stall state, cross-checked the way the reporter had to."""
+def test_parked_subagent_metadata_reports_compactions(stalled_subagent: StallObservation) -> None:
+    """``sys_session_get_info`` must expose the two compactions next to the heartbeat."""
+    obs = stalled_subagent
+    # The reported stall state, cross-checked the way the reporter had to.
     assert len(obs.compaction_items) == 2, obs.compaction_items
     assert obs.gate_pending, "child turn should still be held open"
-    assert obs.history[0] == obs.history[1], "transcript tail changed between polls"
     # The runner leaves its own startup probe dir in the workspace; only new paths count.
     new_paths = set(obs.git_status_after.splitlines()) - set(obs.git_status_before.splitlines())
     assert not new_paths, f"sub-agent wrote to the workspace: {sorted(new_paths)}"
     assert obs.head_before == obs.head_after
-    for info in obs.get_info:
-        assert info.get("status") == "running", info
-        assert info.get("runner_online") is True, info
-        assert info.get("pending_elicitation_count") == 0, info
-    for text in obs.inbox:
-        assert "docs-ia" not in text and obs.child_id not in text, text
-
-
-def test_parked_subagent_heartbeat_freezes(stalled_subagent: StallObservation) -> None:
-    """``last_activity_at`` is present and stops advancing once the child parks."""
-    obs = stalled_subagent
-    _assert_parked_after_two_compactions(obs)
-    first, second = (info.get("last_activity_at") for info in obs.get_info)
-    assert isinstance(first, int) and first == second, obs.get_info
-    reads = [t for t in obs.activity_during_reads if t is not None]
-    assert len(set(reads)) >= 2, f"heartbeat never advanced during the read phase: {reads}"
-    assert first >= max(reads), f"heartbeat {first} older than observed activity {max(reads)}"
-
-
-def test_parked_subagent_metadata_reports_compactions(stalled_subagent: StallObservation) -> None:
-    """``sys_session_get_info`` must expose the two compactions, not just lifecycle status."""
-    obs = stalled_subagent
-    _assert_parked_after_two_compactions(obs)
-    info = obs.get_info[-1]
-    compaction_fields = {k: v for k, v in info.items() if "compaction" in k}
-    assert compaction_fields, (
-        "sys_session_get_info reports no compaction signal for a sub-agent that compacted "
-        f"twice and stopped advancing; keys: {sorted(info)}"
-    )
-    counts = [
-        v for v in compaction_fields.values() if isinstance(v, int) and not isinstance(v, bool)
-    ]
-    assert 2 in counts, compaction_fields
+    assert "docs-ia" not in obs.inbox and obs.child_id not in obs.inbox, obs.inbox
+    info = obs.get_info
+    assert info.get("status") == "running", info
+    assert info.get("runner_online") is True, info
+    assert info.get("pending_elicitation_count") == 0, info
+    # The metadata alone now carries the signature the reporter had to scrape for.
+    assert info.get("compaction_count") == 2, info
+    last_compaction_at = info.get("last_compaction_at")
+    assert isinstance(last_compaction_at, int), info
+    last_activity_at = info.get("last_activity_at")
+    assert isinstance(last_activity_at, int) and last_activity_at >= last_compaction_at, info

@@ -74,9 +74,14 @@ class _ConversationStore:
         self,
         conversations: dict[str, Conversation],
         items_by_conv: dict[str, list[ConversationItem]] | None = None,
+        compaction_stats: CompactionStats | None = None,
     ) -> None:
         self._convs = conversations
         self._items = items_by_conv or {}
+        self.compaction_stats = compaction_stats or CompactionStats(
+            count=0, last_compaction_at=None
+        )
+        self.compaction_stats_calls: list[str] = []
         self.switch_calls: list[dict[str, Any]] = []
         self.todo_updates: list[list[dict[str, Any]]] = []
 
@@ -85,8 +90,9 @@ class _ConversationStore:
         return self._convs.get(conversation_id)
 
     def get_compaction_stats(self, conversation_id: str) -> CompactionStats:
-        """:returns: The empty aggregate; these tests persist no compactions."""
-        return CompactionStats(count=0, last_compaction_at=None)
+        """:returns: The configured aggregate, recording the lookup."""
+        self.compaction_stats_calls.append(conversation_id)
+        return self.compaction_stats
 
     def set_session_todos(self, conversation_id: str, todos: list[dict[str, Any]]) -> bool:
         self.todo_updates.append(todos)
@@ -394,6 +400,7 @@ async def test_switch_same_family_native_carries_history(
                 )
             ]
         },
+        compaction_stats=CompactionStats(count=3, last_compaction_at=1700000099),
     )
     agent_store = _AgentStore(
         {
@@ -418,6 +425,10 @@ async def test_switch_same_family_native_carries_history(
     assert len(body["agent_id"]) == 32 and body["agent_id"] != "52adb39f0c5ea92b5563da5327dac08f"
     # 1 item returned — the in-place transcript is preserved (not copied/empty).
     assert len(body["items"]) == 1
+    # An in-place switch keeps the transcript, so the snapshot keeps the aggregate.
+    assert body["compaction_count"] == 3
+    assert body["last_compaction_at"] == 1700000099
+    assert conv_store.compaction_stats_calls == ["e9f8f58523cec9a57d3bdf93be543e8c"]
 
     assert len(conv_store.switch_calls) == 1, "route must call switch exactly once"
     call = conv_store.switch_calls[0]
