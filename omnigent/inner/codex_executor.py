@@ -1055,6 +1055,26 @@ def _codex_home_config_source_from_env() -> Path:
     )
 
 
+def _strip_host_launched_config(codex_home: Path) -> None:
+    """Drop inherited config that would start user commands beside an unwrapped app-server.
+
+    ``[mcp_servers.*]``, ``notify`` and a symlinked user ``hooks.json`` launch
+    processes the no-route fallback can no longer contain.
+    """
+    import tomlkit
+
+    config_path = codex_home / "config.toml"
+    if config_path.is_file():
+        document = tomlkit.parse(config_path.read_text())
+        if "mcp_servers" in document or "notify" in document:
+            document.pop("mcp_servers", None)
+            document.pop("notify", None)
+            config_path.write_text(tomlkit.dumps(document))
+    hooks_path = codex_home / _CODEX_HOOKS_FILENAME
+    if hooks_path.is_symlink():
+        hooks_path.unlink()
+
+
 def _populate_codex_home_config(
     target_dir: Path,
     source_dir: Path,
@@ -2685,6 +2705,22 @@ class _PendingToolResult:
     duration_ms: float = 0.0
 
 
+# Codex-native capabilities an unwrapped no-route worker must not keep: the
+# same set omnigent/runner/background_titles/codex_native.py switches off.
+_UNWRAPPED_WORKER_NATIVE_FEATURES_OFF = (
+    "features.unified_exec=false",
+    "features.shell_tool=false",
+    'web_search="disabled"',
+    "features.apps=false",
+    "features.browser_use=false",
+    "features.computer_use=false",
+    "features.image_generation=false",
+    "features.multi_agent=false",
+    "features.plugins=false",
+    "features.tool_search=false",
+)
+
+
 class _CodexAppServerSession:
     def __init__(
         self,
@@ -2967,11 +3003,20 @@ class _CodexAppServerSession:
                 await asyncio.to_thread(worker_launch.close)
                 raise RuntimeError("Codex session closed during worker preparation")
             self._worker_launch = worker_launch
-            if not worker_launch.native_tools_allowed:
-                self._disable_native_tools = True
             argv = [self._worker_launch.launch_path, "app-server"]
             for override in self._codex_config_overrides:
                 argv.extend(["-c", override])
+            if not worker_launch.native_tools_allowed:
+                self._disable_native_tools = True
+                for override in _UNWRAPPED_WORKER_NATIVE_FEATURES_OFF:
+                    argv.extend(["-c", override])
+                _strip_host_launched_config(self._codex_home_dir)
+                if router_bridge_dir is not None:
+                    write_codex_router_hooks_file(
+                        self._codex_home_dir,
+                        router_bridge_dir,
+                        session_id=codex_router_session_id(self._env),
+                    )
             spawn_argv = argv
             pass_fds: tuple[int, ...] = ()
             liveness_read_fd: int | None = None
@@ -3546,6 +3591,7 @@ class _CodexAppServerSession:
                     tool_config["features.code_mode.direct_only_tool_namespaces"] = ["functions"]
             if self._disable_native_tools:
                 tool_config["features.shell_tool"] = False
+                tool_config["features.unified_exec"] = False
             if tool_config:
                 params["config"] = tool_config
             response = await self._request("thread/start", params)

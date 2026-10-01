@@ -116,8 +116,8 @@ def prepare_codex_worker(
     """Prepare a contained worker or propagate the containment failure.
 
     A network-denying sandbox with no signer and no ``egress_rules`` leaves the
-    app-server no route to the model; the worker then runs unwrapped with its
-    native tools disabled, like the Claude CLI wrap.
+    app-server no route to the model; the worker then runs unwrapped with
+    Codex's native tools disabled, like the Claude CLI wrap.
     """
     if os_env is None or (os_env.sandbox is not None and os_env.sandbox.type == "none"):
         if signer_readiness is not None:
@@ -146,14 +146,14 @@ def prepare_codex_worker(
         raise ValueError("egress-filtered Codex worker requires an owned worker environment")
     if signer_readiness is None and not egress_rules and not policy.allow_network:
         # The app-server must reach the model, so it cannot live inside a
-        # network-denying sandbox without a route out. File and shell access
-        # stays confined to the separately sandboxed sys_os_* tools.
+        # network-denying sandbox without a route out. Tool access stays
+        # confined to the separately sandboxed sys_os_* tools.
         logger.warning(
             "os_env.sandbox denies network and grants the Codex app-server no "
             "model route (no signer, no egress_rules); running it unwrapped with "
-            "Codex's native shell tool disabled, so file and shell access stays "
-            "confined to the sandboxed sys_os_* tools. Add egress_rules for the "
-            "model host or allow_network: true to contain the worker."
+            "Codex's native tools disabled, so tool access stays confined to the "
+            "sandboxed sys_os_* tools. Add egress_rules for the model host or "
+            "allow_network: true to contain the worker."
         )
         return CodexWorkerLaunch(
             launch_path=codex_path, sandboxed=False, native_tools_allowed=False

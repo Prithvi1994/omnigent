@@ -3,12 +3,15 @@
 With no signer and no ``egress_rules``, an app-server wrapped in that sandbox
 has no route to the model and the turn never answers. Drives the real ``codex``
 CLI through :class:`CodexExecutor` against the mock model server, so it skips
-where the CLI or user namespaces are unavailable.
+where the CLI or bubblewrap is unavailable. The fixed worker runs unwrapped, so
+user namespaces are not required.
 """
 
 from __future__ import annotations
 
 import asyncio
+import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -16,7 +19,7 @@ import pytest
 from omnigent.inner.codex_executor import CodexExecutor
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import ExecutorError, TextChunk, TurnComplete
-from tests.e2e._harness_probes import bwrap_namespace_unavailable, cli_unavailable_reason
+from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.conftest import configure_mock_llm
 
 pytestmark = [
@@ -25,8 +28,8 @@ pytestmark = [
         reason=f"requires a runnable 'codex' CLI; {_codex_reason}",
     ),
     pytest.mark.skipif(
-        (_bwrap_reason := bwrap_namespace_unavailable()) is not None,
-        reason=f"cannot execute bwrap namespaces here: {_bwrap_reason}",
+        not sys.platform.startswith("linux") or shutil.which("bwrap") is None,
+        reason="linux_bwrap requires Linux with bubblewrap installed",
     ),
 ]
 

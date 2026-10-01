@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import http.server
+import itertools
 import json
 import logging
 import os
@@ -717,10 +718,21 @@ async def test_session_disables_native_tools_for_unwrapped_no_route_worker(
             )
         ),
     )
+    spawn = AsyncMock(return_value=process)
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
+    user_hooks = tmp_path / "user-hooks.json"
+    user_hooks.write_text("{}")
+
+    def _inherit_user_config(target_dir: Path, *_args: object, **_kwargs: object) -> None:
+        (target_dir / "config.toml").write_text(
+            'model = "gpt-5.4-mini"\nnotify = ["touch", "notified"]\n'
+            '[mcp_servers.probe]\ncommand = "touch"\nargs = ["mcp-started"]\n'
+        )
+        (target_dir / "hooks.json").symlink_to(user_hooks)
+
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor._create_subprocess_exec", AsyncMock(return_value=process)
+        "omnigent.inner.codex_executor._populate_codex_home_config", _inherit_user_config
     )
-    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
     session = _CodexAppServerSession(
         codex_path="/bin/echo",
         cwd=str(tmp_path),
@@ -736,6 +748,18 @@ async def test_session_disables_native_tools_for_unwrapped_no_route_worker(
 
     assert session._disable_native_tools is True
     assert not session._containment_confirmed
+    assert session._codex_home_dir is not None
+    effective = (session._codex_home_dir / "config.toml").read_text()
+    assert "mcp_servers" not in effective and "notify" not in effective, effective
+    assert 'model = "gpt-5.4-mini"' in effective
+    assert not (session._codex_home_dir / "hooks.json").exists()
+    overrides = set(itertools.pairwise(spawn.await_args.args))
+    for feature in (
+        "features.unified_exec=false",
+        "features.browser_use=false",
+        'web_search="disabled"',
+    ):
+        assert ("-c", feature) in overrides, spawn.await_args.args
     await session.close()
 
 
@@ -778,6 +802,7 @@ async def test_native_shell_tool_is_disabled_even_without_dynamic_tools() -> Non
 
     thread_params = session._request.await_args_list[0].args[1]
     assert thread_params["config"]["features.shell_tool"] is False
+    assert thread_params["config"]["features.unified_exec"] is False
     assert thread_params["sandbox"] == "workspace-write"
 
 
@@ -998,18 +1023,10 @@ def test_real_bwrap_worker_reaches_egress_relay_socket(
             codex_path=str(codex),
             cwd=workspace,
             codex_home=codex_home,
-            os_env=OSEnvSpec(
-                type="caller_process",
-                cwd=str(workspace),
-                sandbox=OSEnvSandboxSpec(
-                    type="linux_bwrap",
-                    write_paths=["."],
-                    allow_network=False,
-                    read_paths=[str(Path(__file__).resolve().parents[2] / "omnigent"), sys.prefix],
-                    egress_rules=["* 127.0.0.1/**"],
-                    egress_allow_private_destinations=True,
-                    cwd_hidden_scan_overflow="error",
-                ),
+            os_env=_egress_filtered_bwrap_spec(
+                workspace,
+                read_paths=[str(Path(__file__).resolve().parents[2] / "omnigent"), sys.prefix],
+                cwd_hidden_scan_overflow="error",
             ),
             spawn_env_names=list(worker_env),
             worker_env=worker_env,

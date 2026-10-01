@@ -911,14 +911,12 @@ class EgressProxy:
             except ValueError:
                 length = None
             try:
-                if length is not None:
-                    if length > 0:
-                        client_writer.write(
-                            await asyncio.wait_for(upstream_reader.readexactly(length), timeout=60)
-                        )
-                        await client_writer.drain()
+                if status_line.split()[1:2] in ([b"204"], [b"304"]):
+                    pass
+                elif length is not None:
+                    await self._relay_exactly(upstream_reader, client_writer, length)
                 elif "chunked" in refused.get("transfer-encoding", "").lower():
-                    await self._relay_chunked_body(upstream_reader, client_writer)
+                    await self._relay_chunked_refusal(upstream_reader, client_writer)
                 else:
                     await self._relay_response(upstream_reader, client_writer)
             except (asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError) as exc:
@@ -1350,7 +1348,7 @@ class EgressProxy:
         return target, default_port
 
     @staticmethod
-    async def _relay_chunked_body(
+    async def _relay_chunked_refusal(
         upstream_reader: asyncio.StreamReader,
         client_writer: asyncio.StreamWriter,
     ) -> None:
@@ -1361,7 +1359,11 @@ class EgressProxy:
         """
         while True:
             size_line = await asyncio.wait_for(upstream_reader.readline(), timeout=60)
-            size = int(size_line.split(b";", 1)[0].strip() or b"-", 16)
+            if not size_line:
+                raise asyncio.IncompleteReadError(partial=b"", expected=None)
+            size = int(size_line.split(b";", 1)[0].strip(), 16)
+            if size < 0:
+                raise ValueError(f"negative chunk size {size}")
             client_writer.write(size_line)
             if size == 0:
                 while True:
@@ -1371,10 +1373,25 @@ class EgressProxy:
                         break
                 await client_writer.drain()
                 return
-            client_writer.write(
-                await asyncio.wait_for(upstream_reader.readexactly(size + 2), timeout=60)
+            await EgressProxy._relay_exactly(upstream_reader, client_writer, size + 2)
+
+    @staticmethod
+    async def _relay_exactly(
+        upstream_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+        length: int,
+    ) -> None:
+        """Relay exactly *length* upstream bytes in bounded reads."""
+        remaining = length
+        while remaining > 0:
+            data = await asyncio.wait_for(
+                upstream_reader.read(min(_BUF_SIZE, remaining)), timeout=60
             )
+            if not data:
+                raise asyncio.IncompleteReadError(partial=b"", expected=remaining)
+            client_writer.write(data)
             await client_writer.drain()
+            remaining -= len(data)
 
     @staticmethod
     async def _relay_response(

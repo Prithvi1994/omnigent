@@ -343,6 +343,9 @@ def test_sandbox_policy_round_trips_mask_scan_skip_roots() -> None:
     assert decoded.mask_scan_skip_roots == [Path("/tmp/omnigent-osenv-ab12")]
     # Old payloads (no key) and unset policies decode to None — "skip
     # nothing", not an empty-but-present list.
+    old_payload = _noop_policy().to_jsonable()
+    del old_payload["mask_scan_skip_roots"]
+    assert SandboxPolicy.from_jsonable(old_payload).mask_scan_skip_roots is None
     assert SandboxPolicy.from_jsonable(_noop_policy().to_jsonable()).mask_scan_skip_roots is None
 
 

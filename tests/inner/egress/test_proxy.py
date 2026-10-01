@@ -3070,7 +3070,8 @@ def _websocket_echo_via_proxy(
                 if follow_up is not None:
                     with contextlib.suppress(OSError):
                         tls.sendall(follow_up)
-                body = head.split(b"\r\n\r\n", 1)[1]
+                parts = head.split(b"\r\n\r\n", 1)
+                body = parts[1] if len(parts) > 1 else b""
                 try:
                     while chunk := tls.recv(4096):
                         body += chunk
@@ -3147,8 +3148,8 @@ async def test_refused_or_denied_websocket_upgrade_never_opens_an_opaque_tunnel(
     A path outside the rules is refused before any upstream connection, and
     an upstream that declines the upgrade has its one response relayed after
     which the tunnel closes, so a follow-up request on it cannot skip the
-    per-request policy check. A chunked refusal from a keep-alive upstream
-    must close promptly too, without waiting for EOF.
+    per-request policy check. Chunked and bodyless refusals from a keep-alive
+    upstream must close promptly too, without waiting for EOF.
     """
     cert_path, key_path, bundle_path = ca_paths
     server_context = HostCertCache(cert_path, key_path).get_ssl_context("localhost")
@@ -3161,7 +3162,9 @@ async def test_refused_or_denied_websocket_upgrade_never_opens_an_opaque_tunnel(
                 upstream_requests.append(request_line)
                 while await reader.readline() not in (b"\r\n", b""):
                     pass
-                if b" /backend-api/chunked " in request_line:
+                if b" /backend-api/bodyless " in request_line:
+                    writer.write(b"HTTP/1.1 204 No Content\r\n\r\n")
+                elif b" /backend-api/chunked " in request_line:
                     writer.write(
                         b"HTTP/1.1 426 Upgrade Required\r\nTransfer-Encoding: chunked\r\n\r\n"
                         + chunked_body
@@ -3216,6 +3219,17 @@ async def test_refused_or_denied_websocket_upgrade_never_opens_an_opaque_tunnel(
             ),
             timeout=60,
         )
+        bodyless, bodyless_tail = await asyncio.wait_for(
+            asyncio.to_thread(
+                _websocket_echo_via_proxy,
+                proxy_port,
+                upstream_port,
+                bundle_path,
+                b"x",
+                path="/backend-api/bodyless",
+            ),
+            timeout=60,
+        )
     finally:
         await proxy.stop()
         server.close()
@@ -3226,7 +3240,10 @@ async def test_refused_or_denied_websocket_upgrade_never_opens_an_opaque_tunnel(
     assert tail == b"", tail
     assert chunked.startswith("HTTP/1.1 426"), chunked
     assert chunked_tail == chunked_body, chunked_tail
+    assert bodyless.startswith("HTTP/1.1 204"), bodyless
+    assert bodyless_tail == b"", bodyless_tail
     assert upstream_requests == [
         b"GET /backend-api/codex/responses HTTP/1.1\r\n",
         b"GET /backend-api/chunked HTTP/1.1\r\n",
+        b"GET /backend-api/bodyless HTTP/1.1\r\n",
     ]

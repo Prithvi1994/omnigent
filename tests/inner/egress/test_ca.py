@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import os
 import ssl
 import threading
 from pathlib import Path
@@ -79,12 +80,24 @@ def test_ensure_ca_bundle_rewrite_never_exposes_partial_bundle(
     process starting moments later reads it as its TLS trust store, so a
     truncate-then-write rewrite hands that process an empty or partial file.
     """
-    monkeypatch.setattr(ca_module, "_system_ca_bundle", lambda: b"X" * 512 * 1024)
+    monkeypatch.setattr(ca_module, "_system_ca_bundle", lambda: b"X" * 256 * 1024)
     cert_path, _key_path = ensure_ca(cache_dir=tmp_path)
     bundle_path = ensure_ca_bundle(cert_path, cache_dir=tmp_path)
     expected = bundle_path.read_bytes()
     assert expected.endswith(cert_path.read_bytes())
 
+    real_replace = os.replace
+    swaps = 0
+
+    def complete_swap(src: str, dst: str) -> None:
+        # The published file must be whole on both sides of the rename.
+        nonlocal swaps
+        assert Path(dst).read_bytes() == expected
+        assert Path(src).read_bytes() == expected
+        swaps += 1
+        real_replace(src, dst)
+
+    monkeypatch.setattr(ca_module.os, "replace", complete_swap)
     stop = threading.Event()
     partial_sizes: list[int] = []
 
@@ -98,13 +111,14 @@ def test_ensure_ca_bundle_rewrite_never_exposes_partial_bundle(
     for reader in readers:
         reader.start()
     try:
-        for _ in range(400):
+        for _ in range(200):
             ensure_ca_bundle(cert_path, cache_dir=tmp_path)
     finally:
         stop.set()
         for reader in readers:
             reader.join(timeout=10)
 
+    assert swaps == 200
     assert not partial_sizes, (
         f"{len(partial_sizes)} concurrent reads saw a partial CA bundle "
         f"(sizes {sorted(set(partial_sizes))[:5]} of {len(expected)} bytes)"
