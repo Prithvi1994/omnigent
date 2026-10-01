@@ -2175,16 +2175,16 @@ class SessionResponse(BaseModel):
         therefore resets the clock, so an orchestrator treating this as a pure
         item-append heartbeat should account for that. Can be compared across
         snapshots independently of lifecycle status.
-    :param compaction_count: Total context compactions persisted to this
-        session's transcript, e.g. ``2``. ``0`` when the session has never
-        compacted. Paired with ``last_compaction_at``, this lets an
-        orchestrator polling metadata spot the repeated-compaction stall
-        signature (count climbing while ``updated_at`` otherwise freezes)
-        without scraping transcript items.
+    :param compaction_count: Context compactions persisted to this
+        session's transcript, e.g. ``2``; ``0`` when it has never
+        compacted. Exact up to 1000, the number of newest compaction items
+        the snapshot aggregate reads; longer histories report 1000. With
+        ``last_compaction_at`` it lets a metadata poller see repeated
+        compactions without scraping transcript items.
     :param last_compaction_at: Unix epoch seconds of the most recent
         persisted compaction item, or ``None`` when the session has never
-        compacted. A recent value alongside no further item appends marks a
-        session parked at a compaction summary rather than progressing.
+        compacted. An ``updated_at`` that stops at this value means the
+        session has written nothing since it last compacted.
     """
 
     id: str

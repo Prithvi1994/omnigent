@@ -241,6 +241,11 @@ class CreatedSession:
     agent: Agent
 
 
+# Newest compaction items a snapshot aggregate reads. Bounds the work per
+# snapshot however long a session has lived; ``count`` saturates here.
+COMPACTION_COUNT_CAP = 1000
+
+
 @dataclass(frozen=True)
 class CompactionStats:
     """
@@ -249,11 +254,11 @@ class CompactionStats:
     Returned by :meth:`ConversationStore.get_compaction_stats` so the
     session snapshot can expose a metadata-level compaction signal
     (``compaction_count`` / ``last_compaction_at``) without paging the
-    transcript. An orchestrator polling session metadata uses it to
-    spot a session that keeps compacting without making progress.
+    transcript.
 
-    :param count: Total compaction items persisted to the
-        conversation, e.g. ``2``. ``0`` when none.
+    :param count: Compaction items persisted to the conversation, e.g.
+        ``2``; ``0`` when none. Exact up to :data:`COMPACTION_COUNT_CAP`,
+        which longer histories report instead.
     :param last_compaction_at: Unix epoch seconds of the most recent
         compaction item, or ``None`` when ``count`` is ``0``.
     """
@@ -697,10 +702,10 @@ class ConversationStore(ABC):
         """
         Return the compaction aggregate for one conversation.
 
-        One ``COUNT``/``MAX`` aggregate over the conversation's
-        compaction items, so the session snapshot can carry
-        ``compaction_count`` / ``last_compaction_at`` without paging
-        the transcript.
+        Aggregates the newest :data:`COMPACTION_COUNT_CAP` compaction
+        items, so the session snapshot can carry ``compaction_count`` /
+        ``last_compaction_at`` without paging the transcript and with
+        bounded work per call.
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.

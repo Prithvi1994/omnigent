@@ -140,14 +140,15 @@ class Session:
         resets the clock — treat it as a session-write heartbeat, not a pure
         item-append signal. ``None`` when connected to an older server that
         does not return the field.
-    :param compaction_count: Total context compactions persisted to this
-        session's transcript, e.g. ``2``. ``0`` when the session has never
-        compacted (or when connected to an older server that does not
-        return the field). A climbing count while ``updated_at`` stays
-        frozen is the repeated-compaction stall signature.
+    :param compaction_count: Context compactions persisted to this
+        session's transcript, e.g. ``2``; ``0`` when the session has never
+        compacted or the server predates the field. Exact up to the
+        server's cap of 1000 newest compaction items.
     :param last_compaction_at: Unix epoch seconds of the most recent
         persisted compaction item, or ``None`` when the session has never
-        compacted (or the server predates the field).
+        compacted (or the server predates the field). An ``updated_at``
+        that stops at this value means nothing was written since the last
+        compaction.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
     :param labels: Session-scoped guardrails labels. Empty dict
@@ -236,7 +237,7 @@ class Session:
             status=str(raw["status"]),
             created_at=int(raw["created_at"]),
             updated_at=int(raw_updated_at) if raw_updated_at is not None else None,
-            compaction_count=int(raw.get("compaction_count", 0)),
+            compaction_count=int(raw.get("compaction_count") or 0),
             last_compaction_at=(
                 int(raw_last_compaction_at) if raw_last_compaction_at is not None else None
             ),

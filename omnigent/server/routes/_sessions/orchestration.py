@@ -11764,10 +11764,8 @@ async def _get_session_snapshot(
         if include_usage
         else {}
     )
-    # Compaction aggregate for the metadata-level stall signal
-    # (compaction_count / last_compaction_at). One indexed COUNT/MAX off
-    # the event loop; independent of include_items so the slim snapshot
-    # the orchestration tools consume still carries it.
+    # Computed independently of include_items so the slim snapshot the
+    # orchestration tools consume still carries the compaction aggregate.
     compaction_stats = await asyncio.to_thread(conv_store.get_compaction_stats, conv.id)
     # Static signal telling the open view a host-bound, host-down session is a
     # resumable managed host it can wake by sending a message, vs a terminal

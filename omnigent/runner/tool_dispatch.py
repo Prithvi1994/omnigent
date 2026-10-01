@@ -4996,9 +4996,7 @@ async def _session_get_info_via_rest(
             # status: repeated polls with an unchanged value let an
             # orchestrator detect a running session that is not advancing.
             "last_activity_at": snap.get("updated_at"),
-            # Compaction aggregate: a climbing count while
-            # last_activity_at stays frozen is the repeated-compaction
-            # stall signature — detectable here without the transcript.
+            # Compaction aggregate: shows repeated compactions without the transcript.
             "compaction_count": snap.get("compaction_count", 0),
             "last_compaction_at": snap.get("last_compaction_at"),
             "title": snap.get("title"),

@@ -2498,6 +2498,44 @@ def test_get_compaction_stats_is_scoped_per_conversation(
     assert other.last_compaction_at is None
 
 
+def test_get_compaction_stats_reads_a_bounded_page(
+    conversation_store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The aggregate reads at most COMPACTION_COUNT_CAP newest compaction items.
+
+    Snapshot cost must not grow with a session's compaction history, so the
+    count saturates at the cap while the timestamp still follows the newest
+    item.
+    """
+    from omnigent.entities import CompactionData
+    from omnigent.stores.conversation_store import sqlalchemy_store as store_module
+
+    monkeypatch.setattr(store_module, "COMPACTION_COUNT_CAP", 3)
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="compaction",
+                response_id=f"resp_compact_{ordinal}",
+                data=CompactionData(
+                    summary=f"Summary {ordinal}",
+                    last_item_id="7ae6efab548a4e13ae0ac9efc56d841e",
+                    model="openai/gpt-4o",
+                    token_count=50,
+                ),
+            )
+            for ordinal in range(5)
+        ],
+    )
+
+    stats = conversation_store.get_compaction_stats(conv.id)
+    assert stats.count == 3, f"count must saturate at the cap, got {stats.count}"
+    latest = conversation_store.list_items(conv.id, type="compaction", order="desc", limit=1)
+    assert stats.last_compaction_at == latest.data[0].created_at
+
+
 # ── Sub-agent conversation isolation ────────────────
 
 
