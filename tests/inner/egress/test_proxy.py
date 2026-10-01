@@ -3074,13 +3074,15 @@ def _websocket_echo_via_proxy(
                     with contextlib.suppress(OSError):
                         tls.sendall(follow_up)
                 parts = head.split(b"\r\n\r\n", 1)
-                body = parts[1] if len(parts) > 1 else b""
+                response_body = parts[1] if len(parts) > 1 else b""
                 try:
                     while chunk := tls.recv(4096):
-                        body += chunk
+                        response_body += chunk
                 except TimeoutError:
                     return status, b"<tunnel open>"
-                return status, body
+                except OSError:
+                    pass  # the proxy closed the tunnel while follow_up was still unread
+                return status, response_body
             accept = base64.b64encode(
                 hashlib.sha1(key.encode() + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest()
             )
@@ -3105,7 +3107,10 @@ async def test_proxy_relays_websocket_upgrade_to_permitted_host(
     rewrites the hop-by-hop headers to ``Connection: close`` and relays a single
     response makes every such attempt fail until the client falls back.
     """
-    from websockets.asyncio.server import serve
+    try:
+        from websockets.asyncio.server import serve
+    except ImportError:  # websockets < 13 (the declared floor)
+        from websockets.server import serve
 
     cert_path, key_path, bundle_path = ca_paths
     server_context = HostCertCache(cert_path, key_path).get_ssl_context("localhost")

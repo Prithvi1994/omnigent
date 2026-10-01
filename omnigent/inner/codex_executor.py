@@ -1074,6 +1074,9 @@ def _strip_host_launched_config(codex_home: Path) -> None:
         if "mcp_servers" in document or "notify" in document:
             document.pop("mcp_servers", None)
             document.pop("notify", None)
+            if config_path.is_symlink():
+                # Never write through to the user's real config.toml.
+                config_path.unlink()
             config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
     # Staging symlinks the user's hooks but falls back to a copy; drop either.
     hooks_path = codex_home / _CODEX_HOOKS_FILENAME
