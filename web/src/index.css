@@ -844,15 +844,8 @@ aside[aria-label="Workspace"][data-maximized] {
   inset: 0 0 auto 0;
   height: 2.25rem;
   -webkit-app-region: drag;
-  /* Drag regions are geometric, so dragging still works; this keeps the fixed
-   * strip from swallowing DOM clicks on anything that lands in its band. */
+  /* Keeps the strip from swallowing clicks; the geometric drag region still works. */
   pointer-events: none;
-}
-/* Drag regions are geometric, so content scrolled under the strip would lose clicks.
- * These pages don't set data-electron-mac, so scope the interactive-elements no-drag
- * counter-rule to the strip's presence instead. */
-body:has(.electron-standalone-drag-strip) :is(a, button, input, textarea, [role="button"]) {
-  -webkit-app-region: no-drag;
 }
 /* The title-bar cluster (Search/Settings/toggle), pinned beside the traffic
  * lights and independent of the sidebar — that independence is the point: it
@@ -915,10 +908,11 @@ body:has(.electron-standalone-drag-strip) :is(a, button, input, textarea, [role=
   .workspace-tab-strip {
   padding-left: 10.5rem;
 }
-/* Drag regions are geometric, not z-ordered: anything that overlaps the
- * strip (e.g. the mobile full-screen sidebar overlay) would lose clicks
- * without an explicit counter-region on interactive elements. */
-[data-electron-mac] :is(a, button, input, textarea, [role="button"]) {
+/* Drag regions are geometric, not z-ordered: anything that overlaps a strip (the
+ * mobile full-screen sidebar overlay, an auth card scrolled under the standalone
+ * strip) would lose clicks without an explicit counter-region on interactive elements. */
+[data-electron-mac] :is(a, button, input, textarea, [role="button"]),
+body:has(.electron-standalone-drag-strip) :is(a, button, input, textarea, [role="button"]) {
   -webkit-app-region: no-drag;
 }
 /* The title-bar breadcrumb doubles as a window-drag handle (its title is a

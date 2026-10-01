@@ -71,6 +71,24 @@ describe("outside-AppShell screens keep the desktop window draggable", () => {
     expectDragStrip(container, "/register");
   });
 
+  it("v2 login page renders the drag strip through AuthCardShell", () => {
+    const { container } = render(
+      <MemoryRouter initialEntries={["/login?login-v2=1"]}>
+        <LoginPage />
+      </MemoryRouter>,
+    );
+    expectDragStrip(container, "/login?login-v2=1");
+  });
+
+  it("v2 register page renders the drag strip through AuthCardShell", () => {
+    const { container } = render(
+      <MemoryRouter initialEntries={["/register?login-v2=1"]}>
+        <RegisterPage />
+      </MemoryRouter>,
+    );
+    expectDragStrip(container, "/register?login-v2=1");
+  });
+
   it("first-run setup page renders the drag strip", () => {
     const { container } = render(
       <MemoryRouter initialEntries={["/"]}>

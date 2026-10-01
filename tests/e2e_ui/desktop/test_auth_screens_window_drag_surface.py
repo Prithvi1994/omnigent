@@ -68,7 +68,7 @@ _DRAG_REGION_AT_JS = f"""
     const covers = r.left <= x && x <= r.right && r.top <= y && y <= r.bottom;
     if (r.width > 0 && r.height > 0 && covers) {{
       const size = `${{Math.round(r.width)}}x${{Math.round(r.height)}}`;
-      return `${{el.tagName.toLowerCase()}}.${{el.className}} ${{size}}`;
+      return `${{el.tagName.toLowerCase()}}.${{el.getAttribute("class") || ""}} ${{size}}`;
     }}
   }}
   return null;
