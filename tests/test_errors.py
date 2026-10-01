@@ -332,22 +332,23 @@ def test_is_cancelled_rpc_error_matches_endpoint_teardown_goaway() -> None:
     cancellation, not an unhandled fault."""
     teardown = _make_rpc_error("UNAVAILABLE", details="Cancelling all calls")
     assert is_cancelled_rpc_error(teardown) is True
-    # A grpc build may wrap the GOAWAY text in its own formatting.
-    wrapped = _make_rpc_error("UNAVAILABLE", details="GOAWAY: Cancelling all calls (shutdown)")
-    assert is_cancelled_rpc_error(wrapped) is True
 
 
 def test_is_cancelled_rpc_error_ignores_other_unavailable_details() -> None:
-    """UNAVAILABLE without the GOAWAY details (a plain outage) never matches."""
+    """UNAVAILABLE without the verbatim GOAWAY details (a plain outage, or a
+    decorated message) never matches."""
     assert (
         is_cancelled_rpc_error(_make_rpc_error("UNAVAILABLE", details="connection refused"))
         is False
     )
+    decorated = _make_rpc_error("UNAVAILABLE", details="GOAWAY: Cancelling all calls (shutdown)")
+    assert is_cancelled_rpc_error(decorated) is False
 
 
 def test_is_cancelled_rpc_error_tolerates_broken_details_readers() -> None:
-    """An UNAVAILABLE error whose details() raises, or whose details is a
-    field rather than the accessor, reads as not-cancelled."""
+    """An UNAVAILABLE error whose details() raises, whose details is a field
+    rather than the accessor, or whose details lookup itself raises, reads as
+    not-cancelled."""
 
     class _Status:
         name = "UNAVAILABLE"
@@ -369,6 +370,17 @@ def test_is_cancelled_rpc_error_tolerates_broken_details_readers() -> None:
     broken = RpcErrorWithField("no accessor")
     broken.details = "Cancelling all calls"  # type: ignore[attr-defined]  # a field, not the accessor
     assert is_cancelled_rpc_error(broken) is False
+
+    class RpcErrorWithRaisingProperty(Exception):
+        def code(self) -> object:
+            return _Status()
+
+        @property
+        def details(self) -> object:
+            raise RuntimeError("details lookup failed")
+
+    RpcErrorWithRaisingProperty.__name__ = "RpcError"
+    assert is_cancelled_rpc_error(RpcErrorWithRaisingProperty("broken property")) is False
 
 
 def test_is_cancelled_rpc_error_requires_rpc_error_ancestry() -> None:

@@ -602,9 +602,8 @@ _TRANSPORT_EXC_NAMES = frozenset(
 )
 
 
-# grpc-core's status message when a server cancels its in-flight calls on
-# shutdown (grpc_server_cancel_all_calls); unchanged through the grpc 1.x
-# series, observed with grpcio 1.83.
+# grpc-core's shutdown detail for cancelled in-flight calls; the real-grpcio
+# lease-release e2e pins it.
 _GOAWAY_CANCELLED_DETAILS = "Cancelling all calls"
 
 
@@ -613,7 +612,7 @@ def is_cancelled_rpc_error(exc: BaseException) -> bool:
 
     Matched structurally — an ``RpcError`` ancestor by class name plus a
     ``code()`` whose status is named ``CANCELLED``, or ``UNAVAILABLE`` whose
-    details carry the GOAWAY text ``Cancelling all calls`` that an endpoint
+    details are the GOAWAY text ``Cancelling all calls`` that an endpoint
     teardown (e.g. a released channel lease) sends to in-flight calls — so a
     vendored copy of grpc (a different class identity than pypi grpcio) still
     matches and this module imports no grpc.
@@ -635,14 +634,12 @@ def is_cancelled_rpc_error(exc: BaseException) -> bool:
         return True
     if status_name != "UNAVAILABLE":
         return False
-    details = getattr(exc, "details", None)
-    if not callable(details):
-        return False
     try:
-        text = details()
+        details = getattr(exc, "details", None)
+        text = details() if callable(details) else None
     except Exception:  # noqa: BLE001 — a details reader that itself fails is not a cancellation
         return False
-    return isinstance(text, str) and _GOAWAY_CANCELLED_DETAILS in text
+    return isinstance(text, str) and text == _GOAWAY_CANCELLED_DETAILS
 
 
 # EDQUOT is POSIX-only; Windows reports a full disk as ENOSPC.

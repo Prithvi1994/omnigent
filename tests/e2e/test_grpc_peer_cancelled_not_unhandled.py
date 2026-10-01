@@ -46,10 +46,9 @@ import threading
 import time
 from collections.abc import Iterator
 from concurrent import futures
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -75,7 +74,7 @@ from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S  # noqa: E402
 _GRPC_SERVICE = "mas.TreeService"
 _GRPC_METHOD = "ListTreeNodeChildren"
 _ROUTE = "/v1/mas/workspace-tree/children"
-# How many clients share the leased channel when one of them cancels.
+# How many clients hold calls on the leased channel when its lease is released.
 _LEASED_CLIENTS = 3
 _CLIENT_TIMEOUT_S = 30.0
 
@@ -378,13 +377,14 @@ def _wait_until_serving(base_url: str) -> None:
 
 
 def _unhandled_records(
-    records: list[logging.LogRecord], status_name: str
+    records: list[logging.LogRecord], status_name: str | None = None
 ) -> list[logging.LogRecord]:
     """
-    ERROR-level catch-all bookings of an RPC that ended with *status_name*.
+    ERROR-level catch-all bookings of a failed RPC.
 
     :param records: Records captured from the ``omnigent.server.app`` logger.
-    :param status_name: gRPC status name quoted in the booked exception.
+    :param status_name: gRPC status name quoted in the booked exception, or
+        ``None`` to match a booking of any status.
     :returns: The matching ``Unhandled exception`` records.
     """
     return [
@@ -393,7 +393,7 @@ def _unhandled_records(
         if record.levelno >= logging.ERROR
         and record.funcName == "_handle_unhandled_exception"
         and record.getMessage().startswith("Unhandled exception:")
-        and f"StatusCode.{status_name}" in record.getMessage()
+        and f"StatusCode.{status_name or ''}" in record.getMessage()
     ]
 
 
@@ -468,7 +468,7 @@ def test_peer_cancelled_rpc_is_not_booked_as_unhandled_session_error(
 
 @dataclass
 class _ClientOutcome:
-    """What one still-connected client received after the lease release."""
+    """What one client received after the lease release."""
 
     name: str
     status_code: int | None = None
@@ -493,39 +493,18 @@ class _ClientOutcome:
             return None
 
 
-def _open_cancellable_request(base_url: str) -> socket.socket:
-    """
-    Issue the listing request on a raw connection the test can drop mid-flight.
-
-    The returned socket is the cancelling client: closing it is the user
-    abandoning the request while the backing call is still held.
-
-    :param base_url: Server base URL.
-    :returns: The open client socket with the request already sent.
-    """
-    parts = urlsplit(base_url)
-    assert parts.hostname is not None and parts.port is not None
-    sock = socket.create_connection((parts.hostname, parts.port), timeout=_CLIENT_TIMEOUT_S)
-    sock.sendall(
-        f"GET {_ROUTE} HTTP/1.1\r\nHost: {parts.hostname}:{parts.port}\r\n"
-        "Accept: application/json\r\n\r\n".encode()
-    )
-    return sock
-
-
 def _drive_lease_release(base_url: str, backend: _LeasedBackend) -> list[_ClientOutcome]:
     """
-    Three clients share the leased channel; one cancels and the lease is released.
+    Several clients hold calls on the leased channel when its lease is released.
 
-    Client A sends the listing request and drops its connection while the
-    backing call is held. The lease release then tears the endpoint down under
-    the calls that clients B and C still have in flight.
+    Each client sends the listing request; once every backing call is held,
+    the lease release tears the endpoint down under all of them.
 
     :param base_url: Server base URL.
     :param backend: The leased backend standing in for the barnacle channel.
-    :returns: What clients B and C received.
+    :returns: What each client received.
     """
-    outcomes = [_ClientOutcome(name) for name in ("client-B", "client-C")]
+    outcomes = [_ClientOutcome(f"client-{index}") for index in range(_LEASED_CLIENTS)]
 
     def _request(outcome: _ClientOutcome) -> None:
         try:
@@ -539,21 +518,17 @@ def _drive_lease_release(base_url: str, backend: _LeasedBackend) -> list[_Client
     threads = [
         threading.Thread(target=_request, args=(outcome,), daemon=True) for outcome in outcomes
     ]
-    with closing(_open_cancellable_request(base_url)):
-        for thread in threads:
-            thread.start()
-        backend.wait_for_inflight(_LEASED_CLIENTS)
-    # Leaving the block drops client A's connection while all three calls are
-    # held. The pause is best-effort ordering only: nothing observable confirms
-    # the server saw the disconnect first, and the assertions hold either way.
-    time.sleep(0.2)
-    backend.release_lease()
-
     for thread in threads:
-        thread.join(timeout=_CLIENT_TIMEOUT_S + 5)
-    assert not any(thread.is_alive() for thread in threads), (
-        "a still-connected client never got a response"
-    )
+        thread.start()
+    try:
+        backend.wait_for_inflight(_LEASED_CLIENTS)
+    finally:
+        # Tear the endpoint down even if a call never arrived, so every request
+        # ends and the client threads can be joined.
+        backend.release_lease()
+        for thread in threads:
+            thread.join(timeout=_CLIENT_TIMEOUT_S + 5)
+    assert not any(thread.is_alive() for thread in threads), "a client never got a response"
     return outcomes
 
 
@@ -572,26 +547,25 @@ def test_lease_release_answers_499_and_books_no_unhandled_errors(
 
     outcomes = _drive_lease_release(base_url, leased_grpc_backend)
 
-    # Responses: the still-connected clients get the coded, retryable 499.
+    # Responses: every client gets the coded, retryable 499.
     received = [(outcome.status_code, outcome.error_code()) for outcome in outcomes]
     assert received == [(499, "upstream_cancelled")] * len(outcomes), (
-        "lease release did not answer still-connected clients with upstream_cancelled:\n"
+        "lease release did not answer the clients with upstream_cancelled:\n"
         + "\n".join(outcome.describe() for outcome in outcomes)
     )
 
-    # Bookings: nothing reaches the catch-all as an unhandled error.
-    unhandled = _unhandled_records(records, "UNAVAILABLE")
+    # Bookings: nothing reaches the catch-all as an unhandled error, whatever
+    # status the teardown surfaced under.
+    unhandled = _unhandled_records(records)
     assert not unhandled, (
         f"lease release booked {len(unhandled)} unhandled session error(s) "
         f"for {_LEASED_CLIENTS} in-flight calls:\n"
         + "\n".join(_describe_booking(record) for record in unhandled)
     )
 
-    # Two or three cancellation bookings, depending on whether the cancelling
-    # client's own call is still in the handler when the teardown lands; the
-    # handler unit test pins exactly one booking per cancelled request.
+    # Exactly one WARNING upstream-cancellation booking per cancelled call.
     cancelled = _upstream_cancelled_records(records, "UNAVAILABLE")
-    assert len(outcomes) <= len(cancelled) <= _LEASED_CLIENTS, (
+    assert len(cancelled) == len(outcomes), (
         "expected one WARNING upstream-cancellation booking per cancelled call, "
         f"got {len(cancelled)}:\n"
         + "\n".join(
