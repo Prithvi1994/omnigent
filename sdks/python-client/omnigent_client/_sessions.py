@@ -936,9 +936,10 @@ class SessionsNamespace:
         and keys not mentioned keep their current value. Nothing is
         removed by this call — an empty-string value is stored as
         ``""``, not treated as a delete (only the server's own project
-        and pin keys clear on ``""``). Server-internal keys and the
-        advisor-owned ``cost_control.*`` family are rejected with 400.
-        An empty mapping leaves the session unchanged.
+        and pin keys clear on ``""``). Server-internal keys are rejected
+        with 400; the advisor-owned ``cost_control.*`` family is rejected
+        with 403 unless the caller is the session's bound runner. An
+        empty mapping leaves the session unchanged.
 
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -946,9 +947,9 @@ class SessionsNamespace:
             ``{"team": "platform"}``.
         :returns: The updated :class:`Session` snapshot; its
             ``labels`` carry the merged result.
-        :raises OmnigentError: On non-2xx status (400 for a reserved
-            key, 403 without edit access, 404 when the session does
-            not exist).
+        :raises OmnigentError: On non-2xx status (400 for a
+            server-internal key, 403 for a ``cost_control.*`` key or
+            without edit access, 404 when the session does not exist).
         """
         resp = await self._http.patch(
             f"{self._base}/v1/sessions/{session_id}",

@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any, Literal, overload
 
 import httpx
+from pydantic import ValidationError
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.server.schemas import UsageReport
@@ -354,11 +355,18 @@ class OmnigentClient:
 
         :returns: The typed usage report.
         :raises OmnigentError: On non-2xx status (401 when the server
-            requires authentication and the client sent none).
+            requires authentication and the client sent none), or when
+            a 2xx body does not match the ``UsageReport`` schema.
         """
         resp = await self._http.get(f"{self._base_url}/v1/usage")
         raise_for_status(resp.status_code, response_body(resp))
-        return UsageReport.model_validate(require_json_object(resp, "GET /v1/usage"))
+        body = require_json_object(resp, "GET /v1/usage")
+        try:
+            return UsageReport.model_validate(body)
+        except ValidationError as exc:
+            raise OmnigentError(
+                f"GET /v1/usage returned an unexpected body: {exc}", resp.status_code
+            ) from exc
 
     async def list_hosts(self) -> list[dict[str, Any]]:
         """List the hosts owned by the calling user.
@@ -370,14 +378,17 @@ class OmnigentClient:
         client choose a launch target through the public API.
 
         :returns: Host dicts, empty when the user owns no hosts.
-        :raises OmnigentError: On non-2xx status.
+        :raises OmnigentError: On non-2xx status, or when a 2xx body
+            lacks a well-formed ``hosts`` array.
         """
         resp = await self._http.get(f"{self._base_url}/v1/hosts")
         raise_for_status(resp.status_code, response_body(resp))
-        hosts = require_json_object(resp, "GET /v1/hosts").get("hosts", [])
-        if not isinstance(hosts, list):
-            return []
-        return [host for host in hosts if isinstance(host, dict)]
+        hosts = require_json_object(resp, "GET /v1/hosts").get("hosts")
+        if not isinstance(hosts, list) or not all(isinstance(host, dict) for host in hosts):
+            raise OmnigentError(
+                "GET /v1/hosts returned a malformed 'hosts' array", resp.status_code
+            )
+        return hosts
 
     async def _fetch_agent_tools(
         self, agent_id: str, session_id: str | None = None

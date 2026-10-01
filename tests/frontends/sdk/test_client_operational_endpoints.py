@@ -117,6 +117,33 @@ async def test_list_hosts_returns_hosts() -> None:
 
 
 @pytest.mark.asyncio
+async def test_usage_malformed_body_raises_omnigent_error() -> None:
+    body = {"object": "usage_report", "cost_today": "not-a-number"}
+    async with OmnigentClient(base_url=_BASE) as client:
+        client._http._transport = httpx.MockTransport(_recording_handler({}, body))
+        with pytest.raises(OmnigentError) as exc_info:
+            await client.usage()
+
+    assert exc_info.value.status_code == 200
+    assert "GET /v1/usage" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [{}, {"hosts": "laptop"}, {"hosts": [{"host_id": "host_a1b2"}, "oops"]}],
+)
+async def test_list_hosts_malformed_body_raises_omnigent_error(body: dict[str, Any]) -> None:
+    async with OmnigentClient(base_url=_BASE) as client:
+        client._http._transport = httpx.MockTransport(_recording_handler({}, body))
+        with pytest.raises(OmnigentError) as exc_info:
+            await client.list_hosts()
+
+    assert exc_info.value.status_code == 200
+    assert "GET /v1/hosts" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("method_name", ["info", "usage", "list_hosts"])
 async def test_operational_endpoints_propagate_server_errors(method_name: str) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
