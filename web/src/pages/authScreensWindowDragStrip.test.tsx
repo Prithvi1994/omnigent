@@ -9,7 +9,6 @@ import { ApprovePage } from "./ApprovePage";
 import { LoginPage } from "./LoginPage";
 import { RegisterPage } from "./RegisterPage";
 import { SetupPage } from "./SetupPage";
-import { AuthCardShell } from "./onboarding/AuthCardShell";
 
 vi.mock("@/lib/accountsApi", () => ({
   // Never resolves: keeps LoginPage's already-authed auto-bounce inert so the
@@ -42,6 +41,7 @@ afterEach(() => {
   cleanup();
   delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   window.localStorage.clear();
 });
 
@@ -109,14 +109,27 @@ describe("outside-AppShell screens keep the desktop window draggable", () => {
     expectDragStrip(container, "/approve");
   });
 
-  it("v2 auth card shell renders the drag strip", () => {
+  it("v2 login page renders the drag strip in AuthCardShell's compact layout", () => {
+    // jsdom has no matchMedia; matching Tailwind's max-md query selects the
+    // compact layout, which mounts its own strip.
+    vi.stubGlobal("matchMedia", (query: string) => ({
+      matches: query.includes("max-width"),
+      media: query,
+      onchange: null,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    }));
     const { container } = render(
-      <MemoryRouter initialEntries={["/login"]}>
-        <AuthCardShell>
-          <div>card body</div>
-        </AuthCardShell>
+      <MemoryRouter initialEntries={["/login?login-v2=1"]}>
+        <LoginPage />
       </MemoryRouter>,
     );
-    expectDragStrip(container, "v2 auth card shell");
+    expectDragStrip(container, "/login?login-v2=1 (compact layout)");
+    // The compact layout folds a 3rem base padding into the safe-area inset.
+    const strip = container.querySelector(".electron-standalone-drag-strip") as HTMLElement;
+    expect((strip.parentElement as HTMLElement).style.paddingTop).toContain("3rem");
   });
 });

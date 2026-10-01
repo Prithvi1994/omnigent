@@ -168,9 +168,10 @@ def test_sign_in_screen_offers_window_drag_surface(
 def test_register_screen_offers_window_drag_surface(
     accounts_server: AccountsServer, mac_desktop_page: Page
 ) -> None:
+    """Any invite token shows the form; the server only validates it on submit."""
     page = mac_desktop_page
-    page.goto(f"{accounts_server.public_url}/register")
-    page.wait_for_selector("[role=alert]", timeout=30_000)
+    page.goto(f"{accounts_server.public_url}/register?invite=e2e-window-drag")
+    page.wait_for_selector("#register-username", timeout=30_000)
     _assert_drag_surface(page, "register")
 
 
