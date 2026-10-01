@@ -10603,7 +10603,9 @@ async def _child_session_summaries_from_conversations(
         child_id: _latest_message_preview(message_items)
         for child_id, message_items in message_items_by_child.items()
     }
-    agent_names = await asyncio.to_thread(_bound_agent_names, children)
+    agent_names = await asyncio.to_thread(
+        _bound_agent_names, [child for child in children if child.sub_agent_name is None]
+    )
     return [
         _child_session_summary_from_conversation(
             child,

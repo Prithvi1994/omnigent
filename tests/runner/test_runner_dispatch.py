@@ -4640,6 +4640,16 @@ _BY_ID_CHILD_IDENTITY_SCENARIOS = [
         "ui:pricing",
         id="verbatim-ui-prefixed-title",
     ),
+    # A verbatim child whose agent binding no longer resolves keeps its whole
+    # title under the last-resort label, like the in-process tools.
+    pytest.param(
+        "research:pricing",
+        None,
+        None,
+        "agent",
+        "research:pricing",
+        id="verbatim-colon-unresolved-agent",
+    ),
     # A named child continued by id: the "<agent>:<title>" parse wins, so
     # the parent's agent_name never leaks into the label.
     pytest.param(
@@ -6507,6 +6517,12 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                         "tool": "pricing_probe_child",
                         "session_name": "auth refactor",
                     },
+                    {
+                        "id": "c7",
+                        "title": "orphaned:binding",
+                        "tool": None,
+                        "session_name": "orphaned:binding",
+                    },
                 ],
             },
         )
@@ -6520,11 +6536,13 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
     # c3 (explicitly closed despite its mixed-type label map), c5
     # (legacy title tombstone), and c4
     # (no session_name) dropped; the ui:-added child surfaces under its
-    # bound agent + label, and the verbatim child c6 under its binding.
+    # bound agent + label, the verbatim child c6 under its binding, and
+    # c7 (binding no longer resolves) under the last-resort label.
     assert out["sub_agents"] == [
         {"agent": "researcher", "title": "auth", "conversation_id": "c1"},
         {"agent": "claude-native-ui", "title": "1", "conversation_id": "c2"},
         {"agent": "pricing_probe_child", "title": "auth refactor", "conversation_id": "c6"},
+        {"agent": "agent", "title": "orphaned:binding", "conversation_id": "c7"},
     ]
 
 

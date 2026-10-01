@@ -1190,6 +1190,30 @@ def test_session_list_decomposes_ui_added_title(
     assert by_id[child_id] == {"agent": "codex", "title": "reviewer", "conversation_id": child_id}
 
 
+def test_session_list_labels_unresolved_binding_as_agent(
+    session_fixture: _Fixture,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verbatim child whose agent binding no longer resolves keeps its title under ``agent``."""
+    monkeypatch.setattr("omnigent.runtime.get_agent_store", lambda: SqlAlchemyAgentStore(db_uri))
+    child = session_fixture.conv_store.create_conversation(
+        kind="sub_agent",
+        title="research:pricing",
+        parent_conversation_id=session_fixture.parent_conv_id,
+        agent_id="f" * 32,
+    )
+
+    raw = SysSessionListTool().invoke("{}", session_fixture.ctx)
+
+    by_id = {entry["conversation_id"]: entry for entry in json.loads(raw)["sub_agents"]}
+    assert by_id[child.id] == {
+        "agent": "agent",
+        "title": "research:pricing",
+        "conversation_id": child.id,
+    }
+
+
 @pytest.mark.parametrize("title", ["research:pricing", None], ids=["colon", "untitled"])
 def test_close_keeps_verbatim_colon_title_whole(
     session_fixture: _Fixture,

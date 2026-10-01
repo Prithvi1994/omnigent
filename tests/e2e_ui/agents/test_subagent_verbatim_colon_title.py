@@ -119,58 +119,60 @@ def verbatim_title_session(
     child_model = f"verbatim-title-child-{uid}"
     work_dir = _REPO_ROOT / ".omnigent" / "e2e-verbatim-title" / uid
     (work_dir / _CHILD_CONFIG_DIR).mkdir(parents=True)
-    (work_dir / _CHILD_CONFIG_DIR / "config.yaml").write_text(
-        _CHILD_YAML.format(name=_CHILD_AGENT_NAME, child_model=child_model)
-    )
-
-    configure_mock_llm(
-        mock_llm_server_url,
-        [
-            {
-                "tool_calls": [
-                    {
-                        "call_id": "call_create_research_child",
-                        "name": "sys_session_create",
-                        "arguments": json.dumps(
-                            {
-                                "config_path": _CHILD_CONFIG_DIR,
-                                "title": _VERBATIM_TITLE,
-                                "message": "Research the pricing page and summarize it.",
-                            }
-                        ),
-                    }
-                ]
-            },
-            {
-                "tool_calls": [
-                    {
-                        "call_id": "call_list_children",
-                        "name": "sys_session_list",
-                        "arguments": "{}",
-                    }
-                ]
-            },
-            {"text": _TURN_DONE},
-        ],
-        key=parent_model,
-        required_tools=["sys_session_create"],
-    )
-    set_fallback_mock_llm(mock_llm_server_url, parent_model, "PARENT_WAKE_DONE")
-    set_fallback_mock_llm(mock_llm_server_url, child_model, "CHILD_RESEARCH_DONE")
-
-    respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
-    runner_id = str(_server_state["runner_id"])
-    session_id = _create_bundled_session(
-        live_server,
-        runner_id,
-        _PARENT_YAML.format(
-            name=f"verbatim_title_probe_{uid}", parent_model=parent_model, cwd=work_dir
-        ),
-    )
+    session_id: str | None = None
+    respawned_runner: subprocess.Popen[bytes] | None = None
     try:
+        (work_dir / _CHILD_CONFIG_DIR / "config.yaml").write_text(
+            _CHILD_YAML.format(name=_CHILD_AGENT_NAME, child_model=child_model)
+        )
+        configure_mock_llm(
+            mock_llm_server_url,
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "call_id": "call_create_research_child",
+                            "name": "sys_session_create",
+                            "arguments": json.dumps(
+                                {
+                                    "config_path": _CHILD_CONFIG_DIR,
+                                    "title": _VERBATIM_TITLE,
+                                    "message": "Research the pricing page and summarize it.",
+                                }
+                            ),
+                        }
+                    ]
+                },
+                {
+                    "tool_calls": [
+                        {
+                            "call_id": "call_list_children",
+                            "name": "sys_session_list",
+                            "arguments": "{}",
+                        }
+                    ]
+                },
+                {"text": _TURN_DONE},
+            ],
+            key=parent_model,
+            required_tools=["sys_session_create"],
+        )
+        set_fallback_mock_llm(mock_llm_server_url, parent_model, "PARENT_WAKE_DONE")
+        set_fallback_mock_llm(mock_llm_server_url, child_model, "CHILD_RESEARCH_DONE")
+
+        respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
+        runner_id = str(_server_state["runner_id"])
+        session_id = _create_bundled_session(
+            live_server,
+            runner_id,
+            _PARENT_YAML.format(
+                name=f"verbatim_title_probe_{uid}", parent_model=parent_model, cwd=work_dir
+            ),
+        )
         yield VerbatimTitleSession(base_url=live_server, session_id=session_id)
     finally:
-        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if session_id is not None:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
         shutil.rmtree(work_dir, ignore_errors=True)
         if respawned_runner is not None:
             respawned_runner.terminate()

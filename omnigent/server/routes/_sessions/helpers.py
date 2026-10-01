@@ -4648,7 +4648,7 @@ def _publish_child_status_to_parent(session_id: str, status: str) -> None:
             parent_id,
             _latest_message_preview(items_by_child.get(conv.id, [])),
             cached_status=status,
-            agent_names=_bound_agent_names([conv]),
+            agent_names=_bound_agent_names([conv]) if conv.sub_agent_name is None else None,
         )
         event = SessionChildSessionUpdatedEvent(
             type="session.child_session.updated",
@@ -10434,8 +10434,9 @@ def _bound_agent_names(convs: list[Conversation]) -> dict[str, str]:
 
     A child whose title is verbatim (no ``sub_agent_name`` stamp) takes its
     ``tool`` from this binding instead of its title. One batched store
-    read; unresolvable ids are omitted and an uninitialized runtime yields
-    an empty map.
+    read; unresolvable ids are omitted, and an uninitialized runtime or a
+    failing store yields an empty map so the summary still publishes with
+    ``tool`` unset.
 
     :param convs: Child conversation rows about to be summarised.
     :returns: ``{agent_id: agent.name}`` for every binding that resolves.
@@ -10446,10 +10447,12 @@ def _bound_agent_names(convs: list[Conversation]) -> dict[str, str]:
     if not agent_ids:
         return {}
     try:
-        store = get_agent_store()
+        return get_agent_store().get_names(sorted(agent_ids))
     except RuntimeError:
         return {}
-    return store.get_names(sorted(agent_ids))
+    except StatementError:
+        _logger.warning("Could not resolve bound agent names for child summaries", exc_info=True)
+        return {}
 
 
 def _child_session_summary_from_conversation(

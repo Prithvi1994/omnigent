@@ -6147,7 +6147,7 @@ def _child_rows_to_entries(
             continue
         entries.append(
             {
-                "agent": _optional_string(row.get("tool")),
+                "agent": _optional_string(row.get("tool")) or "agent",
                 "title": _optional_string(row.get("session_name")),
                 "conversation_id": _optional_string(row.get("id")),
             }

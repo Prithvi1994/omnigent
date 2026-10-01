@@ -926,6 +926,37 @@ async def test_child_sessions_parses_ui_added_agent_title(
     assert row["session_name"] == expected_session_name
 
 
+async def test_child_sessions_keeps_verbatim_title_without_agent_binding(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A verbatim title stays whole even when the child has no resolvable agent.
+
+    With nothing to resolve the summary leaves ``tool`` unset rather than
+    inventing a handle from the title; the runner relay supplies its own
+    last-resort label.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="research:pricing",
+        agent_id=None,
+        sub_agent_name=None,
+    )
+
+    resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+    assert resp.status_code == 200
+    row = {r["id"]: r for r in resp.json()["data"]}[child.id]
+    assert row["agent_id"] is None
+    assert (row["tool"], row["session_name"]) == (None, "research:pricing")
+
+
 async def test_child_sessions_splits_stamped_child_with_colon_in_name(
     client: httpx.AsyncClient,
     db_uri: str,

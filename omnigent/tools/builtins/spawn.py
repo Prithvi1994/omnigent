@@ -1278,7 +1278,7 @@ def _agent_title_from_conversation(
             f"{child.title!r} — expected '<agent>:<title>' format"
         )
     sa_agent, _, sa_title = display_title.partition(":")
-    if sa_agent == "ui" and ":" in sa_title:
+    if child.sub_agent_name is None and sa_agent == "ui" and ":" in sa_title:
         # Add-agent sentinel "ui:<agent>:<label>": the agent is the middle segment.
         sa_agent, _, sa_title = sa_title.partition(":")
     return _AgentTitle(agent=sa_agent, title=sa_title)
