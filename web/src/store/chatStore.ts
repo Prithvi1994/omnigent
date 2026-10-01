@@ -3964,8 +3964,8 @@ async function refreshSessionBinding(id: string): Promise<void> {
  * Do not await the stream response before loading the snapshot:
  * proxies can delay SSE headers until data arrives, and pending
  * elicitations must still replay on refresh while the stream is
- * connecting. Dedupe by item id on merge so stream-delivered
- * persisted items don't double-render alongside hydrated ones.
+ * connecting. After connection, recover items newer than that snapshot
+ * to close the subscription gap. Deduplicate by persisted item id.
  */
 async function bindStream(
   id: string,
@@ -4021,9 +4021,36 @@ async function bindStream(
 
   // The slot is held for the pump's whole lifetime; released when it exits (a
   // terminal close, an abort from switchTo/dispose, or eviction).
-  void startStreamPump(id, controller, set, get, ignoredNativeMessageIds).finally(() =>
-    releaseStreamSlot(id),
-  );
+  interface SnapshotEnd {
+    cursor: string | null;
+    visibleId: string | null;
+  }
+  let finishSnapshot!: (end: SnapshotEnd | undefined) => void;
+  const snapshotReady = new Promise<SnapshotEnd | undefined>((resolve) => {
+    finishSnapshot = resolve;
+  });
+  const reconcileInitialConnection = async (): Promise<void> => {
+    const end = await snapshotReady;
+    if (end === undefined || controller.signal.aborted || get().abortController !== controller)
+      return;
+    await reconcileInitialHistory(
+      id,
+      end.cursor,
+      end.visibleId,
+      controller,
+      set,
+      get,
+      ignoredNativeMessageIds,
+    );
+  };
+  void startStreamPump(
+    id,
+    controller,
+    set,
+    get,
+    ignoredNativeMessageIds,
+    reconcileInitialConnection,
+  ).finally(() => releaseStreamSlot(id));
 
   // Background tabs can miss the `response.elicitation_resolved` SSE event
   // (browser throttling), so a pending ApprovalCard that was answered on
@@ -4266,13 +4293,89 @@ async function bindStream(
     });
     if (session.usageIncluded === false) void hydrateSessionUsage(id);
     racedNativeModelOptions.delete(id);
+    finishSnapshot({
+      cursor: items.at(-1)?.id ?? null,
+      visibleId: snapshotBlocks.at(-1)?.ctx.itemId ?? null,
+    });
   } catch (err) {
     if (isConversationDisposed(id)) return;
     set({
       loadingConversation: false,
       conversationLoadError: err instanceof Error ? err : new Error(String(err)),
     });
+  } finally {
+    finishSnapshot(undefined);
   }
+}
+
+/** Recover items committed between the eager snapshot and the first SSE subscription. */
+async function reconcileInitialHistory(
+  id: string,
+  lastItemId: string | null,
+  lastVisibleItemId: string | null,
+  controller: AbortController,
+  set: Setter,
+  get: Getter,
+  ignoredNativeMessageIds: Set<string>,
+): Promise<void> {
+  const generation = get().historyGeneration;
+  const stale = () =>
+    controller.signal.aborted ||
+    isConversationDisposed(id) ||
+    get().abortController !== controller ||
+    get().historyGeneration !== generation;
+  const pendingAtConnect = new Set(get().pendingUserMessages.map((p) => p.tempId));
+  let cursor = lastItemId;
+  let anchorId = lastVisibleItemId;
+  // Pages form a cursor chain; the pump continues consuming events concurrently.
+  /* oxlint-disable no-await-in-loop */
+  while (!stale()) {
+    let page: SessionItemsPage;
+    try {
+      page = await fetchSessionItemsPage(id, { newerThan: cursor, signal: controller.signal });
+    } catch {
+      return;
+    }
+    if (stale()) return;
+    const nativeIds = nativeCompletedMessageIds(page.items);
+    nativeIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
+    const recovered = itemsToBlocks(page.items);
+    set((state) => {
+      const current = withoutNativePreviews(state.blocks, nativeIds);
+      const seen = new Set(current.map((b) => b.ctx.itemId).filter(Boolean));
+      const unseen = recovered.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
+      if (unseen.length === 0) return current === state.blocks ? {} : { blocks: current };
+      const blocks = [...withoutRebuiltUserInputCards(current, unseen)];
+      // Everything in this page follows the snapshot cursor and precedes the
+      // unpersisted live tail. Keep the server's order even if replies won the race.
+      let insertAt =
+        anchorId === null ? 0 : blocks.findLastIndex((b) => b.ctx.itemId === anchorId) + 1;
+      for (const block of recovered) {
+        if (block.ctx.itemId && seen.has(block.ctx.itemId)) {
+          insertAt = blocks.findLastIndex((b) => b.ctx.itemId === block.ctx.itemId) + 1;
+        } else if (block.ctx.itemId) {
+          blocks.splice(insertAt, 0, block);
+          insertAt += 1;
+        }
+      }
+      const acknowledged = unseen.filter(
+        (b) => b.type === "user_message" && !isSystemUserContent(b.content),
+      ).length;
+      let remaining = acknowledged;
+      const pendingUserMessages = state.pendingUserMessages.filter((p) => {
+        if (remaining === 0 || p.initialDraft || !pendingAtConnect.has(p.tempId)) return true;
+        pendingAtConnect.delete(p.tempId);
+        remaining -= 1;
+        return false;
+      });
+      return { blocks, pendingUserMessages };
+    });
+    const nextCursor = page.items.at(-1)?.id;
+    if (!page.hasMore || !nextCursor || nextCursor === cursor) return;
+    cursor = nextCursor;
+    anchorId = recovered.at(-1)?.ctx.itemId ?? anchorId;
+  }
+  /* oxlint-enable no-await-in-loop */
 }
 
 /** Hydrate display-only subtree totals without delaying session reconciliation. */
@@ -5104,11 +5207,11 @@ if (typeof window !== "undefined") {
  * `ensureBoundSession` doesn't see a dead binding and rebind redundantly
  * during a transient gap) and cleared only when this loop exits.
  *
- * On a re-connect — but not the first connect, whose snapshot `bindStream`
- * already hydrates — the loop drops the stale in-flight bubble and
+ * On a re-connect the loop drops the stale in-flight bubble and
  * reconciles the committed snapshot concurrently with the live pump, so
  * the server's replay rebuilds the streaming turn without duplication and
- * a gap-completed turn isn't lost.
+ * a gap-completed turn isn't lost. The first connection calls the bind's
+ * history catch-up hook without resetting live response state.
  */
 export async function startStreamPump(
   id: string,
@@ -5116,6 +5219,7 @@ export async function startStreamPump(
   set: Setter,
   get: Getter,
   ignoredNativeMessageIds: Set<string> = new Set<string>(),
+  onInitialConnect?: () => Promise<void>,
 ): Promise<void> {
   nativePreviewTombstonesByController.set(controller, ignoredNativeMessageIds);
   let failedOpens = 0;
@@ -5314,6 +5418,8 @@ export async function startStreamPump(
         );
         if (reconnecting) {
           await reconcileOnReconnect(id, set, get, ignoredNativeMessageIds);
+        } else {
+          await onInitialConnect?.();
         }
         let reason = await pumpPromise;
 

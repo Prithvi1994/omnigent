@@ -1100,6 +1100,118 @@ describe("chatStore — lazy subtree usage", () => {
 });
 
 describe("chatStore — switchTo", () => {
+  it.each(["snapshot-first", "stream-first", "background", "paged-gap", "pending-inputs"])(
+    "recovers a side-chat question committed before subscription (%s)",
+    async (order) => {
+      const id = "conv_side_initial_gap";
+      const before = userMessage("before_side", "Earlier question");
+      const hidden: ConversationItem = { ...userMessage("hidden", "internal"), is_meta: true };
+      const initial = order === "paged-gap" ? [before, hidden] : [];
+      seedSession(id, initial);
+      const question = userMessage("side_turn", "Hi");
+      const reply = assistantMessage("side_turn", "Hello");
+      const sink = pushableStream();
+      let openStream!: (response: Response) => void;
+      const stream = new Promise<Response>((resolve) => {
+        openStream = resolve;
+      });
+      let finishInitialItems!: (response: Response) => void;
+      const initialItems = new Promise<Response>((resolve) => {
+        finishInitialItems = resolve;
+      });
+      let finishBackfill!: (response: Response) => void;
+      const backfill = new Promise<Response>((resolve) => {
+        finishBackfill = resolve;
+      });
+      let itemFetches = 0;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input).split("?")[0];
+        if (path === `/v1/sessions/${id}/stream`) return stream;
+        if (path === `/v1/sessions/${id}/items`) {
+          itemFetches += 1;
+          if (itemFetches === 1) return initialItems;
+          if (itemFetches === 2) return backfill;
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const loading = useChatStore.getState().switchTo(id);
+      await vi.waitFor(() => expect(itemFetches).toBe(1));
+      if (order === "stream-first") {
+        openStream(mockResponse(null, { bodyStream: sink.stream }));
+        await tick();
+      }
+      finishInitialItems(mockResponse({ data: [...initial].reverse(), has_more: false }));
+      await loading;
+      // The snapshot predates the user item, and its event precedes subscription.
+      seedSessionItems(id, [...initial, question, reply]);
+      if (order === "background") await useChatStore.getState().switchTo(null);
+      if (order === "pending-inputs") {
+        useChatStore.setState({
+          pendingUserMessages: [{ tempId: "early", content: [{ type: "input_text", text: "Hi" }] }],
+        });
+      }
+      if (order !== "stream-first") openStream(mockResponse(null, { bodyStream: sink.stream }));
+      await vi.waitFor(() => expect(itemFetches).toBe(2));
+      if (order === "pending-inputs") {
+        useChatStore.setState({
+          pendingUserMessages: [
+            ...useChatStore.getState().pendingUserMessages,
+            { tempId: "later", content: [{ type: "input_text", text: "Hi" }] },
+          ],
+        });
+      }
+      // A completed reply races ahead of recovery; it must stay after its input.
+      sink.push(sse("response.output_item.done", { item: reply }));
+      await vi.waitFor(() =>
+        expect(
+          conversationRegistry
+            .peek(id)!
+            .getState()
+            .blocks.some((b) => b.ctx.itemId === reply.id),
+        ).toBe(true),
+      );
+      finishBackfill(
+        mockResponse({
+          data: order === "paged-gap" ? [question] : [question, reply],
+          has_more: order === "paged-gap",
+        }),
+      );
+      const expectedIds = [...(order === "paged-gap" ? [before.id] : []), question.id, reply.id];
+      await vi.waitFor(() =>
+        expect(
+          conversationRegistry
+            .peek(id)!
+            .getState()
+            .blocks.map((b) => b.ctx.itemId),
+        ).toEqual(expectedIds),
+      );
+      if (order === "pending-inputs") {
+        expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(["later"]);
+      } else {
+        // Replaying the persisted user event must not duplicate the recovered item.
+        sink.push(
+          sse("session.input.consumed", {
+            data: {
+              item_id: question.id,
+              type: "message",
+              data: { role: "user", content: [{ type: "input_text", text: "Hi" }] },
+            },
+          }),
+        );
+        await tick();
+      }
+      expect(
+        conversationRegistry
+          .peek(id)!
+          .getState()
+          .blocks.map((b) => b.ctx.itemId),
+      ).toEqual(expectedIds);
+      expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(0);
+      sink.push("data: [DONE]\n\n");
+      sink.close();
+    },
+  );
+
   it("hydrates blocks from the session snapshot when switching to a real conv id", async () => {
     const items: ConversationItem[] = [
       userMessage("resp_1", "hello"),
@@ -1921,13 +2033,14 @@ describe("chatStore — switchTo", () => {
     // Older items remain, so scroll-up loading is armed. `false` here
     // would strand the user with no way to reach earlier turns.
     expect(state.hasMoreHistory).toBe(true);
-    // Exactly ONE request on bind. More than one means the open resumed
-    // fetching history the reader never asked for.
+    // Catch-up only asks for NEWER items; older history remains user-paged.
     const itemFetches = fetchMock.mock.calls.filter(([u]) =>
       String(u).startsWith("/v1/sessions/conv_big/items"),
     );
-    expect(itemFetches).toHaveLength(1);
+    expect(itemFetches).toHaveLength(2);
     expect(String(itemFetches[0]![0])).toContain("order=desc");
+    expect(String(itemFetches[1]![0])).toContain("order=asc");
+    expect(String(itemFetches[1]![0])).toContain(`after=${fullItems.at(-1)!.id}`);
   });
 
   it("loadMoreHistory prepends the page of items immediately older than the window", async () => {

@@ -1274,7 +1274,7 @@ export async function getSessionUsage(
 export interface SessionItemsPage {
   /** Items oldest-to-newest, ready to feed `itemsToBlocks`. */
   items: ConversationItem[];
-  /** True when older items exist before the first item in this page. */
+  /** True when more items exist in the requested scan direction. */
   hasMore: boolean;
 }
 
@@ -1289,26 +1289,29 @@ export interface SessionItemsPage {
  *
  * The server orders by position, so we request the newest `limit` items
  * (`order=desc`, plus `after` the cursor when paging back) and reverse
- * to chronological. `has_more` reports whether still-older items remain.
+ * to chronological. For catch-up, `newerThan` scans forwards; null starts
+ * at the beginning. `has_more` follows the requested scan direction.
  */
 export async function fetchSessionItemsPage(
   sessionId: string,
   {
     olderThan,
+    newerThan,
     limit = SESSION_HISTORY_PAGE_SIZE,
     signal,
-  }: { olderThan?: string; limit?: number; signal?: AbortSignal } = {},
+  }: { olderThan?: string; newerThan?: string | null; limit?: number; signal?: AbortSignal } = {},
 ): Promise<SessionItemsPage> {
-  const params = new URLSearchParams({ limit: String(limit), order: "desc" });
-  // "Older than the cursor" within a descending scan = items after it.
-  if (olderThan) params.set("after", olderThan);
+  const ascending = newerThan !== undefined;
+  const params = new URLSearchParams({ limit: String(limit), order: ascending ? "asc" : "desc" });
+  const cursor = ascending ? newerThan : olderThan;
+  if (cursor) params.set("after", cursor);
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
     { signal },
   );
   const page = await readJsonOrThrow<SessionItemsResponseWire>(res);
-  // Server returns newest-first; reverse to chronological for rendering.
-  return { items: [...page.data].reverse(), hasMore: page.has_more };
+  // Expose both scan directions in chronological order.
+  return { items: ascending ? page.data : [...page.data].reverse(), hasMore: page.has_more };
 }
 
 /**
