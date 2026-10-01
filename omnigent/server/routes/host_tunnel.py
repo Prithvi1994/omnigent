@@ -893,7 +893,7 @@ async def _receive_loop(
                 queue.put_nowait(
                     (
                         "progress",
-                        {"done": frame.done, "total": frame.total},
+                        {"done": frame.done, "total": frame.total, "skipped": frame.skipped},
                     )
                 )
             continue
@@ -913,6 +913,7 @@ async def _receive_loop(
                             "error": frame.error,
                             "failed": frame.failed,
                             "failures": frame.failures,
+                            "skipped": frame.skipped,
                         },
                     )
                 )

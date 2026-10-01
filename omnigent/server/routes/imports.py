@@ -10,10 +10,11 @@ import logging
 import secrets
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast, get_args
 
+import cachetools
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -23,6 +24,8 @@ from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
+    CAP_IMPORT_SKIP_KNOWN,
+    MAX_IMPORT_SKIP_IDS,
     HostImportLocalByIdFrame,
     HostImportLocalCancelFrame,
     HostImportLocalFrame,
@@ -348,6 +351,39 @@ class ImportProgress:
 
     done: int
     total: int | None
+    # How many of ``done`` the host skipped unread because the server already
+    # has them (see ``skip_external_session_ids``).
+    skipped: int = 0
+
+
+# Process-local cache of the external ids an interrupted batch already stored,
+# per (user, host), so its re-run can tell the host to skip them. Best effort:
+# a restart or another replica just re-reads everything (the server dedupes).
+_CONTINUE_SKIP_TTL_S = 15 * 60
+_CONTINUE_SKIP_MAX_ENTRIES = 1024
+_CONTINUE_SKIP_IDS: WorkspaceScopedCache[tuple[str | None, str], tuple[str, ...]] = (
+    WorkspaceScopedCache(
+        lambda: cachetools.TTLCache(maxsize=_CONTINUE_SKIP_MAX_ENTRIES, ttl=_CONTINUE_SKIP_TTL_S)
+    )
+)
+
+
+def _continue_skip_ids(user_id: str | None, host_id: str) -> list[str]:
+    """Ids the last interrupted batch import from this host already has."""
+    return list(_CONTINUE_SKIP_IDS.get((user_id, host_id), ()))
+
+
+def _remember_continue_skip_ids(user_id: str | None, host_id: str, ids: Iterable[str]) -> None:
+    """Remember the newest ids an interrupted batch import has, for its re-run."""
+    newest = list(dict.fromkeys(reversed(list(ids))))[:MAX_IMPORT_SKIP_IDS]
+    if newest:
+        _CONTINUE_SKIP_IDS[(user_id, host_id)] = tuple(newest)
+
+
+def _host_skips_known(host_conn: object) -> bool:
+    """Whether the host can skip sessions the server already has, unread."""
+    capabilities = getattr(getattr(host_conn, "hello", None), "capabilities", None) or ()
+    return CAP_IMPORT_SKIP_KNOWN in capabilities
 
 
 def _host_label(host: object) -> str:
@@ -435,6 +471,7 @@ async def _stream_local_sessions_from_host(
     stats: dict[str, Any] | None = None,
     ping_interval_s: float | None = None,
     deadline_s: float | None = None,
+    skip_external_session_ids: Sequence[str] = (),
 ) -> AsyncIterator[dict[str, Any] | ImportProgress]:
     """Yield requested local sessions one at a time as they stream in.
 
@@ -450,6 +487,8 @@ async def _stream_local_sessions_from_host(
         fast with ``host_unreachable`` instead of being waited on.
     :param deadline_s: Whole-stream budget; defaults to
         :data:`_LOCAL_IMPORT_STREAM_DEADLINE_S`.
+    :param skip_external_session_ids: Sessions the server already has; sent to
+        a host that advertises :data:`CAP_IMPORT_SKIP_KNOWN` with a batch request.
     :raises LocalImportError: If the host is unreachable, disconnects, stops
         responding, or the deadline passes.
     :raises OmnigentError: If the host reports a read failure.
@@ -480,6 +519,9 @@ async def _stream_local_sessions_from_host(
             limit=limit,
             allow_session_chunks=True,
             progress=True,
+            skip_external_session_ids=(
+                list(skip_external_session_ids) if _host_skips_known(host_conn) else []
+            ),
         )
     )
     frame = encode_host_frame(request_frame)
@@ -529,8 +571,11 @@ async def _stream_local_sessions_from_host(
                 done = data.get("done")
                 if isinstance(done, int):
                     total = data.get("total")
+                    skipped = data.get("skipped")
                     yield ImportProgress(
-                        done=done, total=total if isinstance(total, int) else None
+                        done=done,
+                        total=total if isinstance(total, int) else None,
+                        skipped=skipped if isinstance(skipped, int) else 0,
                     )
                 continue
             if kind == "session":
@@ -553,6 +598,7 @@ async def _stream_local_sessions_from_host(
             # explain each failure.
             if stats is not None:
                 stats["host_failed"] = int(data.get("failed") or 0)
+                stats["host_skipped"] = int(data.get("skipped") or 0)
                 raw_failures = data.get("failures")
                 stats["host_failures"] = (
                     [entry for entry in raw_failures if isinstance(entry, dict)]
@@ -589,6 +635,7 @@ def _interrupted_import_error(
     imported: int,
     total: int | None,
     already_imported: int = 0,
+    host_skips_known: bool = True,
 ) -> LocalImportError:
     """Restate a host-liveness failure with the machine's name and the batch's progress.
 
@@ -624,10 +671,19 @@ def _interrupted_import_error(
         # Sessions already there count: the re-run continues from all of them.
         have = imported + already_imported
         count = f"{have}{of_total}" if total is not None else f"{have} session(s)"
-        message = (
-            f"Imported {count} before the time limit — run it again to continue; "
-            "already imported sessions are skipped."
-        )
+        if host_skips_known:
+            message = (
+                f"Imported {count} before the time limit — run it again to continue; "
+                "already imported sessions are skipped."
+            )
+        else:
+            # This host re-reads every session on a re-run, so the same slow
+            # reads can hit the limit again at the same point.
+            message = (
+                f"Imported {count} before the time limit. Import fewer sessions at a "
+                "time, or update Omnigent on that machine so a re-run skips the ones "
+                "already imported."
+            )
     else:
         return exc
     details = {
@@ -1138,6 +1194,22 @@ def create_imports_router(
         # send no frame) and the batch size, from heartbeats and session frames.
         host_done = 0
         total: int | None = None
+        # Sessions the host skipped unread because an interrupted run already
+        # has them: already imported, folded into the tally as they're reported.
+        host_skipped = 0
+        # Keyed by the registry's canonical id, whatever spelling the client used.
+        skip_ids = (
+            _continue_skip_ids(user_id, host_conn.host_id) if body.session_id is None else []
+        )
+        # External ids this run confirmed are in the store (imported or
+        # already there), remembered if the run stops early.
+        confirmed: list[str] = []
+
+        def _note_skipped(reported: int) -> None:
+            nonlocal host_skipped
+            if reported > host_skipped:
+                counts["already_imported"] += reported - host_skipped
+                host_skipped = reported
 
         def _fail(
             external_session_id: object,
@@ -1206,6 +1278,7 @@ def create_imports_router(
                         existing = None
                 if existing is not None:
                     counts["already_imported"] += 1
+                    confirmed.append(external_session_id)
                     return None
                 items = [ImportItemInput.model_validate(raw).to_item() for raw in raw_items]
                 workspace = session.get("workspace")
@@ -1228,6 +1301,7 @@ def create_imports_router(
                     or exc.import_code == ImportErrorCode.ALREADY_IMPORTED
                 ):
                     counts["already_imported"] += 1
+                    confirmed.append(external_session_id)
                     return None
                 if isinstance(exc, LocalImportError):
                     code = exc.import_code
@@ -1255,6 +1329,7 @@ def create_imports_router(
                 )
                 return None
             counts["imported"] += 1
+            confirmed.append(external_session_id)
             return ImportedSessionRef(session_id=session_id, title=title)
 
         # Set by the stream to the sessions the host couldn't read (no frame
@@ -1270,8 +1345,10 @@ def create_imports_router(
                 session_id=body.session_id,
                 stats=stats,
                 ping_interval_s=ping_interval_s,
+                skip_external_session_ids=skip_ids,
             ):
                 if isinstance(session, ImportProgress):
+                    _note_skipped(session.skipped)
                     host_done = max(host_done, session.done)
                     total = session.total if session.total is not None else total
                     if total is not None:
@@ -1287,6 +1364,8 @@ def create_imports_router(
                     yield ref
                 yield ImportProgress(done=max(_processed(), host_done), total=total)
         except LocalImportError as exc:
+            if body.session_id is None:
+                _remember_continue_skip_ids(user_id, host_conn.host_id, [*skip_ids, *confirmed])
             raise _interrupted_import_error(
                 exc,
                 host=host,
@@ -1294,7 +1373,12 @@ def create_imports_router(
                 imported=counts["imported"],
                 already_imported=counts["already_imported"],
                 total=total,
+                host_skips_known=_host_skips_known(host_conn),
             ) from exc
+        _note_skipped(int(stats.get("host_skipped", 0)))
+        if body.session_id is None:
+            # Ran to the end: nothing left to continue.
+            _CONTINUE_SKIP_IDS.pop((user_id, host_conn.host_id), None)
         # Fold in sessions the host enumerated but couldn't read. Newer hosts send
         # a per-session reason; older hosts send only a count, so synthesize a
         # generic reason for each so ``failed`` still equals ``len(failures)``.

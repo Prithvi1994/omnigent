@@ -298,11 +298,11 @@ async def test_legacy_host_stall_keeps_the_original_timeout(
     assert "studio-mac" in error["message"]
 
 
-@pytest.mark.parametrize("legacy_host", [False, True], ids=["current-host", "older-host"])
+@pytest.mark.parametrize("legacy_host", [False, True], ids=["skips-known", "older-host"])
 async def test_deadline_stops_host_and_says_how_to_continue(
     monkeypatch: pytest.MonkeyPatch, legacy_host: bool
 ) -> None:
-    """The deadline cancels the host's read and says how to continue."""
+    """The deadline cancels the host's read; the advice depends on whether a re-run can skip."""
     store = FakeConversationStore()
     expire_deadline_after_first_append(monkeypatch, store)
     pair = TunnelPair(legacy_host=legacy_host)
@@ -325,7 +325,10 @@ async def test_deadline_stops_host_and_says_how_to_continue(
     assert error["retryable"] is True
     assert events[-1]["imported"] == 1
     assert error["message"].startswith("Imported 1 of 20 before the time limit")
-    assert "run it again to continue" in error["message"]
+    if legacy_host:
+        assert "update Omnigent on that machine" in error["message"]
+    else:
+        assert "run it again to continue" in error["message"]
 
 
 class _LaggingClock:
@@ -374,6 +377,35 @@ def test_time_limit_message_counts_sessions_already_there() -> None:
     assert restated.message.startswith("Imported 12 of 14 before the time limit")
     assert restated.details["imported"] == 2
     assert restated.import_code == ImportErrorCode.TIME_LIMIT_REACHED
+
+
+@pytest.mark.parametrize(
+    ("host_skips_known", "message"),
+    [
+        (
+            True,
+            "Imported 3 of 9 before the time limit — run it again to continue; "
+            "already imported sessions are skipped.",
+        ),
+        (
+            False,
+            "Imported 3 of 9 before the time limit. Import fewer sessions at a time, or "
+            "update Omnigent on that machine so a re-run skips the ones already imported.",
+        ),
+    ],
+    ids=["skips-known", "older-host"],
+)
+def test_time_limit_advice_depends_on_the_hosts_skip_support(
+    host_skips_known: bool, message: str
+) -> None:
+    """A host that re-reads everything on a re-run gets advice that can actually help."""
+    exc = LocalImportError(
+        "x", import_code=ImportErrorCode.TIME_LIMIT_REACHED, code=ErrorCode.INTERNAL_ERROR
+    )
+    restated = imports_module._interrupted_import_error(
+        exc, host=None, processed=3, imported=3, total=9, host_skips_known=host_skips_known
+    )
+    assert restated.message == message
 
 
 async def test_buffered_route_reports_time_limit_as_503(monkeypatch: pytest.MonkeyPatch) -> None:
