@@ -62,18 +62,27 @@ _log = logging.getLogger("omnigent_client.sessions")
 _INTERRUPT_TYPE: str = "interrupt"
 
 
-def _session_url(base_url: str, session_id: str) -> str:
+def _session_url(base_url: str, session_id: str, *subpath: str) -> str:
     """
-    Build ``{base_url}/v1/sessions/{session_id}`` with the id confined to
-    one path segment, so a caller-supplied value such as
+    Build ``{base_url}/v1/sessions/{session_id}[/subpath...]`` with the id
+    confined to one path segment, so a caller-supplied value such as
     ``"../projects/p"`` or ``"conv_x?delete_branch=true"`` cannot reach
     another route or add query parameters.
 
     :param base_url: Server base URL without a trailing slash.
     :param session_id: Session/conversation identifier.
+    :param subpath: Fixed route segments appended after the id, e.g.
+        ``"items"``. Pass any further caller-supplied id through
+        :func:`quote` first.
     :returns: The percent-encoded session URL.
+    :raises ValueError: If *session_id* is empty, ``"."``, or ``".."``.
+        ``quote`` leaves dots alone and HTTP clients collapse dot
+        segments, so those values would address ``/v1/sessions`` or
+        ``/v1`` instead of a session.
     """
-    return f"{base_url}/v1/sessions/{quote(session_id, safe='')}"
+    if not session_id or session_id in {".", ".."}:
+        raise ValueError(f"invalid session id: {session_id!r}")
+    return "/".join((f"{base_url}/v1/sessions/{quote(session_id, safe='')}", *subpath))
 
 
 @dataclass(frozen=True)
@@ -760,7 +769,7 @@ class SessionsNamespace:
             registered).
         """
         resp = await self._http.patch(
-            f"{self._base}/v1/sessions/{session_id}",
+            _session_url(self._base, session_id),
             json={"runner_id": runner_id},
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -783,7 +792,7 @@ class SessionsNamespace:
             session does not exist).
         """
         resp = await self._http.patch(
-            f"{self._base}/v1/sessions/{session_id}",
+            _session_url(self._base, session_id),
             json={"runner_id": ""},
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -814,7 +823,7 @@ class SessionsNamespace:
         """
         wire_effort = reasoning_effort if reasoning_effort is not None else "default"
         resp = await self._http.patch(
-            f"{self._base}/v1/sessions/{session_id}",
+            _session_url(self._base, session_id),
             json={"reasoning_effort": wire_effort},
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -859,7 +868,7 @@ class SessionsNamespace:
         if silent:
             body["silent"] = True
         resp = await self._http.patch(
-            f"{self._base}/v1/sessions/{session_id}",
+            _session_url(self._base, session_id),
             json=body,
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -893,7 +902,7 @@ class SessionsNamespace:
             access, 404 when the session does not exist).
         """
         resp = await self._http.patch(
-            f"{self._base}/v1/sessions/{session_id}",
+            _session_url(self._base, session_id),
             json={"archived": archived},
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -928,7 +937,7 @@ class SessionsNamespace:
             exist).
         """
         resp = await self._http.patch(
-            f"{self._base}/v1/sessions/{session_id}",
+            _session_url(self._base, session_id),
             json={"external_session_id": external_session_id},
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -1007,7 +1016,7 @@ class SessionsNamespace:
         if after is not None:
             params["after"] = after
         resp = await self._http.get(
-            f"{self._base}/v1/sessions/{session_id}/items",
+            _session_url(self._base, session_id, "items"),
             params=params,
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -1041,7 +1050,7 @@ class SessionsNamespace:
             session does not exist).
         """
         resp = await self._http.get(
-            f"{self._base}/v1/sessions/{session_id}/child_sessions",
+            _session_url(self._base, session_id, "child_sessions"),
             params={"limit": limit},
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -1141,7 +1150,7 @@ class SessionsNamespace:
             status (404 when the session does not exist).
         """
         resp = await self._http.get(
-            f"{self._base}/v1/sessions/{session_id}",
+            _session_url(self._base, session_id),
         )
         raise_for_status(resp.status_code, response_body(resp))
         return Session.from_dict(require_json_object(resp, "GET /v1/sessions/{session_id}"))
@@ -1204,7 +1213,7 @@ class SessionsNamespace:
             status (404 when the session does not exist).
         """
         resp = await self._http.post(
-            f"{self._base}/v1/sessions/{session_id}/events",
+            _session_url(self._base, session_id, "events"),
             json=event,
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -1243,7 +1252,9 @@ class SessionsNamespace:
             status (404 when the session does not exist).
         """
         resp = await self._http.post(
-            f"{self._base}/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+            _session_url(
+                self._base, session_id, "elicitations", quote(elicitation_id, safe=""), "resolve"
+            ),
             json=result,
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -1288,7 +1299,7 @@ class SessionsNamespace:
         if up_to_response_id is not None:
             body["up_to_response_id"] = up_to_response_id
         resp = await self._http.post(
-            f"{self._base}/v1/sessions/{source_session_id}/fork",
+            _session_url(self._base, source_session_id, "fork"),
             json=body,
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -1401,7 +1412,7 @@ async def _stream_session_events(
     """
     async with http.stream(
         "GET",
-        f"{base_url}/v1/sessions/{session_id}/stream",
+        _session_url(base_url, session_id, "stream"),
         timeout=_SSE_TIMEOUT,
     ) as resp:
         if resp.status_code >= 400:

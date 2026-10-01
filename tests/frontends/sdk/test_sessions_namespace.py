@@ -1608,24 +1608,63 @@ async def test_delete_sends_delete_to_session_url(delete_branch: bool, expected_
         ("conv_x?delete_branch=true", "http://srv/v1/sessions/conv_x%3Fdelete_branch%3Dtrue"),
     ],
 )
-async def test_delete_and_set_labels_confine_id_to_session_path(
+async def test_session_routes_confine_id_to_session_path(
     hostile_id: str, expected_url: str
 ) -> None:
     """A caller-supplied id cannot reach another route or smuggle query parameters."""
-    seen: list[tuple[str, str]] = []
+    seen: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen.append((request.method, str(request.url)))
+        seen.append(f"{request.method} {request.url}")
         return httpx.Response(200, json=_session_response_body())
 
     ns, client = _make_namespace(handler)
     try:
-        await ns.delete(hostile_id)
+        await ns.get(hostile_id)
+        await ns.set_archived(hostile_id, archived=True)
         await ns.set_labels(hostile_id, labels={"team": "platform"})
+        await ns.list_items(hostile_id)
+        await ns.post_event(hostile_id, {"type": "message", "data": {}})
+        await ns.resolve_elicitation(hostile_id, "elicit_1?x=1", {"action": "accept"})
+        await ns.fork(hostile_id)
+        await ns.delete(hostile_id)
     finally:
         await client.aclose()
 
-    assert seen == [("DELETE", expected_url), ("PATCH", expected_url)]
+    assert seen == [
+        f"GET {expected_url}",
+        f"PATCH {expected_url}",
+        f"PATCH {expected_url}",
+        f"GET {expected_url}/items?limit=100&order=asc",
+        f"POST {expected_url}/events",
+        f"POST {expected_url}/elicitations/elicit_1%3Fx%3D1/resolve",
+        f"POST {expected_url}/fork",
+        f"DELETE {expected_url}",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_id", ["", ".", ".."])
+async def test_session_routes_reject_dot_segment_ids(bad_id: str) -> None:
+    """Ids that HTTP clients would collapse into a parent path never reach the wire."""
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(200, json=_session_response_body())
+
+    ns, client = _make_namespace(handler)
+    try:
+        with pytest.raises(ValueError):
+            await ns.get(bad_id)
+        with pytest.raises(ValueError):
+            await ns.set_labels(bad_id, labels={"team": "platform"})
+        with pytest.raises(ValueError):
+            await ns.delete(bad_id)
+    finally:
+        await client.aclose()
+
+    assert calls == []
 
 
 @pytest.mark.asyncio

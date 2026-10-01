@@ -26,28 +26,9 @@ _INFO_BODY: dict[str, Any] = {
     "accounts_enabled": False,
     "single_user": True,
     "login_url": None,
-    "needs_setup": False,
-    "databricks_features": False,
-    "managed_sandboxes_enabled": False,
-    "sandbox_provider": None,
-    "sandbox_providers": [],
-    "sandbox_provider_capabilities": {},
-    "enabled_connections": [],
     "sharing_mode": "on",
-    "public_sharing_enabled": True,
     "server_version": "0.17.0.dev0",
-    "smart_routing_enabled": False,
-    "smart_routing_sources": {"external": False, "oss": False},
     "features": {"usage_page": False},
-    "harness_install_enabled": False,
-    "installable_harnesses": [],
-    "dictation_available": False,
-    "branding": {
-        "app_name": None,
-        "heading": None,
-        "logos": {"main": None, "loading": None, "favicon": None},
-        "powered_by": True,
-    },
 }
 
 _HOSTS_BODY: dict[str, Any] = {
