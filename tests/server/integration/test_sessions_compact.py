@@ -568,9 +568,7 @@ async def test_snapshot_metadata_carries_compaction_aggregate(
     assert fresh_body["compaction_count"] == 0
     assert fresh_body.get("last_compaction_at") is None
 
-    # Persist two back-to-back compaction events — the runner's wire
-    # format for a harness-internal context compaction, and the stall
-    # signature from the report (no tool output between them).
+    # Persist two consecutive compaction events with no tool output between them.
     for ordinal in (1, 2):
         resp = await client.post(
             f"/v1/sessions/{sid}/events",

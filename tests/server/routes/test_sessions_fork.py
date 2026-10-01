@@ -951,7 +951,6 @@ async def test_fork_session_up_to_response_id_passes_through_and_truncates() -> 
     conv_store = _ConversationStore(
         conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
         items_by_conv={"e9f8f58523cec9a57d3bdf93be543e8c": items},
-        compaction_stats=CompactionStats(count=1, last_compaction_at=1700000010),
     )
     client = TestClient(_build_app(conv_store))
 
@@ -970,11 +969,6 @@ async def test_fork_session_up_to_response_id_passes_through_and_truncates() -> 
     assert [item["response_id"] for item in body["items"]] == ["resp_001", "resp_001"], (
         f"Fork should contain only resp_001 items, got {body['items']!r}"
     )
-    # The aggregate is asked of the forked conversation, so a partial fork
-    # reports only the compactions it actually copied.
-    assert conv_store.compaction_stats_calls == [body["id"]]
-    assert body["compaction_count"] == 1
-    assert body["last_compaction_at"] == 1700000010
 
 
 @pytest.mark.asyncio

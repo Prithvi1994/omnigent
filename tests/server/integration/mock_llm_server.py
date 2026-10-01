@@ -473,7 +473,7 @@ def anthropic_sse_text_response(
                 "model": model,
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": 10, "output_tokens": 0, **(usage or {})},
+                "usage": {"input_tokens": 10, **(usage or {}), "output_tokens": 0},
             },
         },
     )
@@ -553,7 +553,7 @@ def anthropic_sse_thinking_text_response(
                 "model": model,
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": 10, "output_tokens": 0, **(usage or {})},
+                "usage": {"input_tokens": 10, **(usage or {}), "output_tokens": 0},
             },
         },
     )
@@ -646,7 +646,7 @@ def anthropic_sse_tool_call_response(
                 "model": model,
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": 10, "output_tokens": 0, **(usage or {})},
+                "usage": {"input_tokens": 10, **(usage or {}), "output_tokens": 0},
             },
         },
     )

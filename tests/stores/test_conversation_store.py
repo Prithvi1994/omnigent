@@ -4609,6 +4609,63 @@ def test_fork_remaps_compaction_boundary_to_copied_item(
     assert fork_compaction.data.last_item_id == fork_items[0].id
 
 
+def test_fork_compaction_stats_count_only_copied_items(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A fork's aggregate reflects the compaction items it copied.
+
+    A cutoff before the source's compaction must leave the fork reporting
+    none, while a full fork reports the copied compaction.
+    """
+    source = conversation_store.create_conversation()
+    [boundary] = conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_001",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "old"}]),
+            )
+        ],
+    )
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="compaction",
+                response_id="compact_001",
+                data=CompactionData(
+                    summary="The user said old.",
+                    last_item_id=boundary.id,
+                    token_count=6,
+                ),
+            )
+        ],
+    )
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_002",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "recent"}]),
+            )
+        ],
+    )
+
+    full = conversation_store.fork_conversation(source.id)
+    partial = conversation_store.fork_conversation(source.id, up_to_response_id="resp_001")
+
+    full_stats = conversation_store.get_compaction_stats(full.id)
+    assert full_stats.count == 1
+    copied = next(i for i in conversation_store.list_items(full.id).data if i.type == "compaction")
+    assert full_stats.last_compaction_at == copied.created_at
+    partial_stats = conversation_store.get_compaction_stats(partial.id)
+    assert partial_stats.count == 0
+    assert partial_stats.last_compaction_at is None
+
+
 def _count_encode_hooks(
     store: SqlAlchemyConversationStore,
     monkeypatch: pytest.MonkeyPatch,

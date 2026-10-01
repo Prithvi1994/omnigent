@@ -5,8 +5,9 @@ through ``sys_session_send`` (purpose ``implement``) with a large read-phase
 prompt. The child's Claude Code reads files until the mock model reports a
 near-full context, auto-compacts, reads again, auto-compacts a second time, and
 then its next model reply is held on the mock gate so the turn never advances
-(no further tool calls, no writes). The orchestrator then runs a status check
-through ``sys_session_get_info`` and ``sys_read_inbox``.
+(no further tool calls, no writes). The orchestrator then runs two status
+checks a few seconds apart through ``sys_session_get_info`` and
+``sys_read_inbox``.
 
 Claude Code only enforces a context window it knows; a third-party base URL
 leaves the window unenforced, so the child's HOME carries
@@ -63,6 +64,7 @@ _SMALL_USAGE = {
 }
 _DOC_COUNT = 6
 _HELD_REPLY = "HELD-REPLY: never delivered while the gate is closed."
+_POLL_GAP_S = 3.0
 
 
 def _write_docs(workspace: Path) -> None:
@@ -366,9 +368,11 @@ def _configure_parent_dispatch(mock_url: str) -> None:
     _mock_post(mock_url, "/mock/set_fallback", {"key": _PARENT_MODEL, "text": "Acknowledged."})
 
 
-def _configure_parent_status_check(mock_url: str, child_id: str) -> None:
+def _configure_parent_status_check(mock_url: str, child_id: str, n: int) -> None:
     def call(name: str, args: dict[str, Any]) -> dict[str, Any]:
-        return {"tool_calls": [{"call_id": name, "name": name, "arguments": json.dumps(args)}]}
+        return {
+            "tool_calls": [{"call_id": f"{name}_{n}", "name": name, "arguments": json.dumps(args)}]
+        }
 
     _mock_post(
         mock_url,
@@ -378,7 +382,7 @@ def _configure_parent_status_check(mock_url: str, child_id: str) -> None:
             "responses": [
                 call("sys_session_get_info", {"session_id": child_id}),
                 call("sys_read_inbox", {}),
-                {"text": "Status check recorded."},
+                {"text": f"Status check {n} recorded."},
             ],
         },
     )
@@ -475,6 +479,20 @@ def _send_user_message(client: httpx.Client, session_id: str, text: str) -> None
     assert send.status_code == 202, f"{send.status_code} {send.text}"
 
 
+def _status_check(
+    client: httpx.Client, mock_url: str, parent_id: str, child_id: str, n: int
+) -> tuple[dict[str, Any], str]:
+    """Run status check *n* on the orchestrator; return its get_info payload and inbox text."""
+    _configure_parent_status_check(mock_url, child_id, n)
+    _send_user_message(client, parent_id, f"Status check {n}: how is the implementer doing?")
+    assert _wait_until(
+        lambda: f"sys_read_inbox_{n}" in _tool_outputs(_items(client, parent_id)), timeout=120
+    ), f"orchestrator status check {n} did not complete"
+    outputs = _tool_outputs(_items(client, parent_id))
+    assert f"sys_session_get_info_{n}" in outputs, f"get_info output missing: {sorted(outputs)}"
+    return json.loads(outputs[f"sys_session_get_info_{n}"]), outputs[f"sys_read_inbox_{n}"]
+
+
 def _stop(client: httpx.Client, *session_ids: str) -> None:
     for sid in session_ids:
         with contextlib.suppress(httpx.HTTPError):
@@ -486,6 +504,7 @@ class StallObservation:
     parent_id: str
     child_id: str
     get_info: dict[str, Any]
+    get_info_again: dict[str, Any]
     inbox: str
     compaction_items: list[dict[str, Any]]
     git_status_before: str
@@ -497,7 +516,7 @@ class StallObservation:
 
 @pytest.fixture(scope="module")
 def stalled_subagent(rig: Rig) -> Iterator[StallObservation]:
-    """Drive the journey once and keep the orchestrator's observation."""
+    """Drive the journey once and keep the orchestrator's observations."""
     client, mock_url, workspace = rig.client, rig.mock_url, rig.workspace
     _configure_child_model(mock_url, workspace)
     _configure_parent_dispatch(mock_url)
@@ -537,17 +556,15 @@ def stalled_subagent(rig: Rig) -> Iterator[StallObservation]:
         )
         # Let the forwarder persist anything still in flight before polling.
         time.sleep(5)
-        _configure_parent_status_check(mock_url, child_id)
-        _send_user_message(client, parent_id, "Status check: how is the implementer doing?")
-        assert _wait_until(
-            lambda: "sys_read_inbox" in _tool_outputs(_items(client, parent_id)), timeout=120
-        ), "orchestrator status check did not complete"
-        outputs = _tool_outputs(_items(client, parent_id))
+        get_info, inbox = _status_check(client, mock_url, parent_id, child_id, 1)
+        time.sleep(_POLL_GAP_S)
+        get_info_again, _ = _status_check(client, mock_url, parent_id, child_id, 2)
         observation = StallObservation(
             parent_id=parent_id,
             child_id=child_id,
-            get_info=json.loads(outputs["sys_session_get_info"]),
-            inbox=outputs["sys_read_inbox"],
+            get_info=get_info,
+            get_info_again=get_info_again,
+            inbox=inbox,
             compaction_items=_compaction_items(client, child_id),
             git_status_before=git_status_before,
             git_status_after=_git(workspace, "status", "--porcelain"),
@@ -568,7 +585,7 @@ def stalled_subagent(rig: Rig) -> Iterator[StallObservation]:
 def test_parked_subagent_metadata_reports_compactions(stalled_subagent: StallObservation) -> None:
     """``sys_session_get_info`` must expose the two compactions next to the heartbeat."""
     obs = stalled_subagent
-    # The reported stall state, cross-checked the way the reporter had to.
+    # Parked state: two compactions, the model reply still held, no writes, no inbox notice.
     assert len(obs.compaction_items) == 2, obs.compaction_items
     assert obs.gate_pending, "child turn should still be held open"
     # The runner leaves its own startup probe dir in the workspace; only new paths count.
@@ -580,9 +597,15 @@ def test_parked_subagent_metadata_reports_compactions(stalled_subagent: StallObs
     assert info.get("status") == "running", info
     assert info.get("runner_online") is True, info
     assert info.get("pending_elicitation_count") == 0, info
-    # The metadata alone now carries the signature the reporter had to scrape for.
+    # get_info metadata must expose the compaction aggregate without transcript scraping.
     assert info.get("compaction_count") == 2, info
     last_compaction_at = info.get("last_compaction_at")
     assert isinstance(last_compaction_at, int), info
     last_activity_at = info.get("last_activity_at")
     assert isinstance(last_activity_at, int) and last_activity_at >= last_compaction_at, info
+    # A second reading while the reply is still held must show the same aggregate
+    # and an unchanged heartbeat: the parked session has produced nothing since.
+    again = obs.get_info_again
+    assert again.get("compaction_count") == 2, again
+    assert again.get("last_compaction_at") == last_compaction_at, again
+    assert again.get("last_activity_at") == last_activity_at, again

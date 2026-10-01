@@ -288,33 +288,19 @@ async def test_get_parses_compaction_aggregate() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_compaction_aggregate_defaults_when_omitted() -> None:
-    """Older servers without the compaction fields remain parseable."""
+@pytest.mark.parametrize(
+    "compaction_fields",
+    [{}, {"compaction_count": None, "last_compaction_at": None}],
+    ids=["omitted", "explicit_null"],
+)
+async def test_get_compaction_aggregate_falls_back_to_empty(
+    compaction_fields: dict[str, Any],
+) -> None:
+    """Older servers omit the fields and an explicit ``null`` parses the same way."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         del request
-        return httpx.Response(200, json=_session_response_body())
-
-    ns, client = _make_namespace(handler)
-    try:
-        session = await ns.get("conv_abc")
-    finally:
-        await client.aclose()
-
-    assert session.compaction_count == 0
-    assert session.last_compaction_at is None
-
-
-@pytest.mark.asyncio
-async def test_get_compaction_count_explicit_null_reads_as_zero() -> None:
-    """An explicit ``null`` count parses like an absent one."""
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        del request
-        return httpx.Response(
-            200,
-            json=_session_response_body() | {"compaction_count": None, "last_compaction_at": None},
-        )
+        return httpx.Response(200, json=_session_response_body() | compaction_fields)
 
     ns, client = _make_namespace(handler)
     try:
