@@ -32,30 +32,11 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests.server.helpers import websocket_scope as _websocket_scope
 
 pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "33296f9b15e02671c34e013dd711407e"
-
-
-def _websocket_scope(path: str) -> dict[str, object]:
-    """Build an ASGI WebSocket scope.
-
-    :param path: WebSocket path.
-    :returns: Minimal ASGI WebSocket scope.
-    """
-    return {
-        "type": "websocket",
-        "asgi": {"version": "3.0"},
-        "scheme": "ws",
-        "path": path,
-        "raw_path": path.encode("ascii"),
-        "query_string": b"",
-        "headers": [],
-        "client": ("127.0.0.1", 50000),
-        "server": ("testserver", 80),
-        "subprotocols": [],
-    }
 
 
 def _make_hello(
@@ -111,6 +92,7 @@ def _build_host_api_app(
     """
     registry = HostRegistry()
     host_store = HostStore(db_uri)
+    registry.launch_authorizer = host_store.admit_launch
     conv_store = SqlAlchemyConversationStore(db_uri)
     app = FastAPI()
     app.include_router(
@@ -781,8 +763,10 @@ async def test_launch_runner_409_host_offline(
     assert resp.status_code == 409
 
 
+@pytest.mark.parametrize("cross_host", [False, True])
 async def test_launch_runner_400_already_bound(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    cross_host: bool,
 ) -> None:
     """
     Verify launch returns 400 when the session already has a runner.
@@ -797,6 +781,8 @@ async def test_launch_runner_400_already_bound(
         agent_id=None,
         runner_id="runner_existing",
     )
+    if cross_host:
+        conv_store.set_host_id(conv.id, "3" * 32, workspace="/tmp/source")
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
@@ -804,6 +790,9 @@ async def test_launch_runner_400_already_bound(
             json={"session_id": conv.id, "workspace": "/tmp"},
         )
     assert resp.status_code == 400
+    unchanged = conv_store.get_conversation(conv.id)
+    assert unchanged.runner_id == "runner_existing"
+    assert unchanged.host_id == ("3" * 32 if cross_host else None)
 
 
 async def test_launch_runner_404_unknown_host(

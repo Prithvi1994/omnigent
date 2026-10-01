@@ -23,6 +23,7 @@ from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
 from tests.runner.conftest import (
+    _build_app_for_spec,
     _drain_session_event_queue,
     _FakeProcessManager,
     _runner_client,
@@ -99,17 +100,7 @@ async def test_events_effort_change_on_native_session_skips_inject_for_unsupport
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the native spec for any agent_id."""
-        del agent_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -172,17 +163,7 @@ async def test_events_effort_change_on_native_session_returns_503_when_bridge_no
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the native spec for any agent_id."""
-        del agent_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -252,17 +233,7 @@ async def test_events_effort_change_on_non_native_session_is_204_noop(
         executor=ExecutorSpec(type="omnigent", config={}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the default spec for any agent_id."""
-        del agent_id
-        return default_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(default_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -319,17 +290,7 @@ async def test_events_permission_mode_change_on_native_session_switches_and_echo
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the native spec for any agent_id."""
-        del agent_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -377,17 +338,7 @@ async def test_events_permission_mode_change_returns_503_when_mode_unreachable(
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the native spec for any agent_id."""
-        del agent_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -439,17 +390,7 @@ async def test_events_permission_mode_change_on_non_native_session_is_204_noop(
         executor=ExecutorSpec(type="omnigent", config={}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the default spec for any agent_id."""
-        del agent_id
-        return default_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(default_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -515,17 +456,7 @@ async def test_events_compact_on_native_session_types_slash_command(
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the native spec for any agent_id."""
-        del agent_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -622,17 +553,7 @@ async def test_events_compact_on_native_session_returns_503_when_bridge_not_read
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the native spec for any agent_id."""
-        del agent_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -712,23 +633,12 @@ async def test_events_compact_on_codex_native_types_settles_then_submits(
         executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the codex-native spec for any agent_id."""
-        del agent_id, session_id
-        return codex_native_spec
-
     conv_id = "9864122f95f2f013c9599f4014725784"
     terminal_registry = TerminalRegistry()
     instance = make_test_terminal_instance("codex", "main", tmp_path)
     terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
 
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-        terminal_registry=terminal_registry,
-    )
+    app, _ = await _build_app_for_spec(codex_native_spec, terminal_registry=terminal_registry)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -800,22 +710,11 @@ async def test_events_compact_on_codex_native_returns_503_when_no_terminal() -> 
         executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the codex-native spec for any agent_id."""
-        del agent_id, session_id
-        return codex_native_spec
-
     conv_id = "4be2f8fe2204fade6a89dafade0a0fd2"
     # Empty registry — no codex terminal registered.
     terminal_registry = TerminalRegistry()
 
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-        terminal_registry=terminal_registry,
-    )
+    app, _ = await _build_app_for_spec(codex_native_spec, terminal_registry=terminal_registry)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -862,23 +761,12 @@ async def test_events_compact_on_codex_native_returns_503_on_tmux_failure(
         executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the codex-native spec for any agent_id."""
-        del agent_id, session_id
-        return codex_native_spec
-
     conv_id = "e5d09a0ff8458b2d6abb7f0c7deda0d3"
     terminal_registry = TerminalRegistry()
     instance = make_test_terminal_instance("codex", "main", tmp_path)
     terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
 
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-        terminal_registry=terminal_registry,
-    )
+    app, _ = await _build_app_for_spec(codex_native_spec, terminal_registry=terminal_registry)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -954,18 +842,8 @@ async def test_events_compact_on_cursor_native_pastes_summarize_and_raises_spinn
         executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the cursor-native spec for any agent_id."""
-        del agent_id, session_id
-        return cursor_native_spec
-
     conv_id = "764ebbade28dd774a5d673378c034933"
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(cursor_native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -1073,18 +951,8 @@ async def test_events_compact_on_cursor_native_503_dismisses_spinner_on_inject_f
         executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the cursor-native spec for any agent_id."""
-        del agent_id, session_id
-        return cursor_native_spec
-
     conv_id = uuid.uuid4().hex
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(cursor_native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -1162,17 +1030,7 @@ async def test_events_compact_on_pi_native_enqueues_compact_payload(
         executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the pi-native spec for any agent_id."""
-        del agent_id, session_id
-        return pi_native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(pi_native_spec)
 
     async with _runner_client(app) as client:
         # Seeds _session_spec_cache so the dispatch detects "pi-native".
@@ -1254,17 +1112,7 @@ async def test_events_compact_on_pi_native_returns_503_when_inbox_unwritable(
         executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the pi-native spec for any agent_id."""
-        del agent_id, session_id
-        return pi_native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(pi_native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -1322,17 +1170,8 @@ async def test_events_compact_on_qwen_native_submits_compress_and_raises_spinner
         executor=ExecutorSpec(type="omnigent", config={"harness": "qwen-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return qwen_native_spec
-
     conv_id = "233c1fedaaeb18c91267904e79b7d10c"
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(qwen_native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -1393,17 +1232,8 @@ async def test_events_compact_on_qwen_native_503_dismisses_spinner_on_submit_fai
         executor=ExecutorSpec(type="omnigent", config={"harness": "qwen-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return qwen_native_spec
-
     conv_id = "7c94e9a0306b300d81233cccef543a84"
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(qwen_native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -1891,17 +1721,7 @@ async def test_events_compact_on_non_native_session_is_204_noop(
         executor=ExecutorSpec(type="omnigent", config={}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the default spec for any agent_id."""
-        del agent_id
-        return default_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(default_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -2002,17 +1822,7 @@ async def test_events_native_dispatch_resolves_bridge_id_via_label_lookup(
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the native spec for any agent_id."""
-        del agent_id, session_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     conv_id = "94e59ac02c7c81b1f65ba05e6481d759"
     async with _runner_client(app) as client:
@@ -2093,17 +1903,7 @@ async def test_events_model_change_on_native_session_types_slash_command(
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the native spec for any agent_id."""
-        del agent_id, session_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -2160,6 +1960,12 @@ async def _post_model_change_with_status_sequence(
     monkeypatch: pytest.MonkeyPatch,
     status_values: list[str | None],
     pane_status: str | None = None,
+    *,
+    model: str = "claude-opus-4-7",
+    picker_values: tuple[str, ...] = (),
+    picker_source: str = "bridge",
+    empty_session_catalog: bool = False,
+    stored_catalog_rows: list[dict[str, object]] | None = None,
 ) -> Any:
     """Run one claude-native ``model_change`` with a scripted status file.
 
@@ -2173,6 +1979,8 @@ async def _post_model_change_with_status_sequence(
     from omnigent.runner import app as runner_app_module
     from omnigent.spec.types import ExecutorSpec
 
+    commands: list[str] = []
+
     def _fake_inject(
         bridge_dir: Any,
         *,
@@ -2181,7 +1989,8 @@ async def _post_model_change_with_status_sequence(
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
     ) -> None:
-        del bridge_dir, command, timeout_s, auto_confirm, confirm_hint
+        del bridge_dir, timeout_s, auto_confirm, confirm_hint
+        commands.append(command)
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
     monkeypatch.setattr(
@@ -2189,6 +1998,30 @@ async def _post_model_change_with_status_sequence(
         "read_model_env",
         lambda _bridge_dir: {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"},
     )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config",
+        lambda *, spec: None,
+    )
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_picker_values",
+        lambda _: list(picker_values) if picker_source == "bridge" else [],
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.stored_claude_picker_values",
+        lambda _config, _rows=None: list(picker_values) if picker_source == "catalog" else [],
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.stored_claude_catalog_rows",
+        lambda _config: stored_catalog_rows,
+    )
+
+    async def _catalog(_config: object) -> list[dict[str, object]]:
+        if empty_session_catalog:
+            return []
+        return [{"id": value, "model": value} for value in picker_values]
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.claude_launch_catalog", _catalog)
     script = list(status_values)
 
     def _scripted_status(_bridge_dir: Any) -> str | None:
@@ -2228,10 +2061,18 @@ async def _post_model_change_with_status_sequence(
         assert create_resp.status_code == 201, create_resp.text
         if pane_status is not None:
             app.state.native_pane_status["68c7c1acc5eeec3978c5e62043da51a5"] = pane_status
-        return await client.post(
+        if picker_source == "session" or empty_session_catalog:
+            catalog = await client.get(
+                "/v1/sessions/68c7c1acc5eeec3978c5e62043da51a5/claude-model-options"
+            )
+            assert catalog.status_code == 200, catalog.text
+        response = await client.post(
             "/v1/sessions/68c7c1acc5eeec3978c5e62043da51a5/events",
-            json={"type": "model_change", "model": "claude-opus-4-7"},
+            json={"type": "model_change", "model": model},
         )
+    switch_rejected = empty_session_catalog or stored_catalog_rows == []
+    assert commands == ([] if switch_rejected else [f"/model {model}"])
+    return response
 
 
 @pytest.mark.asyncio
@@ -2249,6 +2090,98 @@ async def test_events_model_change_confirms_against_the_status_file(
         ["claude-opus-4-6", "claude-opus-4-6", "claude-opus-4-7"],
     )
     assert resp.status_code == 204, resp.text
+
+
+@pytest.mark.parametrize("picker_source", ["bridge", "catalog", "session"])
+async def test_events_managed_glm_switch_confirms_the_terminal_model(
+    monkeypatch: pytest.MonkeyPatch, picker_source: str
+) -> None:
+    response = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-7", "claude-opus-4-7", "system.ai.glm-5-3"],
+        model="system.ai.glm-5-3",
+        picker_values=("system.ai.glm-5-3",),
+        picker_source=picker_source,
+    )
+    assert response.status_code == 204, response.text
+
+
+async def test_bound_claude_switch_preserves_private_model_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.inference_config import inference_config_scope
+
+    selected = "private/model-b[large]"
+    config = {
+        "providers": {"gateway": {"kind": "gateway"}},
+        "inference": {
+            "harnesses": {
+                "claude-native": {
+                    "provider": "gateway",
+                    "default_model": selected,
+                    "model_allowlist": [selected],
+                }
+            }
+        },
+    }
+    with inference_config_scope(config):
+        response = await _post_model_change_with_status_sequence(
+            monkeypatch,
+            ["private/model-a", selected],
+            model=selected,
+        )
+    assert response.status_code == 204, response.text
+
+
+async def test_events_managed_glm_switch_rejects_an_unchanged_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-7"],
+        model="system.ai.glm-5-3",
+        picker_values=("system.ai.glm-5-3",),
+    )
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == "claude_native_model_unconfirmed"
+
+
+@pytest.mark.parametrize("picker_source", ["bridge", "catalog"])
+async def test_events_empty_catalog_does_not_restore_stale_picker_values(
+    monkeypatch: pytest.MonkeyPatch, picker_source: str
+) -> None:
+    response = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-7"],
+        model="system.ai.glm-5-3",
+        picker_values=("system.ai.glm-5-3",),
+        picker_source=picker_source,
+        empty_session_catalog=True,
+    )
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == "claude_native_model_unsupported"
+
+
+async def test_events_empty_stored_catalog_overrides_stale_bridge_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An authoritative empty stored catalog beats launch-recorded vocabulary.
+
+    With a cold session-options cache, nonempty bridge picker values from
+    launch time must not spell a switch once background discovery has stored
+    an explicitly empty catalog (every picker entry disabled): the request is
+    rejected without injecting a command.
+    """
+    response = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-7"],
+        model="system.ai.glm-5-3",
+        picker_values=("system.ai.glm-5-3",),
+        picker_source="bridge",
+        stored_catalog_rows=[],
+    )
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == "claude_native_model_unsupported"
 
 
 @pytest.mark.asyncio
@@ -2318,7 +2251,7 @@ async def test_events_model_change_mid_turn_defers_instead_of_failing(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("pins", "picked", "expected_command"),
+    ("pins", "picker_values", "picked", "expected_command"),
     [
         # The reported bug: a gateway config pins the three families but not
         # fable; picking the probed ``fable`` row injected ``/model opus`` —
@@ -2331,6 +2264,7 @@ async def test_events_model_change_mid_turn_defers_instead_of_failing(
                 "ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5",
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL": "databricks-claude-haiku-4-5",
             },
+            [],
             "fable",
             "/model fable",
             id="gateway-unpinned-family-is-never-swapped-for-the-default",
@@ -2342,6 +2276,7 @@ async def test_events_model_change_mid_turn_defers_instead_of_failing(
                 "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
                 "ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5",
             },
+            [],
             "sonnet[1m]",
             "/model sonnet[1m]",
             id="pinned-bracket-alias-passes-through",
@@ -2350,15 +2285,30 @@ async def test_events_model_change_mid_turn_defers_instead_of_failing(
         # dropping the 1M-context marker.
         pytest.param(
             {},
+            [],
             "sonnet[1m]",
             "/model sonnet[1m]",
             id="bare-login-bracket-alias-keeps-its-context-marker",
+        ),
+        # Managed picker ids can name models outside Claude's family aliases.
+        pytest.param(
+            {
+                "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8[1m]",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "system.ai.claude-sonnet-4-6[1m]",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "system.ai.claude-haiku-4-5",
+            },
+            ["system.ai.claude-opus-4-8[1m]", "system.ai.glm-5-3"],
+            "system.ai.glm-5-3",
+            "/model system.ai.glm-5-3",
+            id="managed-picker-row-of-no-claude-family-is-typed-as-itself",
         ),
     ],
 )
 async def test_events_model_change_applies_the_picked_alias_verbatim(
     monkeypatch: pytest.MonkeyPatch,
     pins: dict[str, str],
+    picker_values: list[str],
     picked: str,
     expected_command: str,
 ) -> None:
@@ -2389,6 +2339,11 @@ async def test_events_model_change_applies_the_picked_alias_verbatim(
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
     monkeypatch.setattr(claude_native_bridge, "read_model_env", lambda _bridge_dir: dict(pins))
     monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_picker_values",
+        lambda _bridge_dir: list(picker_values),
+    )
+    monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main._CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ()
     )
     config = (
@@ -2407,17 +2362,7 @@ async def test_events_model_change_applies_the_picked_alias_verbatim(
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the native spec for any agent_id."""
-        del agent_id, session_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
     conv_id = uuid.uuid4().hex
 
     async with _runner_client(app) as client:
@@ -2474,16 +2419,7 @@ async def test_events_model_change_rejects_a_model_the_picker_cannot_spell(
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -2533,17 +2469,7 @@ async def test_events_model_change_on_kiro_session_types_slash_command(
         executor=ExecutorSpec(type="omnigent", config={"harness": "kiro-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the kiro-native spec for any agent_id."""
-        del agent_id, session_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -2619,17 +2545,7 @@ async def test_events_model_change_on_native_session_skips_inject_for_empty_or_n
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the native spec for any agent_id."""
-        del agent_id, session_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -2688,17 +2604,7 @@ async def test_events_model_change_on_native_session_returns_503_when_bridge_not
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the native spec for any agent_id."""
-        del agent_id, session_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -2764,17 +2670,7 @@ async def test_events_model_change_on_non_native_session_is_204_noop(
         executor=ExecutorSpec(type="omnigent", config={}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the default spec for any agent_id."""
-        del agent_id, session_id
-        return default_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(default_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -2831,17 +2727,7 @@ async def test_events_model_change_on_cursor_native_session_types_slash_command(
         executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the cursor-native spec for any agent_id."""
-        del agent_id, session_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -2897,17 +2783,7 @@ async def test_events_model_change_on_cursor_native_session_skips_inject_for_emp
         executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the cursor-native spec for any agent_id."""
-        del agent_id, session_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -2962,17 +2838,7 @@ async def test_events_model_change_on_cursor_native_session_returns_503_when_not
         executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the cursor-native spec for any agent_id."""
-        del agent_id, session_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -3019,17 +2885,7 @@ async def test_events_effort_change_on_cursor_native_session_is_disabled_noop(
         executor=ExecutorSpec(type="omnigent", config={"harness": "cursor-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the cursor-native spec for any agent_id."""
-        del agent_id, session_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(

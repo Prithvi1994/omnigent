@@ -355,6 +355,7 @@ class PolicyEngine:
         ctx = self._inject_model(ctx)
         ctx = self._inject_labels(ctx)
         ctx = self._inject_llm_client(ctx)
+        ctx = self._inject_conversation_id(ctx)
 
         for policy in self.policies:
             if not self._should_fire(policy.spec, ctx):
@@ -622,12 +623,14 @@ class PolicyEngine:
             approved = float(value)
         except (TypeError, ValueError):
             return
-        owner = self._store.get_session_owner(self._conversation_id)
+        owner = self._store.get_session_owner_authority(self._conversation_id)
         if owner is None:
             return
+        from omnigent.db.account_authority import target_account_scope
         from omnigent.db.utils import now_epoch, utc_day
 
-        self._store.set_daily_ask_approved(owner, utc_day(now_epoch()), approved)
+        with target_account_scope(owner.user_id, owner.generation):
+            self._store.set_daily_ask_approved(owner.user_id, utc_day(now_epoch()), approved)
         # Keep the in-memory snapshot current so any later evaluate() on
         # this engine sees the approval and doesn't re-ASK the checkpoint
         # the user just approved — mirroring how the session policy's
@@ -823,6 +826,23 @@ class PolicyEngine:
             hot cache.
         """
         return replace(ctx, session_state=dict(self._session_state))
+
+    def _inject_conversation_id(self, ctx: EvaluationContext) -> EvaluationContext:
+        """
+        Return a copy of *ctx* with ``conversation_id`` populated.
+
+        Injects the engine's own conversation_id so function policy
+        callables can correlate an event with its session via
+        ``event["context"]["conversation_id"]`` without the caller
+        having to thread it through every :class:`EvaluationContext`
+        it builds.
+
+        :param ctx: Original :class:`EvaluationContext` from the
+            caller.
+        :returns: A new :class:`EvaluationContext` with
+            ``conversation_id`` set to this engine's conversation_id.
+        """
+        return replace(ctx, conversation_id=self._conversation_id)
 
     def _filter_schema_valid(
         self,

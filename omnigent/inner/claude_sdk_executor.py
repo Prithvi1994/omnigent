@@ -57,6 +57,7 @@ from omnigent.models.claude_model_vocabulary import (
     served_canonical_overrides,
 )
 from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
@@ -81,7 +82,7 @@ from .executor import (
     classify_tool_result,
     describe_exception,
 )
-from .native_attachments import unresolved_attachment_marker
+from .native_attachments import framework_notices, unresolved_attachment_marker
 from .sandbox import (
     create_exec_launcher,
     get_backend,
@@ -911,7 +912,13 @@ def _build_mcp_tools(
                     # runtime returns without confusing the type checker.
                     raw = await tool_executor(tool_name, args)
                     result: ToolResult = raw if isinstance(raw, dict) else {"result": raw}
-                    response: McpResponse = {
+                    image_result = decode_mcp_image_result(result)
+                    if image_result is not None:
+                        response: McpResponse = image_result.to_mcp()
+                        # The SDK server reads snake_case; native MCP clients use isError.
+                        response["is_error"] = image_result.is_error
+                        return response
+                    response = {
                         "content": [{"type": "text", "text": json.dumps(result)}],
                     }
                     if result.get("blocked") is True or (
@@ -1705,6 +1712,7 @@ class ClaudeSDKExecutor(Executor):
         self._elicitation_handler: ElicitationHandler | None = None
         # Live Claude SDK clients keyed by Omnigent session id.
         self._clients: dict[str, _ClaudeClientState] = {}
+        self._pending_framework_context: dict[str, str] = {}
         # Session keys whose Claude harness process crashed and must not be reused.
         self._crashed_sessions: dict[str, str] = {}
         # Force-close tasks for clients evicted on turn cancellation, kept
@@ -2186,6 +2194,31 @@ class ClaudeSDKExecutor(Executor):
             env.setdefault(var, model_id)
         return self._gateway_vocabulary.model_overrides
 
+    def _install_framework_context_hook(
+        self, sdk: _ClaudeSDK, options: SdkOptions, session_key: str
+    ) -> None:
+        """Read current-turn context even when the SDK reuses its original hooks."""
+        hook_matcher = getattr(sdk, "HookMatcher", None)
+        if hook_matcher is None:
+            return
+
+        async def add_context(
+            _payload: object, _tool_use_id: str | None, _context: object
+        ) -> _JsonObject:
+            text = self._pending_framework_context.pop(session_key, "")
+            if not text:
+                return {}
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": text,
+                }
+            }
+
+        hooks = dict(getattr(options, "hooks", None) or {})
+        hooks.setdefault("UserPromptSubmit", []).append(hook_matcher(hooks=[add_context]))
+        options.hooks = hooks
+
     def _install_subagent_router_hook(
         self,
         sdk: _ClaudeSDK,
@@ -2456,9 +2489,10 @@ class ClaudeSDKExecutor(Executor):
                 )
             )
             return
+        resume_session = session_key in self._clients
         prompt = self._build_prompt(
             messages,
-            resume_session=session_key in self._clients,
+            resume_session=resume_session,
         )
         if not prompt:
             # Resumed sessions can have nothing new to say; signal turn
@@ -2680,6 +2714,7 @@ class ClaudeSDKExecutor(Executor):
             options.can_use_tool = self._can_use_tool_gate
 
         self._install_subagent_router_hook(sdk, options, model)
+        self._install_framework_context_hook(sdk, options, session_key)
 
         # Log the full configuration for debugging
         logger.info(
@@ -2864,6 +2899,19 @@ class ClaudeSDKExecutor(Executor):
                 yield ExecutorError(message=f"LLM call denied by policy: {_deny_reason}")
                 return
 
+        notice_messages = messages
+        if resume_session:
+            notice_messages = []
+            for message in reversed(messages):
+                if message.get("role") != "user":
+                    break
+                notice_messages.insert(0, message)
+        self._pending_framework_context[session_key] = "\n\n".join(
+            notice
+            for message in notice_messages
+            if message.get("role") == "user"
+            for notice in framework_notices(message.get("content"))
+        )
         try:
             try:
                 sdk_prompt: str | AsyncIterator[_JsonObject]
@@ -3243,6 +3291,7 @@ class ClaudeSDKExecutor(Executor):
             self._evict_client_on_cancel(session_key)
             raise
         except Exception as exc:  # noqa: BLE001 — top-level executor error boundary; records crash and surfaces to caller
+            self._pending_framework_context.pop(session_key, None)
             self._crashed_sessions[session_key] = str(exc)
             await self._close_live_client(session_key)
             stderr_text = "\n".join(stderr_lines) if stderr_lines else "(no stderr captured)"
@@ -3274,6 +3323,8 @@ class ClaudeSDKExecutor(Executor):
                 else _usage_from_observed_call(last_call_usage, observed_model or model),
             )
             return
+        finally:
+            self._pending_framework_context.pop(session_key, None)
         # A turn can end without ``ResultMessage`` usage — the CLI can close
         # the stream early, fail terminally (auth failure, rejected retries),
         # or be cut short before its final usage is reported. In all of those
@@ -3460,6 +3511,19 @@ class ClaudeSDKExecutor(Executor):
         trailing: list[Message] = []
         for msg in reversed(messages):
             if msg.get("role") == "user":
+                content = msg.get("content")
+                if content == "/compact" or (
+                    isinstance(content, list)
+                    and len(content) == 1
+                    and isinstance(content[0], dict)
+                    and content[0].get("type") in {"text", "input_text"}
+                    and content[0].get("text") == "/compact"
+                ):
+                    # The runner dispatches earlier input before a compact control.
+                    # Compaction may emit no assistant text; keep it out of later prompts.
+                    if not trailing:
+                        return "/compact"
+                    break
                 trailing.append(msg)
             else:
                 break
