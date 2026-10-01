@@ -60,6 +60,7 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
 )
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
+    _CODEX_PROVIDER_CREDENTIAL_ENV_VARS,
     _CODEX_ROUTER_HOOK_MODULE,
     _clean_codex_env,
     _codex_cli_version,
@@ -1240,13 +1241,9 @@ async def discover_codex_model_options(*, codex_path: str | None = None) -> list
         listen_url = f"ws://127.0.0.1:{port}"
         env = _clean_codex_env()
         # Discovery runs against an empty CODEX_HOME with no auth command, so
-        # neither the provider credential the user's config.toml declares via
-        # env_key nor the service-principal secrets may reach it.
+        # no provider credential the launch env carries may reach it.
         provider_credentials = {
-            "DATABRICKS_BEARER",
-            "DATABRICKS_CODEX_TOKEN",
-            "DATABRICKS_CLIENT_ID",
-            "DATABRICKS_CLIENT_SECRET",
+            *_CODEX_PROVIDER_CREDENTIAL_ENV_VARS,
             *codex_config_declared_env_key_allowance(),
         }
         for name in tuple(env):
@@ -3859,7 +3856,7 @@ def resolve_native_codex_launch(
         log_info_once(
             _logger,
             "native-codex routing: Codex's own config.toml provider (no provider "
-            "configured for the Codex harness, no Databricks profile).",
+            "configured for the Codex harness; the config's credential takes precedence).",
         )
         return NativeCodexLaunch(
             config_overrides=no_provider_overrides,
@@ -3867,7 +3864,7 @@ def resolve_native_codex_launch(
             profile=None,
             summary=(
                 "Codex's own config.toml provider (no provider configured for the "
-                "codex harness, no Databricks profile)"
+                "codex harness; the config's credential takes precedence)"
             ),
         )
 

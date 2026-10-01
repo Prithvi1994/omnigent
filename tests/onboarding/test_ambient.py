@@ -454,7 +454,7 @@ def test_ollama_detected_when_reachable(clean_env, monkeypatch: pytest.MonkeyPat
 
 
 def test_detection_priority_order(clean_env, monkeypatch: pytest.MonkeyPatch) -> None:
-    """All signals together are returned in env → claude → codex → ollama order.
+    """All signals together are returned in env → claude → codex → pi → ollama order.
 
     Failure means the stable ordering broke, so the setup UI would present
     detected providers in a non-deterministic / surprising order.
@@ -474,12 +474,17 @@ def test_detection_priority_order(clean_env, monkeypatch: pytest.MonkeyPatch) ->
     (codex_dir / "auth.json").write_text(
         '{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-codex-real"}', encoding="utf-8"
     )
+    pi_dir = clean_env / ".pi" / "agent"
+    pi_dir.mkdir(parents=True)
+    (pi_dir / "auth.json").write_text(
+        '{"openai": {"type": "api_key", "key": "sk-pi-real"}}', encoding="utf-8"
+    )
     monkeypatch.setattr(ambient, "_ollama_reachable", lambda: True)
 
     detected = detect_providers()
     # Env keys first, in PROVIDER_ENV_VARS iteration order (openai precedes
-    # anthropic in that dict), then claude login, codex login, ollama.
-    assert [d.name for d in detected] == ["openai", "anthropic", "claude", "codex", "ollama"]
+    # anthropic in that dict), then claude login, codex login, pi login, ollama.
+    assert [d.name for d in detected] == ["openai", "anthropic", "claude", "codex", "pi", "ollama"]
 
 
 # ── Codex config.toml custom provider (cli-config) detection ───────────────
@@ -1050,9 +1055,9 @@ def _write_pi_auth(home: Path, body: str) -> None:
 def test_pi_cli_login_detected(clean_env, auth: dict[str, object]) -> None:
     """A ``~/.pi/agent/auth.json`` carrying a credential is detected.
 
-    Failure means a natively signed-in pi (a bare ``pi`` runs) keeps reading
-    "Not configured" in the setup overview — the user's own login is never
-    credited, the bug this detection fixes.
+    Failure means a natively signed-in pi (a bare ``pi`` runs) reads
+    "Not configured" in the setup overview: the user's own login is never
+    credited.
     """
     _write_pi_auth(clean_env, json.dumps(auth))
     assert detect_providers() == [
@@ -1098,16 +1103,3 @@ def test_pi_auth_path_honors_agent_dir_env(clean_env, monkeypatch: pytest.Monkey
     )
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(relocated))
     assert [d.name for d in detect_providers()] == ["pi"]
-
-
-def test_pi_detected_after_codex_login_before_ollama(
-    clean_env, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Pi's login sits between the codex login and Ollama in priority order."""
-    (clean_env / ".codex").mkdir()
-    (clean_env / ".codex" / "auth.json").write_text(
-        '{"tokens": {"access_token": "at-real"}}', encoding="utf-8"
-    )
-    _write_pi_auth(clean_env, '{"openai": {"type": "api_key", "key": "sk-pi-real"}}')
-    monkeypatch.setattr(ambient, "_ollama_reachable", lambda: True)
-    assert [d.name for d in detect_providers()] == ["codex", "pi", "ollama"]

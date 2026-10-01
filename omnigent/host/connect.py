@@ -770,16 +770,18 @@ HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
 RUNNER_ENV_PASSTHROUGH_ENV_VAR: str = "OMNIGENT_RUNNER_ENV_PASSTHROUGH"
 
 
+# Harnesses whose runner launches the Codex CLI, the only consumer of the
+# variable Codex's own config.toml declares via env_key.
+_CODEX_RUNNER_HARNESSES: frozenset[str] = frozenset({"codex", "codex-native"})
+
+
 def codex_config_declared_env_vars() -> frozenset[str]:
-    """Env var names Codex's own ``config.toml`` declares via ``env_key``.
+    """Return the env var Codex's own ``config.toml`` declares via ``env_key``.
 
-    A custom ``[model_providers.X]`` selected by the user's Codex config
-    authenticates from the variable it names. The runner forwards exactly that
-    variable to the Codex launch (see ``_clean_codex_env``), so it has to
-    survive the host→daemon→runner allowlists first or an ``omnigent codex``
-    session fails on a config a bare ``codex`` runs fine with.
+    Empty when the config declares none or names an Omnigent control-plane
+    (``OMNIGENT_*``) or Codex-denied variable, which are never forwarded.
 
-    :returns: The declared name, or an empty set when the config declares none.
+    :returns: The declared name as a one-element set, or an empty set.
     """
     from omnigent.inner.codex_executor import codex_config_declared_env_key_allowance
 
@@ -854,10 +856,10 @@ def _build_runner_env(
     Harness credentials are the deliberate exception to the allowlist:
     the names in :data:`HARNESS_CREDENTIAL_ENV_VARS` (plus any extras
     the host owner lists in :data:`RUNNER_ENV_PASSTHROUGH_ENV_VAR`, the
-    variables the providers config references, and the variable Codex's
-    own ``config.toml`` declares via ``env_key``) forward when present, so
-    runners can authenticate to LLM providers with the credentials the
-    host owner provisioned for them.
+    variables the providers config references, and — for a Codex runner
+    only — the variable Codex's own ``config.toml`` declares via
+    ``env_key``) forward when present, so runners can authenticate to LLM
+    providers with the credentials the host owner provisioned for them.
 
     :param base_env: Host process environment to filter, e.g.
         ``os.environ``.
@@ -905,12 +907,12 @@ def _build_runner_env(
         config_env_vars |= provider_credential_env_vars(
             inference_config, include_dollar_key_refs=True
         )
-    forwarded = (
-        HARNESS_CREDENTIAL_ENV_VARS
-        | extra_names
-        | config_env_vars
-        | codex_config_declared_env_vars()
+    # Only a Codex runner launches the CLI that consumes the config-declared
+    # variable; other harnesses must not inherit a credential on Codex's say-so.
+    codex_env_vars = (
+        codex_config_declared_env_vars() if harness in _CODEX_RUNNER_HARNESSES else frozenset()
     )
+    forwarded = HARNESS_CREDENTIAL_ENV_VARS | extra_names | config_env_vars | codex_env_vars
     env = {
         key: value
         for key, value in base_env.items()

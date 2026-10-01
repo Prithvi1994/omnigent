@@ -3870,7 +3870,13 @@ def _run_configure_harnesses_interactive() -> None:
             if fam == OPENAI_FAMILY:
                 codex_status = _codex_own_config_status(config)
                 if codex_status is not None:
-                    return (fam, name, codex_status, "ready", "")
+                    return (
+                        fam,
+                        name,
+                        codex_status,
+                        "ready",
+                        "Read from Codex's own config.toml; change or remove it there.",
+                    )
             return (fam, name, "Not configured", "warn", "Open to add a credential.")
         label = _family_credential_label(config, fam, default.name, default)
         return (fam, name, label, "ready", "")

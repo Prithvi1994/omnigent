@@ -207,6 +207,18 @@ _BROKERED_CODEX_PROVIDER_NAME = "omnigent_brokered"
 # developer API key that would charge separately.
 _CODEX_ENV_DENY_EXACT: frozenset[str] = frozenset({"OPENAI_API_KEY"})
 
+# Provider credentials the Codex launch env carries for a gateway auth command
+# or an env_key provider; credential-free model discovery strips them again.
+_CODEX_PROVIDER_CREDENTIAL_ENV_VARS: tuple[str, ...] = (
+    "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
+    "DATABRICKS_CODEX_TOKEN",  # env_key in ~/.codex/config.toml's DB provider
+    # Service-principal M2M credentials so a Databricks-gateway auth.command can
+    # mint an OAuth token; DATABRICKS_CONFIG_PROFILE / DATABRICKS_TOKEN stay host
+    # secrets gated behind env_passthrough.
+    "DATABRICKS_CLIENT_ID",
+    "DATABRICKS_CLIENT_SECRET",
+)
+
 # The codex CLI logs a rejected gateway request to stderr as
 # ``unexpected status <code> <reason>: {...}, url: <url>`` and precedes it with
 # ``Reconnecting... N/5`` retry lines. These parse that shape so the head can
@@ -662,19 +674,14 @@ async def _create_subprocess_exec(
 
 
 def codex_config_declared_env_key_allowance() -> tuple[str, ...]:
-    """Allowance for the env var codex's own config declares via ``env_key``.
+    """Return the env var codex's own config declares via ``env_key``, as an allowance.
 
-    The user's ``config.toml`` can select a custom provider that
-    authenticates from a variable it names in ``env_key``. That variable is
-    the credential of the provider codex itself resolves, so the scrubbed
-    launch env must carry it — otherwise an omnigent-managed codex fails auth
-    on a config a bare ``codex`` runs fine with. Names in
-    :data:`_CODEX_ENV_DENY_EXACT` are never returned, so neither the Codex
-    launch nor the daemon/runner hops forward them. Never raises: env
-    construction must survive a broken config.
+    The declared variable is the credential of the provider codex itself
+    resolves, so the scrubbed launch env carries it. Never names an Omnigent
+    control-plane variable or a :data:`_CODEX_ENV_DENY_EXACT` entry, and never
+    raises: env construction must survive a broken config.
 
-    :returns: A tuple with the declared variable name, or empty when the
-        effective provider declares none.
+    :returns: A one-element tuple with the variable name, or empty.
     """
     from omnigent.onboarding.codex_auth_readiness import codex_config_declared_env_key
 
@@ -716,17 +723,7 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
         allow_exact=(
             "PYTHONUTF8",
             "OTEL_RESOURCE_ATTRIBUTES",
-            "DATABRICKS_BEARER",  # explicit CI/integration bearer used by auth.command
-            "DATABRICKS_CODEX_TOKEN",  # env_key in ~/.codex/config.toml's DB provider
-            # Service-principal M2M credentials, so a Databricks-gateway
-            # ``auth.command`` can mint an OAuth token from the SP on each
-            # refresh. Only DATABRICKS_BEARER survived before, forcing a
-            # pre-minted (expiring) token or an inlined secret; these let the
-            # standard client-credentials mint work on a non-interactive host.
-            # DATABRICKS_CONFIG_PROFILE / DATABRICKS_TOKEN are deliberately NOT
-            # here (they stay host secrets, gated behind env_passthrough).
-            "DATABRICKS_CLIENT_ID",
-            "DATABRICKS_CLIENT_SECRET",
+            *_CODEX_PROVIDER_CREDENTIAL_ENV_VARS,
             *codex_config_declared_env_key_allowance(),
             *_CODEX_OMNIGENT_LAUNCH_ENV_VARS,
         ),

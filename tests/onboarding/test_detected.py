@@ -511,11 +511,10 @@ def _pi_login() -> DetectedProvider:
 def test_pi_login_adopted_and_defaults_pi_scope_when_nothing_serves_pi() -> None:
     """With only a pi login detected, it is adopted and defaults the pi scope.
 
-    The bug's shape: a user signed in to pi natively (a bare ``pi`` runs) but
-    with nothing else configured, ``omni setup`` read Pi as "Not configured"
-    because nothing served the pi surface. The detection must be adopted as
-    the "Pi original auth" subscription AND claim the pi-scope default so the
-    overview and readiness resolve it.
+    A user signed in to pi natively (a bare ``pi`` runs) with nothing else
+    configured has nothing serving the pi surface, so the detection must be
+    adopted as the "Pi original auth" subscription AND claim the pi-scope
+    default for the overview and readiness to resolve it.
     """
     adopt = providers_to_adopt({}, [_pi_login()])
     assert adopt == {"pi": {"kind": "subscription", "cli": "pi"}}
