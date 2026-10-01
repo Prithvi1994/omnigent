@@ -364,12 +364,19 @@ describe("createTerminal", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_abc/resources/terminals");
     expect(init.method).toBe("POST");
-    const body = JSON.parse(init.body as string) as { terminal: string; session_key: string };
+    const body = JSON.parse(init.body as string) as {
+      terminal: string;
+      session_key: string;
+      terminal_theme?: string;
+    };
     expect(body.terminal).toBe("shell");
     // A fresh random `u-` key per call: the runner's launch is
     // idempotent per (terminal, session_key), so a fixed key would
     // return the SAME terminal on every click instead of a new one.
     expect(body.session_key).toMatch(/^u-/);
+    // No resolved theme: the optional field is omitted rather than sent
+    // as null/undefined, so older runners never see an unknown key.
+    expect("terminal_theme" in body).toBe(false);
     // Mapped through terminalInfoFromResource — proves the POST
     // response shape lands as a usable TerminalInfo, not raw wire.
     expect(out).toEqual({
@@ -397,25 +404,6 @@ describe("createTerminal", () => {
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(init.body as string) as { terminal_theme?: string };
     expect(body.terminal_theme).toBe("dark");
-  });
-
-  it("omits terminal_theme when no resolved theme is provided", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({
-        id: "terminal_shell_u-abc123",
-        object: "session.resource",
-        type: "terminal",
-        session_id: "conv_abc",
-        name: "shell:u-abc123",
-        metadata: { terminal_name: "shell", session_key: "u-abc123", running: true },
-      }),
-    );
-
-    await createTerminal("conv_abc", "shell");
-
-    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    const body = JSON.parse(init.body as string) as Record<string, unknown>;
-    expect("terminal_theme" in body).toBe(false);
   });
 
   it("surfaces the server gate's message on a 400 rejection", async () => {

@@ -288,7 +288,9 @@ export async function createTerminal(
  * The created pane's PTY is told which background it renders against:
  * the terminal theme preference is resolved against the app's current
  * appearance at click time and rides the create request (see
- * :func:`createTerminal`'s ``terminalTheme``).
+ * :func:`createTerminal`'s ``terminalTheme``). The hint is fixed at
+ * launch: a later appearance change repaints an existing pane but not
+ * its process environment, so only a newly launched shell picks it up.
  *
  * :param conversationId: Session/conversation identifier.
  * :returns: TanStack mutation taking the declared terminal name.
@@ -301,8 +303,8 @@ export function useCreateTerminal(conversationId: string) {
       createTerminal(
         conversationId,
         terminal,
-        // Read the stored mode at mutate time (not mount) so a Settings
-        // change between renders still resolves fresh.
+        // Stored mode is read at mutate time; resolvedMode is render-fresh
+        // (useTheme re-renders consumers on appearance change).
         resolveTerminalIsDark(readTerminalThemeMode(), resolvedMode === "dark") ? "dark" : "light",
       ),
     onSuccess: (info) => {

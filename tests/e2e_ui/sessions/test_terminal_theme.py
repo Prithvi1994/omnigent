@@ -30,15 +30,20 @@ mirroring ``shells/test_new_shell.py``.
 
 from __future__ import annotations
 
+import os
 import re
 import time
 
+import pytest
 from playwright.sync_api import Locator, Page, WebSocket, expect
 
 from tests.e2e_ui.conftest import open_right_rail
 
 TERMINAL_THEME_KEY = "omnigent:terminal-theme"
 APP_THEME_KEY = "web-theme"
+# The e2e conftest films the journey when this is set; only then is the probe
+# result held on screen long enough to read.
+_RECORDING = bool(os.environ.get("OMNIGENT_E2E_RECORD_DIR"))
 
 # What a TUI that assumes a light background emits (ANSI black text), followed
 # by the background hint the shell actually received.
@@ -143,15 +148,25 @@ def _pane_background_hint(page: Page, terminal_view: Locator, frames: list[bytes
     while time.monotonic() < deadline:
         screen = _ANSI_RE.sub("", b"".join(frames).decode("utf-8", "replace"))
         if match := _PANE_HINT_RE.search(screen):
-            # Leave the result on screen long enough to read in a recording.
-            page.wait_for_timeout(2_000)
+            if _RECORDING:
+                page.wait_for_timeout(2_000)
             return match.group(1)
         page.wait_for_timeout(500)
     raise AssertionError("the shell never echoed the PTYBG probe line")
 
 
+def _journey_page(request: pytest.FixtureRequest) -> Page:
+    """Open the browser page only now, after ``terminal_session`` is set up.
+
+    Taking ``page`` as a test parameter would create it (and start filming
+    it) before the server, agent and session fixtures run, so a recording
+    would open on setup instead of on the journey.
+    """
+    return request.getfixturevalue("page")
+
+
 def test_match_app_terminal_under_dark_app_tells_pty_background(
-    request, terminal_session: tuple[str, str]
+    request: pytest.FixtureRequest, terminal_session: tuple[str, str]
 ) -> None:
     """Under a Dark app with the default "Match app", the pane's process learns it is dark.
 
@@ -162,7 +177,7 @@ def test_match_app_terminal_under_dark_app_tells_pty_background(
     leaves the TUI guessing and the text unreadable.
     """
     base_url, session_id = terminal_session
-    page: Page = request.getfixturevalue("page")
+    page = _journey_page(request)
     frames = _capture_pane_output(page)
 
     _open_appearance(page, base_url)
@@ -182,7 +197,9 @@ def test_match_app_terminal_under_dark_app_tells_pty_background(
     )
 
 
-def test_light_terminal_under_dark_app(request, terminal_session: tuple[str, str]) -> None:
+def test_light_terminal_under_dark_app(
+    request: pytest.FixtureRequest, terminal_session: tuple[str, str]
+) -> None:
     """A "Light" terminal stays light while the app runs Dark, and its shell is told so.
 
     Pins the app to Dark and the terminal to Light in Settings, then launches a
@@ -193,7 +210,7 @@ def test_light_terminal_under_dark_app(request, terminal_session: tuple[str, str
     repainting the browser canvas.
     """
     base_url, session_id = terminal_session
-    page: Page = request.getfixturevalue("page")
+    page = _journey_page(request)
     frames = _capture_pane_output(page)
 
     _open_appearance(page, base_url)
