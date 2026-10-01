@@ -62,6 +62,17 @@ async def test_own_stamp_does_not_raise(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_sibling_stamp_newer_than_own_raises(monkeypatch):
+    """A row stamp newer than this replica's own write is the re-tunnel case:
+    the runner re-registered on a sibling after we last stamped it."""
+    now = int(time.time())
+    conv = _conv("runner_abc", now)
+    with pytest.raises(OmnigentError) as exc:
+        await _run(conv, monkeypatch, classified_runner_id="runner_abc", own_stamp=now - 50)
+    assert exc.value.code == ErrorCode.WRONG_REPLICA
+
+
+@pytest.mark.asyncio
 async def test_stale_stamp_does_not_raise(monkeypatch):
     """A stamp past the liveness TTL is not a live runner anywhere."""
     conv = _conv("runner_abc", int(time.time()) - 10_000)

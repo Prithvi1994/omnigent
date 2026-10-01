@@ -2376,15 +2376,10 @@ def register_events_routes(
             else:
                 _runner_needs_session_init = True
         if runner_client is None:
-            # A rollout can leave the runner healthy on a sibling replica while
-            # this pod has no local tunnel: fail retryably (WRONG_REPLICA) so the
-            # client re-addresses, rather than recording a spurious
-            # runner_failed_to_start against a runner that just re-tunnelled
-            # elsewhere. The runner stamp settles before the host's own liveness
-            # does, so this catches the window the host-level guard above misses.
-            # Skipped when the host definitively refused to launch ("no runner is
-            # coming"): that is an authoritative local answer, so surface it
-            # below instead of converting it into a retry.
+            # A rollout can leave the runner live on a sibling pod; re-address
+            # (WRONG_REPLICA) instead of failing the turn — see the guard's
+            # docstring. Skipped on a definitive host refusal (authoritative
+            # local answer, surfaced below).
             if not relaunched_launch_refused:
                 await _raise_if_runner_re_tunnelled_to_another_replica(
                     session_id, conv.runner_id, conversation_store
