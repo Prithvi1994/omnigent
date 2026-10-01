@@ -14,6 +14,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from sqlalchemy.exc import StatementError
+
 from omnigent.entities import (
     Conversation,
     ConversationItem,
@@ -1278,7 +1280,7 @@ def _agent_title_from_conversation(
             f"{child.title!r} — expected '<agent>:<title>' format"
         )
     sa_agent, _, sa_title = display_title.partition(":")
-    if child.sub_agent_name is None and sa_agent == "ui" and ":" in sa_title:
+    if child.sub_agent_name is None and _is_ui_added_title(display_title):
         # Add-agent sentinel "ui:<agent>:<label>": the agent is the middle segment.
         sa_agent, _, sa_title = sa_title.partition(":")
     return _AgentTitle(agent=sa_agent, title=sa_title)
@@ -1300,7 +1302,8 @@ def _bound_agent_names(children: list[Conversation]) -> dict[str, str]:
     Resolve the bound agent name for each distinct ``agent_id`` in ``children``.
 
     One batched store read; ids whose agent no longer resolves are omitted
-    (and logged) so callers fall back to the ``"agent"`` label.
+    (and logged) so callers fall back to the ``"agent"`` label, and a failing
+    store degrades to that label instead of failing the whole call.
 
     :param children: Child conversations to resolve.
     :returns: ``{agent_id: agent.name}`` for every binding that resolves.
@@ -1310,7 +1313,11 @@ def _bound_agent_names(children: list[Conversation]) -> dict[str, str]:
     agent_ids = {child.agent_id for child in children if child.agent_id}
     if not agent_ids:
         return {}
-    names = get_agent_store().get_names(sorted(agent_ids))
+    try:
+        names = get_agent_store().get_names(sorted(agent_ids))
+    except StatementError:
+        _logger.warning("Could not resolve bound agent names for sub-agent rows", exc_info=True)
+        return {}
     for agent_id in sorted(agent_ids - names.keys()):
         _logger.debug("sub-agent child agent binding %s no longer resolves", agent_id)
     return names

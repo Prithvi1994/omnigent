@@ -6533,11 +6533,9 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                 "sys_session_list", "{}", conversation_id="conv_parent", server_client=client
             )
         )
-    # c3 (explicitly closed despite its mixed-type label map), c5
-    # (legacy title tombstone), and c4
-    # (no session_name) dropped; the ui:-added child surfaces under its
-    # bound agent + label, the verbatim child c6 under its binding, and
-    # c7 (binding no longer resolves) under the last-resort label.
+    # c3 (closed label), c5 (title tombstone) and c4 (no session_name) are
+    # dropped; c2 surfaces under its ui: agent + label, c6 keeps its verbatim
+    # title under its binding, c7 falls back to the "agent" label.
     assert out["sub_agents"] == [
         {"agent": "researcher", "title": "auth", "conversation_id": "c1"},
         {"agent": "claude-native-ui", "title": "1", "conversation_id": "c2"},

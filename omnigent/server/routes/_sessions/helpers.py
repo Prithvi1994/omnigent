@@ -10432,18 +10432,24 @@ def _bound_agent_names(convs: list[Conversation]) -> dict[str, str]:
     """
     Resolve the bound agent name for each distinct ``agent_id`` in ``convs``.
 
-    A child whose title is verbatim (no ``sub_agent_name`` stamp) takes its
-    ``tool`` from this binding instead of its title. One batched store
-    read; unresolvable ids are omitted, and an uninitialized runtime or a
-    failing store yields an empty map so the summary still publishes with
-    ``tool`` unset.
+    Only a child whose title is verbatim (no ``sub_agent_name`` stamp and
+    not the ``ui:`` sentinel) takes its ``tool`` from this binding, so other
+    rows are skipped. One batched store read; unresolvable ids are omitted,
+    and an uninitialized runtime or a failing store yields an empty map so
+    the summary still publishes with ``tool`` unset.
 
     :param convs: Child conversation rows about to be summarised.
     :returns: ``{agent_id: agent.name}`` for every binding that resolves.
     """
     from omnigent.runtime import get_agent_store
 
-    agent_ids = {conv.agent_id for conv in convs if conv.agent_id}
+    agent_ids = {
+        conv.agent_id
+        for conv in convs
+        if conv.agent_id
+        and conv.sub_agent_name is None
+        and not _is_ui_added_title(title_without_closed_marker(conv.title))
+    }
     if not agent_ids:
         return {}
     try:
