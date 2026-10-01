@@ -476,6 +476,49 @@ async def test_call_tool_reconnects_when_session_died_after_connect() -> None:
 
 
 @pytest.mark.asyncio()
+async def test_call_tool_reconnects_when_session_dies_while_waiting_for_call_lock() -> None:
+    """
+    A caller queued behind ``_call_lock`` reconnects when the
+    lifecycle dies before its turn.
+
+    Pooled callers serialize on ``_call_lock``. If the transport
+    fails while one of them waits, the session it saw at entry is
+    gone once it acquires the lock. That must classify as a
+    reconnectable failure, not an ``AttributeError`` on the ``None``
+    session that aborts the call with retries still available.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        ok_result = MagicMock()
+        ok_result.content = [TextContent(type="text", text="recovered")]
+        ok_result.isError = False
+        mock_session.call_tool.return_value = ok_result
+
+        async def _restore_session(**_: object) -> None:
+            conn._session = mock_session
+
+        with patch.object(conn, "_reconnect", side_effect=_restore_session) as mock_reconnect:
+            with patch("omnigent.tools.mcp._sleep", new_callable=AsyncMock):
+                # Hold the call lock so the caller passes the entry guard
+                # and queues; the lifecycle then dies before it runs.
+                await conn._call_lock.acquire()
+                call = asyncio.create_task(conn.call_tool("test_tool", {"query": "hi"}))
+                await asyncio.sleep(0)
+                conn._session = None
+                conn._call_lock.release()
+                result = await call
+
+        assert result == "recovered"
+        mock_reconnect.assert_awaited_once()
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
 async def test_call_tool_reconnect_failure_after_session_death_propagates() -> None:
     """
     A cleared session still surfaces the real error when auth is

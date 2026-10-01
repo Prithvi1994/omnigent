@@ -8,12 +8,6 @@ steady state with a live session. Once the server is *armed* via
 returns ``401 Unauthorized`` -- the shape of an upstream gateway bearer
 token expiring while an MCP connection sits in steady state.
 
-This reproduces the transport-level trigger of the steady-state wedge:
-a remote MCP server backed by an auth gateway returns ``401
-Unauthorized`` mid-session; the streamable-HTTP client's lifecycle task
-then crashes and clears the live session, and the next tool dispatch
-raises ``has no live session``.
-
 Usage::
 
     python tests/tools/fixtures/expiring_auth_http_mcp_server.py <port>

@@ -523,18 +523,12 @@ class McpServerConnection:
     # ``_call_lock`` so only one call is active at a time.
     _active_session_id: str | None = field(default=None, init=False, repr=False)
     _session: ClientSession | None = field(default=None, init=False, repr=False)
-    # True once connect() has established a live session, until
-    # close() runs. Distinguishes "never connected / closed" (caller
-    # misuse — a hard error) from "the session died and needs
-    # rebuilding" (a transient transport fault that cleared, e.g. a
-    # steady-state 401 from an expired bearer that has since
-    # refreshed), which must reconnect on the next call instead of
-    # wedging forever.
+    # Latched after a successful connect, cleared by close(). A None
+    # session with the latch set is a dead session to rebuild on the
+    # next call, not caller misuse.
     _connected: bool = field(default=False, init=False, repr=False)
-    # Single-flights session rebuilds: once a session dies, every
-    # pooled caller classifies as needs-reconnect, so without this
-    # lock they would all run _reconnect() concurrently and tear
-    # down each other's freshly built lifecycles.
+    # Single-flights session rebuilds so concurrent callers do not
+    # each run _reconnect() and tear down one another's lifecycles.
     _reconnect_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     # Most recent network-level transport failure, recorded by
     # ``_TransportErrorRecordingTransport``. The MCP SDK can swallow
@@ -645,13 +639,8 @@ class McpServerConnection:
         :raises McpServerDisabledError: If the circuit breaker is
             tripped.
         """
-        # A None session with no prior successful connect is caller
-        # misuse (call_tool before connect) — hard error. A None
-        # session *after* a successful connect means the lifecycle
-        # task died on a transient transport fault (e.g. a
-        # steady-state 401 that has since cleared); don't wedge here,
-        # let _call_tool_with_reconnect rebuild the session so a
-        # recovered server keeps working.
+        # Only a never-connected or closed connection is caller misuse;
+        # a session that died after connect is rebuilt by the retry loop.
         if self._session is None and not self._connected:
             raise RuntimeError(
                 f"MCP server {self.config.name!r} has no live "
@@ -706,6 +695,13 @@ class McpServerConnection:
         if self._session is None:
             raise RuntimeError("MCP session not initialized — call connect() first")
         async with self._call_lock:
+            # The lifecycle may have died while this call queued for the
+            # lock; a ConnectionError lets the retry loop rebuild it.
+            session = self._session
+            if session is None:
+                raise ConnectionError(
+                    f"MCP server {self.config.name!r} session died before the call was sent"
+                )
             self._active_session_id = session_id
             # Scope the unhealthy-transport signal to this attempt:
             # bumping the serial invalidates recordings from any
@@ -715,7 +711,7 @@ class McpServerConnection:
             self._call_serial += 1
             self._transport_error = None
             try:
-                result = await self._session.call_tool(name=name, arguments=arguments)
+                result = await session.call_tool(name=name, arguments=arguments)
             finally:
                 self._active_session_id = None
 
@@ -1721,10 +1717,8 @@ async def _call_tool_with_reconnect(
     """
     last_exc: Exception | None = None
     total_tries = retry.max_retries + 1
-    # A session that died before the call (lifecycle task torn down
-    # by an earlier fault) must be rebuilt before the first attempt,
-    # not only after an in-call failure — otherwise a cleared 401
-    # never gets a live session to run against.
+    # A session that died before this call must be rebuilt before the
+    # first attempt, not only after an in-call failure.
     needs_reconnect = conn._session is None
     # The session THIS caller observed as dead; lets _reconnect skip
     # the rebuild when a concurrent caller already replaced it.
