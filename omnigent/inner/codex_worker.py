@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -20,6 +21,8 @@ from .sandbox import (
     with_additional_write_roots,
     with_spawn_env_allowlist,
 )
+
+logger = logging.getLogger(__name__)
 
 _FRAMEWORK_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _BROKERED_AUTH_SECRET_ENV = frozenset(
@@ -135,6 +138,17 @@ def prepare_codex_worker(
     )
     if egress_rules and worker_env is None:
         raise ValueError("egress-filtered Codex worker requires an owned worker environment")
+    if signer_readiness is None and not egress_rules and not policy.allow_network:
+        # Like the Claude CLI wrap: the app-server must reach the model, so it
+        # cannot live inside a network-denying sandbox without a route out.
+        # Codex's own sandbox mode still confines its tool commands.
+        logger.warning(
+            "os_env.sandbox denies network and grants the Codex app-server no "
+            "model route (no signer, no egress_rules); running it unwrapped with "
+            "Codex's own sandbox mode for tool commands. Add egress_rules for the "
+            "model host or allow_network: true to contain the worker."
+        )
+        return CodexWorkerLaunch(launch_path=codex_path, sandboxed=False)
 
     codex_dir = Path(codex_path).resolve(strict=False).parent
     policy = with_additional_read_roots(policy, [codex_dir, _FRAMEWORK_PACKAGE_ROOT])

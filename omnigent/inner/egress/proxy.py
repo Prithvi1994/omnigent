@@ -649,6 +649,19 @@ class EgressProxy:
                     )
                     return
 
+                if self._is_websocket_upgrade(inner_headers_raw):
+                    await self._forward_websocket(
+                        tls_reader,
+                        tls_writer,
+                        host,
+                        port,
+                        inner_method,
+                        inner_path,
+                        inner_request_line,
+                        inner_headers_raw,
+                    )
+                    return
+
                 body = b""
                 if content_length > 0:
                     body = await asyncio.wait_for(
@@ -760,22 +773,146 @@ class EgressProxy:
             logger.warning("Cannot connect HTTP/2 upstream %s:%d - %s", host, port, exc)
             return
 
+        try:
+            upstream_writer.write(initial_data)
+            await upstream_writer.drain()
+            await self._relay_bidirectional(
+                client_reader, client_writer, upstream_reader, upstream_writer
+            )
+        finally:
+            upstream_writer.close()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(upstream_writer.wait_closed(), timeout=2)
+
+    @staticmethod
+    async def _relay_bidirectional(
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+        upstream_reader: asyncio.StreamReader,
+        upstream_writer: asyncio.StreamWriter,
+    ) -> None:
+        """Pump bytes both ways until either side closes."""
+
         async def relay(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             while data := await reader.read(_BUF_SIZE):
                 writer.write(data)
                 await writer.drain()
 
+        tasks = {
+            asyncio.create_task(relay(client_reader, upstream_writer)),
+            asyncio.create_task(relay(upstream_reader, client_writer)),
+        }
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*done, *pending, return_exceptions=True)
+
+    @staticmethod
+    def _is_websocket_upgrade(headers_raw: bytes) -> bool:
+        """Return whether the inner request asks to switch the tunnel to WebSocket."""
+        headers = EgressProxy._parse_header_dict(headers_raw)
+        connection_tokens = {
+            token.strip().lower() for token in headers.get("connection", "").split(",")
+        }
+        return (
+            headers.get("upgrade", "").strip().lower() == "websocket"
+            and "upgrade" in connection_tokens
+        )
+
+    async def _forward_websocket(
+        self,
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+        host: str,
+        port: int,
+        method: str,
+        path: str,
+        request_line: bytes,
+        headers_raw: bytes,
+    ) -> None:
+        """Complete a policy-approved WebSocket upgrade upstream and relay the tunnel.
+
+        Only a ``101`` switches the tunnel to an opaque relay. A refused upgrade
+        is relayed as one response and the tunnel is closed, so no later
+        request can skip the per-request policy check.
+        """
         try:
-            upstream_writer.write(initial_data)
+            pinned_ip = await self._assert_destination_allowed(host, port)
+        except PermissionError as exc:
+            logger.warning("BLOCKED-DEST wss://%s:%d - %s", host, port, exc)
+            await self._send_forbidden(client_writer, str(exc))
+            return
+        rewrite = await self._rewrite_authorization_async(
+            method=method, host=host, headers_raw=headers_raw
+        )
+        if rewrite.error is not None:
+            if rewrite.status_code == 502:
+                await self._send_bad_gateway(client_writer, rewrite.error)
+                return
+            logger.warning(
+                "BLOCKED-CREDENTIAL %s wss://%s%s — %s", method, host, path, rewrite.error
+            )
+            await self._send_forbidden(client_writer, rewrite.error)
+            return
+        headers_raw = self._force_connection_upgrade(rewrite.headers)
+        try:
+            upstream_reader, upstream_writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    pinned_ip or host,
+                    port,
+                    ssl=self._upstream_ssl_ctx,
+                    server_hostname=host,
+                ),
+                timeout=30,
+            )
+        except Exception as exc:  # noqa: BLE001 — upstream connect failure maps to 502
+            logger.warning("Cannot connect to %s:%d - %s", host, port, exc)
+            await self._send_bad_gateway(client_writer, str(exc))
+            return
+
+        try:
+            upstream_writer.write(request_line)
+            upstream_writer.write(headers_raw)
             await upstream_writer.drain()
-            tasks = {
-                asyncio.create_task(relay(client_reader, upstream_writer)),
-                asyncio.create_task(relay(upstream_reader, client_writer)),
-            }
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*done, *pending, return_exceptions=True)
+            try:
+                status_line = await asyncio.wait_for(upstream_reader.readline(), timeout=60)
+                response_headers = (
+                    await self._read_headers(upstream_reader) if status_line else b""
+                )
+            except asyncio.TimeoutError:
+                await self._send_gateway_timeout(
+                    client_writer, f"upstream {host}:{port} did not answer the upgrade"
+                )
+                return
+            if not status_line:
+                logger.warning("Upstream %s:%d closed without answering the upgrade", host, port)
+                await self._send_bad_gateway(
+                    client_writer, f"upstream {host}:{port} closed without response"
+                )
+                return
+            client_writer.write(status_line)
+            client_writer.write(response_headers)
+            await client_writer.drain()
+            if status_line.split()[1:2] == [b"101"]:
+                logger.info("UPGRADE wss://%s%s", host, path)
+                await self._relay_bidirectional(
+                    client_reader, client_writer, upstream_reader, upstream_writer
+                )
+                return
+            logger.info(
+                "UPGRADE-REFUSED wss://%s%s %s",
+                host,
+                path,
+                status_line.decode("latin-1", errors="replace").strip(),
+            )
+            declared_length = self._parse_header_dict(response_headers).get("content-length")
+            if declared_length is None:
+                await self._relay_response(upstream_reader, client_writer)
+            elif (length := int(declared_length)) > 0:
+                client_writer.write(
+                    await asyncio.wait_for(upstream_reader.readexactly(length), timeout=60)
+                )
+                await client_writer.drain()
         finally:
             upstream_writer.close()
             with contextlib.suppress(Exception):
@@ -1625,6 +1762,21 @@ class EgressProxy:
         del msg["Proxy-Connection"]
         del msg["Keep-Alive"]
         msg["Connection"] = "close"
+        return msg.as_bytes(policy=email.policy.HTTP)
+
+    @staticmethod
+    def _force_connection_upgrade(headers_raw: bytes) -> bytes:
+        """Leave ``Connection: Upgrade`` as the only hop-by-hop directive on an upgrade request.
+
+        ``Connection: close`` contradicts an upgrade (upstreams answer ``426``),
+        and the switched tunnel needs no single-shot EOF: it is relayed until
+        either side closes.
+        """
+        msg = _parse_http_headers(headers_raw)
+        del msg["Connection"]
+        del msg["Proxy-Connection"]
+        del msg["Keep-Alive"]
+        msg["Connection"] = "Upgrade"
         return msg.as_bytes(policy=email.policy.HTTP)
 
     @staticmethod

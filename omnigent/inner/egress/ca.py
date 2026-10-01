@@ -8,10 +8,12 @@ created for injection into the sandbox via environment variables.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import logging
 import os
 import ssl
+import tempfile
 from pathlib import Path
 
 from cryptography import x509
@@ -85,7 +87,18 @@ def ensure_ca_bundle(
 
     parts.append(ca_cert_path.read_bytes())
 
-    bundle_path.write_bytes(b"\n".join(parts))
+    # Another proxy start may be loading the bundle as its trust store while
+    # this one rewrites it; publish the new contents in a single rename.
+    fd, tmp_name = tempfile.mkstemp(dir=cache, prefix=".ca-bundle-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(b"\n".join(parts))
+        os.chmod(tmp_name, 0o644)
+        os.replace(tmp_name, bundle_path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
     logger.debug("Wrote combined CA bundle to %s", bundle_path)
     return bundle_path
 
