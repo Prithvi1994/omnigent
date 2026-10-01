@@ -66,6 +66,50 @@ def import_code_is_retryable(code: str) -> bool:
     return _RETRYABLE.get(code, True)
 
 
+MISSING_SQLITE_MESSAGE = (
+    "Your machine's Python was built without SQLite (`_sqlite3` is missing), so "
+    "`omnigent host` can't read local sessions. Fix: update Omnigent on that machine "
+    "(newer hosts no longer need SQLite to import), or reinstall Python with SQLite "
+    "support and restart `omnigent host`."
+)
+
+# ``fix_commands`` entries: ``label`` says when it applies, ``command`` is
+# exactly what to paste into a shell (the UI's copy button copies only that; the
+# CLI prints "label: command").
+MISSING_SQLITE_FIX_COMMANDS: tuple[Mapping[str, str], ...] = (
+    {
+        "label": "macOS (or reinstall Python from python.org)",
+        "command": "brew install sqlite && pyenv install --force 3.12",
+    },
+    {
+        "label": "Linux",
+        "command": "sudo apt-get install libsqlite3-dev && pyenv install --force 3.12",
+    },
+)
+
+
+def mentions_missing_sqlite(text: object) -> bool:
+    """Whether a host-reported error says Python's SQLite module is missing.
+
+    Older hosts import ``sqlite3`` eagerly, so on a Python built without it every
+    import fails with ``No module named '_sqlite3'`` (or ``'sqlite3'``) as text.
+    """
+    if not isinstance(text, str):
+        return False
+    return "No module named '_sqlite3'" in text or "No module named 'sqlite3'" in text
+
+
+def missing_sqlite_error() -> LocalImportError:
+    """The whole-import failure for a host whose Python lacks SQLite."""
+    return LocalImportError(
+        MISSING_SQLITE_MESSAGE,
+        import_code=ImportErrorCode.HOST_PYTHON_MISSING_SQLITE,
+        # 409 like host_offline: the host's state, not the request, is at fault.
+        code=ErrorCode.CONFLICT,
+        details={"fix_commands": [dict(fix) for fix in MISSING_SQLITE_FIX_COMMANDS]},
+    )
+
+
 class LocalImportError(OmnigentError):
     """An import failure with a stable import code and a user-facing message.
 
@@ -113,7 +157,11 @@ class LocalImportError(OmnigentError):
 
 
 __all__ = [
+    "MISSING_SQLITE_FIX_COMMANDS",
+    "MISSING_SQLITE_MESSAGE",
     "ImportErrorCode",
     "LocalImportError",
     "import_code_is_retryable",
+    "mentions_missing_sqlite",
+    "missing_sqlite_error",
 ]

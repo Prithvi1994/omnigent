@@ -11,6 +11,8 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes import imports as imports_module
 from omnigent.session_import.errors import (
+    MISSING_SQLITE_FIX_COMMANDS,
+    MISSING_SQLITE_MESSAGE,
     ImportErrorCode,
     LocalImportError,
 )
@@ -174,6 +176,10 @@ def test_store_default_hook_classifies_nothing() -> None:
             ImportErrorCode.SESSION_TOO_LARGE,
         ),
         ({"reason": "future", "code": "some_future_code"}, "some_future_code"),
+        (
+            {"reason": "ModuleNotFoundError: No module named '_sqlite3'"},
+            ImportErrorCode.HOST_PYTHON_MISSING_SQLITE,
+        ),
     ],
 )
 def test_host_failure_code_passes_through_or_defaults(entry: dict[str, Any], code: str) -> None:
@@ -200,6 +206,11 @@ async def test_host_reported_failures_keep_code_and_retryability(
                 "reason": "This session is too large for the connected server.",
                 "code": ImportErrorCode.SESSION_TOO_LARGE,
             },
+            {
+                "external_session_id": "old",
+                "source": "codex",
+                "reason": "ModuleNotFoundError: No module named '_sqlite3'",
+            },
         ]
 
     response = await _post_with_fake_stream(monkeypatch, _fake_stream, "/v1/imports/local/stream")
@@ -209,7 +220,11 @@ async def test_host_reported_failures_keep_code_and_retryability(
         ImportErrorCode.SESSION_TOO_LARGE,
         False,
     )
-    assert (events[-1]["imported"], events[-1]["failed"]) == (1, 1)
+    # An older host's raw ImportError text is replaced with the actionable message.
+    assert by_id["old"]["code"] == ImportErrorCode.HOST_PYTHON_MISSING_SQLITE
+    assert by_id["old"]["reason"] == MISSING_SQLITE_MESSAGE
+    assert by_id["old"]["retryable"] is False
+    assert (events[-1]["imported"], events[-1]["failed"]) == (1, 2)
 
 
 async def test_oversized_item_count_is_session_too_large(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -279,6 +294,37 @@ async def test_done_total_is_null_when_the_host_never_said(
             "complete": True,
         }
     ]
+
+
+@pytest.mark.parametrize("route", ["stream", "buffered"])
+async def test_host_missing_sqlite_whole_import_is_actionable(
+    monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    """A host whose listing fails on a missing SQLite module gets the fix, not a generic error."""
+
+    def _across(*, limit: int) -> list[tuple[str, str]]:
+        raise ModuleNotFoundError("No module named '_sqlite3'")
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_sessions_across_harnesses", _across
+    )
+    pair = TunnelPair()
+    app = imports_app(FakeConversationStore(), host_registry=pair.registry, host=host_record())
+    path = "/v1/imports/local/stream" if route == "stream" else "/v1/imports/local"
+    async with pair, client(app) as http:
+        response = await http.post(path, json=local_import_body())
+    if route == "buffered":
+        assert response.status_code == 409
+        error = response.json()["error"]
+        assert error["import_code"] == ImportErrorCode.HOST_PYTHON_MISSING_SQLITE
+    else:
+        events = ndjson(response)
+        (error,) = [e for e in events if e["event"] == "error"]
+        assert error["code"] == ImportErrorCode.HOST_PYTHON_MISSING_SQLITE
+        assert events[-1]["complete"] is False
+    assert error["retryable"] is False
+    assert error["message"] == MISSING_SQLITE_MESSAGE
+    assert error["fix_commands"] == [dict(fix) for fix in MISSING_SQLITE_FIX_COMMANDS]
 
 
 @pytest.mark.parametrize(

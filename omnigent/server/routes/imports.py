@@ -44,9 +44,12 @@ from omnigent.session_import import (
     title_from_items,
 )
 from omnigent.session_import.errors import (
+    MISSING_SQLITE_MESSAGE,
     ImportErrorCode,
     LocalImportError,
     import_code_is_retryable,
+    mentions_missing_sqlite,
+    missing_sqlite_error,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.conversation_store import ConversationAlreadyExistsError
@@ -385,6 +388,10 @@ async def _stream_local_sessions_from_host(
                 yield data
             else:  # "done"
                 if data.get("status") != "ok":
+                    if mentions_missing_sqlite(data.get("error")):
+                        # An older host imports sqlite3 eagerly, so a Python built
+                        # without it fails the whole read; say how to fix it.
+                        raise missing_sqlite_error()
                     raise OmnigentError(
                         data.get("error") or "host failed to read local sessions",
                         code=ErrorCode.INTERNAL_ERROR,
@@ -415,6 +422,8 @@ def _host_failure_code(entry: dict[str, Any]) -> str:
     code = entry.get("code")
     if isinstance(code, str) and code:
         return code
+    if mentions_missing_sqlite(entry.get("reason")):
+        return ImportErrorCode.HOST_PYTHON_MISSING_SQLITE
     return ImportErrorCode.SESSION_UNREADABLE
 
 
@@ -1024,6 +1033,9 @@ def create_imports_router(
             for entry in host_failures:
                 reason = str(entry.get("reason") or "This session could not be read on the host.")
                 code = _host_failure_code(entry)
+                if code == ImportErrorCode.HOST_PYTHON_MISSING_SQLITE:
+                    # A legacy host's raw ImportError text isn't actionable.
+                    reason = MISSING_SQLITE_MESSAGE
                 _fail(
                     entry.get("external_session_id"),
                     entry.get("source"),

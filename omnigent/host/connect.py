@@ -180,7 +180,11 @@ from omnigent.runtime.websocket_metrics import (
     websocket_close_code,
     websocket_close_reason,
 )
-from omnigent.session_import.errors import ImportErrorCode
+from omnigent.session_import.errors import (
+    MISSING_SQLITE_MESSAGE,
+    ImportErrorCode,
+    mentions_missing_sqlite,
+)
 from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
@@ -1070,6 +1074,21 @@ class _RunnerHandle:
 
 class HostRetryableConnectionError(Exception):
     """Server-reported channel failure that should use reconnect backoff."""
+
+
+def _unreadable_session_failure(exc: BaseException) -> dict[str, object]:
+    """The failure entry for a session the host could not read.
+
+    A missing SQLite module gets its own code (and the fix) so the server can
+    say what to do; anything else stays the generic reason, since the
+    exception text may hold local paths.
+    """
+    if isinstance(exc, ImportError) and mentions_missing_sqlite(str(exc)):
+        return {
+            "reason": MISSING_SQLITE_MESSAGE,
+            "code": ImportErrorCode.HOST_PYTHON_MISSING_SQLITE,
+        }
+    return {"reason": "This session could not be read."}
 
 
 class HostProcess:
@@ -2563,14 +2582,21 @@ class HostProcess:
             if isinstance(frame, HostImportLocalByIdFrame):
                 return [(frame.source, frame.session_id)], None
             if frame.source == "all":
+                # Each harness is listed independently there, so one broken
+                # reader skips only its own sessions.
                 return list(list_recent_sessions_across_harnesses(limit=frame.limit)), None
             source = cast(ImportSource, frame.source)
             try:
                 ids = list_recent_local_session_ids(source, limit=frame.limit)
             except SessionImportNotFoundError:
                 return [], None
-            except (OSError, ValueError, TypeError) as exc:
-                return [], str(exc)
+            except Exception as exc:
+                _logger.exception("import_local: listing sessions failed source=%r", source)
+                # The raw text may hold local paths; only the missing-SQLite text
+                # is passed on, so the server can say how to fix it.
+                if isinstance(exc, ImportError) and mentions_missing_sqlite(str(exc)):
+                    return [], str(exc)
+                return [], "Local sessions could not be listed on the host."
             return [(source, sid) for sid in ids], None
 
         def _load(
@@ -2666,7 +2692,7 @@ class HostProcess:
                     # Dead tunnel: abort the batch (recovery is owned upstream),
                     # never a per-session skip — nothing more can be sent.
                     raise
-                except Exception:
+                except Exception as exc:
                     # Any other failure reading, normalizing, encoding, or sending
                     # one session must not drop the rest of the batch: count it and
                     # move on so the remaining sessions still upload.
@@ -2677,7 +2703,7 @@ class HostProcess:
                         {
                             "external_session_id": session_id,
                             "source": source,
-                            "reason": "This session could not be read.",
+                            **_unreadable_session_failure(exc),
                         }
                     )
                     continue
