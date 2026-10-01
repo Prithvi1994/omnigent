@@ -1121,6 +1121,35 @@ def test_session_list_skips_label_closed_child_with_original_title(
     assert payload["sub_agents"] == []
 
 
+def _create_verbatim_child(
+    session_fixture: _Fixture,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    title: str,
+) -> tuple[str, str]:
+    """
+    Seed an unstamped child the way ``sys_session_create`` stores it.
+
+    Binds the child to a fresh ``pricing_probe_child`` agent, patches the
+    runtime agent-store accessor so the tools can resolve that binding, and
+    stores ``title`` verbatim with no ``sub_agent_name`` stamp.
+
+    :returns: ``(agent_name, conversation_id)`` of the seeded child.
+    """
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    child_agent = agent_store.create(
+        "b" * 32, "pricing_probe_child", "bundles/pricing_probe_child"
+    )
+    monkeypatch.setattr("omnigent.runtime.get_agent_store", lambda: agent_store)
+    child = session_fixture.conv_store.create_conversation(
+        kind="sub_agent",
+        title=title,
+        parent_conversation_id=session_fixture.parent_conv_id,
+        agent_id=child_agent.id,
+    )
+    return child_agent.name, child.id
+
+
 def test_session_list_keeps_verbatim_colon_title_whole(
     session_fixture: _Fixture,
     db_uri: str,
@@ -1167,33 +1196,65 @@ def test_close_keeps_verbatim_colon_title_whole(
     ``"research:pricing"`` is punctuation: the marker is appended to the
     full title and the result names the bound agent.
     """
-    agent_store = SqlAlchemyAgentStore(db_uri)
-    child_agent = agent_store.create(
-        "b" * 32, "pricing_probe_child", "bundles/pricing_probe_child"
-    )
-    monkeypatch.setattr("omnigent.runtime.get_agent_store", lambda: agent_store)
-    verbatim_child = session_fixture.conv_store.create_conversation(
-        kind="sub_agent",
-        title="research:pricing",
-        parent_conversation_id=session_fixture.parent_conv_id,
-        agent_id=child_agent.id,
+    agent_name, child_id = _create_verbatim_child(
+        session_fixture, db_uri, monkeypatch, "research:pricing"
     )
 
     payload = json.loads(
         SysSessionCloseTool().invoke(
-            json.dumps({"conversation_id": verbatim_child.id}), session_fixture.ctx
+            json.dumps({"conversation_id": child_id}), session_fixture.ctx
         )
     )
 
     assert payload == {
         "closed": True,
-        "conversation_id": verbatim_child.id,
-        "agent": child_agent.name,
+        "conversation_id": child_id,
+        "agent": agent_name,
         "title": "research:pricing",
     }
-    refreshed = session_fixture.conv_store.get_conversation(verbatim_child.id)
+    refreshed = session_fixture.conv_store.get_conversation(child_id)
     assert refreshed is not None
-    assert refreshed.title == f"research:pricing{_CLOSED_TITLE_INFIX}{verbatim_child.id}"
+    assert refreshed.title == f"research:pricing{_CLOSED_TITLE_INFIX}{child_id}"
+
+
+def test_get_history_keeps_verbatim_colon_title_whole(
+    session_fixture: _Fixture,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``sys_session_get_history`` labels a verbatim child by its bound agent and whole title."""
+    agent_name, child_id = _create_verbatim_child(
+        session_fixture, db_uri, monkeypatch, "research:pricing"
+    )
+
+    payload = json.loads(
+        SysSessionGetHistoryTool().invoke(
+            json.dumps({"conversation_id": child_id}), session_fixture.ctx
+        )
+    )
+
+    assert (payload["agent"], payload["title"]) == (agent_name, "research:pricing")
+    assert payload["items"] == []
+
+
+def test_session_list_includes_colonless_verbatim_child(
+    session_fixture: _Fixture,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unstamped child is listed whether or not its verbatim title has a colon."""
+    agent_name, child_id = _create_verbatim_child(
+        session_fixture, db_uri, monkeypatch, "auth refactor"
+    )
+
+    raw = SysSessionListTool().invoke("{}", session_fixture.ctx)
+
+    by_id = {entry["conversation_id"]: entry for entry in json.loads(raw)["sub_agents"]}
+    assert by_id[child_id] == {
+        "agent": agent_name,
+        "title": "auth refactor",
+        "conversation_id": child_id,
+    }
 
 
 def test_session_list_schema_exposes_bounded_pagination() -> None:

@@ -10417,6 +10417,17 @@ def _child_session_current_task_status_from_cached_status(status: object) -> str
     return None
 
 
+def _is_ui_added_title(title: str | None) -> bool:
+    """
+    Whether ``title`` is the Web UI "Add agent" sentinel ``"ui:<agent>:<label>"``.
+
+    :param title: Display title, e.g. ``"ui:codex:reviewer"``.
+    :returns: ``True`` only for the 3-segment reserved form.
+    """
+    head, _, tail = (title or "").partition(":")
+    return head == _UI_ADDED_AGENT_TITLE_PREFIX and ":" in tail
+
+
 def _bound_agent_names(convs: list[Conversation]) -> dict[str, str]:
     """
     Resolve the bound agent name for each distinct ``agent_id`` in ``convs``.
@@ -10429,13 +10440,18 @@ def _bound_agent_names(convs: list[Conversation]) -> dict[str, str]:
     :param convs: Child conversation rows about to be summarised.
     :returns: ``{agent_id: agent.name}`` for every binding that resolves.
     """
-    from omnigent.runtime._globals import _agent_store
+    from omnigent.runtime import get_agent_store
 
-    if _agent_store is None:
+    agent_ids = {conv.agent_id for conv in convs if conv.agent_id}
+    if not agent_ids:
+        return {}
+    try:
+        store = get_agent_store()
+    except RuntimeError:
         return {}
     names: dict[str, str] = {}
-    for agent_id in {conv.agent_id for conv in convs if conv.agent_id}:
-        agent = _agent_store.get(agent_id)
+    for agent_id in agent_ids:
+        agent = store.get(agent_id)
         if agent is not None:
             names[agent_id] = agent.name
     return names
@@ -10457,18 +10473,13 @@ def _child_session_summary_from_conversation(
     :func:`omnigent.tools.builtins.spawn._spawn_one`, plus the
     3-segment ``"ui:{agent_name}:{user_label}"`` form written by the
     Web UI "Add agent" flow (surfaced as ``tool={agent_name}`` and
-    ``session_name={user_label}``). The split applies only to
-    framework-named children — recognized by a non-null
-    ``conv.sub_agent_name``, which every framework spawn path stamps
-    and the ``sys_session_create`` JSON body cannot set. A child whose
-    title is the caller's verbatim string keeps it whole: a colon in
-    ``"research:pricing"`` is title punctuation, not an agent handle,
-    so ``tool`` is the bound agent's name (looked up through
-    ``agent_names``) and ``session_name`` carries the full title. Tolerates
-    malformed/legacy rows: if the title is ``None`` or has no colon,
-    ``tool`` falls back to the raw title and ``session_name`` is
-    ``None`` — the row is still surfaced so debug views can
-    investigate.
+    ``session_name={user_label}``). The split applies only to rows
+    stamped with ``conv.sub_agent_name``; an unstamped non-UI title is
+    the caller's verbatim ``sys_session_create`` title, kept whole in
+    ``session_name`` with ``tool`` resolved from the agent binding via
+    ``agent_names``. A stamped title without a colon is tolerated as
+    legacy: ``tool`` falls back to the raw title and ``session_name``
+    is ``None`` so the row still surfaces for debugging.
 
     Native-harness children are the exception: their titles are
     uniqueness keys built from opaque runtime ids, so Codex and Claude
@@ -10526,6 +10537,11 @@ def _child_session_summary_from_conversation(
         # the raw Devin agent_id as ``session_name`` for correlation.
         tool = _devin_subagent_display_tool(labels)
         session_name = labels.get(_DEVIN_NATIVE_SUBAGENT_AGENT_ID_LABEL_KEY)
+    elif conv.sub_agent_name is None and not _is_ui_added_title(display_title):
+        # Verbatim caller title (``sys_session_create``): any colon is
+        # punctuation, so identity comes from the agent binding.
+        tool = agent_names.get(conv.agent_id) if agent_names and conv.agent_id else None
+        session_name = display_title
     elif display_title and ":" in display_title:
         head, _, tail = display_title.partition(":")
         if head == _UI_ADDED_AGENT_TITLE_PREFIX and ":" in tail:
@@ -10535,16 +10551,11 @@ def _child_session_summary_from_conversation(
             agent_name, _, user_label = tail.partition(":")
             tool = agent_name
             session_name = user_label
-        elif conv.sub_agent_name is not None:
+        else:
             # Framework-named child: every spawn path stamps
             # ``sub_agent_name`` alongside its "<agent>:<title>" title.
             tool = head
             session_name = tail
-        else:
-            # Verbatim caller title (``sys_session_create``): the colon is
-            # punctuation, so identity comes from the agent binding.
-            tool = agent_names.get(conv.agent_id) if agent_names and conv.agent_id else None
-            session_name = display_title
     else:
         tool = display_title or None
         session_name = None

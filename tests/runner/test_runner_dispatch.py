@@ -4630,6 +4630,16 @@ _BY_ID_CHILD_IDENTITY_SCENARIOS = [
         "research:pricing",
         id="verbatim-colon-title",
     ),
+    # A verbatim title that merely starts with "ui:" is not the 3-segment
+    # Add-agent sentinel, so it stays whole too.
+    pytest.param(
+        "ui:pricing",
+        "pricing_probe_child",
+        None,
+        "pricing_probe_child",
+        "ui:pricing",
+        id="verbatim-ui-prefixed-title",
+    ),
     # A named child continued by id: the "<agent>:<title>" parse wins, so
     # the parent's agent_name never leaks into the label.
     pytest.param(
@@ -6441,8 +6451,8 @@ def _session_query_client(
 async def test_session_list_maps_children_and_skips_closed() -> None:
     """
     ``sys_session_list`` maps ``child_sessions`` rows to
-    ``{agent, title, conversation_id}`` and drops closed and
-    colonless rows, matching ``SysSessionListTool``.
+    ``{agent, title, conversation_id}`` and drops closed rows and rows
+    the server left unidentified, matching ``SysSessionListTool``.
     """
     from omnigent.runner.tool_dispatch import _execute_session_query_tool
 
@@ -6491,6 +6501,12 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                         "tool": "legacy-untyped",
                         "session_name": None,
                     },
+                    {
+                        "id": "c6",
+                        "title": "auth refactor",
+                        "tool": "pricing_probe_child",
+                        "session_name": "auth refactor",
+                    },
                 ],
             },
         )
@@ -6503,11 +6519,12 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
         )
     # c3 (explicitly closed despite its mixed-type label map), c5
     # (legacy title tombstone), and c4
-    # (no colon) dropped; the ui:-added child surfaces under its bound
-    # agent + label.
+    # (no session_name) dropped; the ui:-added child surfaces under its
+    # bound agent + label, and the verbatim child c6 under its binding.
     assert out["sub_agents"] == [
         {"agent": "researcher", "title": "auth", "conversation_id": "c1"},
         {"agent": "claude-native-ui", "title": "1", "conversation_id": "c2"},
+        {"agent": "pricing_probe_child", "title": "auth refactor", "conversation_id": "c6"},
     ]
 
 
@@ -7003,14 +7020,16 @@ async def test_session_close_patches_tombstoned_title() -> None:
 
 
 @pytest.mark.asyncio
-async def test_session_close_keeps_verbatim_colon_title_whole() -> None:
+@pytest.mark.parametrize("title", ["research:pricing", "wake-check"])
+async def test_session_close_keeps_verbatim_title_whole(title: str) -> None:
     """
     Closing a ``sys_session_create`` child tombstones its verbatim title whole.
 
-    The target has no ``sub_agent_name`` stamp, so the colon in
-    ``"research:pricing"`` is punctuation: the tombstone appends the marker
-    to the full title and the result names the bound agent, not a bogus
-    ``"research"`` handle with a truncated title.
+    The target has no ``sub_agent_name`` stamp, so any colon in its title is
+    punctuation: the tombstone appends the marker to the full title and the
+    result names the bound agent, whether or not the title has a colon.
+
+    :param title: The child's verbatim title.
     """
     from omnigent.runner.tool_dispatch import _execute_session_query_tool
 
@@ -7022,7 +7041,7 @@ async def test_session_close_keeps_verbatim_colon_title_whole() -> None:
                 200,
                 json={
                     "id": "conv_target",
-                    "title": "research:pricing",
+                    "title": title,
                     "sub_agent_name": None,
                     "agent_name": "pricing_probe_child",
                     "root_conversation_id": "conv_root",
@@ -7048,12 +7067,12 @@ async def test_session_close_keeps_verbatim_colon_title_whole() -> None:
                 server_client=client,
             )
         )
-    assert patched["title"] == "research:pricing:closed:conv_target"
+    assert patched["title"] == f"{title}:closed:conv_target"
     assert out == {
         "closed": True,
         "conversation_id": "conv_target",
         "agent": "pricing_probe_child",
-        "title": "research:pricing",
+        "title": title,
     }
 
 

@@ -224,8 +224,7 @@ def test_sys_session_create_child_keeps_verbatim_colon_title(
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name=re.compile("^Agents")).click()
     rows = rail.locator(_SUBAGENT_ROW)
-    expect(rows.first).to_be_visible(timeout=60_000)
-    page.wait_for_timeout(2_000)
+    expect(rows.first).to_contain_text(_VERBATIM_TITLE, timeout=60_000)
     rail_label = rows.first.inner_text().splitlines()[0]
 
     listed = _session_list_output(chat.base_url, chat.session_id)["sub_agents"]

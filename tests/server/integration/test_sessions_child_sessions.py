@@ -732,6 +732,51 @@ async def test_child_status_edge_fans_out_to_parent_stream(
         session_stream.close(session["id"])
 
 
+async def test_child_status_edge_fans_out_verbatim_identity(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    The parent-stream fan-out carries a verbatim child's whole title and bound agent.
+
+    ``session.child_session.updated`` is built from the same summary as the
+    listing route, so an unstamped ``research:pricing`` child must not be
+    split there either.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    from omnigent.runtime import session_stream
+    from tests.server.helpers import start_session_stream_collector
+
+    session = await _create_parent_session(client, agent_name="orchestrator-fanout")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="research:pricing",
+        agent_id=session["agent_id"],
+        sub_agent_name=None,
+    )
+    collector = await start_session_stream_collector(session["id"])
+    try:
+        sessions_module._publish_status(child.id, "running")
+        while True:
+            event = await asyncio.wait_for(collector.queue.get(), timeout=5.0)
+            if event.get("type") == "session.child_session.updated":
+                break
+        assert event["child_session_id"] == child.id
+        assert event["child"]["title"] == "research:pricing"
+        assert (event["child"]["tool"], event["child"]["session_name"]) == (
+            "orchestrator-fanout",
+            "research:pricing",
+        )
+    finally:
+        await collector.stop()
+        sessions_module._session_status_cache.pop(child.id, None)
+        session_stream.close(session["id"])
+
+
 async def test_child_sessions_truncates_long_message_preview(
     client: httpx.AsyncClient,
     db_uri: str,
@@ -787,12 +832,12 @@ async def test_child_sessions_handles_title_without_colon(
     db_uri: str,
 ) -> None:
     """
-    A child whose title has no ``:`` is still surfaced.
+    A stamped child whose title has no ``:`` is still surfaced.
 
-    The canonical spawn path always writes ``"type:name"``, but the
-    schema does not enforce it. The route must treat the title as
-    opaque-but-displayable (tool = raw title, session_name = None)
-    rather than dropping the row or crashing.
+    The canonical spawn path stamps ``sub_agent_name`` and writes
+    ``"type:name"``, but the schema does not enforce the title shape. The
+    route must treat such a title as opaque-but-displayable (tool = raw
+    title, session_name = None) rather than dropping the row or crashing.
 
     :param client: The test HTTP client.
     :param db_uri: Per-test SQLite database URI.
@@ -805,6 +850,7 @@ async def test_child_sessions_handles_title_without_colon(
         parent_id=session["id"],
         title="legacy-untyped",
         agent_id=session["agent_id"],
+        sub_agent_name="researcher",
     )
 
     resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
@@ -2266,7 +2312,7 @@ async def test_fork_of_child_promotes_it_into_the_sidebar(
 # ── sys_session_create child with a verbatim colon title ──────────
 
 
-@pytest.mark.parametrize("title", ["research:pricing", "deploy: prod"])
+@pytest.mark.parametrize("title", ["research:pricing", "deploy: prod", "auth refactor"])
 async def test_child_sessions_keeps_verbatim_colon_title_whole(
     client: httpx.AsyncClient,
     title: str,
@@ -2277,10 +2323,11 @@ async def test_child_sessions_keeps_verbatim_colon_title_whole(
     caller's verbatim ``title``, no ``sub_agent_name``) is summarised with
     its bound agent as ``tool`` and the untouched title as ``session_name``.
     The first colon of a verbatim title is not the framework's
-    ``"<agent>:<title>"`` separator, so it must not be split on.
+    ``"<agent>:<title>"`` separator, so it must not be split on; a
+    colon-free verbatim title is identified the same way.
 
     :param client: The test HTTP client.
-    :param title: Verbatim caller title containing a colon.
+    :param title: Verbatim caller title.
     """
     parent = await _create_parent_session(client, agent_name="orchestrator-verbatim")
     child_agent = await create_test_agent(client, name="pricing_probe_child")

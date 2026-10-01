@@ -9,6 +9,7 @@ sub-agent. See designs/STEERABLE_SUBAGENTS.md for the full design.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -632,16 +633,19 @@ class SysSessionListTool(Tool):
             limit=100,
         )
         result: list[dict[str, str]] = []
+        agent_names = _bound_agent_names(
+            [child for child in children.data if child.sub_agent_name is None]
+        )
         for child in children.data:
-            # Skip rows whose title has no ":" (defensive — Phase-3
-            # anonymous spawns left None titles, but those have NULL
-            # parent_conversation_id and won't appear in this query at
-            # all) and closed rows, so neither re-surfaces to the LLM.
-            if child.title is None or ":" not in child.title:
+            # Skip untitled rows, stamped rows missing their "<agent>:<title>"
+            # separator, and closed rows so none re-surfaces to the LLM.
+            if child.title is None or (
+                child.sub_agent_name is not None and ":" not in child.title
+            ):
                 continue
             if is_session_closed(child.labels, child.title):
                 continue
-            labelled = _agent_title_from_conversation(child)
+            labelled = _agent_title_from_conversation(child, agent_names)
             result.append(
                 {
                     "agent": labelled.agent,
@@ -1226,55 +1230,81 @@ class _CallerTree:
     root_id: str
 
 
-def _agent_title_from_conversation(child: Conversation) -> _AgentTitle:
+def _agent_title_from_conversation(
+    child: Conversation, agent_names: Mapping[str, str] | None = None
+) -> _AgentTitle:
     """
     Recover a child conversation's agent + title from its stored row.
 
     Named sub-agents persist ``"<agent>:<title>"`` in
     ``Conversation.title`` next to a ``sub_agent_name`` stamp (and
     internally rewrite to ``"<agent>:<title>:closed:<conv_id>"`` when
-    closed); those split on the first ``":"``. A ``sys_session_create``
-    child carries the caller's verbatim title and no stamp, so its colon
-    is punctuation: the agent is the bound agent's name and the title
-    stays whole.
+    closed); those split on the first ``":"``, as does the Web UI's
+    reserved ``"ui:<agent>:<label>"`` form. An unstamped row carries the
+    caller's verbatim ``sys_session_create`` title, so any colon in it is
+    punctuation: the agent is the bound agent's name and the title stays
+    whole.
 
-    :param child: The child :class:`Conversation`. Must have a
-        non-empty title containing at least one ``":"``.
+    :param child: The child :class:`Conversation`.
+    :param agent_names: Bound agent names keyed by ``agent_id`` (see
+        :func:`_bound_agent_names`); resolved on demand when omitted.
     :returns: An :class:`_AgentTitle` with the closed marker stripped
         from the title side when present.
-    :raises RuntimeError: If the title is missing or doesn't contain
-        a ``":"`` separator — both indicate a framework invariant
-        broken upstream (sub-agent conversations are always created
-        with ``"<agent>:<title>"``). Failing loud here surfaces the
-        bug at its source instead of letting empty fields propagate
-        into JSON results and rebuilt tombstone titles.
+    :raises RuntimeError: If a stamped title lacks its ``":"`` separator
+        — a framework invariant broken upstream (named sub-agent
+        conversations are always created with ``"<agent>:<title>"``).
+        Failing loud here surfaces the bug at its source instead of
+        letting empty fields propagate into JSON results and rebuilt
+        tombstone titles.
     """
-    if not child.title or ":" not in child.title:
+    display_title = title_without_closed_marker(child.title) or ""
+    if child.sub_agent_name is None and not _is_ui_added_title(display_title):
+        if agent_names is None:
+            agent_names = _bound_agent_names([child])
+        agent = agent_names.get(child.agent_id or "", "agent")
+        return _AgentTitle(agent=agent, title=display_title)
+    if ":" not in display_title:
         raise RuntimeError(
             f"sub-agent conversation {child.id!r} has malformed title "
             f"{child.title!r} — expected '<agent>:<title>' format"
         )
-    display_title = title_without_closed_marker(child.title) or ""
-    # Add-agent rows keep the reserved "ui:<agent>:<label>" sentinel and
-    # are not verbatim, so only unstamped non-sentinel titles are.
-    if child.sub_agent_name is None and not display_title.startswith("ui:"):
-        return _AgentTitle(agent=_bound_agent_name(child), title=display_title)
     sa_agent, _, sa_title = display_title.partition(":")
     return _AgentTitle(agent=sa_agent, title=sa_title)
 
 
-def _bound_agent_name(child: Conversation) -> str:
+def _is_ui_added_title(title: str) -> bool:
     """
-    Name of the agent a child conversation is bound to.
+    Whether ``title`` is the Web UI "Add agent" sentinel ``"ui:<agent>:<label>"``.
 
-    :param child: The child :class:`Conversation`.
-    :returns: ``agent.name`` for the row's ``agent_id``; ``"agent"`` when
-        the binding is missing or no longer resolves.
+    :param title: Display title, e.g. ``"ui:codex:reviewer"``.
+    :returns: ``True`` only for the 3-segment reserved form.
+    """
+    head, _, tail = title.partition(":")
+    return head == "ui" and ":" in tail
+
+
+def _bound_agent_names(children: list[Conversation]) -> dict[str, str]:
+    """
+    Resolve the bound agent name for each distinct ``agent_id`` in ``children``.
+
+    One store read per distinct id; ids whose agent no longer resolves are
+    omitted so callers fall back to the ``"agent"`` label.
+
+    :param children: Child conversations to resolve.
+    :returns: ``{agent_id: agent.name}`` for every binding that resolves.
     """
     from omnigent.runtime import get_agent_store
 
-    agent = get_agent_store().get(child.agent_id) if child.agent_id else None
-    return agent.name if agent is not None else "agent"
+    agent_ids = {child.agent_id for child in children if child.agent_id}
+    if not agent_ids:
+        return {}
+    store = get_agent_store()
+    names: dict[str, str] = {}
+    for agent_id in agent_ids:
+        agent = store.get(agent_id)
+        if agent is not None:
+            names[agent_id] = agent.name
+    return names
 
 
 def _resolve_caller_tree(ctx: ToolContext) -> _CallerTree:
