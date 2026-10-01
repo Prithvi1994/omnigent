@@ -564,8 +564,20 @@ jobs:
 
           ### Tests
           Include a compact table with columns: Test / case, Behavior protected,
-          Layer, Needed?, and Action / rationale. Use exact file paths and test/case
-          names. Account for every added, modified, or removed test; parameterized
+          Layer, Needed?, and Action / rationale. In the first column of every row,
+          use the exact repository-relative file path followed by `::test_or_case_name`
+          (or `::helper_name` for test support). Use the path alone for a whole-file
+          assessment with no named test/helper. Repeat the path in each row, even
+          when grouping rows under a file heading. Paths only in headings, prose,
+          or other columns do not satisfy the publication validator.
+
+          Example format (illustrative paths; replace with the actual changed files):
+          | Test / case | Behavior protected | Layer | Needed? | Action / rationale |
+          | --- | --- | --- | --- | --- |
+          | tests/test_parser.py::test_empty | Empty input | Unit | keep | Guards empty-input handling. |
+          | tests/helpers.py::make_input | Fresh input per call | Test support | keep | Shared setup preserves isolation. |
+
+          Account for every added, modified, or removed test; parameterized
           cases may share a row only when their purpose and recommendation match.
           Use one of keep, consolidate, move layer, remove, or uncertain in Needed?,
           and explain each one. All five fields are required for each assessment row.

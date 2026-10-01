@@ -4,6 +4,7 @@ and the rules included only for some changes."""
 import hashlib
 import json
 import re
+import runpy
 import stat
 import subprocess
 import sys
@@ -145,6 +146,28 @@ def test_prompt_lists_pr_labels_for_compat_waiver(
     prompt = (prompt_workspace / "artifacts/review_prompt.txt").read_text()
     assert f"- **Labels:** {expected}\n" in prompt
     assert "`intentional-api-break` label" in prompt
+
+
+def test_prompt_test_assessment_example_passes_publication_gate(prompt_workspace: Path) -> None:
+    (prompt_workspace / "docs/DATABASE_BEST_PRACTICES.md").write_text("# Database practices\n")
+    result = _generate_prompt(prompt_workspace, "MEMBER")
+    assert result.returncode == 0, result.stdout + result.stderr
+    prompt = (prompt_workspace / "artifacts/review_prompt.txt").read_text()
+    assessment = prompt.split("### Tests\n", 1)[1].split("### Scope\n", 1)[0]
+    assert "first column" in assessment
+    table = "\n".join(line for line in assessment.splitlines() if line.startswith("|"))
+    compose = runpy.run_path(str(_WORKFLOW.parents[1] / "scripts/polly-review-summary.py"))[
+        "compose_review"
+    ]
+    review = f"## Summary\n### Changes\nFix.\n### Tests\n{table}\n### Scope\nRelated.\n"
+    stats = {"markdown": "Counts", "test_files": ["tests/test_parser.py", "tests/helpers.py"]}
+    assert "Test-by-test assessment" in compose(review, stats)
+    # A file heading cannot replace the path in an assessment row.
+    heading_only = review.replace("tests/test_parser.py::", "").replace(
+        "### Tests\n", "### Tests\n#### tests/test_parser.py\n"
+    )
+    with pytest.raises(ValueError, match=r"unassessed test files: tests/test_parser\.py"):
+        compose(heading_only, stats)
 
 
 @pytest.mark.parametrize("failure", ["blank", "directory", "invalid-utf8"])
