@@ -273,6 +273,8 @@ def test_in_process_teammate_appears_in_agents_rail(
     _boot_and_spawn_teammate(page, base_url, session_id, mock_llm_server_url, teammate_delay_s=30)
 
     rail = _open_agents_tab(page)
+    # The forwarder registers the teammate a poll tick after the spawn.
+    expect(rail.get_by_text(_TEAMMATE, exact=False).first).to_be_visible(timeout=30_000)
     running = _rail_snapshot(page, rail, evidence, "running")
 
     # Baseline: Claude's own TUI while the teammate runs.

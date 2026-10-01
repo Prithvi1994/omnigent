@@ -41,8 +41,16 @@ _FRAMED_DELIVERY = (
         (_ENVELOPE, None, False, False),
         (_ENVELOPE, {"kind": "peer", "handback": True, "senderTaskId": "agent-1"}, True, True),
         (_TEAM_COMPLETION, {"kind": "task-notification"}, True, True),
+        (_FRAMED_DELIVERY, {"kind": "human"}, True, False),
     ],
-    ids=["web-teammate", "web-handback", "terminal", "internal-handback", "agent-team"],
+    ids=[
+        "web-teammate",
+        "web-handback",
+        "terminal",
+        "internal-handback",
+        "agent-team",
+        "typed-framed",
+    ],
 )
 @pytest.mark.asyncio
 async def test_native_authorship_survives_delivery_and_retries(

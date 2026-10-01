@@ -7,6 +7,7 @@ import {
   isSystemUserContent,
   parseSystemMessage,
   parseTeammateDeliveries,
+  teammateDeliveryMarker,
   teammateDeliveryMarkerContent,
   teammateMarkerOf,
 } from "./systemMessage";
@@ -350,6 +351,10 @@ describe("teammate deliveries", () => {
 
   it("renders a prose delivery as a teammate marker carrying its summary", () => {
     expect(teammateDeliveryMarkerContent(text(framed(prose)))).toEqual(proseMarker);
+    expect(teammateDeliveryMarker(text(framed(prose)))).toEqual({
+      content: proseMarker,
+      marker: { teammateId: "buddy", kind: "teammate_message" },
+    });
   });
 
   it("renders an idle-only result as a finished marker and drops an empty idle ping", () => {

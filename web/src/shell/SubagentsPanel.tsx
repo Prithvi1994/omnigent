@@ -61,6 +61,7 @@ const SubagentsGraphView = lazy(() =>
 );
 import {
   CLAUDE_NATIVE_SUBAGENT_WRAPPER,
+  CLAUDE_TEAMMATE_BADGE_LABEL,
   isClaudeTeammateChild,
   nativeCodingAgentForWrapper,
   WRAPPER_LABEL_KEY,
@@ -661,7 +662,7 @@ function SubagentRow({
                 data-testid="subagent-teammate-badge"
                 className="h-4 shrink-0 px-1 text-[10px] font-normal text-muted-foreground"
               >
-                Teammate
+                {CLAUDE_TEAMMATE_BADGE_LABEL}
               </Badge>
             )}
             {child.routed_model ? (

@@ -120,10 +120,20 @@ function teammateMarkerHeader(
   finished: boolean,
 ): string {
   // The header regex takes the id as one token and keeps the summary on its line.
-  const id = teammateId.replace(/\s+/g, "-");
+  const id = teammateMarkerId(teammateId);
   if (finished) return `[System: teammate ${id} finished]`;
   const line = summary?.replace(/\s+/g, " ").trim();
   return line ? `[System: teammate ${id}: ${line}]` : `[System: teammate ${id}]`;
+}
+
+function teammateMarkerId(teammateId: string): string {
+  return teammateId.replace(/\s+/g, "-");
+}
+
+/** A framed delivery re-labelled as a marker, with the identity the marker carries. */
+export interface TeammateDeliveryMarker {
+  content: MessageContentBlock[];
+  marker: TeammateMarker;
 }
 
 /**
@@ -132,9 +142,9 @@ function teammateMarkerHeader(
  * trails a prose message from the same teammate only restates it and is folded
  * away; a result-less idle ping has nothing to show. `null` for anything else.
  */
-export function teammateDeliveryMarkerContent(
+export function teammateDeliveryMarker(
   content: MessageContentBlock[],
-): MessageContentBlock[] | null {
+): TeammateDeliveryMarker | null {
   if (content.some((block) => !isTextBlock(block))) return null;
   const texts = content
     .filter(isTextBlock)
@@ -169,7 +179,20 @@ export function teammateDeliveryMarkerContent(
     );
   }
   const body = lines.filter(Boolean).join("\n\n");
-  return [{ type: "input_text", text: body ? `${header}\n${body}` : header }];
+  return {
+    content: [{ type: "input_text", text: body ? `${header}\n${body}` : header }],
+    marker: {
+      teammateId: teammateMarkerId(lead.teammateId),
+      kind: lead.idleResult === null ? "teammate_message" : "teammate_finished",
+    },
+  };
+}
+
+/** Marker content of a framed delivery; `null` for anything else. */
+export function teammateDeliveryMarkerContent(
+  content: MessageContentBlock[],
+): MessageContentBlock[] | null {
+  return teammateDeliveryMarker(content)?.content ?? null;
 }
 
 /** Identify a teammate marker in user-message content; `null` for anything else. */

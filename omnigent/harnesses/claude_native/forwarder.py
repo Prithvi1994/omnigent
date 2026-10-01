@@ -1714,6 +1714,28 @@ def _parse_json_response(resp: httpx.Response, *, context: str) -> dict[str, obj
     return {str(key): value for key, value in payload.items()}
 
 
+def _external_subagent_start_data(
+    subagent_id: str,
+    *,
+    agent_type: str,
+    description: str,
+    tool_use_id: str,
+    name: str = "",
+    task_kind: str = "",
+) -> dict[str, str]:
+    """``external_subagent_start`` payload; the POST and its dead letter share it."""
+    if not tool_use_id and task_kind == _TEAMMATE_TASK_KIND:
+        tool_use_id = f"{_TEAMMATE_CORRELATION_PREFIX}{subagent_id}"
+    return {
+        "subagent_id": subagent_id,
+        "agent_type": agent_type,
+        "description": description,
+        "tool_use_id": tool_use_id,
+        **({"name": name} if name else {}),
+        **({"task_kind": task_kind} if task_kind else {}),
+    }
+
+
 async def _post_external_subagent_start(
     client: httpx.AsyncClient,
     *,
@@ -1755,20 +1777,18 @@ async def _post_external_subagent_start(
         mismatch and is unrecoverable for this sub-agent.
     :raises RuntimeError: If the server response body is not JSON.
     """
-    if not tool_use_id and task_kind == _TEAMMATE_TASK_KIND:
-        tool_use_id = f"{_TEAMMATE_CORRELATION_PREFIX}{subagent_id}"
     resp = await client.post(
         f"/v1/sessions/{parent_session_id}/events",
         json={
             "type": "external_subagent_start",
-            "data": {
-                "subagent_id": subagent_id,
-                "agent_type": agent_type,
-                "description": description,
-                "tool_use_id": tool_use_id,
-                **({"name": name} if name else {}),
-                **({"task_kind": task_kind} if task_kind else {}),
-            },
+            "data": _external_subagent_start_data(
+                subagent_id,
+                agent_type=agent_type,
+                description=description,
+                tool_use_id=tool_use_id,
+                name=name,
+                task_kind=task_kind,
+            ),
         },
     )
     resp.raise_for_status()
@@ -2685,10 +2705,14 @@ async def _forward_available_subagents(
                         session_id=immediate_parent_session_id,
                         event_type="external_subagent_start",
                         payload={
-                            "subagent_id": subagent_id,
-                            "agent_type": meta["agentType"],
-                            "description": meta["description"],
-                            "tool_use_id": meta["toolUseId"],
+                            **_external_subagent_start_data(
+                                subagent_id,
+                                agent_type=meta["agentType"],
+                                description=meta["description"],
+                                tool_use_id=meta["toolUseId"],
+                                name=meta["name"],
+                                task_kind=meta["taskKind"],
+                            ),
                             "parent_subagent_id": parent_subagent_id,
                         },
                         reason="permanent HTTP failure after retries",

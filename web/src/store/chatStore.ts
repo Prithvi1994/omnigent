@@ -150,6 +150,7 @@ import {
   isSystemUserContent,
   taskNotificationMarkerContent,
   teammateDeliveryMarkerContent,
+  teammateMarkerOf,
 } from "@/lib/systemMessage";
 import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
 import type { StoredReplyDraft } from "@/lib/replyDraft";
@@ -7148,7 +7149,15 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         // 3. Nothing pending (or a marker that owns no bubble) — render the
         //    event payload fresh.
         if (eventContent === null) return {};
-        const fresh = committedUserBlock(event.itemId, eventContent, undefined, event.createdBy);
+        // Only an internal delivery carries marker identity; human text never folds anything.
+        const teammate =
+          event.isMeta === true && !isHumanAuthoredInput(event)
+            ? teammateMarkerOf(eventContent)
+            : null;
+        const fresh: UserMessageBlock = {
+          ...committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
+          ...(teammate ? { teammate } : {}),
+        };
         if (foldsTeammateIdleMarker(fresh, s.blocks)) return {};
         return { blocks: [...s.blocks, fresh] };
       });

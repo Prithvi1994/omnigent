@@ -2554,6 +2554,7 @@ def augment_claude_args(
     allowed_tools: tuple[str, ...] = (),
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
+    launch_cwd: Path | None = None,
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -2606,6 +2607,8 @@ def augment_claude_args(
         Routing on, threaded to :func:`build_hook_settings` so the
         ``UserPromptSubmit`` first-message routing hook is registered.
         ``False`` keeps every prompt off the routing round trip.
+    :param launch_cwd: Directory Claude launches in; a relative ``--settings``
+        path resolves against it. ``None`` resolves against this process's cwd.
     :returns: Augmented argument list for the terminal resource.
     """
     mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
@@ -2625,7 +2628,7 @@ def augment_claude_args(
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
-    args, settings = _merge_launch_settings(args, hook_settings)
+    args, settings = _merge_launch_settings(args, hook_settings, launch_cwd=launch_cwd)
     settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
     _write_json_file(settings_path, settings)
     args.extend(
@@ -2716,12 +2719,19 @@ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
     return args
 
 
-def _load_settings_layer(value: str) -> _JsonObject | None:
-    """Parse a ``--settings`` value: a JSON object literal or the path of one."""
+def _load_settings_layer(value: str, launch_cwd: Path | None) -> _JsonObject | None:
+    """Parse a ``--settings`` value: a JSON object literal or the path of one.
+
+    A relative path is taken from the directory Claude launches in, which on a
+    hosted session is the workspace rather than the runner daemon's cwd.
+    """
     text = value.strip()
     if not text.startswith("{"):
+        path = Path(value).expanduser()
+        if launch_cwd is not None and not path.is_absolute():
+            path = launch_cwd / path
         try:
-            text = Path(value).expanduser().read_text(encoding="utf-8")
+            text = path.read_text(encoding="utf-8")
         except OSError:
             return None
     try:
@@ -2756,7 +2766,7 @@ def _overlay_settings(base: _JsonObject, top: _JsonObject) -> _JsonObject:
 
 
 def _merge_launch_settings(
-    args: list[str], hook_settings: _JsonObject
+    args: list[str], hook_settings: _JsonObject, *, launch_cwd: Path | None = None
 ) -> tuple[list[str], _JsonObject]:
     """
     Fold user-supplied ``--settings`` layers into the invocation settings.
@@ -2764,7 +2774,8 @@ def _merge_launch_settings(
     Claude keeps only the last ``--settings`` flag, so a per-session layer (e.g.
     enabling agent teams) would otherwise be discarded by the hook settings
     appended after it. User layers form the base, in order, with the Omnigent
-    wiring applied on top; an unparseable value is left for Claude to report.
+    wiring applied on top. An unreadable layer is dropped with a warning: left
+    in place, Claude would silently ignore it behind the appended flag.
     """
     remaining: list[str] = []
     layers: list[_JsonObject] = []
@@ -2772,22 +2783,20 @@ def _merge_launch_settings(
     while index < len(args):
         arg = args[index]
         if arg == "--settings" and index + 1 < len(args):
-            flag, value, index = [arg, args[index + 1]], args[index + 1], index + 2
+            value, index = args[index + 1], index + 2
         elif arg.startswith("--settings="):
-            flag, value, index = [arg], arg.partition("=")[2], index + 1
+            value, index = arg.partition("=")[2], index + 1
         else:
             remaining.append(arg)
             index += 1
             continue
-        layer = _load_settings_layer(value)
+        layer = _load_settings_layer(value, launch_cwd)
         if layer is None:
             # Inline JSON may carry env secrets; name the layer without echoing it.
             source = "inline JSON" if value.lstrip().startswith("{") else f"file {value!r}"
             _logger.warning(
-                "claude-native: leaving --settings %s for Claude: not a readable JSON object",
-                source,
+                "claude-native: dropping --settings %s: not a readable JSON object", source
             )
-            remaining.extend(flag)
             continue
         layers.append(layer)
     merged: _JsonObject = {}
@@ -8363,7 +8372,7 @@ def _is_framed_teammate_delivery(text: str) -> bool:
     """Claude's own delivery framing: prefix, envelopes, then its guidance paragraph.
 
     Claude Code 2.1.x writes teammate deliveries without ``origin`` metadata, so
-    this framing is the provenance; a human typing in the TUI never produces it.
+    this framing is their provenance; callers still exclude a human ``origin``.
     """
     remainder = _prefixed_teammate_envelopes(text)
     return remainder is not None and remainder.startswith(_TEAMMATE_DELIVERY_GUIDANCE)
@@ -8379,11 +8388,16 @@ def _wakes_parent_turn(text: str) -> bool:
     )
 
 
+def _is_human_origin(origin: object) -> bool:
+    """Claude stamps prompts typed or pasted into its TUI with ``origin.kind == "human"``."""
+    return isinstance(origin, dict) and origin.get("kind") == "human"
+
+
 def _is_trusted_agent_notification_text(text: str, *, origin: object = None) -> bool:
     """Honor peer provenance, Claude's delivery framing, and the task-notification boundary."""
     if isinstance(origin, dict) and origin.get("kind") == "peer":
         return True
-    if _is_framed_teammate_delivery(text):
+    if _is_framed_teammate_delivery(text) and not _is_human_origin(origin):
         return True
     stripped = text.lstrip()
     return stripped.startswith("<task-notification>") and all(

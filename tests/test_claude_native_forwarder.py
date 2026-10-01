@@ -6218,12 +6218,12 @@ async def test_subagent_watcher_registers_a_task_named_spawn(
 
 
 async def _register_subagents_once(
-    tmp_path: Path, transcript_path: Path, *, older_server: bool = False
+    tmp_path: Path, transcript_path: Path, *, reject_start: bool = False
 ) -> tuple[dict[str, dict[str, Any]], forwarder.SubagentForwardState]:
     """Run one watcher tick against a mock server; return the start payloads by id.
 
-    ``older_server`` mimics a server that predates ``task_kind`` and rejects a
-    registration without a non-empty ``tool_use_id``.
+    ``reject_start`` makes the server refuse every registration with a permanent
+    400 and gives the tracker a one-attempt budget, so the tick parks the sub-agent.
     """
     start_bodies: dict[str, dict[str, Any]] = {}
 
@@ -6231,18 +6231,10 @@ async def _register_subagents_once(
         body = json.loads(request.content)
         if body.get("type") != "external_subagent_start":
             return httpx.Response(202, json={})
-        if older_server and not body["data"].get("tool_use_id"):
-            return httpx.Response(
-                400,
-                json={
-                    "error": {
-                        "code": "invalid_input",
-                        "message": "external_subagent_start requires non-empty data.tool_use_id",
-                    }
-                },
-            )
         subagent_id = body["data"]["subagent_id"]
         start_bodies[subagent_id] = body["data"]
+        if reject_start:
+            return httpx.Response(400, json={"error": {"code": "invalid_input"}})
         return httpx.Response(
             202, json={"queued": False, "child_session_id": f"conv_{subagent_id}"}
         )
@@ -6257,7 +6249,9 @@ async def _register_subagents_once(
             transcript_path=transcript_path,
             state=forwarder.SubagentForwardState(subagents={}),
             agent_name="claude-native-ui",
-            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            start_retry_tracker=forwarder._PostRetryTracker(
+                base_delay_s=0.0, max_permanent_attempts=1 if reject_start else 3
+            ),
             item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
             status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
         )
@@ -6265,7 +6259,11 @@ async def _register_subagents_once(
 
 
 async def test_subagent_watcher_registers_an_in_process_teammate(tmp_path: Path) -> None:
-    """A teammate meta has no ``toolUseId`` (its spawn returns at once); it registers by name."""
+    """A teammate meta has no ``toolUseId`` (its spawn returns at once); it registers by name.
+
+    The ``teammate:<id>`` placeholder satisfies servers that still require a
+    non-empty ``tool_use_id``.
+    """
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
     _seed_subagent_on_disk(
@@ -6299,10 +6297,10 @@ async def test_subagent_watcher_registers_an_in_process_teammate(tmp_path: Path)
     assert entry.parent_subagent_id is None
 
 
-async def test_subagent_watcher_registers_a_teammate_with_an_older_server(
+async def test_subagent_watcher_dead_letters_the_payload_it_posted_for_a_teammate(
     tmp_path: Path,
 ) -> None:
-    """A server that still requires ``tool_use_id`` accepts the teammate's placeholder."""
+    """A parked teammate registration is replayable: its dead letter matches the POST."""
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
     _seed_subagent_on_disk(
@@ -6315,14 +6313,21 @@ async def test_subagent_watcher_registers_a_teammate_with_an_older_server(
     )
 
     start_bodies, state = await _register_subagents_once(
-        tmp_path, transcript_path, older_server=True
+        tmp_path, transcript_path, reject_start=True
     )
 
-    assert start_bodies["abuddy-9837bbf1d431dcca"]["tool_use_id"] == (
-        "teammate:abuddy-9837bbf1d431dcca"
-    )
-    entry = state.subagents["abuddy-9837bbf1d431dcca"]
-    assert entry.child_conversation_id == "conv_abuddy-9837bbf1d431dcca"
+    [record] = [
+        json.loads(line)
+        for line in (tmp_path / "bridge" / "dead_letter.jsonl").read_text("utf-8").splitlines()
+    ]
+    assert record["event_type"] == "external_subagent_start"
+    assert record["reason"] == "permanent HTTP failure after retries"
+    assert record["payload"] == {
+        **start_bodies["abuddy-9837bbf1d431dcca"],
+        "parent_subagent_id": None,
+    }
+    assert record["payload"]["tool_use_id"] == "teammate:abuddy-9837bbf1d431dcca"
+    assert state.subagents["abuddy-9837bbf1d431dcca"].child_conversation_id == ""
 
 
 async def test_subagent_watcher_forwards_the_name_of_a_named_background_agent(

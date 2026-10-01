@@ -1374,6 +1374,30 @@ def test_framed_teammate_delivery_is_internal_and_wakes_a_new_turn(
 
 
 @pytest.mark.parametrize(
+    "content,origin",
+    [
+        (_FRAMED_DELIVERIES["prose"], {"kind": "human"}),
+        (
+            f'<pasted_content id="1">\n{_FRAMED_DELIVERIES["prose"]}\n</pasted_content id="1">',
+            None,
+        ),
+    ],
+    ids=["typed", "pasted"],
+)
+def test_framed_text_from_a_human_stays_a_visible_message(
+    tmp_path: Path, content: str, origin: dict[str, str] | None
+) -> None:
+    """Quoting a delivery in the TUI keeps the human's authorship."""
+    _, response_id, items = _read_native_user(tmp_path, content, origin=origin)
+    [item] = items
+    assert item.data["role"] == "user"
+    assert "is_meta" not in item.data
+    assert _PROSE_ENVELOPE in item.data["content"][0]["text"]
+    # Like any typed prompt, the message opens the human's own turn.
+    assert response_id is None
+
+
+@pytest.mark.parametrize(
     "queued,text,metadata",
     [
         ("prompt", _TEAMMATE_MESSAGE, {"isMeta": True}),
@@ -3505,17 +3529,43 @@ def test_augment_claude_args_reads_a_user_settings_file(tmp_path: Path) -> None:
     assert settings["enableAllProjectMcpServers"] is True
 
 
-def test_augment_claude_args_leaves_an_unparseable_settings_value_to_claude(
-    tmp_path: Path,
+def test_augment_claude_args_resolves_a_relative_settings_file_against_the_launch_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Hosted sessions augment in the daemon's cwd but launch Claude in the workspace."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "team.json").write_text(json.dumps({"teammateMode": "in-process"}))
+    daemon = tmp_path / "daemon"
+    daemon.mkdir()
+    (daemon / "team.json").write_text(json.dumps({"teammateMode": "tmux"}))
+    monkeypatch.chdir(daemon)
+
     args = augment_claude_args(
-        ("--settings", "not json"),
+        ("--settings", "team.json"),
+        bridge_dir=tmp_path / "bridge",
+        python_executable="/venv/bin/python",
+        launch_cwd=workspace,
+    )
+
+    assert args.count("--settings") == 1
+    assert _load_invocation_settings(args)["teammateMode"] == "in-process"
+
+
+def test_augment_claude_args_drops_an_unreadable_settings_layer(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Claude would ignore the broken flag behind Omnigent's own; say so instead."""
+    args = augment_claude_args(
+        ("--settings", "not json", "--resume", "abc"),
         bridge_dir=tmp_path,
         python_executable="/venv/bin/python",
     )
 
-    assert args[:2] == ["--settings", "not json"]
-    assert args.count("--settings") == 2
+    assert "not json" not in args
+    assert args[:2] == ["--resume", "abc"]
+    assert args.count("--settings") == 1
+    assert "dropping --settings file 'not json'" in caplog.text
 
 
 def test_augment_claude_args_observes_worktree_moves(tmp_path: Path) -> None:

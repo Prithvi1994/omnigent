@@ -1,6 +1,7 @@
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import { MAX_TREE_DEPTH } from "@/hooks/useChildSessions";
 import {
+  CLAUDE_TEAMMATE_BADGE_LABEL,
   isClaudeTeammateChild,
   nativeCodingAgentForSubagentWrapper,
   WRAPPER_LABEL_KEY,
@@ -191,7 +192,7 @@ export function buildTree(
                 childrenMap,
                 depth + 1,
                 visited,
-                isClaudeTeammateChild(child.labels) ? "Teammate" : null,
+                isClaudeTeammateChild(child.labels) ? CLAUDE_TEAMMATE_BADGE_LABEL : null,
               );
             }),
   };

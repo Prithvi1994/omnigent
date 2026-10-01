@@ -64,8 +64,7 @@ import { routingExtrasFromWire } from "./routingDecision";
 import {
   isClaudeAgentMessageContent,
   taskNotificationMarkerContent,
-  teammateDeliveryMarkerContent,
-  teammateMarkerOf,
+  teammateDeliveryMarker,
 } from "./systemMessage";
 import { readSubagentActivity } from "./subagentActivity";
 
@@ -136,13 +135,13 @@ const LEAD_REPLY_BLOCKS = new Set<AnyBlock["type"]>([
  * as does a one-shot idle result with no prose before it.
  */
 export function foldsTeammateIdleMarker(block: AnyBlock, previous: readonly AnyBlock[]): boolean {
-  if (block.type !== "user_message") return false;
-  const marker = teammateMarkerOf(block.content);
+  const marker = block.type === "user_message" ? block.teammate : undefined;
   if (marker?.kind !== "teammate_finished") return false;
   for (let index = previous.length - 1; index >= 0; index -= 1) {
     const candidate = previous[index]!;
     if (candidate.type === "user_message") {
-      const earlier = teammateMarkerOf(candidate.content);
+      // Only a delivery the bridge marked internal carries `teammate`; human text never does.
+      const earlier = candidate.teammate;
       return earlier?.teammateId === marker.teammateId && earlier.kind === "teammate_message";
     }
     if (!LEAD_REPLY_BLOCKS.has(candidate.type)) return false;
@@ -297,8 +296,10 @@ function itemToBlock(item: ConversationItem, agentName?: string | null): AnyBloc
     }
     // An agent-teams delivery is hidden context that wakes the lead; show it
     // as a readable teammate marker instead of the raw envelope.
-    const teammate = teammateDeliveryMarkerContent(item.content);
-    if (teammate !== null) return { ...userMessageToBlock(item), content: teammate };
+    const teammate = teammateDeliveryMarker(item.content);
+    if (teammate !== null) {
+      return { ...userMessageToBlock(item), content: teammate.content, teammate: teammate.marker };
+    }
     if (isClaudeAgentMessageContent(item.content)) return null;
     // Claude Code's background-task wake: the CLI injects a
     // `<task-notification>` user entry (mirrored with `is_meta`) and

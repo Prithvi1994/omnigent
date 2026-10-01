@@ -13,6 +13,8 @@ export const CLAUDE_NATIVE_SUBAGENT_NAME_LABEL_KEY = "omnigent.claude_native.sub
 /** Claude's `taskKind` for the child; agent-teams teammates run in the lead's process. */
 export const CLAUDE_NATIVE_TASK_KIND_LABEL_KEY = "omnigent.claude_native.task_kind";
 export const CLAUDE_NATIVE_TEAMMATE_TASK_KIND = "in_process_teammate";
+/** Kind tag shown beside an in-process teammate in the Agents list and graph. */
+export const CLAUDE_TEAMMATE_BADGE_LABEL = "Teammate";
 
 /** Whether a child row tracks an in-process Claude agent-teams teammate. */
 export function isClaudeTeammateChild(labels: Record<string, string> | undefined): boolean {
