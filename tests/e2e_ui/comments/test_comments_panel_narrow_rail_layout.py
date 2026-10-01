@@ -35,9 +35,12 @@ it run on staged files via git commit). Fix any issues it reports so the \
 commit lands clean.
 """
 
-# A 14" MacBook default window, a 13" laptop, and a half-width window.
-_VIEWPORTS = [(1512, 982), (1280, 800), (1024, 768)]
-_VIEWPORT_IDS = [f"{w}x{h}" for w, h in _VIEWPORTS]
+# A 14" MacBook default window, a 13" laptop, and a half-width window. The rail
+# is wide enough for the panel beside the editor at the first two; at 1024x768
+# it is narrower than 448px, so the panel stacks under the editor.
+_VIEWPORTS = [(1512, 982, "beside"), (1280, 800, "beside"), (1024, 768, "stacked")]
+_VIEWPORT_IDS = [f"{w}x{h}" for w, h, _ in _VIEWPORTS]
+_STACKING_BREAKPOINT_PX = 448
 _LAYOUT_SETTLE_MS = 500
 _RECORDING_HOLD_MS = 2500
 _EDGE_TOLERANCE_PX = 1
@@ -202,7 +205,7 @@ def _measure(page: Page, file_viewer: Locator, panel: Locator, out_dir: Path, ta
     toolbar = file_viewer.get_by_role("toolbar", name="Formatting")
     report = {
         "url": page.url,
-        "video": page.video.path() if page.video else None,
+        "video": str(page.video.path()) if page.video else None,
         "viewport": viewport,
         "sidebar_collapsed": conversations.get_attribute("data-collapsed") == "true",
         "rail": _box(page.get_by_role("complementary", name="Workspace"), "Workspace rail"),
@@ -270,6 +273,26 @@ def _toolbar_violations(report: dict) -> list[str]:
     return violations
 
 
+def _layout_violations(report: dict, layout: str) -> list[str]:
+    """Check the viewport reached the intended layout (the test's precondition)."""
+    rail_width = report["rail"]["width"]
+    panel, toolbar, editor = report["panel"], report["toolbar"], report["editor"]
+    stacked = panel["y"] >= toolbar["y"] + toolbar["height"] - _EDGE_TOLERANCE_PX
+    beside = editor is not None and panel["x"] >= _right(editor) - _EDGE_TOLERANCE_PX
+    violations: list[str] = []
+    if layout == "stacked":
+        if rail_width >= _STACKING_BREAKPOINT_PX:
+            violations.append(f"expected a rail narrower than 448px, got {rail_width:.0f}px")
+        if not stacked:
+            violations.append("expected the panel under the editor, but it sits beside it")
+    else:
+        if rail_width < _STACKING_BREAKPOINT_PX:
+            violations.append(f"expected a rail of at least 448px, got {rail_width:.0f}px")
+        if not beside:
+            violations.append("expected the panel beside the editor, but it is stacked")
+    return violations
+
+
 def _tab_strip_violations(report: dict) -> list[str]:
     return [
         f"workspace tab {c['label']!r} shows only {c['visible']}px inside its "
@@ -291,13 +314,14 @@ def _report_for(
         page.context.close()
 
 
-@pytest.mark.parametrize(("width", "height"), _VIEWPORTS, ids=_VIEWPORT_IDS)
+@pytest.mark.parametrize(("width", "height", "layout"), _VIEWPORTS, ids=_VIEWPORT_IDS)
 def test_comments_panel_layout_in_narrow_rail(
     browser: Browser,
     seeded_agents_md_session: tuple[str, str],
     output_path: str,
     width: int,
     height: int,
+    layout: str,
 ) -> None:
     """One journey per viewport: panel controls stay inside the rail and window and
     clear of the toolbar, the toolbar keeps one row inside its box, and every
@@ -306,6 +330,7 @@ def test_comments_panel_layout_in_narrow_rail(
     violations = [
         f"{group}: {violation}"
         for group, found in (
+            ("layout", _layout_violations(report, layout)),
             ("comments panel controls", _control_violations(report)),
             ("editor toolbar", _toolbar_violations(report)),
             ("workspace tabs", _tab_strip_violations(report)),
@@ -336,7 +361,11 @@ def test_folded_toolbar_menu_inserts_table(
 
         expect(editor.locator("table")).to_be_visible()
         expect(editor.locator("table tr")).to_have_count(2)
-        # The "⋯" menu closes once the tool has run.
+        # The "⋯" menu closes once the tool has run and the caret is back in the
+        # document, so typing lands in the new table.
         expect(page.get_by_role("button", name="Insert table")).to_have_count(0)
+        expect(editor).to_be_focused()
+        page.keyboard.type("cell text")
+        expect(editor.locator("table")).to_contain_text("cell text")
     finally:
         page.context.close()

@@ -297,9 +297,17 @@ function useToolbarOverflow(items: readonly ToolbarItem[]) {
   const clusterRef = useRef<HTMLDivElement | null>(null);
   const statusRef = useRef<HTMLButtonElement | null>(null);
   const itemsRef = useRef(items);
-  itemsRef.current = items;
   const [folded, setFolded] = useState<ReadonlySet<string>>(() => new Set());
   const itemsKey = items.map((item) => item.key).join(",");
+  // React 18 drops a boolean `inert` prop, so mark the clone inert as it mounts.
+  const setMeasureRef = useCallback((el: HTMLDivElement | null) => {
+    measureRef.current = el;
+    el?.setAttribute("inert", "");
+  }, []);
+
+  useLayoutEffect(() => {
+    itemsRef.current = items;
+  });
 
   useLayoutEffect(() => {
     const row = rowRef.current;
@@ -307,15 +315,13 @@ function useToolbarOverflow(items: readonly ToolbarItem[]) {
     const cluster = clusterRef.current;
     const status = statusRef.current;
     if (!row || !measure || !cluster || !status) return;
-    // React 18 drops a boolean `inert` prop, so keep the clone unfocusable here.
-    measure.setAttribute("inert", "");
 
     const evaluate = () => {
       const rowStyle = getComputedStyle(row);
       const padding =
         (parseFloat(rowStyle.paddingLeft) || 0) + (parseFloat(rowStyle.paddingRight) || 0);
       const available = row.getBoundingClientRect().width - padding;
-      // Not laid out yet (or jsdom): keep everything inline.
+      // Not laid out yet (or jsdom): keep the current fold state.
       if (available <= 0) return;
       const gap = parseFloat(rowStyle.columnGap) || 0;
       const clusterGap = parseFloat(getComputedStyle(cluster).columnGap) || 0;
@@ -373,7 +379,7 @@ function useToolbarOverflow(items: readonly ToolbarItem[]) {
     return () => ro.disconnect();
   }, [itemsKey]);
 
-  return { rowRef, measureRef, clusterRef, statusRef, folded };
+  return { rowRef, measureRef: setMeasureRef, clusterRef, statusRef, folded };
 }
 
 function ToolbarOverflowMenu({
@@ -404,6 +410,7 @@ function ToolbarOverflowMenu({
       </PopoverTrigger>
       <PopoverContent
         align="end"
+        aria-label="More formatting"
         className="w-auto gap-1 p-1"
         // A command refocuses the editor; don't pull focus back to the trigger.
         onCloseAutoFocus={(e) => {
@@ -474,9 +481,9 @@ export function ToolbarPlugin({
 
   const handleCopy = useCallback(() => {
     const md = getMarkdown();
+    if (!navigator?.clipboard?.writeText) return;
     // Keep the caret in the document, also when Copy ran from the "⋯" menu.
     editor?.commands.focus();
-    if (!navigator?.clipboard?.writeText) return;
     navigator.clipboard
       .writeText(md)
       .then(() => {

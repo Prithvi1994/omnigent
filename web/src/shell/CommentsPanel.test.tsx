@@ -12,6 +12,7 @@ import type { Comment } from "@/hooks/useComments";
 import { getCurrentAuthorId } from "@/lib/identity";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { CommentsPanel } from "./CommentsPanel";
+import { resetCommentsWidthStoreForTesting } from "@/hooks/useResizableCommentsPanel";
 
 // CommentsPanel reads the current user's identity (getCurrentAuthorId) to
 // decide whose comments expose Edit/Delete. Mock it so author-ownership tests
@@ -484,32 +485,39 @@ describe("CommentsPanel resize affordance", () => {
       renderPanelInRow(() => rowWidth);
       const handle = () => screen.queryByRole("separator", { name: "Resize comments panel" });
       const panel = handle()?.parentElement as HTMLElement;
-      expect(panel.style.getPropertyValue("--comments-panel-width")).toBe("240px");
+      const width = () => panel.style.getPropertyValue("--comments-panel-width");
+      expect(width()).toBe("240px");
+
+      // The user widens the panel by one keyboard step; that choice persists.
+      fireEvent.keyDown(handle() as HTMLElement, { key: "ArrowLeft" });
+      expect(width()).toBe("260px");
 
       // The rail shrinks below the breakpoint: the panel stacks and the width
       // clamps to the floor.
       rowWidth = 300;
       act(() => observers.forEach((cb) => cb([], {} as ResizeObserver)));
       expect(handle()).toBeNull();
-      expect(panel.style.getPropertyValue("--comments-panel-width")).toBe("200px");
+      expect(width()).toBe("200px");
 
       // The 28rem (448px) boundary shared with the container query.
       rowWidth = 447;
       act(() => observers.forEach((cb) => cb([], {} as ResizeObserver)));
       expect(handle()).toBeNull();
-      expect(panel.style.getPropertyValue("--comments-panel-width")).toBe("207px");
+      expect(width()).toBe("207px");
       rowWidth = 448;
       act(() => observers.forEach((cb) => cb([], {} as ResizeObserver)));
       expect(handle()).not.toBeNull();
-      expect(panel.style.getPropertyValue("--comments-panel-width")).toBe("208px");
+      expect(width()).toBe("208px");
 
-      // Space returns: the default width is restored.
+      // Space returns: the saved choice, not the default, is restored.
       rowWidth = 800;
       act(() => observers.forEach((cb) => cb([], {} as ResizeObserver)));
       expect(handle()).not.toBeNull();
-      expect(panel.style.getPropertyValue("--comments-panel-width")).toBe("240px");
+      expect(width()).toBe("260px");
     } finally {
       vi.unstubAllGlobals();
+      window.localStorage.clear();
+      resetCommentsWidthStoreForTesting();
     }
   });
 });

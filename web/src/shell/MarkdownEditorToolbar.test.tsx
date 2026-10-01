@@ -70,7 +70,6 @@ afterEach(() => {
 });
 
 // ── Responsive overflow ─────────────────────────────────────────────────────────────────
-//
 // jsdom has no layout: getBoundingClientRect is stubbed so the row reports the
 // given width, each clone item 28px (divider 9px) and the status pill 70px.
 
@@ -184,10 +183,13 @@ describe("MarkdownEditorToolbar overflow", () => {
 
   it("closes the ⋯ menu after a folded Copy and hands focus back to the editor", () => {
     installToolbarWidths(212);
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
     const { editor, calls } = chainRecordingEditor();
     renderToolbar({ editor });
     fireEvent.click(screen.getByRole("button", { name: "More formatting" }));
     fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+    expect(writeText).toHaveBeenCalledWith(MARKDOWN);
     // Copy has no editor chain of its own, so it refocuses the editor explicitly.
     expect(calls).toEqual(["commands.focus"]);
     expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();

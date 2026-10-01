@@ -129,7 +129,8 @@ export function useResizableCommentsPanel() {
     return Math.max(MIN_WIDTH_PX, Math.min(candidate, max));
   }, []);
 
-  // A rail resize changes row width without resizing the window.
+  // A rail resize changes row width without resizing the window. The row spans
+  // the viewer's content box, the width the `@md/viewer` query measures.
   useLayoutEffect(() => {
     const row = containerRef.current?.parentElement;
     if (!row) return;
@@ -202,12 +203,10 @@ export function useResizableCommentsPanel() {
     };
   }, [clampWidth, removeDragOverlay]);
 
-  // Re-clamp the stored width when the viewport resizes so a width chosen on
-  // a wider layout doesn't crowd out the viewer after the window shrinks.
+  // Without ResizeObserver, fall back to re-clamping on window resizes.
   useEffect(() => {
+    if (typeof ResizeObserver !== "undefined") return;
     function onResize() {
-      // Re-derive the effective width from the persisted preference so the
-      // panel widens back to the user's choice when the row regains space.
       setStoredWidth(clampWidth(preferredWidth ?? DEFAULT_WIDTH_PX));
     }
     window.addEventListener("resize", onResize);
