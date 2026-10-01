@@ -1673,6 +1673,17 @@ def _persist_native_cumulative_usage(
             # cache reads at the full input rate.
             ccache = int(current.get("cache_read_input_tokens", 0) or 0)
         cached = min(int(ccache), int(cin))
+        if int(ccache) > int(cin):
+            # The cumulative input total dropped below the cached count carried
+            # from earlier turns; surface it so operators can spot a shrunken or
+            # malformed cumulative report instead of silently clamping.
+            _logger.warning(
+                "Cumulative cache reads (%d) exceed the reported input total (%d) "
+                "for session %r; clamping cache reads to the input total.",
+                int(ccache),
+                int(cin),
+                session_id,
+            )
         current["cache_read_input_tokens"] = cached
         current["input_tokens"] = int(cin) - cached
     if cout is not None:

@@ -268,9 +268,19 @@ def test_token_report_without_cache_field_keeps_persisted_cache_split(
     assert bucket["total_cost_usd"] == pytest.approx(expected_cost)
 
 
-def test_explicit_zero_cache_count_replaces_persisted_split(db_uri: str) -> None:
+def test_explicit_zero_cache_count_replaces_persisted_split(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="codex-cache-zero", agent_id=_AGENT_ID)
+
+    # Only token splits are asserted here; keep the token-pricing branch off
+    # the live catalog so the test is deterministic and offline.
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: None,
+    )
 
     _persist_native_cumulative_usage(
         conv.id,
@@ -299,9 +309,19 @@ def test_explicit_zero_cache_count_replaces_persisted_split(db_uri: str) -> None
     assert usage["input_tokens"] == 120_000
 
 
-def test_carried_cache_count_is_clamped_to_a_lowered_input_total(db_uri: str) -> None:
+def test_carried_cache_count_is_clamped_to_a_lowered_input_total(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="codex-cache-lowered", agent_id=_AGENT_ID)
+
+    # Only token splits are asserted here; keep the token-pricing branch off
+    # the live catalog so the test is deterministic and offline.
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: None,
+    )
 
     _persist_native_cumulative_usage(
         conv.id,
