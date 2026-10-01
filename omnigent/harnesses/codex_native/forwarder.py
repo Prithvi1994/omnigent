@@ -1618,8 +1618,8 @@ class _OutputTextDeltaCoalescer:
             _logger.warning("Codex forwarder delta flush failed", exc_info=True)
 
 
-# Posted together: the server prices one token post as a single cumulative
-# snapshot, reading an omitted cache count as zero cached tokens.
+# Posted together so each token post is a self-contained cumulative snapshot;
+# older servers read an omitted cache count as zero cached tokens.
 _CUMULATIVE_TOKEN_KEYS = (
     "cumulative_input_tokens",
     "cumulative_cache_read_input_tokens",

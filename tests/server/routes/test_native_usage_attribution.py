@@ -268,6 +268,71 @@ def test_token_report_without_cache_field_keeps_persisted_cache_split(
     assert bucket["total_cost_usd"] == pytest.approx(expected_cost)
 
 
+def test_explicit_zero_cache_count_replaces_persisted_split(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="codex-cache-zero", agent_id=_AGENT_ID)
+
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            "cumulative_input_tokens": 100_000,
+            "cumulative_cache_read_input_tokens": 90_000,
+            "cumulative_output_tokens": 200,
+            "model": "gpt-5.6",
+        },
+        store,
+    )
+    # An explicit zero is a report, not an omission: it is honored as-is.
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            "cumulative_input_tokens": 120_000,
+            "cumulative_cache_read_input_tokens": 0,
+            "cumulative_output_tokens": 300,
+            "model": "gpt-5.6",
+        },
+        store,
+    )
+
+    usage = _usage(store, conv.id)
+    assert usage["cache_read_input_tokens"] == 0
+    assert usage["input_tokens"] == 120_000
+
+
+def test_carried_cache_count_is_clamped_to_a_lowered_input_total(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="codex-cache-lowered", agent_id=_AGENT_ID)
+
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            "cumulative_input_tokens": 100_000,
+            "cumulative_cache_read_input_tokens": 90_000,
+            "cumulative_output_tokens": 200,
+            "model": "gpt-5.6",
+        },
+        store,
+    )
+    # A lowered cumulative total without a cache count keeps the carried split
+    # within the reported input, and later reports carry that clamped count.
+    _persist_native_cumulative_usage(
+        conv.id,
+        {"cumulative_input_tokens": 50_000, "cumulative_output_tokens": 250, "model": "gpt-5.6"},
+        store,
+    )
+    assert _usage(store, conv.id)["cache_read_input_tokens"] == 50_000
+    assert _usage(store, conv.id)["input_tokens"] == 0
+
+    _persist_native_cumulative_usage(
+        conv.id,
+        {"cumulative_input_tokens": 200_000, "cumulative_output_tokens": 400, "model": "gpt-5.6"},
+        store,
+    )
+    usage = _usage(store, conv.id)
+    assert usage["cache_read_input_tokens"] == 50_000
+    assert usage["input_tokens"] == 150_000
+
+
 def _conversation_point_reads(statements: list[str]) -> list[str]:
     """Filter captured SQL to point reads of a single conversation row."""
     matches: list[str] = []

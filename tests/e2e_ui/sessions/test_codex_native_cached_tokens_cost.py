@@ -1,29 +1,18 @@
 r"""UI journey: a codex-native session's Session cost stays cache-aware.
 
-Codex reports cumulative token usage after every model request
-(``tokenUsage.total``, with the cached portion in ``cachedInputTokens``). The
-codex-native forwarder mirrors those running totals to Omnigent, which prices
-them into the Session cost behind the agent-info button and into the per-model
-Token usage breakdown. A later request served with no prompt-cache hits leaves
-the cumulative cached count unchanged; the tokens cached earlier must still be
-billed at the cache-read rate.
+Codex reports cumulative token usage (``tokenUsage.total``, cached portion in
+``cachedInputTokens``) that the forwarder mirrors to Omnigent for pricing. A
+request served with no prompt-cache hits leaves the cumulative cached count
+unchanged; tokens cached earlier must still be billed at the cache-read rate.
 
 Journey (real web SPA, live server + runner, real ``codex`` CLI against the
-mock ``/v1/responses``):
+mock ``/v1/responses``): send a cache-heavy turn (100K input, 90K cached), then
+a cache-miss turn (100K input, 0 cached), then open the agent-info popover and
+check the Session cost and the per-model Input / Cache read split.
 
-1. open a fresh codex-native session and wait for its terminal to attach
-2. send a message whose model request reports 100K input tokens, 90K of them
-   cached; wait for the reply
-3. send a second message whose request reports 100K input tokens with no cache
-   hits; wait for the reply
-4. open the agent-info popover: Session cost equals the cache-aware bill for
-   the reported tokens and the per-model row keeps 90K under Cache read
-
-Pricing comes from the provider config the server reads; the mock codex
-provider written by ``temp_omnigent_mock_config`` prices input 2.5 / output 10 /
-cache read 0.25 USD per 1M. ``OMNIGENT_E2E_CODEX_PRICING_PER_MILLION``
-(``input,output,cache_read``) overrides those rates for a workflow-owned
-provider.
+Pricing comes from the mock codex provider written by
+``temp_omnigent_mock_config``; ``OMNIGENT_E2E_CODEX_PRICING_PER_MILLION``
+(``input,output,cache_read``) overrides it for a workflow-owned provider.
 """
 
 from __future__ import annotations
@@ -41,6 +30,7 @@ import pytest
 from playwright.sync_api import Locator, Page, expect
 
 from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm, set_fallback_mock_llm
+from tests.helpers.ui_configuration import _CODEX_MOCK_PRICING_PER_MILLION
 
 from ..messages.test_message_render_parity import (
     _ASSISTANT,
@@ -80,8 +70,15 @@ _TURN_USAGE = (
 
 
 def _pricing_per_million() -> tuple[float, float, float]:
-    raw = os.environ.get("OMNIGENT_E2E_CODEX_PRICING_PER_MILLION", "2.5,10,0.25")
-    input_rate, output_rate, cache_read_rate = (float(part) for part in raw.split(","))
+    default = ",".join(str(rate) for rate in _CODEX_MOCK_PRICING_PER_MILLION)
+    raw = os.environ.get("OMNIGENT_E2E_CODEX_PRICING_PER_MILLION", default)
+    parts = raw.split(",")
+    if len(parts) != 3:
+        raise ValueError(
+            "OMNIGENT_E2E_CODEX_PRICING_PER_MILLION must be 'input,output,cache_read', "
+            f"got {raw!r}"
+        )
+    input_rate, output_rate, cache_read_rate = (float(part) for part in parts)
     return input_rate, output_rate, cache_read_rate
 
 
@@ -106,6 +103,10 @@ def _wait_for_usage(base_url: str, session_id: str, settled: Callable[[dict], bo
     while not settled(_model_usage(snapshot)) and time.monotonic() < deadline:
         time.sleep(0.5)
         snapshot = _session_snapshot(base_url, session_id)
+    if not settled(_model_usage(snapshot)):
+        pytest.fail(
+            f"usage never settled within {_USAGE_TIMEOUT_S}s; last usage: {_model_usage(snapshot)}"
+        )
     return snapshot
 
 
@@ -126,7 +127,7 @@ def _open_agent_info(page: Page) -> Locator:
 
 
 def _compact(tokens: int) -> str:
-    """Mirror the SPA's compact token formatting for thousands (e.g. ``110K``)."""
+    """Mirror the SPA's compact token formatting for the sub-1M counts used here (``110K``)."""
     if tokens < 1_000:
         return str(tokens)
     value = round(tokens / 1_000, 1)
