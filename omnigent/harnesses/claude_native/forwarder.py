@@ -104,6 +104,10 @@ _SUBAGENT_IDLE_THRESHOLD_S = 5.0
 # One per Claude Task-tool subagent; appears alongside the matching
 # ``agent-<id>.jsonl`` transcript.
 _SUBAGENT_META_GLOB = "agent-*.meta.json"
+# ``taskKind`` Claude stamps on an in-process teammate (agent teams). Its meta
+# carries no ``toolUseId``: the lead's ``Agent`` call returns at once and the
+# teammate reports back through mailbox deliveries instead of a tool result.
+_TEAMMATE_TASK_KIND = "in_process_teammate"
 # Claude's built-in sub-agent spawn tool; its tool-use id is the ``toolUseId``
 # stamped into each ``agent-<id>.meta.json``. Reuse the router's canonical set so
 # both the current ``Agent`` name and the still-supported ``Task`` alias match.
@@ -1715,6 +1719,8 @@ async def _post_external_subagent_start(
     agent_type: str,
     description: str,
     tool_use_id: str,
+    name: str = "",
+    task_kind: str = "",
 ) -> str:
     """
     POST ``external_subagent_start`` to the Omnigent server and return the
@@ -1731,7 +1737,12 @@ async def _post_external_subagent_start(
     :param description: Free-form description from the meta file,
         e.g. ``"Investigate web UI session data flow"``.
     :param tool_use_id: Parent transcript's ``Task`` tool-use block
-        id this sub-agent was spawned from, e.g. ``"toolu_..."``.
+        id this sub-agent was spawned from, e.g. ``"toolu_..."``. Empty
+        for an in-process teammate, which has no spawn result to correlate.
+    :param name: Name the lead gave the agent, e.g. ``"buddy"``; empty
+        when the spawn was anonymous.
+    :param task_kind: Claude's ``taskKind`` for the meta, e.g.
+        ``"in_process_teammate"``; empty for an ordinary sub-agent.
     :returns: The Omnigent child conversation id, e.g. ``"conv_child456"``.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     :raises KeyError: If the server response is missing
@@ -1747,7 +1758,9 @@ async def _post_external_subagent_start(
                 "subagent_id": subagent_id,
                 "agent_type": agent_type,
                 "description": description,
-                "tool_use_id": tool_use_id,
+                **({"tool_use_id": tool_use_id} if tool_use_id else {}),
+                **({"name": name} if name else {}),
+                **({"task_kind": task_kind} if task_kind else {}),
             },
         },
     )
@@ -1770,8 +1783,10 @@ def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
 
     :param meta_path: Path to ``agent-<id>.meta.json``.
     :returns: A dict with string-typed ``agentType``, ``description``,
-        and ``toolUseId``; or ``None`` when the file is missing /
-        malformed / missing any required key.
+        ``toolUseId``, ``name`` and ``taskKind``; or ``None`` when the file
+        is missing / malformed / missing a required key. ``toolUseId`` is
+        empty only for an in-process teammate, which Claude writes without
+        one; ``name`` and ``taskKind`` are empty when the meta omits them.
     """
     try:
         raw = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -1782,16 +1797,26 @@ def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
     agent_type = raw.get("agentType")
     description = raw.get("description")
     tool_use_id = raw.get("toolUseId")
+    name = raw.get("name")
+    task_kind = raw.get("taskKind")
     if not isinstance(agent_type, str) or not agent_type:
         return None
     if not isinstance(description, str):
         return None
+    if not isinstance(name, str):
+        name = ""
+    if not isinstance(task_kind, str):
+        task_kind = ""
     if not isinstance(tool_use_id, str) or not tool_use_id:
-        return None
+        if task_kind != _TEAMMATE_TASK_KIND:
+            return None
+        tool_use_id = ""
     return {
         "agentType": agent_type,
         "description": description,
         "toolUseId": tool_use_id,
+        "name": name,
+        "taskKind": task_kind,
     }
 
 
@@ -2559,6 +2584,11 @@ async def _forward_available_subagents(
         if meta is None:
             continue
         tool_use_id = meta["toolUseId"]
+        if not tool_use_id:
+            # An in-process teammate reports to the team lead, so the root
+            # session owns it; there is no spawn record to correlate against.
+            pending.append((meta_path, meta, None))
+            continue
         if tool_use_id not in parents_by_tool_use:
             # No transcript owns this spawn yet: the record is still mid-write, or
             # it resolved to two owners and was dropped as ambiguous. Either way we
@@ -2627,6 +2657,8 @@ async def _forward_available_subagents(
                     agent_type=meta["agentType"],
                     description=meta["description"],
                     tool_use_id=meta["toolUseId"],
+                    name=meta["name"],
+                    task_kind=meta["taskKind"],
                 )
             except httpx.HTTPError as exc:
                 decision = start_retry_tracker.record_failure(

@@ -1,6 +1,10 @@
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import { MAX_TREE_DEPTH } from "@/hooks/useChildSessions";
-import { nativeCodingAgentForSubagentWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import {
+  isClaudeTeammateChild,
+  nativeCodingAgentForSubagentWrapper,
+  WRAPPER_LABEL_KEY,
+} from "@/lib/nativeCodingAgents";
 import { childStatus, type AgentActivity } from "./subagentStatus";
 
 export type { AgentActivity };
@@ -12,6 +16,8 @@ export interface AgentNodeData {
   sessionId: string;
   isActive: boolean;
   preview: string | null;
+  /** Kind tag beside the label, e.g. "Teammate" for an in-process Claude teammate. */
+  badge?: string | null;
   [key: string]: unknown;
 }
 
@@ -21,6 +27,7 @@ export interface TreeNode {
   activity: AgentActivity;
   statusLabel: string;
   preview: string | null;
+  badge?: string | null;
   children: TreeNode[];
 }
 
@@ -92,6 +99,7 @@ export function layoutTree(
         sessionId: node.id,
         isActive: node.id === activeId,
         preview: node.preview,
+        badge: node.badge ?? null,
       },
     });
 
@@ -138,6 +146,7 @@ export function buildTree(
   childrenMap: Map<string, ChildSessionInfo[]>,
   depth: number,
   visited = new Set<string>(),
+  rootBadge: string | null = null,
 ): TreeNode {
   visited.add(rootId);
   const children = childrenMap.get(rootId) ?? [];
@@ -147,6 +156,7 @@ export function buildTree(
     activity: rootActivity,
     statusLabel: rootStatusLabel,
     preview: rootPreview,
+    ...(rootBadge ? { badge: rootBadge } : {}),
     children:
       depth >= MAX_TREE_DEPTH
         ? []
@@ -181,6 +191,7 @@ export function buildTree(
                 childrenMap,
                 depth + 1,
                 visited,
+                isClaudeTeammateChild(child.labels) ? "Teammate" : null,
               );
             }),
   };

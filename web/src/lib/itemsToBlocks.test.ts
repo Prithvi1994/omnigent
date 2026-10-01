@@ -209,7 +209,7 @@ describe("itemsToBlocks — flat shape", () => {
     }
   });
 
-  it("keeps legacy teammate handbacks out of the transcript while preserving user discussion", () => {
+  it("renders framed teammate deliveries readably and keeps bare legacy handbacks out of the transcript", () => {
     const envelope =
       '<teammate-message teammate_id="reviewer" summary="Review complete">Ready</teammate-message>';
     const blocks = itemsToBlocks([
@@ -223,9 +223,78 @@ describe("itemsToBlocks — flat shape", () => {
 
     expect(blocks.map((block) => block.ctx.itemId)).toEqual([
       "msg_before",
+      "msg_peer",
       "msg_asst",
       "msg_after",
     ]);
+    const peer = blocks[1] as UserMessageBlock;
+    expect(peer.content).toEqual([
+      { type: "input_text", text: "[System: teammate reviewer: Review complete]\nReady" },
+    ]);
+  });
+
+  describe("agent-teams deliveries", () => {
+    const guidance =
+      "This came from another Claude session — not typed by your user, but very likely working on their behalf.";
+    const framed = (envelope: string) =>
+      `Another Claude session sent a message:\n${envelope}\n\n${guidance}`;
+    const prose =
+      '<teammate-message teammate_id="buddy" color="blue" summary="All good over here">\nAll good here - TMCHAT.\n</teammate-message>';
+    const idle = (result: string) =>
+      `<teammate-message teammate_id="buddy" color="blue">\n{"type":"idle_notification","from":"buddy","idleReason":"available","result":${JSON.stringify(result)}}\n</teammate-message>`;
+    const delivery = (responseId: string, envelope: string, id: string): ConversationItem => ({
+      ...userMessage(responseId, framed(envelope), id),
+      is_meta: true,
+    });
+
+    it("renders a hidden teammate delivery as a readable marker, not a raw bubble", () => {
+      const blocks = itemsToBlocks([
+        delivery("resp_1", prose, "msg_prose"),
+        assistantMessage("resp_1", "CHAT-ACK"),
+      ]);
+
+      expect(blocks.map((block) => block.ctx.itemId)).toEqual(["msg_prose", "msg_asst"]);
+      expect((blocks[0] as UserMessageBlock).content).toEqual([
+        {
+          type: "input_text",
+          text: "[System: teammate buddy: All good over here]\nAll good here - TMCHAT.",
+        },
+      ]);
+    });
+
+    it("keeps a one-shot idle result visible and folds the idle twin after a prose message", () => {
+      const blocks = itemsToBlocks([
+        delivery("resp_1", idle("TMREPLY done."), "msg_idle_first"),
+        assistantMessage("resp_1", "IDLE-ACK", "msg_ack_1"),
+        delivery("resp_2", prose, "msg_prose"),
+        assistantMessage("resp_2", "CHAT-ACK", "msg_ack_2"),
+        delivery("resp_3", idle("resting."), "msg_idle_twin"),
+      ]);
+
+      expect(blocks.map((block) => block.ctx.itemId)).toEqual([
+        "msg_idle_first",
+        "msg_ack_1",
+        "msg_prose",
+        "msg_ack_2",
+      ]);
+      expect((blocks[0] as UserMessageBlock).content).toEqual([
+        { type: "input_text", text: "[System: teammate buddy finished]\nTMREPLY done." },
+      ]);
+    });
+
+    it("keeps a delivery a human submitted from the web as their own bubble", () => {
+      const human: ConversationItem = {
+        ...userMessage("resp_1", framed(prose), "msg_human"),
+        user_authored: true,
+      };
+
+      const [block] = itemsToBlocks([human]);
+
+      expect((block as UserMessageBlock).content[0]).toEqual({
+        type: "input_text",
+        text: framed(prose),
+      });
+    });
   });
 
   it("user + assistant items produce [UserMessageBlock, TextDone] in order", () => {

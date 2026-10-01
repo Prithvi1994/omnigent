@@ -61,7 +61,12 @@ import {
 } from "./conversationItems";
 import { nativePolicyNameForAgentName } from "./nativeCodingAgents";
 import { routingExtrasFromWire } from "./routingDecision";
-import { isClaudeAgentMessageContent, taskNotificationMarkerContent } from "./systemMessage";
+import {
+  isClaudeAgentMessageContent,
+  taskNotificationMarkerContent,
+  teammateDeliveryMarkerContent,
+  teammateMarkerOf,
+} from "./systemMessage";
 import { readSubagentActivity } from "./subagentActivity";
 
 // Claude built-ins whose call is a question TO the user rather than work
@@ -104,9 +109,28 @@ export function itemsToBlocks(items: ConversationItem[]): AnyBlock[] {
       if (card !== null) blocks.push(card);
     }
     const block = itemToBlock(item, agents.get(item.response_id));
-    if (block !== null) blocks.push(block);
+    if (block === null || foldsTeammateIdleMarker(block, blocks)) continue;
+    blocks.push(block);
   }
   return blocks;
+}
+
+/**
+ * Whether a "teammate finished" marker only restates the prose delivery that
+ * precedes it from the same teammate (Claude sends an idle notification after
+ * every teammate turn). A one-shot idle result with no prose before it stays.
+ */
+export function foldsTeammateIdleMarker(block: AnyBlock, previous: readonly AnyBlock[]): boolean {
+  if (block.type !== "user_message") return false;
+  const marker = teammateMarkerOf(block.content);
+  if (marker?.kind !== "teammate_finished") return false;
+  for (let index = previous.length - 1; index >= 0; index -= 1) {
+    const candidate = previous[index]!;
+    if (candidate.type !== "user_message") continue;
+    const earlier = teammateMarkerOf(candidate.content);
+    if (earlier?.teammateId === marker.teammateId) return earlier.kind === "teammate_message";
+  }
+  return false;
 }
 
 function agentNamesByResponseId(items: ConversationItem[]): Map<string, string | null> {
@@ -254,6 +278,10 @@ function itemToBlock(item: ConversationItem, agentName?: string | null): AnyBloc
     if (!item.is_meta && (item.created_by || item.user_authored === true)) {
       return userMessageToBlock(item);
     }
+    // An agent-teams delivery is hidden context that wakes the lead; show it
+    // as a readable teammate marker instead of the raw envelope.
+    const teammate = teammateDeliveryMarkerContent(item.content);
+    if (teammate !== null) return { ...userMessageToBlock(item), content: teammate };
     if (isClaudeAgentMessageContent(item.content)) return null;
     // Claude Code's background-task wake: the CLI injects a
     // `<task-notification>` user entry (mirrored with `is_meta`) and

@@ -56,7 +56,7 @@ import type {
 import { userInputElicitationKey } from "@/lib/askUserQuestion";
 import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
-import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import { foldsTeammateIdleMarker, itemsToBlocks } from "@/lib/itemsToBlocks";
 import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
 import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
@@ -149,6 +149,7 @@ import {
   isClaudeAgentMessageContent,
   isSystemUserContent,
   taskNotificationMarkerContent,
+  teammateDeliveryMarkerContent,
 } from "@/lib/systemMessage";
 import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
 import type { StoredReplyDraft } from "@/lib/replyDraft";
@@ -6213,10 +6214,10 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
       (b.type === "input_text" || b.type === "input_image" || b.type === "input_file"),
   );
   if (event.isMeta !== true && isHumanAuthoredInput(event)) return content;
-  // A Claude background-task wake is hidden context (`is_meta`) that still
-  // has to start a new turn on screen: render it as a system marker. Every
-  // other meta message (injected skill text) stays hidden.
-  const marker = taskNotificationMarkerContent(content);
+  // A Claude background-task wake or agent-teams delivery is hidden context
+  // (`is_meta`) that still has to start a new turn on screen: render it as a
+  // readable marker. Every other meta message (injected skill text) stays hidden.
+  const marker = taskNotificationMarkerContent(content) ?? teammateDeliveryMarkerContent(content);
   if (marker !== null) return marker;
   if (event.isMeta === true) return null;
   return content;
@@ -7147,12 +7148,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         // 3. Nothing pending (or a marker that owns no bubble) — render the
         //    event payload fresh.
         if (eventContent === null) return {};
-        return {
-          blocks: [
-            ...s.blocks,
-            committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
-          ],
-        };
+        const fresh = committedUserBlock(event.itemId, eventContent, undefined, event.createdBy);
+        if (foldsTeammateIdleMarker(fresh, s.blocks)) return {};
+        return { blocks: [...s.blocks, fresh] };
       });
       return;
     case "slash_command":

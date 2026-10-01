@@ -48,6 +48,144 @@ function isClaudeAgentMessageText(text: string): boolean {
   );
 }
 
+/** One `<teammate-message>` envelope from a Claude agent-teams delivery. */
+export interface TeammateDelivery {
+  teammateId: string;
+  summary: string | null;
+  /** Envelope body; the raw `idle_notification` JSON when `idleResult` is set. */
+  body: string;
+  /** `result` of an `idle_notification` envelope; `null` for a prose message. */
+  idleResult: string | null;
+}
+
+/** Identity of a readable teammate marker produced by `teammateDeliveryMarkerContent`. */
+export interface TeammateMarker {
+  teammateId: string;
+  kind: "teammate_message" | "teammate_finished";
+}
+
+const TEAMMATE_ENVELOPE_RE = /^<teammate-message\s+([^>]*)>([\s\S]*?)<\/teammate-message>/;
+const TEAMMATE_ATTR_RE = /([A-Za-z_][\w-]*)="([^"]*)"/g;
+const TEAMMATE_HEADER_RE = /^teammate (\S+)(?: (finished)|: (.*))?$/;
+
+function idleNotificationResult(body: string): string | null {
+  if (!body.startsWith("{")) return null;
+  try {
+    const decoded: unknown = JSON.parse(body);
+    if (!decoded || typeof decoded !== "object") return null;
+    const record = decoded as Record<string, unknown>;
+    if (record.type !== "idle_notification") return null;
+    return typeof record.result === "string" ? record.result.trim() : "";
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse Claude's framed agent-teams delivery ("Another Claude session sent a
+ * message:" + envelopes, optionally followed by Claude's guidance) into its
+ * envelopes; bare envelopes, human discussion, and incomplete markup yield `null`.
+ */
+export function parseTeammateDeliveries(text: string): TeammateDelivery[] | null {
+  const prefix = TEAMMATE_MESSAGE_PREFIXES.find((candidate) => text.startsWith(candidate));
+  if (!prefix) return null;
+  let remaining = text.slice(prefix.length).trimStart();
+  const deliveries: TeammateDelivery[] = [];
+  let match = TEAMMATE_ENVELOPE_RE.exec(remaining);
+  while (match) {
+    const attrs = new Map<string, string>();
+    for (const [, key, value] of match[1]!.matchAll(TEAMMATE_ATTR_RE)) attrs.set(key!, value!);
+    const teammateId = attrs.get("teammate_id")?.trim();
+    if (!teammateId) return null;
+    const body = match[2]!.trim();
+    deliveries.push({
+      teammateId,
+      summary: attrs.get("summary")?.trim() || null,
+      body,
+      idleResult: idleNotificationResult(body),
+    });
+    remaining = remaining.slice(match[0].length).trimStart();
+    match = TEAMMATE_ENVELOPE_RE.exec(remaining);
+  }
+  if (deliveries.length === 0) return null;
+  if (remaining && !TEAMMATE_DELIVERY_GUIDANCE.some((guidance) => remaining.startsWith(guidance))) {
+    return null;
+  }
+  return deliveries;
+}
+
+function teammateMarkerHeader(
+  teammateId: string,
+  summary: string | null,
+  finished: boolean,
+): string {
+  // The header regex takes the id as one token and keeps the summary on its line.
+  const id = teammateId.replace(/\s+/g, "-");
+  if (finished) return `[System: teammate ${id} finished]`;
+  const line = summary?.replace(/\s+/g, " ").trim();
+  return line ? `[System: teammate ${id}: ${line}]` : `[System: teammate ${id}]`;
+}
+
+/**
+ * Re-label a framed teammate delivery as a readable marker: the prose body with
+ * its `summary`, or the result an idle notification carries. An idle twin that
+ * trails a prose message from the same teammate only restates it and is folded
+ * away; a result-less idle ping has nothing to show. `null` for anything else.
+ */
+export function teammateDeliveryMarkerContent(
+  content: MessageContentBlock[],
+): MessageContentBlock[] | null {
+  if (content.some((block) => !isTextBlock(block))) return null;
+  const texts = content
+    .filter(isTextBlock)
+    .map((block) => block.text.trim())
+    .filter(Boolean);
+  if (texts.length === 0) return null;
+  const deliveries: TeammateDelivery[] = [];
+  for (const text of texts) {
+    const parsed = parseTeammateDeliveries(text);
+    if (parsed === null) return null;
+    deliveries.push(...parsed);
+  }
+  let header: string | null = null;
+  const lines: string[] = [];
+  deliveries.forEach((delivery, index) => {
+    const idle = delivery.idleResult !== null;
+    if (idle) {
+      const restatesProse = deliveries
+        .slice(0, index)
+        .some((other) => other.teammateId === delivery.teammateId && other.idleResult === null);
+      if (restatesProse || !delivery.idleResult) return;
+    }
+    const text = idle ? (delivery.idleResult ?? "") : delivery.body;
+    if (header === null) {
+      header = teammateMarkerHeader(delivery.teammateId, delivery.summary, idle);
+      if (text) lines.push(text);
+      return;
+    }
+    lines.push(
+      idle ? `@${delivery.teammateId} finished: ${text}` : `@${delivery.teammateId}: ${text}`,
+    );
+  });
+  if (header === null) return null;
+  const text = lines.length > 0 ? `${header}\n${lines.join("\n\n")}` : header;
+  return [{ type: "input_text", text }];
+}
+
+/** Identify a teammate marker in user-message content; `null` for anything else. */
+export function teammateMarkerOf(content: MessageContentBlock[]): TeammateMarker | null {
+  if (content.some((block) => !isTextBlock(block))) return null;
+  const text = content
+    .filter(isTextBlock)
+    .map((block) => block.text)
+    .join("")
+    .trim();
+  const parsed = parseSystemMessage(text);
+  if (!parsed?.teammate) return null;
+  if (parsed.kind !== "teammate_message" && parsed.kind !== "teammate_finished") return null;
+  return { teammateId: parsed.teammate.id, kind: parsed.kind };
+}
+
 export type SystemMessageKind =
   | "task_completed"
   | "task_failed"
@@ -55,6 +193,8 @@ export type SystemMessageKind =
   | "timer_fired"
   | "terminal_idle"
   | "subagent_wake"
+  | "teammate_message"
+  | "teammate_finished"
   | "interrupted"
   | "generic";
 
@@ -64,6 +204,8 @@ export interface ParsedSystemMessage {
   label: string;
   /** Everything after the header line. Empty for headers without a body. */
   body: string;
+  /** Set for the teammate kinds: who sent the delivery and its one-line summary. */
+  teammate?: { id: string; summary: string | null };
 }
 
 const HEADER_RE = /^\[System: (.+)\]$/;
@@ -168,6 +310,14 @@ export function parseSystemMessage(text: string): ParsedSystemMessage | null {
       label: "Sub-agent result ready",
       body,
     };
+  }
+  const teammateMatch = TEAMMATE_HEADER_RE.exec(inner);
+  if (teammateMatch) {
+    const [, id, finished, summary] = teammateMatch;
+    const teammate = { id: id!, summary: finished ? null : (summary ?? null) };
+    return finished
+      ? { kind: "teammate_finished", label: `Teammate ${id} finished`, body, teammate }
+      : { kind: "teammate_message", label: `Teammate ${id}`, body, teammate };
   }
   // Known prefix, unknown pattern — still treat as a system marker so new
   // producers get the muted styling without an web change.

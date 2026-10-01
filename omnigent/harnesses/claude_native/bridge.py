@@ -2625,8 +2625,9 @@ def augment_claude_args(
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
+    args, settings = _merge_launch_settings(args, hook_settings)
     settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
-    _write_json_file(settings_path, hook_settings)
+    _write_json_file(settings_path, settings)
     args.extend(
         [
             "--mcp-config",
@@ -2713,6 +2714,81 @@ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
     existing = [tool for tool in args[value_idx].split(",") if tool]
     args[value_idx] = ",".join(dict.fromkeys([*existing, *extra]))
     return args
+
+
+def _load_settings_layer(value: str) -> _JsonObject | None:
+    """Parse a ``--settings`` value: a JSON object literal or the path of one."""
+    text = value.strip()
+    if not text.startswith("{"):
+        try:
+            text = Path(value).expanduser().read_text(encoding="utf-8")
+        except OSError:
+            return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _overlay_settings(base: _JsonObject, top: _JsonObject) -> _JsonObject:
+    """Apply ``top`` over ``base``: hooks concatenate per event, env/permissions merge per key."""
+    merged = dict(base)
+    for key, value in top.items():
+        current = merged.get(key)
+        if key == "hooks" and isinstance(current, dict) and isinstance(value, dict):
+            hooks = dict(current)
+            for event, entries in value.items():
+                existing = hooks.get(event)
+                hooks[event] = (
+                    [*existing, *entries]
+                    if isinstance(existing, list) and isinstance(entries, list)
+                    else entries
+                )
+            merged[key] = hooks
+        elif (
+            key in ("env", "permissions") and isinstance(current, dict) and isinstance(value, dict)
+        ):
+            merged[key] = {**current, **value}
+        else:
+            merged[key] = value
+    return merged
+
+
+def _merge_launch_settings(
+    args: list[str], hook_settings: _JsonObject
+) -> tuple[list[str], _JsonObject]:
+    """
+    Fold user-supplied ``--settings`` layers into the invocation settings.
+
+    Claude keeps only the last ``--settings`` flag, so a per-session layer (e.g.
+    enabling agent teams) would otherwise be discarded by the hook settings
+    appended after it. User layers form the base, in order, with the Omnigent
+    wiring applied on top; an unparseable value is left for Claude to report.
+    """
+    remaining: list[str] = []
+    layers: list[_JsonObject] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--settings" and index + 1 < len(args):
+            flag, value, index = [arg, args[index + 1]], args[index + 1], index + 2
+        elif arg.startswith("--settings="):
+            flag, value, index = [arg], arg.partition("=")[2], index + 1
+        else:
+            remaining.append(arg)
+            index += 1
+            continue
+        layer = _load_settings_layer(value)
+        if layer is None:
+            _logger.warning("claude-native: leaving unparseable --settings value for Claude")
+            remaining.extend(flag)
+            continue
+        layers.append(layer)
+    merged: _JsonObject = {}
+    for layer in layers:
+        merged = _overlay_settings(merged, layer)
+    return remaining, _overlay_settings(merged, hook_settings)
 
 
 def _merge_disallowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
@@ -8252,9 +8328,47 @@ def _parse_slash_command_record(content: str) -> _SlashCommandPayload | None:
     return _SlashCommandPayload(name=name, arguments=arguments, output=output)
 
 
+def _prefixed_teammate_envelopes(text: str) -> str | None:
+    """Return what follows Claude's delivery prefix and teammate envelopes, or ``None``."""
+    stripped = text.lstrip()
+    for prefix in _TEAMMATE_MESSAGE_PREFIXES:
+        if stripped.startswith(prefix):
+            stripped = stripped[len(prefix) :].lstrip()
+            break
+    else:
+        return None
+    if _TEAMMATE_MESSAGE_RE.match(stripped) is None:
+        return None
+    while match := _TEAMMATE_MESSAGE_RE.match(stripped):
+        stripped = stripped[match.end() :].lstrip()
+    return stripped
+
+
+def _is_framed_teammate_delivery(text: str) -> bool:
+    """Claude's own delivery framing: prefix, envelopes, then its guidance paragraph.
+
+    Claude Code 2.1.x writes teammate deliveries without ``origin`` metadata, so
+    this framing is the provenance; a human typing in the TUI never produces it.
+    """
+    remainder = _prefixed_teammate_envelopes(text)
+    return remainder is not None and remainder.startswith(_TEAMMATE_DELIVERY_GUIDANCE)
+
+
+def _wakes_parent_turn(text: str) -> bool:
+    """Hidden input that starts a new lead turn: a task notification or a teammate delivery."""
+    if text.lstrip().startswith("<task-notification>"):
+        return True
+    remainder = _prefixed_teammate_envelopes(text)
+    return remainder is not None and (
+        not remainder or remainder.startswith(_TEAMMATE_DELIVERY_GUIDANCE)
+    )
+
+
 def _is_trusted_agent_notification_text(text: str, *, origin: object = None) -> bool:
-    """Honor native peer provenance and the existing task-notification boundary."""
+    """Honor peer provenance, Claude's delivery framing, and the task-notification boundary."""
     if isinstance(origin, dict) and origin.get("kind") == "peer":
+        return True
+    if _is_framed_teammate_delivery(text):
         return True
     stripped = text.lstrip()
     return stripped.startswith("<task-notification>") and all(
@@ -8528,12 +8642,7 @@ def _user_transcript_items_from_entry(
                     subagent_return_id=return_id,
                 )
             )
-            return (
-                None
-                if content.lstrip().startswith("<task-notification>")
-                else current_response_id,
-                items,
-            )
+            return (None if _wakes_parent_turn(content) else current_response_id, items)
         stripped = content.lstrip()
         # Skill invocations with args ship the tag order
         # ``<command-message>…<command-name>…<command-args>…`` — i.e.
@@ -8638,7 +8747,7 @@ def _user_transcript_items_from_entry(
                     )
                 )
                 item_index += 1
-                saw_user_text = saw_user_text or text.lstrip().startswith("<task-notification>")
+                saw_user_text = saw_user_text or _wakes_parent_turn(text)
                 continue
             # Claude may emit CLI scaffolding as text blocks; never render it
             # as user input when the transcript shape changes.
