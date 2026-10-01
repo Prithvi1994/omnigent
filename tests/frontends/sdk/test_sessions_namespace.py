@@ -1661,6 +1661,8 @@ async def test_session_routes_reject_dot_segment_ids(bad_id: str) -> None:
             await ns.set_labels(bad_id, labels={"team": "platform"})
         with pytest.raises(ValueError):
             await ns.delete(bad_id)
+        with pytest.raises(ValueError):
+            await ns.resolve_elicitation("conv_abc", bad_id, {"action": "accept"})
     finally:
         await client.aclose()
 

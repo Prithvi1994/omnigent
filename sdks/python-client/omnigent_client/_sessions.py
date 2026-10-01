@@ -64,25 +64,26 @@ _INTERRUPT_TYPE: str = "interrupt"
 
 def _session_url(base_url: str, session_id: str, *subpath: str) -> str:
     """
-    Build ``{base_url}/v1/sessions/{session_id}[/subpath...]`` with the id
-    confined to one path segment, so a caller-supplied value such as
+    Build ``{base_url}/v1/sessions/{session_id}[/subpath...]`` with every
+    segment percent-encoded on its own, so a caller-supplied value such as
     ``"../projects/p"`` or ``"conv_x?delete_branch=true"`` cannot reach
     another route or add query parameters.
 
     :param base_url: Server base URL without a trailing slash.
     :param session_id: Session/conversation identifier.
-    :param subpath: Fixed route segments appended after the id, e.g.
-        ``"items"``. Pass any further caller-supplied id through
-        :func:`quote` first.
+    :param subpath: Further segments appended after the id, e.g.
+        ``"items"`` or a caller-supplied elicitation id.
     :returns: The percent-encoded session URL.
-    :raises ValueError: If *session_id* is empty, ``"."``, or ``".."``.
+    :raises ValueError: If any segment is empty, ``"."``, or ``".."``.
         ``quote`` leaves dots alone and HTTP clients collapse dot
-        segments, so those values would address ``/v1/sessions`` or
-        ``/v1`` instead of a session.
+        segments, so those values would address a parent route instead.
     """
-    if not session_id or session_id in {".", ".."}:
-        raise ValueError(f"invalid session id: {session_id!r}")
-    return "/".join((f"{base_url}/v1/sessions/{quote(session_id, safe='')}", *subpath))
+    segments = (session_id, *subpath)
+    if any(not segment or segment in {".", ".."} for segment in segments):
+        raise ValueError(f"invalid session URL segment in {segments!r}")
+    return "/".join(
+        (f"{base_url}/v1/sessions", *(quote(segment, safe="") for segment in segments))
+    )
 
 
 @dataclass(frozen=True)
@@ -1252,9 +1253,7 @@ class SessionsNamespace:
             status (404 when the session does not exist).
         """
         resp = await self._http.post(
-            _session_url(
-                self._base, session_id, "elicitations", quote(elicitation_id, safe=""), "resolve"
-            ),
+            _session_url(self._base, session_id, "elicitations", elicitation_id, "resolve"),
             json=result,
         )
         raise_for_status(resp.status_code, response_body(resp))
