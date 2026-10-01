@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from omnigent.db.utils import builtin_agent_id, now_epoch
 from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.debug_logging import add_audit_attrs, debug_event
 from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
@@ -716,6 +717,62 @@ def _host_failure_code(entry: dict[str, Any]) -> str:
     return ImportErrorCode.SESSION_UNREADABLE
 
 
+def _log_import_outcome(
+    route: str,
+    *,
+    source: str,
+    counts: dict[str, int],
+    failures: list[ImportFailureRef],
+    error: _ImportFailureReport | None,
+    started_at: float,
+) -> None:
+    """Record one import's outcome where the debug sink and logs can see it.
+
+    The stream answers 200 before anything is imported, so request metrics and
+    the audit envelope (written when the response starts) can't tell a failed
+    import from a good one; this event carries the tally and every code.
+    """
+    failure_codes: dict[str, int] = {}
+    for failure in failures:
+        failure_codes[failure.code] = failure_codes.get(failure.code, 0) + 1
+        _logger.info(
+            "Imported session failed (%s)",
+            failure.code,
+            extra=debug_event(
+                "import_session_failed",
+                route=route,
+                source=failure.source or source,
+                code=failure.code,
+                retryable=failure.retryable,
+                external_session_id=failure.external_session_id,
+            ),
+        )
+    outcome = "error" if error is not None else ("partial" if failures else "ok")
+    log = _logger.warning if error is not None else _logger.info
+    log(
+        "Local session import finished (%s): imported=%d already_imported=%d failed=%d",
+        outcome,
+        counts.get("imported", 0),
+        counts.get("already_imported", 0),
+        counts.get("failed", 0),
+        extra=debug_event(
+            "import_local_finished",
+            route=route,
+            source=source,
+            outcome=outcome,
+            imported=counts.get("imported", 0),
+            already_imported=counts.get("already_imported", 0),
+            failed=counts.get("failed", 0),
+            total=counts.get("total"),
+            code=error.import_code if error is not None else None,
+            error_id=(error.error_id or None) if error is not None else None,
+            failure_codes=",".join(f"{code}:{n}" for code, n in sorted(failure_codes.items()))
+            or None,
+            duration_ms=int((time.monotonic() - started_at) * 1000),
+        ),
+    )
+
+
 def _already_imported_error(message: str, session_id: str) -> LocalImportError:
     """The 409 for a duplicate import, naming the session that already exists."""
     return LocalImportError(
@@ -1095,6 +1152,7 @@ def create_imports_router(
                 # Matches a prior import or a native run of the same session
                 # (both record the external id), so "exists", not "imported".
                 # The id lets the CLI point at it instead of failing.
+                add_audit_attrs(import_code=ImportErrorCode.ALREADY_IMPORTED)
                 raise _already_imported_error(
                     f"This {body.source} session already exists as {existing.id}", existing.id
                 )
@@ -1119,7 +1177,13 @@ def create_imports_router(
         except Exception as exc:
             # A storage failure the backend recognizes gets its status and message;
             # anything else is `internal` with the id of its log line.
-            raise _session_store_error(conversation_store, exc) from exc
+            failure = _session_store_error(conversation_store, exc)
+            error_id = failure.details.get("error_id")
+            add_audit_attrs(
+                import_code=failure.import_code,
+                error_id=error_id if isinstance(error_id, str) else None,
+            )
+            raise failure from exc
 
         response.status_code = 201
         return ImportSessionResponse(
@@ -1426,6 +1490,25 @@ def create_imports_router(
         counts: dict[str, int] = {}
         sessions: list[ImportedSessionRef] = []
         failures: list[ImportFailureRef] = []
+        started_at = time.monotonic()
+
+        def _finish(error: _ImportFailureReport | None) -> None:
+            _log_import_outcome(
+                "imports_local",
+                source=body.source,
+                counts=counts,
+                failures=failures,
+                error=error,
+                started_at=started_at,
+            )
+            add_audit_attrs(
+                import_code=error.import_code if error is not None else None,
+                error_id=error.error_id if error is not None else None,
+                imported=counts.get("imported", 0),
+                already_imported=counts.get("already_imported", 0),
+                failed=counts.get("failed", 0),
+            )
+
         try:
             async for event in _import_local_core(
                 body,
@@ -1440,16 +1523,19 @@ def create_imports_router(
                     sessions.append(event)
         except OmnigentError as exc:
             report = _record_local_import_failure(exc)
+            _finish(report)
             return JSONResponse(
                 status_code=exc.http_status,
                 content={"error": {**exc.details, **report.body(), "code": exc.code}},
             )
         except Exception as exc:  # noqa: BLE001 - classified body instead of a bare 500
             report = _record_local_import_failure(exc)
+            _finish(report)
             return JSONResponse(
                 status_code=500,
                 content={"error": {**report.body(), "code": ErrorCode.INTERNAL_ERROR}},
             )
+        _finish(None)
         return LocalImportResponse(
             imported=counts.get("imported", 0),
             already_imported=counts.get("already_imported", 0),
@@ -1491,6 +1577,7 @@ def create_imports_router(
             counts: dict[str, int] = {}
             failures: list[ImportFailureRef] = []
             error: _ImportFailureReport | None = None
+            started_at = time.monotonic()
             last_progress: tuple[int, int | None] | None = None
             try:
                 async for event in _import_local_core(
@@ -1518,6 +1605,28 @@ def create_imports_router(
                 # a body that just stops reads as a network error and loses the tally.
                 # Cancellation (client gone) is a BaseException and still propagates.
                 error = _record_local_import_failure(exc)
+            except BaseException:
+                # Client gone or server shutting down: nothing more can be sent,
+                # but the outcome is still worth a record.
+                _log_import_outcome(
+                    "imports_local_stream",
+                    source=body.source,
+                    counts=counts,
+                    failures=failures,
+                    error=_ImportFailureReport(
+                        "", "stream cancelled", ImportErrorCode.STREAM_INTERRUPTED, True
+                    ),
+                    started_at=started_at,
+                )
+                raise
+            _log_import_outcome(
+                "imports_local_stream",
+                source=body.source,
+                counts=counts,
+                failures=failures,
+                error=error,
+                started_at=started_at,
+            )
             # Per-session failures (with reasons) after the successes so the
             # caller can name each one, not just count them.
             for failure in failures:
