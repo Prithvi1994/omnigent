@@ -164,7 +164,11 @@ def test_scrolling_back_through_history_never_moves_the_offset(
     page_fetches: list[str] = []
     page.on(
         "request",
-        lambda request: page_fetches.append(request.url) if "after=" in request.url else None,
+        lambda request: (
+            page_fetches.append(request.url)
+            if "after=" in request.url and "order=asc" not in request.url
+            else None
+        ),
     )
     page.set_viewport_size(_VIEWPORT)
     page.goto(f"{base_url}/c/{session_id}")

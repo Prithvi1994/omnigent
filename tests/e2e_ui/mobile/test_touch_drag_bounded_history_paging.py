@@ -131,7 +131,7 @@ def _seed_tool_heavy_transcript(session_id: str) -> None:
 
 
 def _track_items_requests(page, session_id: str) -> None:
-    """Record every `/items` request the page makes, in order."""
+    """Record history-window reads, excluding forward connection catch-up."""
     endpoint = f"/v1/sessions/{session_id}/items"
     page.add_init_script(
         f"""
@@ -141,7 +141,10 @@ def _track_items_requests(page, session_id: str) -> None:
           const originalFetch = window.fetch.bind(window);
           window.fetch = (input, init) => {{
             const url = typeof input === "string" ? input : input.url;
-            if (url.includes(endpoint)) window.__itemsUrls.push(url);
+            const isCatchUp = new URL(url, location.href).searchParams.get("order") === "asc";
+            if (url.includes(endpoint) && !isCatchUp) {{
+              window.__itemsUrls.push(url);
+            }}
             return originalFetch(input, init);
           }};
         }})();
@@ -209,8 +212,7 @@ def test_one_touch_drag_loads_bounded_history(
         # The newest assistant summary hydrates into view.
         expect(page.get_by_text("FINAL SUMMARY 1", exact=False)).to_be_visible(timeout=30_000)
 
-        # Hands off: the open fetches its whole window in exactly one request
-        # and nothing more happens while the reader hasn't touched anything.
+        # Opening fetches one history window; older pages need a reader gesture.
         page.wait_for_timeout(3_000)
         urls = page.evaluate("window.__itemsUrls")
         assert len(urls) == 1, urls

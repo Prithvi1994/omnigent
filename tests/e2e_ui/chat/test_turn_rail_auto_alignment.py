@@ -18,11 +18,11 @@ _STABLE_READS = 8
 
 
 def _track_history_paging(page: Page) -> list[str]:
-    """Collect item fetches that page older history (carry an `after` cursor)."""
+    """Collect item fetches that page older history (descending scan with an `after` cursor)."""
     paging: list[str] = []
 
     def on_request(request: Request) -> None:
-        if "/items?" in request.url and "after=" in request.url:
+        if "/items?" in request.url and "after=" in request.url and "order=asc" not in request.url:
             paging.append(request.url)
 
     page.on("request", on_request)
