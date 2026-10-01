@@ -6,7 +6,7 @@
 //   3. Link button appears for addressed comments too (after switching the tab).
 //   4. No link button is rendered when onCopyCommentLink is omitted.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Comment } from "@/hooks/useComments";
 import { getCurrentAuthorId } from "@/lib/identity";
@@ -408,16 +408,17 @@ describe("CommentsPanel show more / less", () => {
 //
 // Parent-row width, not viewport width, controls the resize handle.
 
-/** Render the panel inside a parent row that reports the given pixel width. */
-function renderPanelInRow(rowWidth: number) {
+/** Render the panel inside a parent row whose pixel width the getter reports. */
+function renderPanelInRow(rowWidth: number | (() => number)) {
+  const width = typeof rowWidth === "function" ? rowWidth : () => rowWidth;
   const row = document.createElement("div");
   row.getBoundingClientRect = () =>
     ({
-      width: rowWidth,
+      width: width(),
       height: 600,
       top: 0,
       left: 0,
-      right: rowWidth,
+      right: width(),
       bottom: 600,
       x: 0,
       y: 0,
@@ -465,6 +466,41 @@ describe("CommentsPanel resize affordance", () => {
   it("omits the handle when the viewer row is too narrow", () => {
     renderPanelInRow(220);
     expect(screen.queryByRole("separator", { name: "Resize comments panel" })).toBeNull();
+  });
+
+  it("follows the row across the breakpoint and restores the preferred width", () => {
+    const observers: ResizeObserverCallback[] = [];
+    class StubResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        observers.push(callback);
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+    let rowWidth = 800;
+    try {
+      renderPanelInRow(() => rowWidth);
+      const handle = () => screen.queryByRole("separator", { name: "Resize comments panel" });
+      const panel = handle()?.parentElement as HTMLElement;
+      expect(panel.style.getPropertyValue("--comments-panel-width")).toBe("240px");
+
+      // The rail shrinks below the breakpoint: the panel stacks and the width
+      // clamps to the floor.
+      rowWidth = 300;
+      act(() => observers.forEach((cb) => cb([], {} as ResizeObserver)));
+      expect(handle()).toBeNull();
+      expect(panel.style.getPropertyValue("--comments-panel-width")).toBe("200px");
+
+      // Space returns: the handle is back and the default width is restored.
+      rowWidth = 800;
+      act(() => observers.forEach((cb) => cb([], {} as ResizeObserver)));
+      expect(handle()).not.toBeNull();
+      expect(panel.style.getPropertyValue("--comments-panel-width")).toBe("240px");
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

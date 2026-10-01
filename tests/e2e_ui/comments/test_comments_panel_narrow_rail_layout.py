@@ -1,10 +1,8 @@
 """E2E: Comments panel and editor toolbar layout in a narrow Workspace rail.
 
-Opening the Comments panel next to the rich-text editor inside the Workspace
-rail squeezes the editor column on a laptop-sized window. The panel's controls
-must stay inside the rail and the window without covering the editor's
-formatting toolbar, the toolbar's buttons must keep to one row inside the
-toolbar, and every Workspace tab must stay reachable.
+With Comments open beside the rich-text editor on a laptop-sized window, the
+panel's controls must stay inside the rail and clear of the toolbar, the toolbar
+must keep one row inside its box, and every Workspace tab must stay reachable.
 """
 
 from __future__ import annotations
@@ -47,7 +45,9 @@ _ROW_TOLERANCE_PX = 4
 
 Box = dict[str, float]
 
-# Workspace tabs clipped by an ancestor the user cannot scroll are unreachable.
+# A tab is reachable when it sits inside its clipping ancestor, or when that
+# ancestor is user-scrollable and scrolling shows as much of the tab as the
+# ancestor's own width allows.
 _TAB_STRIP_CLIP_JS = """
 () => {
   const out = [];
@@ -65,13 +65,19 @@ _TAB_STRIP_CLIP_JS = """
       a = a.parentElement;
     }
     if (!container) continue;
-    if (['auto', 'scroll'].includes(getComputedStyle(container).overflowX)) continue;
+    const scrollable = ['auto', 'scroll'].includes(getComputedStyle(container).overflowX);
+    if (scrollable) b.scrollIntoView({ inline: 'nearest', block: 'nearest' });
+    const br = b.getBoundingClientRect();
     const cr = container.getBoundingClientRect();
-    if (r.right > cr.right + 1 || r.left < cr.left - 1) {
+    const visible = Math.min(br.right, cr.right) - Math.max(br.left, cr.left);
+    const required = scrollable ? Math.min(br.width, cr.width) : br.width;
+    if (visible < required - 1) {
       out.push({
         label: (b.getAttribute('aria-label') || b.title || b.textContent || '')
           .trim().replace(/\\s+/g, ' ').slice(0, 40),
-        rect: [r.left, r.right].map(Math.round),
+        scrollable,
+        visible: Math.round(visible),
+        rect: [br.left, br.right].map(Math.round),
         container: [cr.left, cr.right].map(Math.round),
       });
     }
@@ -205,6 +211,7 @@ def _measure(page: Page, file_viewer: Locator, panel: Locator, out_dir: Path, ta
         "toolbar": _box(toolbar, "Formatting toolbar"),
         "controls": {name: _box(loc, name) for name, loc in _panel_controls(panel).items()},
         "toolbar_buttons": _toolbar_buttons(toolbar),
+        # Evaluated last: it may scroll the tab strip to reveal a tab.
         "clipped_tabs": page.evaluate(_TAB_STRIP_CLIP_JS),
     }
     (out_dir / f"{tag}.json").write_text(json.dumps(report, indent=1))
@@ -265,7 +272,8 @@ def _toolbar_violations(report: dict) -> list[str]:
 
 def _tab_strip_violations(report: dict) -> list[str]:
     return [
-        f"workspace tab {c['label']!r} is clipped outside its non-scrollable strip: "
+        f"workspace tab {c['label']!r} shows only {c['visible']}px inside its "
+        f"{'strip even after scrolling' if c['scrollable'] else 'non-scrollable strip'}: "
         f"tab x={c['rect'][0]}..{c['rect'][1]} vs strip x={c['container'][0]}..{c['container'][1]}"
         for c in report["clipped_tabs"]
     ]
@@ -323,3 +331,28 @@ def test_workspace_tabs_stay_reachable_beside_comments_panel(
     report = _report_for(browser, seeded_agents_md_session, output_path, "tabs", width, height)
     violations = _tab_strip_violations(report)
     assert not violations, f"at {width}x{height}:\n" + "\n".join(violations)
+
+
+def test_folded_toolbar_menu_inserts_table(
+    browser: Browser,
+    seeded_agents_md_session: tuple[str, str],
+) -> None:
+    """Tools folded into the toolbar's "⋯" menu still act on the editor."""
+    base_url, session_id = seeded_agents_md_session
+    page = _new_page(browser, 1024, 768)
+    try:
+        file_viewer, _panel = _open_file_with_pending_comment(page, base_url, session_id)
+        toolbar = file_viewer.get_by_role("toolbar", name="Formatting")
+        editor = file_viewer.locator("[contenteditable='true']")
+        expect(editor.locator("table")).to_have_count(0)
+
+        toolbar.get_by_role("button", name="More formatting").click()
+        # Folded tools render in a popover outside the toolbar; the table picker
+        # opens a second popover inside it.
+        page.get_by_role("button", name="Insert table").click()
+        page.get_by_role("button", name="Insert 2×2 table").click()
+
+        expect(editor.locator("table")).to_be_visible()
+        expect(editor.locator("table tr")).to_have_count(2)
+    finally:
+        page.context.close()

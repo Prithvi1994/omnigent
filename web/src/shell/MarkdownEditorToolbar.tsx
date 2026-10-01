@@ -246,28 +246,32 @@ interface ToolbarItem {
   node: React.ReactNode;
 }
 
+type ToolbarSlot = { kind: "item"; item: ToolbarItem } | { kind: "divider"; key: string };
+
 const MEASURE_DIVIDER = "divider";
 const MEASURE_MORE = "more";
+/** Tolerance for sub-pixel rounding in the measured widths. */
+const FIT_SLACK_PX = 2;
 
-function renderWithDividers(items: readonly ToolbarItem[]): React.ReactNode[] {
-  const nodes: React.ReactNode[] = [];
+/** The inline row's slots: visible items with a divider between adjacent groups. */
+function inlineSequence(items: readonly ToolbarItem[], hidden: ReadonlySet<string>): ToolbarSlot[] {
+  const slots: ToolbarSlot[] = [];
   let lastGroup: ToolbarGroup | null = null;
   for (const item of items) {
+    if (item.group === "copy" || hidden.has(item.key)) continue;
     if (lastGroup !== null && lastGroup !== item.group) {
-      nodes.push(<Divider key={`${item.key}-divider`} />);
+      slots.push({ kind: "divider", key: `${item.key}-divider` });
     }
-    nodes.push(<Fragment key={item.key}>{item.node}</Fragment>);
+    slots.push({ kind: "item", item });
     lastGroup = item.group;
   }
-  return nodes;
+  return slots;
 }
 
 /**
- * Keep the toolbar on one row by folding items into a trailing "⋯" menu.
- *
- * Widths come from an offscreen clone of every item (`measureRef`) plus the
- * live save-status pill, so the decision never depends on which items are
- * currently inline. Items fold lowest priority first until the row fits.
+ * Fold items into a trailing "⋯" menu, lowest priority first, until the row
+ * fits. Widths come from an offscreen clone of every item plus the live status
+ * pill, so the decision never depends on which items are currently inline.
  */
 function useToolbarOverflow(items: readonly ToolbarItem[]) {
   const rowRef = useRef<HTMLDivElement | null>(null);
@@ -285,6 +289,8 @@ function useToolbarOverflow(items: readonly ToolbarItem[]) {
     const cluster = clusterRef.current;
     const status = statusRef.current;
     if (!row || !measure || !cluster || !status) return;
+    // React 18 drops a boolean `inert` prop, so keep the clone unfocusable here.
+    measure.setAttribute("inert", "");
 
     const evaluate = () => {
       const rowStyle = getComputedStyle(row);
@@ -303,28 +309,19 @@ function useToolbarOverflow(items: readonly ToolbarItem[]) {
       const current = itemsRef.current;
 
       const fits = (hidden: ReadonlySet<string>, withMore: boolean): boolean => {
+        const slots = inlineSequence(current, hidden);
         let total = 0;
-        let children = 0;
-        let lastGroup: ToolbarGroup | null = null;
-        for (const item of current) {
-          if (item.group === "copy" || hidden.has(item.key)) continue;
-          if (lastGroup !== null && lastGroup !== item.group) {
-            total += widths.get(MEASURE_DIVIDER) ?? 0;
-            children += 1;
-          }
-          total += widths.get(item.key) ?? 0;
-          children += 1;
-          lastGroup = item.group;
+        for (const slot of slots) {
+          total += widths.get(slot.kind === "item" ? slot.item.key : MEASURE_DIVIDER) ?? 0;
         }
+        let children = slots.length + 1;
         if (withMore) {
           total += widths.get(MEASURE_MORE) ?? 0;
           children += 1;
         }
         const copyWidth = hidden.has("copy") ? 0 : (widths.get("copy") ?? 0) + clusterGap;
-        total += statusWidth + copyWidth;
-        children += 1;
-        total += Math.max(0, children - 1) * gap;
-        return total <= available;
+        total += statusWidth + copyWidth + Math.max(0, children - 1) * gap;
+        return total + FIT_SLACK_PX <= available;
       };
 
       const hidden = new Set<string>();
@@ -744,7 +741,6 @@ export function ToolbarPlugin({
   ];
 
   const { rowRef, measureRef, clusterRef, statusRef, folded } = useToolbarOverflow(items);
-  const inlineItems = items.filter((item) => item.group !== "copy" && !folded.has(item.key));
   const foldedItems = items.filter((item) => folded.has(item.key));
   const copyItem = items.find((item) => item.key === "copy");
 
@@ -754,14 +750,21 @@ export function ToolbarPlugin({
         ref={rowRef}
         role="toolbar"
         aria-label="Formatting"
-        className="flex flex-wrap items-center gap-0.5 px-2 py-1"
+        className="flex flex-nowrap items-center gap-0.5 px-2 py-1"
       >
-        {renderWithDividers(inlineItems)}
+        {inlineSequence(items, folded).map((slot) =>
+          slot.kind === "divider" ? (
+            <Divider key={slot.key} />
+          ) : (
+            <Fragment key={slot.item.key}>{slot.item.node}</Fragment>
+          ),
+        )}
         {foldedItems.length > 0 && <ToolbarOverflowMenu editor={editor} items={foldedItems} />}
         <div ref={clusterRef} className="ml-auto flex items-center gap-2">
           {copyItem && !folded.has(copyItem.key) && copyItem.node}
           <button
             ref={statusRef}
+            data-slot="save-status"
             type="button"
             title={saveStatus.title}
             aria-label={saveStatus.title}
@@ -786,8 +789,8 @@ export function ToolbarPlugin({
           </button>
         </div>
       </div>
-      {/* Offscreen, non-interactive clone of every item: its widths drive the
-          fold decision independently of the live (state-dependent) row. */}
+      {/* Offscreen, inert clone of every item: its widths drive the fold
+          decision independently of the live (state-dependent) row. */}
       <div
         ref={measureRef}
         aria-hidden

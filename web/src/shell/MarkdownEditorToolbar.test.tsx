@@ -71,10 +71,8 @@ afterEach(() => {
 
 // ── Responsive overflow ─────────────────────────────────────────────────────────────────
 //
-// jsdom has no layout, so the fold measurement is driven by stubbing
-// getBoundingClientRect: the toolbar row reports the given width, every clone
-// item 28px (a divider 9px) and the save-status pill 70px. Computed gaps and
-// padding read as 0 here, so the row fits exactly when those widths add up.
+// jsdom has no layout: getBoundingClientRect is stubbed so the row reports the
+// given width, each clone item 28px (divider 9px) and the status pill 70px.
 
 function installToolbarWidths(rowWidth: number): void {
   class StubResizeObserver {
@@ -90,7 +88,7 @@ function installToolbarWidths(rowWidth: number): void {
     if (this.getAttribute("role") === "toolbar") width = rowWidth;
     else if (this.dataset.measure === "divider") width = 9;
     else if (this.dataset.measure !== undefined) width = 28;
-    else if (this.getAttribute("aria-label") === "All changes saved") width = 70;
+    else if (this.dataset.slot === "save-status") width = 70;
     return {
       width,
       height: 0,
@@ -142,9 +140,9 @@ describe("MarkdownEditorToolbar overflow", () => {
   });
 
   it("folds low-priority tools into a ⋯ menu and keeps the inline marks and status pill", () => {
-    // Four marks (112) + ⋯ (28) + status (70) fit exactly; undo and its
-    // divider would not, so everything below the marks folds.
-    installToolbarWidths(210);
+    // Four marks (112) + ⋯ (28) + status (70) + 2px slack fit exactly; undo
+    // and its divider would not, so everything below the marks folds.
+    installToolbarWidths(212);
     renderToolbar();
     const row = within(screen.getByRole("toolbar", { name: "Formatting" }));
     for (const name of [...INLINE_MARKS, "More formatting", "All changes saved"]) {

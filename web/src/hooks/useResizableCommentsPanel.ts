@@ -29,8 +29,8 @@ const MIN_WIDTH_PX = 200;
 const MAX_WIDTH_PX = 640;
 /** Keep at least this much room for the code/diff viewer beside the panel. */
 const MIN_VIEWER_PX = 240;
-/** Matches the `@md/viewer` (28rem) container breakpoint. */
-const SIDE_BY_SIDE_MIN_PX = 448;
+/** Matches the `@md/viewer` container breakpoint; resolved against the root font size. */
+const SIDE_BY_SIDE_MIN_REM = 28;
 
 // ---------------------------------------------------------------------------
 // Module-level width store (shared across panel remounts within a session)
@@ -134,7 +134,8 @@ export function useResizableCommentsPanel() {
     const row = containerRef.current?.parentElement;
     if (!row) return;
     const update = () => {
-      setSideBySide(row.getBoundingClientRect().width >= SIDE_BY_SIDE_MIN_PX);
+      const rem = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+      setSideBySide(row.getBoundingClientRect().width >= SIDE_BY_SIDE_MIN_REM * rem);
       // Restore the preferred width as space returns.
       setStoredWidth(clampWidth(preferredWidth ?? DEFAULT_WIDTH_PX));
     };
