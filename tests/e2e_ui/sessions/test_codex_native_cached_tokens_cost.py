@@ -215,8 +215,10 @@ def test_codex_native_session_cost_keeps_cached_tokens_at_cache_rate(
     page.screenshot(
         path=str(Path(pytestconfig.getoption("--output")) / "codex-native-agent-info.png")
     )
+    # Mirror the SPA's formatSessionCostUsd: sub-cent spend renders as "<$0.01".
+    expected_cost_text = "<$0.01" if 0 < expected_cost < 0.01 else f"${expected_cost:.2f}"
     expect(panel.get_by_test_id("agent-info-session-cost")).to_have_text(
-        f"${expected_cost:.2f}", timeout=30_000
+        expected_cost_text, timeout=30_000
     )
     expect(model_row).to_contain_text(
         re.compile(rf"Cache read\s*{re.escape(_compact(reported_cached))}(?![\d.])")
