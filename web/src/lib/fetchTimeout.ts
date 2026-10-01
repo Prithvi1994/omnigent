@@ -12,6 +12,17 @@
 
 export const DEFAULT_API_TIMEOUT_MS = 30_000;
 
+/**
+ * Deadline for session-create / runner-launch POSTs.
+ *
+ * These mutations can synchronously run a host `git worktree add`
+ * (server budget `_WORKTREE_TIMEOUT_S` = 150 s) plus host launch (~30 s)
+ * and runner init (~10 s). The client deadline must sit ABOVE the
+ * server's worst case so it only fires when the server is genuinely
+ * wedged (never responds) — not on a slow-but-valid create.
+ */
+export const SESSION_MUTATION_TIMEOUT_MS = 240_000;
+
 /** Thrown when `fetchWithTimeout` fires its deadline before `run` settles. */
 export class ApiTimeoutError extends Error {
   constructor(timeoutMs: number) {
