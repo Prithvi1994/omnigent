@@ -3021,51 +3021,6 @@ async def test_stop_cancels_in_flight_connection_handlers(
 # ---------------------------------------------------------------------------
 
 
-def _loopback_tls_server_context(tmp_path: Path) -> tuple[ssl.SSLContext, Path]:
-    """Return a server TLS context for ``localhost`` and the path of its cert."""
-    import datetime
-    import ipaddress
-
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.x509.oid import NameOID
-
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
-    now = datetime.datetime.now(datetime.timezone.utc)
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(minutes=5))
-        .not_valid_after(now + datetime.timedelta(days=1))
-        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-        .add_extension(
-            x509.SubjectAlternativeName(
-                [x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]
-            ),
-            critical=False,
-        )
-        .sign(key, hashes.SHA256())
-    )
-    cert_path = tmp_path / "upstream-cert.pem"
-    key_path = tmp_path / "upstream-key.pem"
-    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-    key_path.write_bytes(
-        key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.TraditionalOpenSSL,
-            serialization.NoEncryption(),
-        )
-    )
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.load_cert_chain(cert_path, key_path)
-    return context, cert_path
-
-
 def _websocket_echo_via_proxy(
     proxy_port: int,
     upstream_port: int,
@@ -3079,8 +3034,8 @@ def _websocket_echo_via_proxy(
 
     Returns ``(status, reply)``: after a ``101`` the reply is the echo of one
     sent frame; otherwise *follow_up* (if any) is written on the same tunnel
-    and the reply is whatever arrives before EOF, or ``b"<tunnel open>"``
-    when the proxy never closed it.
+    and the reply is the refused response's body up to EOF, or
+    ``b"<tunnel open>"`` when the proxy never closed the tunnel.
     """
     import hashlib
 
@@ -3094,6 +3049,7 @@ def _websocket_echo_via_proxy(
             head += raw.recv(4096)
         assert head.startswith(b"HTTP/1.1 200"), head
         context = ssl.create_default_context(cafile=str(cafile))
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         with context.wrap_socket(raw, server_hostname="localhost") as tls:
             tls.settimeout(20)
             key = base64.b64encode(b"0123456789abcdef").decode()
@@ -3114,13 +3070,13 @@ def _websocket_echo_via_proxy(
                 if follow_up is not None:
                     with contextlib.suppress(OSError):
                         tls.sendall(follow_up)
-                tail = b""
+                body = head.split(b"\r\n\r\n", 1)[1]
                 try:
                     while chunk := tls.recv(4096):
-                        tail += chunk
+                        body += chunk
                 except TimeoutError:
                     return status, b"<tunnel open>"
-                return status, tail
+                return status, body
             accept = base64.b64encode(
                 hashlib.sha1(key.encode() + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest()
             )
@@ -3137,7 +3093,7 @@ def _websocket_echo_via_proxy(
 
 @pytest.mark.asyncio
 async def test_proxy_relays_websocket_upgrade_to_permitted_host(
-    ca_paths: tuple[Path, Path, Path], tmp_path: Path
+    ca_paths: tuple[Path, Path, Path],
 ) -> None:
     """A permitted WebSocket upgrade must complete end to end through the tunnel.
 
@@ -3148,7 +3104,7 @@ async def test_proxy_relays_websocket_upgrade_to_permitted_host(
     from websockets.asyncio.server import serve
 
     cert_path, key_path, bundle_path = ca_paths
-    server_context, upstream_cert = _loopback_tls_server_context(tmp_path)
+    server_context = HostCertCache(cert_path, key_path).get_ssl_context("localhost")
 
     async def echo(connection) -> None:
         async for message in connection:
@@ -3160,7 +3116,7 @@ async def test_proxy_relays_websocket_upgrade_to_permitted_host(
             parse_rules(["* localhost/**"]),
             cert_path,
             key_path,
-            upstream_ca_bundle=upstream_cert,
+            upstream_ca_bundle=bundle_path,
             block_private_destinations=False,
         )
         proxy_port = await proxy.start_tcp()
@@ -3184,18 +3140,20 @@ async def test_proxy_relays_websocket_upgrade_to_permitted_host(
 
 @pytest.mark.asyncio
 async def test_refused_or_denied_websocket_upgrade_never_opens_an_opaque_tunnel(
-    ca_paths: tuple[Path, Path, Path], tmp_path: Path
+    ca_paths: tuple[Path, Path, Path],
 ) -> None:
     """Only a ``101`` switches the tunnel to a raw relay.
 
     A path outside the rules is refused before any upstream connection, and
     an upstream that declines the upgrade has its one response relayed after
     which the tunnel closes, so a follow-up request on it cannot skip the
-    per-request policy check.
+    per-request policy check. A chunked refusal from a keep-alive upstream
+    must close promptly too, without waiting for EOF.
     """
     cert_path, key_path, bundle_path = ca_paths
-    server_context, upstream_cert = _loopback_tls_server_context(tmp_path)
+    server_context = HostCertCache(cert_path, key_path).get_ssl_context("localhost")
     upstream_requests: list[bytes] = []
+    chunked_body = b"5\r\nnope!\r\n0\r\n\r\n"
 
     async def decline_upgrade(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -3203,7 +3161,13 @@ async def test_refused_or_denied_websocket_upgrade_never_opens_an_opaque_tunnel(
                 upstream_requests.append(request_line)
                 while await reader.readline() not in (b"\r\n", b""):
                     pass
-                writer.write(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\n\r\n")
+                if b" /backend-api/chunked " in request_line:
+                    writer.write(
+                        b"HTTP/1.1 426 Upgrade Required\r\nTransfer-Encoding: chunked\r\n\r\n"
+                        + chunked_body
+                    )
+                else:
+                    writer.write(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\n\r\n")
                 await writer.drain()
         finally:
             writer.close()
@@ -3214,7 +3178,7 @@ async def test_refused_or_denied_websocket_upgrade_never_opens_an_opaque_tunnel(
         parse_rules(["* localhost/backend-api/**"]),
         cert_path,
         key_path,
-        upstream_ca_bundle=upstream_cert,
+        upstream_ca_bundle=bundle_path,
         block_private_destinations=False,
     )
     proxy_port = await proxy.start_tcp()
@@ -3241,6 +3205,17 @@ async def test_refused_or_denied_websocket_upgrade_never_opens_an_opaque_tunnel(
             ),
             timeout=60,
         )
+        chunked, chunked_tail = await asyncio.wait_for(
+            asyncio.to_thread(
+                _websocket_echo_via_proxy,
+                proxy_port,
+                upstream_port,
+                bundle_path,
+                b"x",
+                path="/backend-api/chunked",
+            ),
+            timeout=60,
+        )
     finally:
         await proxy.stop()
         server.close()
@@ -3249,4 +3224,9 @@ async def test_refused_or_denied_websocket_upgrade_never_opens_an_opaque_tunnel(
     assert denied.startswith("HTTP/1.1 403"), denied
     assert declined.startswith("HTTP/1.1 426"), declined
     assert tail == b"", tail
-    assert upstream_requests == [b"GET /backend-api/codex/responses HTTP/1.1\r\n"]
+    assert chunked.startswith("HTTP/1.1 426"), chunked
+    assert chunked_tail == chunked_body, chunked_tail
+    assert upstream_requests == [
+        b"GET /backend-api/codex/responses HTTP/1.1\r\n",
+        b"GET /backend-api/chunked HTTP/1.1\r\n",
+    ]

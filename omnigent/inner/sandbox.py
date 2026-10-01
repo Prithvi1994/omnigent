@@ -188,12 +188,9 @@ class SandboxPolicy:
     # non-secret synthetic payload over the config FD, and resolved
     # secrets never touch the policy that serialises into logs / dumps.
     credential_proxy: CredentialProxySpec | None = None
-    # Write roots the dotfile / escaping-symlink mask scan must NOT walk:
-    # framework scaffolding added via :func:`with_additional_write_roots`
-    # (scratch tmpdir with the egress ``.egress.sock``, CA bundle, harness
-    # state dirs), which never holds pre-existing user secrets. Serialised
-    # with the policy because exec launchers build the spawn-time wrap in
-    # :func:`run_launcher` from the decoded copy.
+    # Write roots the mask scan skips (see the class docstring). Serialised
+    # because exec launchers rebuild the spawn-time wrap in
+    # :func:`run_launcher` from the decoded policy.
     mask_scan_skip_roots: list[Path] | None = None
 
     def to_jsonable(self) -> dict[str, JsonValue]:

@@ -2967,6 +2967,8 @@ class _CodexAppServerSession:
                 await asyncio.to_thread(worker_launch.close)
                 raise RuntimeError("Codex session closed during worker preparation")
             self._worker_launch = worker_launch
+            if not worker_launch.native_tools_allowed:
+                self._disable_native_tools = True
             argv = [self._worker_launch.launch_path, "app-server"]
             for override in self._codex_config_overrides:
                 argv.extend(["-c", override])
@@ -3535,16 +3537,16 @@ class _CodexAppServerSession:
                 params["modelProvider"] = self._thread_model_provider
             if system_prompt:
                 params["developerInstructions"] = system_prompt
+            tool_config: CodexParams = {}
             if tools:
                 params["dynamicTools"] = _dynamic_tool_specs(tools)
-                tool_config: CodexParams = {
-                    "features.unified_exec": False,
-                }
+                tool_config["features.unified_exec"] = False
                 if self._supports_direct_tool_namespaces:
                     # Code Mode flattens dynamic image results into strings.
                     tool_config["features.code_mode.direct_only_tool_namespaces"] = ["functions"]
-                if self._disable_native_tools:
-                    tool_config["features.shell_tool"] = False
+            if self._disable_native_tools:
+                tool_config["features.shell_tool"] = False
+            if tool_config:
                 params["config"] = tool_config
             response = await self._request("thread/start", params)
             thread = response.get("result", {}).get("thread", {})

@@ -905,14 +905,29 @@ class EgressProxy:
                 path,
                 status_line.decode("latin-1", errors="replace").strip(),
             )
-            declared_length = self._parse_header_dict(response_headers).get("content-length")
-            if declared_length is None:
-                await self._relay_response(upstream_reader, client_writer)
-            elif (length := int(declared_length)) > 0:
-                client_writer.write(
-                    await asyncio.wait_for(upstream_reader.readexactly(length), timeout=60)
+            refused = self._parse_header_dict(response_headers)
+            try:
+                length = int(refused["content-length"]) if "content-length" in refused else None
+            except ValueError:
+                length = None
+            try:
+                if length is not None:
+                    if length > 0:
+                        client_writer.write(
+                            await asyncio.wait_for(upstream_reader.readexactly(length), timeout=60)
+                        )
+                        await client_writer.drain()
+                elif "chunked" in refused.get("transfer-encoding", "").lower():
+                    await self._relay_chunked_body(upstream_reader, client_writer)
+                else:
+                    await self._relay_response(upstream_reader, client_writer)
+            except (asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError) as exc:
+                logger.warning(
+                    "Refused upgrade from %s:%d ended with a malformed or truncated body: %s",
+                    host,
+                    port,
+                    exc,
                 )
-                await client_writer.drain()
         finally:
             upstream_writer.close()
             with contextlib.suppress(Exception):
@@ -1333,6 +1348,33 @@ class EgressProxy:
             except ValueError:
                 return target, default_port
         return target, default_port
+
+    @staticmethod
+    async def _relay_chunked_body(
+        upstream_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+    ) -> None:
+        """Relay a chunked body through its last chunk and trailers, then stop.
+
+        Used for a refused upgrade on a keep-alive upstream, where waiting for
+        EOF would hold the tunnel open until the read timeout.
+        """
+        while True:
+            size_line = await asyncio.wait_for(upstream_reader.readline(), timeout=60)
+            size = int(size_line.split(b";", 1)[0].strip() or b"-", 16)
+            client_writer.write(size_line)
+            if size == 0:
+                while True:
+                    trailer = await asyncio.wait_for(upstream_reader.readline(), timeout=60)
+                    client_writer.write(trailer)
+                    if trailer in (b"\r\n", b"\n", b""):
+                        break
+                await client_writer.drain()
+                return
+            client_writer.write(
+                await asyncio.wait_for(upstream_reader.readexactly(size + 2), timeout=60)
+            )
+            await client_writer.drain()
 
     @staticmethod
     async def _relay_response(

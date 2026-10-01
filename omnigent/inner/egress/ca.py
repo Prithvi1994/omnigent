@@ -91,7 +91,12 @@ def ensure_ca_bundle(
     # this one rewrites it; publish the new contents in a single rename.
     fd, tmp_name = tempfile.mkstemp(dir=cache, prefix=".ca-bundle-", suffix=".tmp")
     try:
-        with os.fdopen(fd, "wb") as fh:
+        try:
+            fh = os.fdopen(fd, "wb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with fh:
             fh.write(b"\n".join(parts))
         os.chmod(tmp_name, 0o644)
         os.replace(tmp_name, bundle_path)

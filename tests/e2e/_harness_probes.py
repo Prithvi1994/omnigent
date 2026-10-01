@@ -169,19 +169,23 @@ def bwrap_namespace_unavailable() -> str | None:
     """
     if not sys.platform.startswith("linux") or shutil.which("bwrap") is None:
         return "Linux with bubblewrap is required"
-    probe = subprocess.run(
-        ["bwrap", "--ro-bind", "/", "/", "true"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
+    try:
+        probe = subprocess.run(
+            ["bwrap", "--ro-bind", "/", "/", "true"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"bwrap probe failed to run: {exc}"
     if probe.returncode == 0:
         return None
     detail = (probe.stderr or probe.stdout).strip().splitlines()
     return detail[0] if detail else f"bwrap exited {probe.returncode}"
 
 
+@cache
 def cli_unavailable_reason(binary: str) -> str | None:
     """
     Return ``None`` when *binary* exists and starts, else a skip reason.

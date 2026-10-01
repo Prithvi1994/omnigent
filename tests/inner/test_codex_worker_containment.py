@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import http.server
 import json
 import logging
@@ -24,6 +25,7 @@ import pytest
 from omnigent.inner.codex_executor import _CodexAppServerSession
 from omnigent.inner.codex_worker import (
     _BROKERED_AUTH_SECRET_ENV,
+    CodexWorkerLaunch,
     prepare_codex_catalog_probe,
     prepare_codex_worker,
 )
@@ -210,6 +212,7 @@ def test_network_denied_worker_without_model_route_runs_unwrapped(
 
     assert worker.launch_path == str(codex)
     assert not worker.sandboxed
+    assert worker.native_tools_allowed is False
     create_launcher.assert_not_called()
     assert any("no model route" in record.getMessage() for record in caplog.records)
     worker.close()
@@ -699,6 +702,85 @@ async def test_spawn_failure_releases_launcher_and_private_home(
     assert session._worker_launch is None
 
 
+async def test_session_disables_native_tools_for_unwrapped_no_route_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A worker that fell back to running unwrapped must not keep Codex's native shell tool."""
+    process = Mock(stdin=None, stdout=_Pipe(), stderr=_Pipe(), returncode=0, pid=123)
+    process.wait = AsyncMock(return_value=0)
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.prepare_codex_worker",
+        Mock(
+            return_value=CodexWorkerLaunch(
+                "/bin/echo", sandboxed=False, native_tools_allowed=False
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._create_subprocess_exec", AsyncMock(return_value=process)
+    )
+    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd=str(tmp_path),
+        env={},
+        tool_executor=None,
+        os_env=OSEnvSpec(
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap", write_paths=["."], allow_network=False)
+        ),
+    )
+    session._request = AsyncMock(return_value={"result": {}})
+
+    await session.start()
+
+    assert session._disable_native_tools is True
+    assert not session._containment_confirmed
+    await session.close()
+
+
+async def test_native_shell_tool_is_disabled_even_without_dynamic_tools() -> None:
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd="/tmp/workspace",
+        env={},
+        tool_executor=None,
+    )
+    session.start = AsyncMock()
+    session._proc = Mock()
+    session._disable_native_tools = True
+    session._request = AsyncMock(
+        side_effect=[
+            {"result": {"thread": {"id": "thread-1"}}},
+            {"result": {"turn": {"id": "turn-1"}}},
+        ]
+    )
+
+    async def _complete_turn() -> None:
+        await asyncio.sleep(0)
+        session._events.put_nowait(
+            {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+        )
+
+    completion = asyncio.create_task(_complete_turn())
+    _ = [
+        event
+        async for event in session.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+            model="gpt-5.4-mini",
+            cwd="/tmp/workspace",
+            sandbox="workspace-write",
+        )
+    ]
+    await completion
+
+    thread_params = session._request.await_args_list[0].args[1]
+    assert thread_params["config"]["features.shell_tool"] is False
+    assert thread_params["sandbox"] == "workspace-write"
+
+
 async def test_nested_codex_sandbox_is_disabled_only_after_confirmation() -> None:
     session = _CodexAppServerSession(
         codex_path="/bin/echo",
@@ -778,35 +860,39 @@ def test_spawn_time_wrap_keeps_egress_socket_unmasked(
     codex.chmod(0o755)
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir()
-    egress_tmpdir = Path(tempfile.mkdtemp(prefix="omnigent-osenv-"))
-    relay_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    relay_socket.bind(str(egress_tmpdir / ".egress.sock"))
-    handle = Mock(
-        relay_port=43124,
-        socket_path=egress_tmpdir / ".egress.sock",
-        ca_bundle_path=egress_tmpdir / "ca-bundle.pem",
-    )
     launchers: list[tuple[str, SandboxPolicy]] = []
 
     def _record_launcher(target: str, policy: SandboxPolicy, **kwargs: object) -> str:
         launchers.append((target, policy))
         return create_exec_launcher(target, policy, **kwargs)
 
-    monkeypatch.setattr("omnigent.inner.codex_worker.create_private_tmpdir", lambda: egress_tmpdir)
-    monkeypatch.setattr(
-        "omnigent.inner.codex_worker.start_egress_proxy", Mock(return_value=handle)
-    )
-    monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", _record_launcher)
-    worker_env = {"PATH": os.environ["PATH"], "CODEX_HOME": str(codex_home)}
-    worker = prepare_codex_worker(
-        codex_path=str(codex),
-        cwd=workspace,
-        codex_home=codex_home,
-        os_env=_egress_filtered_bwrap_spec(workspace),
-        spawn_env_names=list(worker_env),
-        worker_env=worker_env,
-    )
-    try:
+    with contextlib.ExitStack() as cleanup:
+        egress_tmpdir = Path(tempfile.mkdtemp(prefix="omnigent-osenv-"))
+        cleanup.callback(shutil.rmtree, egress_tmpdir, ignore_errors=True)
+        relay_socket = cleanup.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+        relay_socket.bind(str(egress_tmpdir / ".egress.sock"))
+        handle = Mock(
+            relay_port=43124,
+            socket_path=egress_tmpdir / ".egress.sock",
+            ca_bundle_path=egress_tmpdir / "ca-bundle.pem",
+        )
+        monkeypatch.setattr(
+            "omnigent.inner.codex_worker.create_private_tmpdir", lambda: egress_tmpdir
+        )
+        monkeypatch.setattr(
+            "omnigent.inner.codex_worker.start_egress_proxy", Mock(return_value=handle)
+        )
+        monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", _record_launcher)
+        worker_env = {"PATH": os.environ["PATH"], "CODEX_HOME": str(codex_home)}
+        worker = prepare_codex_worker(
+            codex_path=str(codex),
+            cwd=workspace,
+            codex_home=codex_home,
+            os_env=_egress_filtered_bwrap_spec(workspace),
+            spawn_env_names=list(worker_env),
+            worker_env=worker_env,
+        )
+        cleanup.callback(worker.close)
         ((target, policy),) = launchers
         program = (
             "import json, os, sys\n"
@@ -825,20 +911,26 @@ def test_spawn_time_wrap_keeps_egress_socket_unmasked(
             timeout=60,
             check=False,
         )
-    finally:
-        worker.close()
-        relay_socket.close()
 
     assert completed.returncode == 0, completed.stderr
     wrap_lines = [line for line in completed.stdout.splitlines() if line.startswith("WRAP ")]
     assert wrap_lines, completed.stdout
     argv = json.loads(wrap_lines[-1][len("WRAP ") :])
-    socket_masks = [
-        argv[index : index + 3]
-        for index, token in enumerate(argv)
-        if ((token == "--bind-try" and argv[index + 1] == "/dev/null") or token == "--tmpfs")
-        and argv[index + (2 if token == "--bind-try" else 1)].startswith(str(egress_tmpdir))
-    ]
+    socket_masks: list[list[str]] = []
+    for index, token in enumerate(argv):
+        if (
+            token == "--tmpfs"
+            and index + 1 < len(argv)
+            and argv[index + 1].startswith(str(egress_tmpdir))
+        ):
+            socket_masks.append(argv[index : index + 2])
+        if (
+            token == "--bind-try"
+            and index + 2 < len(argv)
+            and argv[index + 1] == "/dev/null"
+            and argv[index + 2].startswith(str(egress_tmpdir))
+        ):
+            socket_masks.append(argv[index : index + 3])
     assert not socket_masks, (
         f"the spawn-time wrap masks the worker's own egress relay socket: {socket_masks}"
     )
@@ -848,75 +940,81 @@ def test_spawn_time_wrap_keeps_egress_socket_unmasked(
     bwrap_namespace_unavailable() is not None,
     reason=f"cannot execute bwrap namespaces here: {bwrap_namespace_unavailable()}",
 )
-def test_real_bwrap_worker_reaches_egress_relay_socket(tmp_path: Path) -> None:
+def test_real_bwrap_worker_reaches_egress_relay_socket(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """An egress-filtered worker must see the relay's Unix socket, not a masked stub.
 
     The egress tmpdir is a framework-owned write root; if the spawn-time
     dotfile mask hides its ``.egress.sock`` the in-namespace relay cannot
     reach the proxy and every model request dies with a connection reset.
     """
-    upstream = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _OkHandler)
-    upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
-    upstream_thread.start()
-    upstream_port = upstream.server_address[1]
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    (workspace / "README.md").write_text("workspace\n")
-    codex_home = tmp_path / "codex-home"
-    codex_home.mkdir()
-    codex = tmp_path / "codex"
-    codex.write_text(
-        textwrap.dedent(
-            f"""\
-            #!{sys.executable}
-            import json, os, stat, urllib.request
-            sock = os.path.join(os.environ["EGRESS_TMPDIR"], ".egress.sock")
-            report = {{"is_socket": stat.S_ISSOCK(os.lstat(sock).st_mode)}}
-            proxy = os.environ["HTTP_PROXY"]
-            opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({{"http": proxy, "https": proxy}})
-            )
-            try:
-                with opener.open("http://127.0.0.1:{upstream_port}/", timeout=15) as resp:
-                    report["status"] = resp.status
-            except Exception as exc:
-                report["error"] = f"{{type(exc).__name__}}: {{exc}}"
-            print(json.dumps(report))
-            """
-        ),
-        encoding="utf-8",
-    )
-    codex.chmod(0o755)
-    worker_env = {
-        "PATH": os.environ["PATH"],
-        "HOME": os.environ.get("HOME", str(tmp_path)),
-        "CODEX_HOME": str(codex_home),
-        # Allowlisted by name at prepare time; the value is filled in below.
-        "EGRESS_TMPDIR": "",
-    }
-    worker = prepare_codex_worker(
-        codex_path=str(codex),
-        cwd=workspace,
-        codex_home=codex_home,
-        os_env=OSEnvSpec(
-            type="caller_process",
-            cwd=str(workspace),
-            sandbox=OSEnvSandboxSpec(
-                type="linux_bwrap",
-                write_paths=["."],
-                allow_network=False,
-                read_paths=[str(Path(__file__).resolve().parents[2] / "omnigent"), sys.prefix],
-                egress_rules=["* 127.0.0.1/**"],
-                egress_allow_private_destinations=True,
-                cwd_hidden_scan_overflow="error",
+    with contextlib.ExitStack() as cleanup:
+        upstream = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _OkHandler)
+        cleanup.callback(upstream.server_close)
+        cleanup.callback(upstream.shutdown)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        upstream_port = upstream.server_address[1]
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "README.md").write_text("workspace\n")
+        codex_home = tmp_path / "codex-home"
+        codex_home.mkdir()
+        codex = tmp_path / "codex"
+        codex.write_text(
+            textwrap.dedent(
+                f"""\
+                #!{sys.executable}
+                import json, os, stat, urllib.request
+                sock = os.path.join(os.environ["EGRESS_TMPDIR"], ".egress.sock")
+                report = {{"is_socket": stat.S_ISSOCK(os.lstat(sock).st_mode)}}
+                proxy = os.environ["HTTP_PROXY"]
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({{"http": proxy, "https": proxy}})
+                )
+                try:
+                    with opener.open("http://127.0.0.1:{upstream_port}/", timeout=15) as resp:
+                        report["status"] = resp.status
+                except Exception as exc:
+                    report["error"] = f"{{type(exc).__name__}}: {{exc}}"
+                print(json.dumps(report))
+                """
             ),
-        ),
-        spawn_env_names=list(worker_env),
-        worker_env=worker_env,
-    )
-    try:
-        assert worker._egress_tmpdir is not None
-        worker_env["EGRESS_TMPDIR"] = str(worker._egress_tmpdir)
+            encoding="utf-8",
+        )
+        codex.chmod(0o755)
+        egress_tmpdir = Path(tempfile.mkdtemp(prefix="omnigent-osenv-"))
+        cleanup.callback(shutil.rmtree, egress_tmpdir, ignore_errors=True)
+        monkeypatch.setattr(
+            "omnigent.inner.codex_worker.create_private_tmpdir", lambda: egress_tmpdir
+        )
+        worker_env = {
+            "PATH": os.environ["PATH"],
+            "HOME": os.environ.get("HOME", str(tmp_path)),
+            "CODEX_HOME": str(codex_home),
+            "EGRESS_TMPDIR": str(egress_tmpdir),
+        }
+        worker = prepare_codex_worker(
+            codex_path=str(codex),
+            cwd=workspace,
+            codex_home=codex_home,
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=str(workspace),
+                sandbox=OSEnvSandboxSpec(
+                    type="linux_bwrap",
+                    write_paths=["."],
+                    allow_network=False,
+                    read_paths=[str(Path(__file__).resolve().parents[2] / "omnigent"), sys.prefix],
+                    egress_rules=["* 127.0.0.1/**"],
+                    egress_allow_private_destinations=True,
+                    cwd_hidden_scan_overflow="error",
+                ),
+            ),
+            spawn_env_names=list(worker_env),
+            worker_env=worker_env,
+        )
+        cleanup.callback(worker.close)
         completed = subprocess.run(
             [worker.launch_path, "app-server"],
             cwd=workspace,
@@ -926,10 +1024,6 @@ def test_real_bwrap_worker_reaches_egress_relay_socket(tmp_path: Path) -> None:
             timeout=120,
             check=False,
         )
-    finally:
-        worker.close()
-        upstream.shutdown()
-        upstream.server_close()
 
     assert completed.returncode == 0, completed.stderr
     report = json.loads(completed.stdout.strip().splitlines()[-1])
@@ -974,7 +1068,9 @@ def test_real_seatbelt_worker_cannot_write_outside_grants(tmp_path: Path) -> Non
             cwd=str(tmp_path),
             sandbox=OSEnvSandboxSpec(
                 type="darwin_seatbelt",
-                allow_network=False,
+                # Network stays allowed so the worker is wrapped; the no-route
+                # fallback is covered separately.
+                allow_network=True,
                 cwd_hidden_scan_overflow="error",
             ),
         ),
