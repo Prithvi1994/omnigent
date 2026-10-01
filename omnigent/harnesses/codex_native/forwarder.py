@@ -1706,9 +1706,14 @@ class _SessionUsageCoalescer:
             self._pending.clear()
             return
         if data.keys() & _CUMULATIVE_TOKEN_KEYS:
-            data.update(
-                {key: self._pending[key] for key in _CUMULATIVE_TOKEN_KEYS if key in self._pending}
-            )
+            # Re-attach every cumulative count so the post stays self-contained:
+            # the latest pending value, else the last posted one when this frame
+            # omitted the field (older servers read an omitted count as zero).
+            for key in _CUMULATIVE_TOKEN_KEYS:
+                if key in self._pending:
+                    data[key] = self._pending[key]
+                elif key in self._last_posted:
+                    data[key] = self._last_posted[key]
         # Attach the model to every token-bearing post (not via the
         # changed-keys dedup, so it rides along even when only token
         # counts changed) — the server reprices cumulative tokens into
