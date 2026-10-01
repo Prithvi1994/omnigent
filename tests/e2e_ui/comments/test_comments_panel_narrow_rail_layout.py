@@ -2,7 +2,8 @@
 
 With Comments open beside the rich-text editor on a laptop-sized window, the
 panel's controls must stay inside the rail and clear of the toolbar, the toolbar
-must keep one row inside its box, and every Workspace tab must stay reachable.
+must keep one row inside its box, every Workspace tab must stay reachable, and
+the panel keeps a resize handle whether it sits beside or under the editor.
 """
 
 from __future__ import annotations
@@ -42,6 +43,8 @@ _VIEWPORTS = [(1512, 982, "beside"), (1280, 800, "beside"), (1024, 768, "stacked
 _VIEWPORT_IDS = [f"{w}x{h}" for w, h, _ in _VIEWPORTS]
 # Mirrors the `@md/viewer` (28rem) container breakpoint the panel stacks under.
 _STACKING_BREAKPOINT_PX = 448
+# Default height of the stacked panel before the user drags its top edge.
+_STACKED_PANEL_HEIGHT_PX = 256
 _LAYOUT_SETTLE_MS = 500
 _RECORDING_HOLD_MS = 2500
 _EDGE_TOLERANCE_PX = 1
@@ -182,6 +185,12 @@ def _panel_controls(panel: Locator) -> dict[str, Locator]:
     }
 
 
+def _handle_orientation(panel: Locator) -> str | None:
+    """``aria-orientation`` of the panel's resize handle, or ``None`` when absent."""
+    handle = panel.get_by_role("separator", name="Resize comments panel")
+    return handle.get_attribute("aria-orientation") if handle.count() else None
+
+
 def _toolbar_buttons(toolbar: Locator) -> list[tuple[str, Box]]:
     buttons: list[tuple[str, Box]] = []
     for button in toolbar.get_by_role("button").all():
@@ -211,6 +220,7 @@ def _measure(page: Page, file_viewer: Locator, panel: Locator, out_dir: Path, ta
         "sidebar_collapsed": conversations.get_attribute("data-collapsed") == "true",
         "rail": _box(page.get_by_role("complementary", name="Workspace"), "Workspace rail"),
         "panel": _box(panel, "Comments panel"),
+        "handle_orientation": _handle_orientation(panel),
         "editor": editor.bounding_box(),
         "toolbar": _box(toolbar, "Formatting toolbar"),
         "controls": {name: _box(loc, name) for name, loc in _panel_controls(panel).items()},
@@ -286,11 +296,24 @@ def _layout_violations(report: dict, layout: str) -> list[str]:
             violations.append(f"expected a rail narrower than 448px, got {rail_width:.0f}px")
         if not stacked:
             violations.append("expected the panel under the editor, but it sits beside it")
+        if abs(panel["height"] - _STACKED_PANEL_HEIGHT_PX) > _EDGE_TOLERANCE_PX:
+            violations.append(
+                f"expected the stacked panel to be {_STACKED_PANEL_HEIGHT_PX}px tall, "
+                f"got {panel['height']:.0f}px"
+            )
+        expected_handle = "horizontal"
     else:
         if rail_width < _STACKING_BREAKPOINT_PX:
             violations.append(f"expected a rail of at least 448px, got {rail_width:.0f}px")
         if not beside:
             violations.append("expected the panel beside the editor, but it is stacked")
+        expected_handle = "vertical"
+    # The handle drags the width beside the editor and the height under it.
+    if report["handle_orientation"] != expected_handle:
+        violations.append(
+            f"expected a {expected_handle} resize handle on the panel, "
+            f"got {report['handle_orientation']!r}"
+        )
     return violations
 
 
