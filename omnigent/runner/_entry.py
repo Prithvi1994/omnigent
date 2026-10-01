@@ -518,13 +518,13 @@ class _InitialAuthTokenFactory:
 
                 refusal = stored_login_renewal_refusal(self._server_url)
                 if refusal:
-                    from omnigent.util.server_url import display_server_url
+                    from omnigent.util.server_url import display_server_url_without_userinfo
 
                     _logger.error(
                         "host bootstrap token expired and the stored login could not "
                         "renew it (%s); run `omnigent login %s` to re-authenticate",
                         refusal,
-                        display_server_url(self._server_url),
+                        display_server_url_without_userinfo(self._server_url),
                         extra={"session_id": runner_primary_session_id()},
                     )
                 else:

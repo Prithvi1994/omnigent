@@ -467,7 +467,10 @@ def test_rejected_bootstrap_diagnosis_names_refused_stored_login_renewal(
     )
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda *_a, **_kw: None)
 
-    factory = _InitialAuthTokenFactory("host-bootstrap-token", "https://srv.example.com")
+    # The server URL carries basic-auth userinfo; the login hint must not echo it.
+    factory = _InitialAuthTokenFactory(
+        "host-bootstrap-token", "https://user:s3cret@srv.example.com"
+    )
     assert factory.invalidate()
     with caplog.at_level(logging.ERROR, logger="omnigent.runner._entry"):
         assert factory() is None
@@ -476,9 +479,11 @@ def test_rejected_bootstrap_diagnosis_names_refused_stored_login_renewal(
     assert any(
         "stored login could not renew it (refresh refused with HTTP 403)" in message
         and "`omnigent login " in message
+        and "srv.example.com" in message
         for message in messages
     ), messages
     assert not any("no SDK/OIDC credential is available" in m for m in messages), messages
+    assert not any("s3cret" in m or "user:" in m for m in messages), messages
 
 
 def test_rejected_bootstrap_diagnosis_without_stored_login_reports_no_credential(
