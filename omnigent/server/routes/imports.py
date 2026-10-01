@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -16,7 +17,7 @@ from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from omnigent.db.utils import builtin_agent_id
+from omnigent.db.utils import builtin_agent_id, now_epoch
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.errors import ErrorCode, OmnigentError
@@ -427,6 +428,44 @@ def _already_imported_error(message: str, session_id: str) -> LocalImportError:
     )
 
 
+# An import conversation without its items/external id that is older than this
+# was abandoned by a request that died (pod restart), not one still writing:
+# the stream deadline plus a generous allowance for one session's writes.
+_ABANDONED_IMPORT_AGE_S = 600
+
+# Strong refs to rollbacks that outlive their cancelled request.
+# custom-lint: disable-next=workspace-scoped-cache -- holds task objects, no tenant keys
+_PENDING_ROLLBACKS: set[asyncio.Task[None]] = set()
+
+
+async def _rollback_import(conversation_store: ConversationStore, conversation_id: str) -> None:
+    """Delete a half-written import; logged, never raised over the original error."""
+    try:
+        await conversation_store.delete_conversation(conversation_id)
+    except Exception:
+        _logger.exception("Could not roll back partial import %s", conversation_id)
+
+
+def _rollback_import_in_background(
+    conversation_store: ConversationStore,
+    write: asyncio.Future[None],
+    created: list[str],
+) -> None:
+    """Roll back a cancelled import once its in-flight writes have finished."""
+
+    async def _run() -> None:
+        with contextlib.suppress(BaseException):
+            await write
+        # Even a write that completed is undone: the caller never learned it
+        # succeeded, and an import is all-or-nothing from its point of view.
+        if created:
+            await _rollback_import(conversation_store, created[0])
+
+    task = asyncio.get_running_loop().create_task(_run())
+    _PENDING_ROLLBACKS.add(task)
+    task.add_done_callback(_PENDING_ROLLBACKS.discard)
+
+
 # The ``internal`` text for one session; the error id travels as ``error_id``
 # (clients show it as a detail), never inline.
 _SESSION_INTERNAL_ERROR_MESSAGE = (
@@ -571,9 +610,9 @@ def create_imports_router(
         resolved_host_id = resolved_create.body.host_id
         title = (native_title or "").strip() or title_from_items(items)
         conversation_id = _import_conversation_id(source, external_session_id)
-        try:
-            conversation = await asyncio.to_thread(
-                conversation_store.create_conversation,
+
+        def _create() -> Any:
+            return conversation_store.create_conversation(
                 title=title,
                 agent_id=agent_id,
                 host_id=resolved_host_id,
@@ -581,35 +620,140 @@ def create_imports_router(
                 conversation_id=conversation_id,
                 project_id=resolved_create.project_id,
             )
-        except ConversationAlreadyExistsError as exc:
-            raise _already_imported_error(
-                "This source session has already been imported", conversation_id
-            ) from exc
-        try:
-            await asyncio.to_thread(
-                conversation_store.set_external_session_id,
-                conversation.id,
-                external_session_id,
-            )
-            await asyncio.to_thread(conversation_store.append, conversation.id, items)
+
+        # Set once the row exists, so a rollback knows what to delete even when
+        # a later write raised or the request was cancelled mid-write.
+        created: list[str] = []
+
+        async def _write() -> None:
+            try:
+                await asyncio.to_thread(_create)
+            except ConversationAlreadyExistsError as exc:
+                # The deterministic id is taken: by a finished import (a real
+                # duplicate), or by one a crash left half-written, which would
+                # otherwise read as "already imported" forever.
+                existing = await asyncio.to_thread(
+                    conversation_store.get_conversation, conversation_id
+                )
+                if existing is None or not await _is_abandoned_import(
+                    existing, source, external_session_id, user_id
+                ):
+                    raise _already_imported_error(
+                        "This source session has already been imported", conversation_id
+                    ) from exc
+                if not await _discard_abandoned_import(existing):
+                    raise _already_imported_error(
+                        "This source session has already been imported", conversation_id
+                    ) from exc
+                try:
+                    await asyncio.to_thread(_create)
+                except ConversationAlreadyExistsError as again:
+                    raise _already_imported_error(
+                        "This source session has already been imported", conversation_id
+                    ) from again
+            created.append(conversation_id)
+            await asyncio.to_thread(conversation_store.append, conversation_id, items)
             labels = {
                 **native_agent.presentation_labels,
                 IMPORT_SOURCE_LABEL_KEY: source,
                 IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY: external_session_id,
             }
-            await asyncio.to_thread(conversation_store.set_labels, conversation.id, labels)
+            await asyncio.to_thread(conversation_store.set_labels, conversation_id, labels)
             if permission_store is not None and user_id is not None:
                 await asyncio.to_thread(permission_store.ensure_user, user_id)
                 await asyncio.to_thread(
                     permission_store.grant,
                     user_id,
-                    conversation.id,
+                    conversation_id,
                     LEVEL_OWNER,
                 )
+            # Last: the external id is the dedupe key, so the source session only
+            # counts as imported once everything above has landed.
+            await asyncio.to_thread(
+                conversation_store.set_external_session_id,
+                conversation_id,
+                external_session_id,
+            )
+
+        # Shielded: a cancelled request (client gone, deadline, shutdown) must
+        # not interrupt the writes half-way; the rollback then waits for them
+        # to finish before deleting, so nothing is written after the delete.
+        write = asyncio.ensure_future(_write())
+        try:
+            await asyncio.shield(write)
         except Exception:
-            await conversation_store.delete_conversation(conversation.id)
+            if created:
+                await _rollback_import(conversation_store, conversation_id)
             raise
-        return conversation.id, title
+        except BaseException:
+            _rollback_import_in_background(conversation_store, write, created)
+            raise
+        return conversation_id, title
+
+    async def _is_abandoned_import(
+        conversation: Any, source: ImportSource, external_session_id: str, user_id: str | None
+    ) -> bool:
+        """Whether this importer may replace an import a dead request half-wrote.
+
+        Only the deterministic import id qualifies (a native run of the same
+        session has its own id). It must be older than any live import could
+        be, and either never got its external id (written last) or holds no
+        items (older servers wrote the external id first). The id derives from
+        the source session alone, so another user importing the same external
+        id lands on the same row: only its owner may discard it.
+        """
+        if conversation.id != _import_conversation_id(source, external_session_id):
+            return False
+        created_at = getattr(conversation, "created_at", None)
+        if isinstance(created_at, (int, float)) and (
+            now_epoch() - created_at < _ABANDONED_IMPORT_AGE_S
+        ):
+            return False
+        if getattr(conversation, "external_session_id", None) == external_session_id:
+            page = await asyncio.to_thread(conversation_store.list_items, conversation.id, limit=1)
+            if page.data:
+                return False
+        return await _importer_owns_partial(conversation.id, user_id)
+
+    async def _discard_abandoned_import(conversation: Any) -> bool:
+        """Delete a half-written import judged abandoned, unless it was replaced since.
+
+        The judgment awaits reads, so a concurrent import may already have
+        replaced the row with a complete one; a changed ``created_at`` means
+        that happened, and the fresh row is kept (``False``).
+        """
+        current = await asyncio.to_thread(conversation_store.get_conversation, conversation.id)
+        if current is not None and getattr(current, "created_at", None) != getattr(
+            conversation, "created_at", None
+        ):
+            return False
+        _logger.warning("Replacing an abandoned partial import %s", conversation.id)
+        await conversation_store.delete_conversation(conversation.id)
+        return True
+
+    async def _importer_owns_partial(conversation_id: str, user_id: str | None) -> bool:
+        """Whether ``user_id`` may discard a half-written import row.
+
+        The owner check is the one ``--force`` replacement uses. A row that
+        never got its owner grant (the grant is written after the items)
+        belongs to nobody, so the importer may replace it. Auth off (no
+        permission store or user) is single-user, like the host check.
+        """
+        if permission_store is None or user_id is None:
+            return True
+        try:
+            await require_access(
+                user_id, conversation_id, LEVEL_OWNER, permission_store, conversation_store
+            )
+            return True
+        except OmnigentError:
+            pass
+        try:
+            return not await asyncio.to_thread(permission_store.has_any_grants, conversation_id)
+        except NotImplementedError:
+            # Stores whose ownership is fixed at create time (no grant rows)
+            # can't have an ownerless row; the owner check above is final.
+            return False
 
     @router.post(
         "/imports",
@@ -631,6 +775,16 @@ def create_imports_router(
             conversation_store.find_conversation_by_external_session_id,
             body.external_session_id,
         )
+        if existing is not None and await _is_abandoned_import(
+            existing, body.source, body.external_session_id, user_id
+        ):
+            # Half-written by a request that died: replace it, don't report it.
+            if await _discard_abandoned_import(existing):
+                existing = None
+            else:
+                existing = await asyncio.to_thread(
+                    conversation_store.get_conversation, existing.id
+                )
         if existing is not None:
             await require_access(
                 user_id,
@@ -786,6 +940,11 @@ def create_imports_router(
                     conversation_store.find_conversation_by_external_session_id,
                     external_session_id,
                 )
+                if existing is not None and await _is_abandoned_import(
+                    existing, source, external_session_id, user_id
+                ):
+                    if await _discard_abandoned_import(existing):
+                        existing = None
                 if existing is not None:
                     counts["already_imported"] += 1
                     return None
