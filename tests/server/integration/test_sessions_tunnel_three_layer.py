@@ -2059,3 +2059,137 @@ async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
         )
         assert store.get_conversation(child.id).runner_id == _RUNNER_ID
         assert store.get_conversation(finished.id).runner_id == child_runner
+
+
+# ── Stale "running" settlement on reconnect ──────────────────────────────
+
+
+async def _bind_running_session(
+    ap_client: httpx.AsyncClient,
+    *,
+    runner_last_seen_fresh: bool = False,
+    cache_status: str | None = None,
+) -> str:
+    """Create a session bound to ``_RUNNER_ID`` whose row reads ``running``.
+
+    Seeds the post-server-restart state: ``live_status="running"`` in the DB,
+    a stale (NULL) or fresh ``runner_last_seen``, and an empty (or explicitly
+    seeded) status-cache entry.
+    """
+    import time
+
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _build_harness_agent_bundle(),
+                "application/gzip",
+            ),
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+
+    store = get_conversation_store()
+    store.replace_runner_id(session_id, _RUNNER_ID)
+    store.set_session_live_status(session_id, "running")
+    if runner_last_seen_fresh:
+        store.touch_runner_liveness([_RUNNER_ID], int(time.time()))
+    if cache_status is not None:
+        sessions_module._session_status_cache[session_id] = cache_status
+    else:
+        sessions_module._session_status_cache.pop(session_id, None)
+    return session_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_on_runner_connect_settles_stale_running_session_after_restart(
+    tunnel_three_layer_stack: _TunnelStack,
+) -> None:
+    """Reconnect settles a row a restarted server left ``running``.
+
+    The restart dropped the in-memory disconnect-grace timer, so the row still
+    reads ``running`` with a stale stamp and a cold cache. Without settling
+    before the reconnect stamps liveness, nothing ever clears it.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+    fake_pm = tunnel_three_layer_stack.fake_pm
+
+    session_id = await _bind_running_session(ap_client)
+    store = get_conversation_store()
+
+    assert store.get_conversation(session_id).live_status == "running"
+    assert sessions_module._session_status_cache.get(session_id) is None
+
+    try:
+        async with _reconnect_fires_connect_hook(ap_app, fake_pm, wait_for_recover=session_id):
+            assert sessions_module._session_status_cache.get(session_id) == "idle"
+            assert store.get_conversation(session_id).live_status == "idle"
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_on_runner_connect_skips_settlement_for_fresh_runner(
+    tunnel_three_layer_stack: _TunnelStack,
+) -> None:
+    """A runner re-tunnelling within its liveness lease keeps its turn running.
+
+    A fresh stamp means the runner was reachable moments ago (e.g. a rolling
+    server restart), so its turn may still be in flight.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+    fake_pm = tunnel_three_layer_stack.fake_pm
+
+    session_id = await _bind_running_session(ap_client, runner_last_seen_fresh=True)
+    store = get_conversation_store()
+
+    try:
+        async with _reconnect_fires_connect_hook(ap_app, fake_pm, wait_for_recover=session_id):
+            assert sessions_module._session_status_cache.get(session_id) != "idle"
+            assert store.get_conversation(session_id).live_status == "running"
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_on_runner_connect_skips_settlement_when_cache_has_running(
+    tunnel_three_layer_stack: _TunnelStack,
+) -> None:
+    """A ``running`` this replica already holds is never settled on reconnect.
+
+    Covers both a turn this replica saw start and a live harness's
+    post-reconnect resync landing before the session's turn in the loop.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+    fake_pm = tunnel_three_layer_stack.fake_pm
+
+    session_id = await _bind_running_session(ap_client, cache_status="running")
+    store = get_conversation_store()
+
+    try:
+        async with _reconnect_fires_connect_hook(ap_app, fake_pm, wait_for_recover=session_id):
+            assert sessions_module._session_status_cache.get(session_id) == "running"
+            assert store.get_conversation(session_id).live_status == "running"
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)

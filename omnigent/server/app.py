@@ -129,6 +129,7 @@ from omnigent.stores import (
 )
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
+    RUNNER_LIVENESS_TTL_S,
     ConversationNotFoundError,
     SessionConnectivity,
     runner_seen_is_fresh,
@@ -3523,17 +3524,15 @@ def create_app(
         )
         from omnigent.server.routes._sessions.common import (
             _session_sandbox_status_cache,
+            _session_status_cache,
         )
+        from omnigent.server.routes._sessions.helpers import reconcile_orphaned_running_status
         from omnigent.server.routes.sessions import (
             _ensure_runner_relay,
             _publish_runner_recovered_status,
             _publish_sandbox_status,
             prefetch_session_routing_catalogs,
         )
-
-        # Stamp liveness immediately so other replicas see the runner
-        # online before the first periodic sweep.
-        session_live_state.touch_runner_liveness([runner_id])
 
         # Direct by-runner lookup instead of list-everything-and-filter:
         # the listing path may be backed by an eventually-consistent
@@ -3547,6 +3546,31 @@ def create_app(
         convs = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
+        # A server that restarted during the outage lost its disconnect-grace
+        # timer, so rows this runner left mid-turn still read "running". Settle
+        # them before the fresh stamp below blocks the orphan check for good.
+        stale_before = int(time.time()) - RUNNER_LIVENESS_TTL_S
+        for conv in convs:
+            # Checked per session: a live harness's post-reconnect resync may
+            # have republished "running" while earlier sessions settled.
+            if (
+                conv.agent_id is None
+                or conv.live_status not in ("running", "waiting")
+                or runner_seen_is_fresh(conv.runner_last_seen)
+                or _session_status_cache.get(conv.id) is not None
+            ):
+                continue
+            if await asyncio.to_thread(
+                reconcile_orphaned_running_status, conv.id, conversation_store, stale_before
+            ):
+                _logger.info(
+                    "_on_runner_connect: settled stale running session %s",
+                    conv.id,
+                    extra={"session_id": conv.id},
+                )
+        # Stamp liveness so other replicas see the runner online before the
+        # first periodic sweep.
+        session_live_state.touch_runner_liveness([runner_id])
         # Restore each tree from its root before ordinary child initialization
         # can clear the interruption status or cache an init without continuation.
         bound_ids = {conv.id for conv in convs}
