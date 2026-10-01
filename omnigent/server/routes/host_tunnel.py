@@ -922,7 +922,12 @@ async def _receive_loop(
         if isinstance(frame, HostImportLocalProgressFrame):
             queue = conn.pending_import_local.get(frame.request_id)
             if queue is not None:
-                queue.put_nowait(("progress", {"done": frame.done, "total": frame.total}))
+                queue.put_nowait(
+                    (
+                        "progress",
+                        {"done": frame.done, "total": frame.total, "skipped": frame.skipped},
+                    )
+                )
             continue
         if isinstance(frame, HostImportLocalDoneFrame):
             queue = conn.pending_import_local.get(frame.request_id)
@@ -940,6 +945,7 @@ async def _receive_loop(
                             "error": frame.error,
                             "failed": frame.failed,
                             "failures": frame.failures,
+                            "skipped": frame.skipped,
                         },
                     )
                 )
