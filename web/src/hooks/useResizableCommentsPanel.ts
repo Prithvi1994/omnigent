@@ -141,7 +141,11 @@ export function useResizableCommentsPanel() {
       setStoredWidth(clampWidth(preferredWidth ?? DEFAULT_WIDTH_PX));
     };
     update();
-    if (typeof ResizeObserver === "undefined") return;
+    // Without ResizeObserver, fall back to re-measuring on window resizes.
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", update);
+      return () => window.removeEventListener("resize", update);
+    }
     const ro = new ResizeObserver(update);
     ro.observe(row);
     return () => ro.disconnect();
@@ -202,16 +206,6 @@ export function useResizableCommentsPanel() {
       removeDragOverlay();
     };
   }, [clampWidth, removeDragOverlay]);
-
-  // Without ResizeObserver, fall back to re-clamping on window resizes.
-  useEffect(() => {
-    if (typeof ResizeObserver !== "undefined") return;
-    function onResize() {
-      setStoredWidth(clampWidth(preferredWidth ?? DEFAULT_WIDTH_PX));
-    }
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, [clampWidth]);
 
   return {
     /** Side-by-side width in px; the panel applies it only beside the viewer. */

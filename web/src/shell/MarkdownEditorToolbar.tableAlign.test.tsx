@@ -183,6 +183,7 @@ describe("setColumnAlign dispatch", () => {
         dispatch: mockDispatch,
         focus: vi.fn(),
       },
+      commands: { focus: vi.fn() },
     } as unknown as Editor;
     return { editor, mockSetNodeMarkup, mockDispatch };
   }
@@ -205,6 +206,49 @@ describe("setColumnAlign dispatch", () => {
       height: 2,
       cellsInRect: vi.fn().mockReturnValue([4, 9]),
     } as unknown as ReturnType<typeof TableMap.get>);
+  });
+
+  it("keeps the alignment controls reachable from the ⋯ menu in a narrow toolbar", () => {
+    class StubResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+    // jsdom has no layout: a 212px row with 28px items folds the table group.
+    const rectSpy = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: HTMLElement) {
+        let width = 0;
+        if (this.getAttribute("role") === "toolbar") width = 212;
+        else if (this.dataset.measure === "divider") width = 9;
+        else if (this.dataset.measure !== undefined) width = 28;
+        else if (this.dataset.slot === "save-status") width = 70;
+        return {
+          width,
+          height: 0,
+          top: 0,
+          left: 0,
+          right: width,
+          bottom: 0,
+          x: 0,
+          y: 0,
+          toJSON: () => ({}),
+        } as DOMRect;
+      });
+    try {
+      const { editor, mockDispatch } = makeEditorWithView();
+      renderToolbar(editor);
+      expect(screen.queryByRole("button", { name: "Align column center" })).toBeNull();
+
+      fireEvent.click(screen.getByRole("button", { name: "More formatting" }));
+      fireEvent.click(screen.getByRole("button", { name: "Align column center" }));
+
+      expect(mockDispatch).toHaveBeenCalledOnce();
+    } finally {
+      rectSpy.mockRestore();
+      vi.unstubAllGlobals();
+    }
   });
 
   it("clicking 'center' dispatches one transaction updating both column cells", () => {

@@ -40,6 +40,7 @@ commit lands clean.
 # it is narrower than 448px, so the panel stacks under the editor.
 _VIEWPORTS = [(1512, 982, "beside"), (1280, 800, "beside"), (1024, 768, "stacked")]
 _VIEWPORT_IDS = [f"{w}x{h}" for w, h, _ in _VIEWPORTS]
+# Mirrors the `@md/viewer` (28rem) container breakpoint the panel stacks under.
 _STACKING_BREAKPOINT_PX = 448
 _LAYOUT_SETTLE_MS = 500
 _RECORDING_HOLD_MS = 2500

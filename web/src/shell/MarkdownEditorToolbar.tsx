@@ -368,6 +368,7 @@ function useToolbarOverflow(items: readonly ToolbarItem[]) {
     };
 
     evaluate();
+    // Without ResizeObserver only window resizes re-evaluate the fold.
     if (typeof ResizeObserver === "undefined") {
       window.addEventListener("resize", evaluate);
       return () => window.removeEventListener("resize", evaluate);
@@ -390,7 +391,11 @@ function ToolbarOverflowMenu({
   items: readonly ToolbarItem[];
 }) {
   const [open, setOpen] = useState(false);
-  const close = useCallback(() => setOpen(false), []);
+  // The popover held focus while open; hand it back to the editor afterwards.
+  const close = useCallback(() => {
+    setOpen(false);
+    editor?.commands.focus();
+  }, [editor]);
   const groups: ToolbarItem[][] = [];
   for (const item of items) {
     const last = groups[groups.length - 1];
@@ -482,8 +487,6 @@ export function ToolbarPlugin({
   const handleCopy = useCallback(() => {
     const md = getMarkdown();
     if (!navigator?.clipboard?.writeText) return;
-    // Keep the caret in the document, also when Copy ran from the "⋯" menu.
-    editor?.commands.focus();
     navigator.clipboard
       .writeText(md)
       .then(() => {
@@ -494,7 +497,7 @@ export function ToolbarPlugin({
       .catch(() => {
         // ignore clipboard errors
       });
-  }, [editor, getMarkdown]);
+  }, [getMarkdown]);
 
   const handleSave = useCallback(() => {
     if (!isDirty || saveDisabled || hasExternalUpdate) return;

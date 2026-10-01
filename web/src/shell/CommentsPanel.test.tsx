@@ -409,10 +409,14 @@ describe("CommentsPanel show more / less", () => {
 //
 // Parent-row width, not viewport width, controls the resize handle.
 
+const rows: HTMLElement[] = [];
+afterEach(() => rows.splice(0).forEach((row) => row.remove()));
+
 /** Render the panel inside a parent row whose pixel width the getter reports. */
 function renderPanelInRow(rowWidth: number | (() => number)) {
   const width = typeof rowWidth === "function" ? rowWidth : () => rowWidth;
   const row = document.createElement("div");
+  rows.push(row);
   row.getBoundingClientRect = () =>
     ({
       width: width(),

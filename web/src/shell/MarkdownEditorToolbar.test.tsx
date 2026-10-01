@@ -8,7 +8,7 @@
 // only useEditorState (formatting badges) and the editor.getMarkdown()
 // call on save are exercised.
 
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tiptap/react", () => ({
@@ -73,18 +73,25 @@ afterEach(() => {
 // jsdom has no layout: getBoundingClientRect is stubbed so the row reports the
 // given width, each clone item 28px (divider 9px) and the status pill 70px.
 
-function installToolbarWidths(rowWidth: number): void {
+function installToolbarWidths(rowWidth: number | (() => number)): {
+  observers: ResizeObserverCallback[];
+} {
+  const observers: ResizeObserverCallback[] = [];
   class StubResizeObserver {
+    constructor(callback: ResizeObserverCallback) {
+      observers.push(callback);
+    }
     observe() {}
     unobserve() {}
     disconnect() {}
   }
   vi.stubGlobal("ResizeObserver", StubResizeObserver);
+  const currentRowWidth = typeof rowWidth === "function" ? rowWidth : () => rowWidth;
   vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
     this: HTMLElement,
   ) {
     let width = 0;
-    if (this.getAttribute("role") === "toolbar") width = rowWidth;
+    if (this.getAttribute("role") === "toolbar") width = currentRowWidth();
     else if (this.dataset.measure === "divider") width = 9;
     else if (this.dataset.measure !== undefined) width = 28;
     else if (this.dataset.slot === "save-status") width = 70;
@@ -100,6 +107,7 @@ function installToolbarWidths(rowWidth: number): void {
       toJSON: () => ({}),
     } as DOMRect;
   });
+  return { observers };
 }
 
 /** A chainable editor stub that records every command name it receives. */
@@ -176,24 +184,47 @@ describe("MarkdownEditorToolbar overflow", () => {
     const folded = screen.getByRole("button", { name: "Bullet list" });
     expect(screen.getByRole("toolbar", { name: "Formatting" })).not.toContainElement(folded);
     fireEvent.click(folded);
-    expect(calls).toEqual(["focus", "toggleBulletList", "run"]);
-    // The menu closes once the command has run.
+    // The menu closes once the command has run and hands focus back to the editor.
+    expect(calls).toEqual(["focus", "toggleBulletList", "run", "commands.focus"]);
     expect(screen.queryByRole("button", { name: "Bullet list" })).toBeNull();
+  });
+
+  it("refolds as the measured row width changes after mount", () => {
+    let rowWidth = 1000;
+    const { observers } = installToolbarWidths(() => rowWidth);
+    renderToolbar();
+    const row = () => within(screen.getByRole("toolbar", { name: "Formatting" }));
+    expect(row().getByRole("button", { name: "Undo (⌘Z)" })).toBeInTheDocument();
+    expect(row().queryByRole("button", { name: "More formatting" })).toBeNull();
+
+    rowWidth = 212;
+    act(() => observers.forEach((cb) => cb([], {} as ResizeObserver)));
+    expect(row().queryByRole("button", { name: "Undo (⌘Z)" })).toBeNull();
+    expect(row().getByRole("button", { name: "More formatting" })).toBeInTheDocument();
+
+    rowWidth = 1000;
+    act(() => observers.forEach((cb) => cb([], {} as ResizeObserver)));
+    expect(row().getByRole("button", { name: "Undo (⌘Z)" })).toBeInTheDocument();
+    expect(row().queryByRole("button", { name: "More formatting" })).toBeNull();
   });
 
   it("closes the ⋯ menu after a folded Copy and hands focus back to the editor", () => {
     installToolbarWidths(212);
     const writeText = vi.fn().mockResolvedValue(undefined);
-    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
-    const { editor, calls } = chainRecordingEditor();
-    renderToolbar({ editor });
-    fireEvent.click(screen.getByRole("button", { name: "More formatting" }));
-    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
-    expect(writeText).toHaveBeenCalledWith(MARKDOWN);
-    // Copy has no editor chain of its own, so it refocuses the editor explicitly.
-    expect(calls).toEqual(["commands.focus"]);
-    expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
-    expect(screen.getByRole("button", { name: "More formatting" })).toBeInTheDocument();
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    try {
+      const { editor, calls } = chainRecordingEditor();
+      renderToolbar({ editor });
+      fireEvent.click(screen.getByRole("button", { name: "More formatting" }));
+      fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+      expect(writeText).toHaveBeenCalledWith(MARKDOWN);
+      // Copy has no editor chain of its own; closing the menu refocuses the editor.
+      expect(calls).toEqual(["commands.focus"]);
+      expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
+      expect(screen.getByRole("button", { name: "More formatting" })).toBeInTheDocument();
+    } finally {
+      Reflect.deleteProperty(navigator, "clipboard");
+    }
   });
 });
 
