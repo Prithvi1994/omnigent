@@ -588,14 +588,15 @@ pnpm run build             # current platform
 pnpm run build:mac         # .dmg + .zip (signed if an identity is available, not notarized)
 pnpm run build:mac:release # .dmg + .zip; app and DMG signed + notarized (see below)
 pnpm run build:linux       # AppImage + .deb
-pnpm run build:win         # NSIS installer
+pnpm run build:win         # NSIS installer (signed if WIN_CSC_LINK is set, see below)
+pnpm run build:win:release # NSIS installer; aborts unless it is signed (see below)
 ```
 
 Local packages use the `ai.omnigent.desktop-dev` app ID and the **Omnigent Dev**
 name; output lands in `electron/dist-dev/` (the DMG is named
 `Omnigent Dev-<version>-<arch>.dmg`). They keep their own app data and do not
-install production desktop updates. `build:mac:release` retains
-`ai.omnigent.desktop`, **Omnigent**, and `electron/dist/`.
+install production desktop updates. `build:mac:release` and `build:win:release`
+retain `ai.omnigent.desktop`, **Omnigent**, and `electron/dist/`.
 
 Unpackaged `pnpm start` / `just electron-dev` runs inside Electron's own macOS
 bundle, but reads local preferences from `ai.omnigent.desktop-dev` explicitly
@@ -704,8 +705,8 @@ export WIN_CSC_KEY_PASSWORD='the pfx password'
 then:
 
 ```bash
-pnpm run build:win          # signed if WIN_CSC_LINK is set, unsigned otherwise
-pnpm run build:win:release  # aborts unless every artifact is signed
+pnpm run build:win          # Omnigent Dev package; signed if WIN_CSC_LINK is set, unsigned otherwise
+pnpm run build:win:release  # production package; aborts unless every artifact is signed
 ```
 
 `build:win:release` sets `forceCodeSigning`, so a release build **fails
