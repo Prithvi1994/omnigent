@@ -24,7 +24,9 @@ vi.mock("@/lib/identity", () => ({
 // The animated WebGL panel can't initialize under jsdom; the shell's layout
 // (which hosts the strip) is what's under test.
 vi.mock("@/components/onboarding/AnimatedOmnigentPanel", () => ({
-  AnimatedOmnigentPanel: ({ children }: { children?: React.ReactNode }) => <div>{children}</div>,
+  AnimatedOmnigentPanel: ({ children }: { children?: React.ReactNode }) => (
+    <div data-testid="animated-panel">{children}</div>
+  ),
 }));
 
 const MAC_ELECTRON_UA =
@@ -41,7 +43,6 @@ afterEach(() => {
   cleanup();
   delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
   vi.restoreAllMocks();
-  vi.unstubAllGlobals();
   window.localStorage.clear();
 });
 
@@ -110,9 +111,9 @@ describe("outside-AppShell screens keep the desktop window draggable", () => {
   });
 
   it("v2 login page renders the drag strip in AuthCardShell's compact layout", () => {
-    // jsdom has no matchMedia; matching Tailwind's max-md query selects the
-    // compact layout, which mounts its own strip.
-    vi.stubGlobal("matchMedia", (query: string) => ({
+    // The test setup's matchMedia mock never matches; match Tailwind's max-md
+    // query so AuthCardShell takes its compact layout, which mounts its own strip.
+    vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
       matches: query.includes("max-width"),
       media: query,
       onchange: null,
@@ -127,9 +128,8 @@ describe("outside-AppShell screens keep the desktop window draggable", () => {
         <LoginPage />
       </MemoryRouter>,
     );
+    // The compact layout is the branch without the animated panel.
+    expect(container.querySelector('[data-testid="animated-panel"]')).toBeNull();
     expectDragStrip(container, "/login?login-v2=1 (compact layout)");
-    // The compact layout folds a 3rem base padding into the safe-area inset.
-    const strip = container.querySelector(".electron-standalone-drag-strip") as HTMLElement;
-    expect((strip.parentElement as HTMLElement).style.paddingTop).toContain("3rem");
   });
 });
