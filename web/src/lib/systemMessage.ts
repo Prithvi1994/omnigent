@@ -147,29 +147,29 @@ export function teammateDeliveryMarkerContent(
     if (parsed === null) return null;
     deliveries.push(...parsed);
   }
-  let header: string | null = null;
-  const lines: string[] = [];
-  deliveries.forEach((delivery, index) => {
-    const idle = delivery.idleResult !== null;
-    if (idle) {
-      const restatesProse = deliveries
-        .slice(0, index)
-        .some((other) => other.teammateId === delivery.teammateId && other.idleResult === null);
-      if (restatesProse || !delivery.idleResult) return;
-    }
-    const text = idle ? (delivery.idleResult ?? "") : delivery.body;
-    if (header === null) {
-      header = teammateMarkerHeader(delivery.teammateId, delivery.summary, idle);
-      if (text) lines.push(text);
-      return;
-    }
-    lines.push(
-      idle ? `@${delivery.teammateId} finished: ${text}` : `@${delivery.teammateId}: ${text}`,
-    );
+  const shown = deliveries.filter((delivery, index) => {
+    if (delivery.idleResult === null) return true;
+    if (!delivery.idleResult) return false;
+    return !deliveries
+      .slice(0, index)
+      .some((other) => other.teammateId === delivery.teammateId && other.idleResult === null);
   });
-  if (header === null) return null;
-  const text = lines.length > 0 ? `${header}\n${lines.join("\n\n")}` : header;
-  return [{ type: "input_text", text }];
+  // A prose message heads the marker when there is one, so a delivery that
+  // also carries another teammate's finish is not titled as a finish.
+  const lead = shown.find((delivery) => delivery.idleResult === null) ?? shown[0];
+  if (lead === undefined) return null;
+  const header = teammateMarkerHeader(lead.teammateId, lead.summary, lead.idleResult !== null);
+  const lines = [lead.idleResult ?? lead.body];
+  for (const delivery of shown) {
+    if (delivery === lead) continue;
+    lines.push(
+      delivery.idleResult === null
+        ? `@${delivery.teammateId}: ${delivery.body}`
+        : `@${delivery.teammateId} finished: ${delivery.idleResult}`,
+    );
+  }
+  const body = lines.filter(Boolean).join("\n\n");
+  return [{ type: "input_text", text: body ? `${header}\n${body}` : header }];
 }
 
 /** Identify a teammate marker in user-message content; `null` for anything else. */
@@ -178,7 +178,7 @@ export function teammateMarkerOf(content: MessageContentBlock[]): TeammateMarker
   const text = content
     .filter(isTextBlock)
     .map((block) => block.text)
-    .join("")
+    .join("\n")
     .trim();
   const parsed = parseSystemMessage(text);
   if (!parsed?.teammate) return null;

@@ -3652,9 +3652,10 @@ async def _persist_external_subagent_start(
         ``subagent_id`` (Claude-side id, e.g. ``"a5c7eff..."``),
         ``agent_type`` (e.g. ``"Explore"``), ``description``
         (free-form, used in the title), ``tool_use_id``
-        (e.g. ``"toolu_..."``; optional only for an in-process teammate,
-        whose spawn has no tool result). Optional keys: ``name`` (the name
-        the lead gave the agent, e.g. ``"buddy"``) and ``task_kind``
+        (e.g. ``"toolu_..."``; ignored for an in-process teammate, whose
+        spawn has no tool result — the forwarder sends a placeholder only
+        so older servers accept the row). Optional keys: ``name`` (the
+        name the lead gave the agent, e.g. ``"buddy"``) and ``task_kind``
         (Claude's ``taskKind``, e.g. ``"in_process_teammate"``).
     :param conversation_store: Store used to read existing children
         (for idempotency) and create the new row.
@@ -3670,12 +3671,12 @@ async def _persist_external_subagent_start(
     tool_use_id = body.data.get("tool_use_id")
     name = body.data.get("name")
     task_kind = body.data.get("task_kind")
-    if not isinstance(name, str):
-        name = ""
-    if not isinstance(task_kind, str):
-        task_kind = ""
+    name = name.strip() if isinstance(name, str) else ""
+    task_kind = task_kind.strip() if isinstance(task_kind, str) else ""
     teammate = task_kind == _CLAUDE_NATIVE_TEAMMATE_TASK_KIND
-    if tool_use_id is None and teammate:
+    if teammate:
+        # No spawn result exists to correlate; any value sent is a placeholder
+        # for older servers, not a tool-use id worth storing.
         tool_use_id = ""
     if not isinstance(subagent_id, str) or not subagent_id:
         raise OmnigentError(

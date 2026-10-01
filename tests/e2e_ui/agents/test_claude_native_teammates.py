@@ -275,7 +275,7 @@ def test_in_process_teammate_appears_in_agents_rail(
     rail = _open_agents_tab(page)
     running = _rail_snapshot(page, rail, evidence, "running")
 
-    # Control from the report: Claude Code's own TUI while the teammate runs.
+    # Baseline: Claude's own TUI while the teammate runs.
     _open_terminal_view(page)
     page.wait_for_timeout(2_000)
     page.screenshot(path=str(evidence / "terminal-while-running.png"))

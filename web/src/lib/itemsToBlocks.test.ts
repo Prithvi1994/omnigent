@@ -282,6 +282,38 @@ describe("itemsToBlocks — flat shape", () => {
       ]);
     });
 
+    it("keeps an idle result that answers work assigned after the folded twin", () => {
+      const blocks = itemsToBlocks([
+        delivery("resp_1", prose, "msg_prose"),
+        assistantMessage("resp_1", "CHAT-ACK", "msg_ack_1"),
+        delivery("resp_2", idle("resting."), "msg_idle_twin"),
+        userMessage("resp_3", "give buddy another task", "msg_human"),
+        functionCall("resp_3", "call_send", "SendMessage", { to: "buddy", message: "task two" }),
+        functionCallOutput("resp_3", "call_send", "sent"),
+        assistantMessage("resp_3", "RELAY-SENT", "msg_ack_2"),
+        delivery("resp_4", idle("Task two done."), "msg_idle_result"),
+      ]);
+
+      const ids = blocks.map((block) => block.ctx.itemId);
+      expect(ids).not.toContain("msg_idle_twin");
+      expect(ids.slice(-2)).toEqual(["msg_ack_2", "msg_idle_result"]);
+      expect((blocks.at(-1) as UserMessageBlock).content).toEqual([
+        { type: "input_text", text: "[System: teammate buddy finished]\nTask two done." },
+      ]);
+    });
+
+    it("keeps an idle result once the lead has given the teammate new work", () => {
+      const blocks = itemsToBlocks([
+        delivery("resp_1", prose, "msg_prose"),
+        functionCall("resp_1", "call_send", "SendMessage", { to: "buddy", message: "task two" }),
+        functionCallOutput("resp_1", "call_send", "sent"),
+        assistantMessage("resp_1", "RELAY-SENT", "msg_ack"),
+        delivery("resp_2", idle("Task two done."), "msg_idle_result"),
+      ]);
+
+      expect(blocks.at(-1)?.ctx.itemId).toBe("msg_idle_result");
+    });
+
     it("keeps a delivery a human submitted from the web as their own bubble", () => {
       const human: ConversationItem = {
         ...userMessage("resp_1", framed(prose), "msg_human"),

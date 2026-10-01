@@ -108,6 +108,9 @@ _SUBAGENT_META_GLOB = "agent-*.meta.json"
 # carries no ``toolUseId``: the lead's ``Agent`` call returns at once and the
 # teammate reports back through mailbox deliveries instead of a tool result.
 _TEAMMATE_TASK_KIND = "in_process_teammate"
+# Placeholder ``tool_use_id`` for a teammate registration: servers that predate
+# ``task_kind`` require a non-empty value and would otherwise reject the row.
+_TEAMMATE_CORRELATION_PREFIX = "teammate:"
 # Claude's built-in sub-agent spawn tool; its tool-use id is the ``toolUseId``
 # stamped into each ``agent-<id>.meta.json``. Reuse the router's canonical set so
 # both the current ``Agent`` name and the still-supported ``Task`` alias match.
@@ -1738,7 +1741,9 @@ async def _post_external_subagent_start(
         e.g. ``"Investigate web UI session data flow"``.
     :param tool_use_id: Parent transcript's ``Task`` tool-use block
         id this sub-agent was spawned from, e.g. ``"toolu_..."``. Empty
-        for an in-process teammate, which has no spawn result to correlate.
+        for an in-process teammate, which has no spawn result to correlate;
+        a ``teammate:<subagent_id>`` placeholder is sent in its place so
+        older servers accept the registration.
     :param name: Name the lead gave the agent, e.g. ``"buddy"``; empty
         when the spawn was anonymous.
     :param task_kind: Claude's ``taskKind`` for the meta, e.g.
@@ -1750,6 +1755,8 @@ async def _post_external_subagent_start(
         mismatch and is unrecoverable for this sub-agent.
     :raises RuntimeError: If the server response body is not JSON.
     """
+    if not tool_use_id and task_kind == _TEAMMATE_TASK_KIND:
+        tool_use_id = f"{_TEAMMATE_CORRELATION_PREFIX}{subagent_id}"
     resp = await client.post(
         f"/v1/sessions/{parent_session_id}/events",
         json={
@@ -1758,7 +1765,7 @@ async def _post_external_subagent_start(
                 "subagent_id": subagent_id,
                 "agent_type": agent_type,
                 "description": description,
-                **({"tool_use_id": tool_use_id} if tool_use_id else {}),
+                "tool_use_id": tool_use_id,
                 **({"name": name} if name else {}),
                 **({"task_kind": task_kind} if task_kind else {}),
             },

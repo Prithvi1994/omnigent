@@ -95,6 +95,9 @@ function TeammateMessageView({ message }: SystemMessageViewProps) {
   const teammate = message.teammate;
   const finished = message.kind === "teammate_finished";
   const body = message.body.trim();
+  let heading = "";
+  if (finished) heading = " finished";
+  else if (teammate?.summary) heading = ` · ${teammate.summary}`;
   return (
     <div
       className="my-1 flex max-w-[640px] flex-col gap-1 rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-sm"
@@ -106,7 +109,7 @@ function TeammateMessageView({ message }: SystemMessageViewProps) {
         <UsersIcon className="size-3.5 shrink-0" />
         <span className="truncate">
           <strong className="font-semibold text-foreground">@{teammate?.id ?? "teammate"}</strong>
-          {finished ? " finished" : teammate?.summary ? ` · ${teammate.summary}` : ""}
+          {heading}
         </span>
       </div>
       {body && <div className="whitespace-pre-wrap text-foreground">{body}</div>}

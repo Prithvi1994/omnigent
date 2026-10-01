@@ -2781,7 +2781,12 @@ def _merge_launch_settings(
             continue
         layer = _load_settings_layer(value)
         if layer is None:
-            _logger.warning("claude-native: leaving unparseable --settings value for Claude")
+            # Inline JSON may carry env secrets; name the layer without echoing it.
+            source = "inline JSON" if value.lstrip().startswith("{") else f"file {value!r}"
+            _logger.warning(
+                "claude-native: leaving --settings %s for Claude: not a readable JSON object",
+                source,
+            )
             remaining.extend(flag)
             continue
         layers.append(layer)
@@ -8328,20 +8333,30 @@ def _parse_slash_command_record(content: str) -> _SlashCommandPayload | None:
     return _SlashCommandPayload(name=name, arguments=arguments, output=output)
 
 
-def _prefixed_teammate_envelopes(text: str) -> str | None:
-    """Return what follows Claude's delivery prefix and teammate envelopes, or ``None``."""
+def _split_teammate_envelopes(text: str) -> tuple[bool, str] | None:
+    """Strip Claude's optional delivery prefix and the teammate envelopes.
+
+    Returns whether the prefix was present and what follows the envelopes;
+    ``None`` when the text does not open with an envelope.
+    """
     stripped = text.lstrip()
+    wrapped = False
     for prefix in _TEAMMATE_MESSAGE_PREFIXES:
         if stripped.startswith(prefix):
             stripped = stripped[len(prefix) :].lstrip()
+            wrapped = True
             break
-    else:
-        return None
     if _TEAMMATE_MESSAGE_RE.match(stripped) is None:
         return None
     while match := _TEAMMATE_MESSAGE_RE.match(stripped):
         stripped = stripped[match.end() :].lstrip()
-    return stripped
+    return wrapped, stripped
+
+
+def _prefixed_teammate_envelopes(text: str) -> str | None:
+    """Return what follows Claude's delivery prefix and teammate envelopes, or ``None``."""
+    split = _split_teammate_envelopes(text)
+    return split[1] if split is not None and split[0] else None
 
 
 def _is_framed_teammate_delivery(text: str) -> bool:
@@ -8380,21 +8395,12 @@ def _is_agent_notification_text(text: str) -> bool:
     """Recognize possible agent context; text alone does not prove its origin."""
     if _is_trusted_agent_notification_text(text):
         return True
-    stripped = text.lstrip()
-    wrapped = False
-    for prefix in _TEAMMATE_MESSAGE_PREFIXES:
-        if stripped.startswith(prefix):
-            stripped = stripped[len(prefix) :].lstrip()
-            wrapped = True
-            break
-    if _TEAMMATE_MESSAGE_RE.match(stripped) is None:
+    split = _split_teammate_envelopes(text)
+    if split is None:
         return False
-    while match := _TEAMMATE_MESSAGE_RE.match(stripped):
-        stripped = stripped[match.end() :].lstrip()
-        if not stripped:
-            return True
+    wrapped, remainder = split
     # Wrapped peer messages can append Claude's own explanatory guidance.
-    return wrapped and stripped.startswith(_TEAMMATE_DELIVERY_GUIDANCE)
+    return not remainder or (wrapped and remainder.startswith(_TEAMMATE_DELIVERY_GUIDANCE))
 
 
 def _subagent_handback_id(origin: object) -> str | None:

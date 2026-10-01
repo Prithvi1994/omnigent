@@ -365,6 +365,16 @@ describe("teammate deliveries", () => {
     );
   });
 
+  it("leads a mixed delivery with the prose message, not another teammate's finish", () => {
+    const charlie =
+      '<teammate-message teammate_id="charlie" summary="Docs reviewed">\nDocs look fine.\n</teammate-message>';
+    expect(teammateDeliveryMarkerContent(text(framed(idle("TMREPLY done."), charlie)))).toEqual(
+      text(
+        "[System: teammate charlie: Docs reviewed]\nDocs look fine.\n\n@buddy finished: TMREPLY done.",
+      ),
+    );
+  });
+
   it("parses the markers back into teammate kinds", () => {
     expect(
       parseSystemMessage(proseMarker[0]!.type === "input_text" ? proseMarker[0].text : ""),
@@ -384,6 +394,12 @@ describe("teammate deliveries", () => {
       teammateId: "buddy",
       kind: "teammate_finished",
     });
+    expect(
+      teammateMarkerOf([
+        { type: "input_text", text: "[System: teammate buddy finished]" },
+        { type: "input_text", text: "TMREPLY done." },
+      ]),
+    ).toEqual({ teammateId: "buddy", kind: "teammate_finished" });
     expect(teammateMarkerOf(text("[System: background task t1 completed]"))).toBeNull();
     expect(isSystemUserContent(text("[System: teammate buddy]\nhi"))).toBe(true);
   });

@@ -115,10 +115,25 @@ export function itemsToBlocks(items: ConversationItem[]): AnyBlock[] {
   return blocks;
 }
 
+// Blocks the lead emits while replying to a delivery. Anything else between a
+// prose message and an idle marker (a human message, another marker, a tool
+// call) starts new work, so the idle result is a fresh one and stays visible.
+const LEAD_REPLY_BLOCKS = new Set<AnyBlock["type"]>([
+  "response_start",
+  "response_end",
+  "text_chunk",
+  "text_done",
+  "reasoning_start",
+  "reasoning_chunk",
+  "reasoning_block",
+]);
+
 /**
- * Whether a "teammate finished" marker only restates the prose delivery that
- * precedes it from the same teammate (Claude sends an idle notification after
- * every teammate turn). A one-shot idle result with no prose before it stays.
+ * Whether a "teammate finished" marker only restates the prose delivery it
+ * follows from the same teammate (Claude sends an idle notification after
+ * every teammate turn). The scan stops at the first block that is not the
+ * lead's own reply, so an idle result that answers later work stays visible,
+ * as does a one-shot idle result with no prose before it.
  */
 export function foldsTeammateIdleMarker(block: AnyBlock, previous: readonly AnyBlock[]): boolean {
   if (block.type !== "user_message") return false;
@@ -126,9 +141,11 @@ export function foldsTeammateIdleMarker(block: AnyBlock, previous: readonly AnyB
   if (marker?.kind !== "teammate_finished") return false;
   for (let index = previous.length - 1; index >= 0; index -= 1) {
     const candidate = previous[index]!;
-    if (candidate.type !== "user_message") continue;
-    const earlier = teammateMarkerOf(candidate.content);
-    if (earlier?.teammateId === marker.teammateId) return earlier.kind === "teammate_message";
+    if (candidate.type === "user_message") {
+      const earlier = teammateMarkerOf(candidate.content);
+      return earlier?.teammateId === marker.teammateId && earlier.kind === "teammate_message";
+    }
+    if (!LEAD_REPLY_BLOCKS.has(candidate.type)) return false;
   }
   return false;
 }

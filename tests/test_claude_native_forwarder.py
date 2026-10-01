@@ -6218,15 +6218,29 @@ async def test_subagent_watcher_registers_a_task_named_spawn(
 
 
 async def _register_subagents_once(
-    tmp_path: Path, transcript_path: Path
+    tmp_path: Path, transcript_path: Path, *, older_server: bool = False
 ) -> tuple[dict[str, dict[str, Any]], forwarder.SubagentForwardState]:
-    """Run one watcher tick against a mock server; return the start payloads by id."""
+    """Run one watcher tick against a mock server; return the start payloads by id.
+
+    ``older_server`` mimics a server that predates ``task_kind`` and rejects a
+    registration without a non-empty ``tool_use_id``.
+    """
     start_bodies: dict[str, dict[str, Any]] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         if body.get("type") != "external_subagent_start":
             return httpx.Response(202, json={})
+        if older_server and not body["data"].get("tool_use_id"):
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "code": "invalid_input",
+                        "message": "external_subagent_start requires non-empty data.tool_use_id",
+                    }
+                },
+            )
         subagent_id = body["data"]["subagent_id"]
         start_bodies[subagent_id] = body["data"]
         return httpx.Response(
@@ -6275,6 +6289,7 @@ async def test_subagent_watcher_registers_an_in_process_teammate(tmp_path: Path)
             "subagent_id": "abuddy-9837bbf1d431dcca",
             "agent_type": "buddy",
             "description": "Probe teammate",
+            "tool_use_id": "teammate:abuddy-9837bbf1d431dcca",
             "name": "buddy",
             "task_kind": "in_process_teammate",
         }
@@ -6282,6 +6297,32 @@ async def test_subagent_watcher_registers_an_in_process_teammate(tmp_path: Path)
     entry = state.subagents["abuddy-9837bbf1d431dcca"]
     assert entry.child_conversation_id == "conv_abuddy-9837bbf1d431dcca"
     assert entry.parent_subagent_id is None
+
+
+async def test_subagent_watcher_registers_a_teammate_with_an_older_server(
+    tmp_path: Path,
+) -> None:
+    """A server that still requires ``tool_use_id`` accepts the teammate's placeholder."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="abuddy-9837bbf1d431dcca",
+        agent_type="buddy",
+        description="Probe teammate",
+        tool_use_id=None,
+        meta_extras={"name": "buddy", "taskKind": "in_process_teammate"},
+    )
+
+    start_bodies, state = await _register_subagents_once(
+        tmp_path, transcript_path, older_server=True
+    )
+
+    assert start_bodies["abuddy-9837bbf1d431dcca"]["tool_use_id"] == (
+        "teammate:abuddy-9837bbf1d431dcca"
+    )
+    entry = state.subagents["abuddy-9837bbf1d431dcca"]
+    assert entry.child_conversation_id == "conv_abuddy-9837bbf1d431dcca"
 
 
 async def test_subagent_watcher_forwards_the_name_of_a_named_background_agent(
