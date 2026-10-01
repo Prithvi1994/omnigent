@@ -9,6 +9,7 @@ import json
 import logging
 import secrets
 import threading
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast, get_args
@@ -23,6 +24,7 @@ from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HostImportLocalByIdFrame,
+    HostImportLocalCancelFrame,
     HostImportLocalFrame,
     encode_host_frame,
 )
@@ -36,6 +38,7 @@ from omnigent.server.routes._host_launch import (
     resolve_host_owner,
 )
 from omnigent.server.routes._session_create_validation import resolve_project_session_create
+from omnigent.server.routes.host_tunnel import PING_INTERVAL_S
 from omnigent.server.schemas import SessionCreateRequest
 from omnigent.session_import import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
@@ -53,7 +56,7 @@ from omnigent.session_import.errors import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.conversation_store import ConversationAlreadyExistsError
-from omnigent.stores.host_store import HostStore
+from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 
@@ -323,7 +326,103 @@ async def _serialize_source_import(body: ImportSessionRequest) -> AsyncIterator[
 # this bounds the gap between frames — one transcript's read — not the whole
 # batch. A batch of any size can take arbitrarily long without tripping it, so
 # this can be tight: it's how fast a stalled or silently-dropped host is caught.
+# Heartbeats don't shorten it: one can't overtake a multi-MiB session frame
+# still in transit on the same socket.
 _HOST_IMPORT_TIMEOUT_S: float = 60.0
+# Whole-request budget, kept under the ~300 s route timeout of typical ingress
+# proxies so the import ends with an explicit "run it again to continue" rather
+# than the proxy cutting the response mid-stream.
+_LOCAL_IMPORT_STREAM_DEADLINE_S: float = 270.0
+# A healthy host answers every ping, so a registered tunnel silent for longer
+# than this many ping intervals is dead but not yet reaped (the ping loop only
+# declares it dead at 3x); importing through it would just wait out a timeout.
+_HOST_STALE_PING_MULTIPLE = 1.5
+
+
+@dataclass(frozen=True)
+class ImportProgress:
+    """Sessions processed so far in a host import, for a progress readout.
+
+    ``total`` is ``None`` until the host knows how many sessions it will send.
+    """
+
+    done: int
+    total: int | None
+
+
+def _host_label(host: object) -> str:
+    """A human name for the machine in import messages."""
+    name = getattr(host, "name", None)
+    return f"“{name}”" if isinstance(name, str) and name.strip() else "Your machine"
+
+
+def _ago(seconds: float) -> str:
+    """Render an elapsed time compactly, e.g. ``"45 s"``, ``"3 min"``, ``"2 h"``."""
+    seconds = max(0, int(seconds))
+    if seconds < 90:
+        return f"{seconds} s"
+    if seconds < 90 * 60:
+        return f"{round(seconds / 60)} min"
+    if seconds < 36 * 3600:
+        return f"{round(seconds / 3600)} h"
+    return f"{round(seconds / 86400)} d"
+
+
+def _host_offline_error(host: Host) -> LocalImportError:
+    """The 409 for a host with no tunnel here, naming the machine and its last sighting.
+
+    A row that still reads as live is a host the picker shows online whose
+    tunnel is gone (a server restart or a tunnel drop that has not reconnected
+    yet), so the advice differs from a host that has been gone for a while.
+    """
+    label = _host_label(host)
+    updated_at = getattr(host, "updated_at", None)
+    details: dict[str, object] = {}
+    name = getattr(host, "name", None)
+    if isinstance(name, str):
+        details["host_name"] = name
+    if isinstance(updated_at, int):
+        last_seen = max(0, now_epoch() - updated_at)
+        details["last_seen_seconds"] = last_seen
+        # A host that dropped a moment ago reads better than "0 s ago".
+        seen = " (last seen just now)" if last_seen < 5 else f" (last seen {_ago(last_seen)} ago)"
+    else:
+        seen = ""
+    status = getattr(host, "status", None)
+    if isinstance(status, str) and isinstance(updated_at, int) and host_is_live(host):
+        message = (
+            f"{label} isn't connected right now{seen}. It usually reconnects within a "
+            "minute — try again shortly, or restart `omnigent host` on that machine."
+        )
+    else:
+        message = (
+            f"{label} is offline{seen}. Start `omnigent host` on that machine, then try again."
+        )
+    return LocalImportError(
+        message,
+        import_code=ImportErrorCode.HOST_OFFLINE,
+        code=ErrorCode.CONFLICT,
+        details=details,
+    )
+
+
+def _host_wrong_replica_error(host: Host, absent: OmnigentError) -> LocalImportError:
+    """The 400 for a live host whose tunnel is on another replica.
+
+    Keeps the global ``wrong_replica`` code the client's keyless re-address
+    matches on; the import code and message are for when that retry also
+    lands elsewhere (the tunnel is moving between replicas).
+    """
+    name = getattr(host, "name", None)
+    has_name = isinstance(name, str) and bool(name.strip())
+    whose = f"“{name}”'s" if has_name else "your machine's"
+    return LocalImportError(
+        f"Couldn't reach {whose} connection. Try again in a few seconds.",
+        import_code=ImportErrorCode.HOST_UNREACHABLE,
+        code=absent.code,
+        http_status=absent.http_status,
+        details={"host_name": name} if has_name else None,
+    )
 
 
 async def _stream_local_sessions_from_host(
@@ -334,18 +433,37 @@ async def _stream_local_sessions_from_host(
     limit: int,
     session_id: str | None = None,
     stats: dict[str, Any] | None = None,
-) -> AsyncIterator[dict[str, Any]]:
+    ping_interval_s: float | None = None,
+    deadline_s: float | None = None,
+) -> AsyncIterator[dict[str, Any] | ImportProgress]:
     """Yield requested local sessions one at a time as they stream in.
 
     Sends a recent or exact import frame and drains the per-request queue the
     tunnel fills: each ``host.import_local_session`` frame yields one session
-    dict (``{total, external_session_id, workspace, items, title, source}``); the
-    terminal ``host.import_local_done`` ends the stream. The caller persists each
-    session as it arrives, so a large batch never buffers in one frame.
+    dict (``{total, external_session_id, workspace, items, title, source}``),
+    each heartbeat an :class:`ImportProgress`; the terminal
+    ``host.import_local_done`` ends the stream. The caller persists each session
+    as it arrives, so a large batch never buffers in one frame.
 
-    :raises OmnigentError: If the host connection drops, a frame times out, or
-        the host reports a read failure.
+    :param ping_interval_s: The tunnel's ping cadence. When given, a tunnel that
+        has been silent for :data:`_HOST_STALE_PING_MULTIPLE` intervals fails
+        fast with ``host_unreachable`` instead of being waited on.
+    :param deadline_s: Whole-stream budget; defaults to
+        :data:`_LOCAL_IMPORT_STREAM_DEADLINE_S`.
+    :raises LocalImportError: If the host is unreachable, disconnects, stops
+        responding, or the deadline passes.
+    :raises OmnigentError: If the host reports a read failure.
     """
+    if ping_interval_s is not None:
+        last_frame_at = getattr(host_conn, "last_frame_at", None)
+        if isinstance(last_frame_at, (int, float)):
+            silent_for = time.time() - last_frame_at
+            if silent_for > ping_interval_s * _HOST_STALE_PING_MULTIPLE:
+                raise LocalImportError(
+                    f"host '{host_conn.host_id}' has sent nothing for {silent_for:.0f}s",
+                    import_code=ImportErrorCode.HOST_UNREACHABLE,
+                    details={"silent_seconds": int(silent_for)},
+                )
     request_id = secrets.token_hex(8)
     request_frame = (
         HostImportLocalByIdFrame(
@@ -353,6 +471,7 @@ async def _stream_local_sessions_from_host(
             source=source,
             session_id=session_id,
             allow_session_chunks=True,
+            progress=True,
         )
         if session_id is not None
         else HostImportLocalFrame(
@@ -360,57 +479,171 @@ async def _stream_local_sessions_from_host(
             source=source,
             limit=limit,
             allow_session_chunks=True,
+            progress=True,
         )
     )
     frame = encode_host_frame(request_frame)
     queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
     host_conn.pending_import_local[request_id] = queue
+    deadline = time.monotonic() + (
+        deadline_s if deadline_s is not None else _LOCAL_IMPORT_STREAM_DEADLINE_S
+    )
+    frame_timeout = _HOST_IMPORT_TIMEOUT_S
+    finished = False
     try:
         try:
             host_registry.send_text(host_conn, frame)
         except ConnectionError as exc:
-            raise OmnigentError(
+            raise LocalImportError(
                 f"host '{host_conn.host_id}' connection lost during import",
-                code=ErrorCode.CONFLICT,
+                import_code=ImportErrorCode.HOST_DISCONNECTED,
             ) from exc
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _time_limit_error()
+            # Decide which bound fired here, not by re-reading the clock: a coarse
+            # event-loop clock (uvloop) can fire a hair early, reading as a silent host.
+            deadline_bound = remaining <= frame_timeout
             try:
-                kind, data = await asyncio.wait_for(queue.get(), timeout=_HOST_IMPORT_TIMEOUT_S)
+                kind, data = await asyncio.wait_for(
+                    queue.get(), timeout=remaining if deadline_bound else frame_timeout
+                )
             except asyncio.TimeoutError as exc:
-                raise OmnigentError(
+                if deadline_bound:
+                    raise _time_limit_error() from exc
+                raise LocalImportError(
                     f"host '{host_conn.host_id}' stalled mid-import "
-                    f"(no session within {_HOST_IMPORT_TIMEOUT_S:.0f}s)",
-                    code=ErrorCode.CONFLICT,
+                    f"(no session within {frame_timeout:.0f}s)",
+                    import_code=ImportErrorCode.HOST_UNRESPONSIVE,
+                    details={"silent_seconds": int(frame_timeout)},
                 ) from exc
+            if kind == "disconnected":
+                raise LocalImportError(
+                    f"host '{host_conn.host_id}' disconnected mid-import",
+                    import_code=ImportErrorCode.HOST_DISCONNECTED,
+                )
             if kind == "progress":
+                # A chunk slice ({}) only proves the host is alive; a heartbeat
+                # also carries the host's count.
+                done = data.get("done")
+                if isinstance(done, int):
+                    total = data.get("total")
+                    yield ImportProgress(
+                        done=done, total=total if isinstance(total, int) else None
+                    )
                 continue
             if kind == "session":
                 yield data
-            else:  # "done"
-                if data.get("status") != "ok":
-                    if mentions_missing_sqlite(data.get("error")):
-                        # An older host imports sqlite3 eagerly, so a Python built
-                        # without it fails the whole read; say how to fix it.
-                        raise missing_sqlite_error()
-                    raise OmnigentError(
-                        data.get("error") or "host failed to read local sessions",
-                        code=ErrorCode.INTERNAL_ERROR,
-                    )
-                # Sessions the host enumerated but couldn't read send no frame;
-                # surface the count (every host) and per-session reasons (newer
-                # hosts) so the caller's tally covers every target and can
-                # explain each failure.
-                if stats is not None:
-                    stats["host_failed"] = int(data.get("failed") or 0)
-                    raw_failures = data.get("failures")
-                    stats["host_failures"] = (
-                        [entry for entry in raw_failures if isinstance(entry, dict)]
-                        if isinstance(raw_failures, list)
-                        else []
-                    )
-                return
+                continue
+            # "done"
+            finished = True
+            if data.get("status") != "ok":
+                if mentions_missing_sqlite(data.get("error")):
+                    # An older host imports sqlite3 eagerly, so a Python built
+                    # without it fails the whole read; say how to fix it.
+                    raise missing_sqlite_error()
+                raise OmnigentError(
+                    data.get("error") or "host failed to read local sessions",
+                    code=ErrorCode.INTERNAL_ERROR,
+                )
+            # Sessions the host enumerated but couldn't read send no frame;
+            # surface the count (every host) and per-session reasons (newer
+            # hosts) so the caller's tally covers every target and can
+            # explain each failure.
+            if stats is not None:
+                stats["host_failed"] = int(data.get("failed") or 0)
+                raw_failures = data.get("failures")
+                stats["host_failures"] = (
+                    [entry for entry in raw_failures if isinstance(entry, dict)]
+                    if isinstance(raw_failures, list)
+                    else []
+                )
+            return
     finally:
         host_conn.pending_import_local.pop(request_id, None)
+        if not finished:
+            # Stop the host reading transcripts nobody will persist (deadline,
+            # client gone, or an error here). Older hosts ignore the frame.
+            with contextlib.suppress(Exception):
+                host_registry.send_text(
+                    host_conn, encode_host_frame(HostImportLocalCancelFrame(request_id=request_id))
+                )
+
+
+def _time_limit_error() -> LocalImportError:
+    """The stream deadline passed; the caller restates it with the batch's progress."""
+    return LocalImportError(
+        "local import reached its time limit",
+        import_code=ImportErrorCode.TIME_LIMIT_REACHED,
+        code=ErrorCode.INTERNAL_ERROR,
+        http_status=503,
+    )
+
+
+def _interrupted_import_error(
+    exc: LocalImportError,
+    *,
+    host: object | None,
+    processed: int,
+    imported: int,
+    total: int | None,
+    already_imported: int = 0,
+) -> LocalImportError:
+    """Restate a host-liveness failure with the machine's name and the batch's progress.
+
+    The stream consumer knows only that the tunnel went quiet or away; the
+    import loop knows how far it got, which is what tells the user that a re-run
+    continues rather than starts over.
+    """
+    label = _host_label(host)
+    of_total = f" of {total}" if total is not None else ""
+    progress = f"after {processed}{of_total} session{'s' if (total or processed) != 1 else ''}"
+    code = exc.import_code
+    if code == ImportErrorCode.HOST_DISCONNECTED:
+        message = (
+            f"{label} disconnected {progress}. Reconnect it (run `omnigent host`) and "
+            "import again — sessions already imported are skipped."
+        )
+    elif code == ImportErrorCode.HOST_UNRESPONSIVE:
+        silent = exc.details.get("silent_seconds")
+        quiet = f" (nothing for {silent} s)" if isinstance(silent, int) else ""
+        message = (
+            f"{label} stopped responding {progress}{quiet}. Check that the machine is "
+            "awake and `omnigent host` is running, then import again — sessions "
+            "already imported are skipped."
+        )
+    elif code == ImportErrorCode.HOST_UNREACHABLE:
+        silent = exc.details.get("silent_seconds")
+        quiet = f" (nothing heard for {_ago(silent)})" if isinstance(silent, int) else ""
+        message = (
+            f"{label} isn't responding{quiet}. Check that the machine is awake and "
+            "online and `omnigent host` is running, then try again."
+        )
+    elif code == ImportErrorCode.TIME_LIMIT_REACHED:
+        # Sessions already there count: the re-run continues from all of them.
+        have = imported + already_imported
+        count = f"{have}{of_total}" if total is not None else f"{have} session(s)"
+        message = (
+            f"Imported {count} before the time limit — run it again to continue; "
+            "already imported sessions are skipped."
+        )
+    else:
+        return exc
+    details = {
+        key: value for key, value in exc.details.items() if key not in ("import_code", "retryable")
+    }
+    name = getattr(host, "name", None)
+    if isinstance(name, str):
+        details["host_name"] = name
+    details.update(processed=processed, imported=imported, total=total)
+    return LocalImportError(
+        message,
+        import_code=code,
+        code=exc.code,
+        http_status=exc.http_status,
+        details=details,
+    )
 
 
 def _host_failure_code(entry: dict[str, Any]) -> str:
@@ -841,8 +1074,8 @@ def create_imports_router(
 
     def _resolve_import_target(
         request: Request, body: LocalImportRequest
-    ) -> tuple[str | None, HostConnection]:
-        """Validate a host-mediated import and return ``(user_id, host_conn)``.
+    ) -> tuple[str | None, HostConnection, Host]:
+        """Validate a host-mediated import and return ``(user_id, host_conn, host)``.
 
         Shared by the buffered ``/imports/local`` and the streaming
         ``/imports/local/stream``. Raises the usual HTTP error ahead of any
@@ -862,8 +1095,13 @@ def create_imports_router(
             # A live host absent from THIS replica is a wrong-replica landing, not
             # an offline host: WRONG_REPLICA (400) so the client re-addresses
             # keyless, CONFLICT (409) only when the row is genuinely stale.
-            raise host_absent_error(host)
-        return user_id, host_conn
+            absent = host_absent_error(host)
+            if absent.code == ErrorCode.CONFLICT:
+                raise _host_offline_error(host)
+            if absent.code == ErrorCode.WRONG_REPLICA:
+                raise _host_wrong_replica_error(host, absent)
+            raise absent
+        return user_id, host_conn, host
 
     async def _import_local_core(
         body: LocalImportRequest,
@@ -871,18 +1109,23 @@ def create_imports_router(
         host_conn: HostConnection,
         counts: dict[str, int],
         failures: list[ImportFailureRef],
-    ) -> AsyncIterator[ImportedSessionRef]:
+        *,
+        host: object | None = None,
+        ping_interval_s: float | None = None,
+    ) -> AsyncIterator[ImportedSessionRef | ImportProgress]:
         """Import the host's requested sessions, one at a time.
 
-        Yields one ref per newly imported session and tracks the running tally in
-        ``counts`` (``imported`` / ``already_imported`` / ``failed``, plus the
-        batch ``total`` once the host reports it); each failed session appends an
-        :class:`ImportFailureRef` (with a reason and import code) to
-        ``failures``, so ``len(failures) == counts["failed"]``. Persists each
-        session as its frame arrives, so a large batch never buffers. Raises
-        ``OmnigentError`` if the host read drops mid-stream, after the sessions
+        Yields one ref per newly imported session, plus an :class:`ImportProgress`
+        after each processed session and each host heartbeat, and tracks the
+        running tally in ``counts`` (``imported`` / ``already_imported`` /
+        ``failed``); each failed session appends an :class:`ImportFailureRef`
+        (with a reason) to ``failures``, so ``len(failures) == counts["failed"]``.
+        Persists each session as its frame arrives, so a large batch never
+        buffers. Raises if the host read drops mid-stream, after the sessions
         read so far are already committed (retry is idempotent, and re-import of a
-        success comes back as already-imported, never a duplicate).
+        success comes back as already-imported, never a duplicate); a
+        :class:`LocalImportError` raised for the host's liveness carries a message
+        naming the machine and how far the batch got.
         """
         assert host_registry is not None  # guaranteed by _resolve_import_target
         # Each session carries its own source (an "all" import mixes harnesses),
@@ -891,6 +1134,10 @@ def create_imports_router(
         counts["imported"] = 0
         counts["already_imported"] = 0
         counts["failed"] = 0
+        # The host's own count (including sessions it failed to read, which
+        # send no frame) and the batch size, from heartbeats and session frames.
+        host_done = 0
+        total: int | None = None
 
         def _fail(
             external_session_id: object,
@@ -912,6 +1159,9 @@ def create_imports_router(
                     error_id=error_id,
                 )
             )
+
+        def _processed() -> int:
+            return counts["imported"] + counts["already_imported"] + counts["failed"]
 
         async def _import_one(session: dict[str, Any]) -> ImportedSessionRef | None:
             external_session_id = session.get("external_session_id")
@@ -1011,20 +1261,40 @@ def create_imports_router(
         # arrives for them): a count (every host) plus per-session reasons (newer
         # hosts). Folded into ``failed`` after the loop.
         stats: dict[str, Any] = {}
-        async for session in _stream_local_sessions_from_host(
-            host_registry=host_registry,
-            host_conn=host_conn,
-            source=body.source,
-            limit=body.limit,
-            session_id=body.session_id,
-            stats=stats,
-        ):
-            # A failed chunked session's placeholder carries ``total: 0``.
-            if isinstance(session.get("total"), int) and session["total"] > 0:
-                counts["total"] = session["total"]
-            ref = await _import_one(session)
-            if ref is not None:
-                yield ref
+        try:
+            async for session in _stream_local_sessions_from_host(
+                host_registry=host_registry,
+                host_conn=host_conn,
+                source=body.source,
+                limit=body.limit,
+                session_id=body.session_id,
+                stats=stats,
+                ping_interval_s=ping_interval_s,
+            ):
+                if isinstance(session, ImportProgress):
+                    host_done = max(host_done, session.done)
+                    total = session.total if session.total is not None else total
+                    if total is not None:
+                        counts["total"] = total
+                    yield ImportProgress(done=max(_processed(), host_done), total=total)
+                    continue
+                # A failed chunked session's placeholder carries ``total: 0``.
+                if isinstance(session.get("total"), int) and session["total"] > 0:
+                    total = session["total"]
+                    counts["total"] = total
+                ref = await _import_one(session)
+                if ref is not None:
+                    yield ref
+                yield ImportProgress(done=max(_processed(), host_done), total=total)
+        except LocalImportError as exc:
+            raise _interrupted_import_error(
+                exc,
+                host=host,
+                processed=_processed(),
+                imported=counts["imported"],
+                already_imported=counts["already_imported"],
+                total=total,
+            ) from exc
         # Fold in sessions the host enumerated but couldn't read. Newer hosts send
         # a per-session reason; older hosts send only a count, so synthesize a
         # generic reason for each so ``failed`` still equals ``len(failures)``.
@@ -1068,13 +1338,22 @@ def create_imports_router(
         mid-stream this raises after the sessions read so far are already
         committed; a retry is idempotent (they come back as already-imported).
         """
-        user_id, host_conn = _resolve_import_target(request, body)
+        user_id, host_conn, host = _resolve_import_target(request, body)
         counts: dict[str, int] = {}
         sessions: list[ImportedSessionRef] = []
         failures: list[ImportFailureRef] = []
         try:
-            async for ref in _import_local_core(body, user_id, host_conn, counts, failures):
-                sessions.append(ref)
+            async for event in _import_local_core(
+                body,
+                user_id,
+                host_conn,
+                counts,
+                failures,
+                host=host,
+                ping_interval_s=PING_INTERVAL_S,
+            ):
+                if isinstance(event, ImportedSessionRef):
+                    sessions.append(event)
         except OmnigentError as exc:
             report = _record_local_import_failure(exc)
             return JSONResponse(
@@ -1111,7 +1390,8 @@ def create_imports_router(
         Same import as the buffered ``POST /v1/imports/local``, but responds with
         NDJSON: one ``{"event": "session", ...}`` line per newly imported session
         as its frame lands, so the caller lists sessions as they arrive rather
-        than waiting out the whole batch. Each session that
+        than waiting out the whole batch, and ``{"event": "progress", "done",
+        "total"}`` lines as the host works through the batch. Each session that
         could not be imported emits one ``{"event": "failed",
         "external_session_id", "source", "reason"}`` line (after the successes),
         and a terminal ``{"event": "done", ...}`` carries the tally plus the full
@@ -1121,16 +1401,33 @@ def create_imports_router(
         Request validation still fails ahead of the stream with the usual HTTP
         error.
         """
-        user_id, host_conn = _resolve_import_target(request, body)
+        user_id, host_conn, host = _resolve_import_target(request, body)
 
         async def _events() -> AsyncIterator[bytes]:
             counts: dict[str, int] = {}
             failures: list[ImportFailureRef] = []
             error: _ImportFailureReport | None = None
+            last_progress: tuple[int, int | None] | None = None
             try:
-                async for ref in _import_local_core(body, user_id, host_conn, counts, failures):
+                async for event in _import_local_core(
+                    body,
+                    user_id,
+                    host_conn,
+                    counts,
+                    failures,
+                    host=host,
+                    ping_interval_s=PING_INTERVAL_S,
+                ):
+                    if isinstance(event, ImportProgress):
+                        # Heartbeats and per-session updates often repeat a count.
+                        if (event.done, event.total) != last_progress:
+                            last_progress = (event.done, event.total)
+                            yield _import_event_line(
+                                {"event": "progress", "done": event.done, "total": event.total}
+                            )
+                        continue
                     yield _import_event_line(
-                        {"event": "session", "session_id": ref.session_id, "title": ref.title}
+                        {"event": "session", "session_id": event.session_id, "title": event.title}
                     )
             except Exception as exc:  # noqa: BLE001 - the stream must always end with done
                 # The 200 + partial body is already sent, so report the failure inline;

@@ -76,8 +76,10 @@ from omnigent.host.frames import (
     HostHelloFrame,
     HostImportedLocalSession,
     HostImportLocalByIdFrame,
+    HostImportLocalCancelFrame,
     HostImportLocalDoneFrame,
     HostImportLocalFrame,
+    HostImportLocalProgressFrame,
     HostInstallHarnessFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerFrame,
@@ -199,6 +201,10 @@ if TYPE_CHECKING:
 
 # Workspaces whose fs reader (and change registry) stay warm between requests.
 _FS_READER_CACHE_SIZE = 8
+
+# Import heartbeat cadence: keeps the server's per-frame timeout from firing
+# during a slow transcript read and drives its progress readout.
+_IMPORT_PROGRESS_INTERVAL_S = 10.0
 
 _logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
@@ -1270,6 +1276,9 @@ class HostProcess:
         # Strong refs to in-flight frame tasks (create_task results are
         # otherwise GC-able); each discards itself on completion.
         self._frame_tasks: set[asyncio.Task[None]] = set()
+        # In-flight import handlers by request id, so a server cancel frame can
+        # stop the one it names.
+        self._import_tasks: dict[str, asyncio.Task[object]] = {}
         # Background watcher that force-drops a stale tunnel on wake from system
         # suspend (laptop sleep) so the reconnect loop reattaches at once
         # instead of waiting out the ~90s keepalive timeout. See run() /
@@ -2634,7 +2643,60 @@ class HostProcess:
                 None,
             )
 
+        # Read by the heartbeat closure, so always the latest counts.
+        progress_done = 0
+        progress_total: int | None = None
+
+        async def _send_progress() -> None:
+            # Only a server that asked for heartbeats gets them; an older one
+            # would log every unknown frame as malformed.
+            if frame.progress:
+                await ws.send(
+                    encode_host_frame(
+                        HostImportLocalProgressFrame(
+                            request_id=frame.request_id,
+                            done=progress_done,
+                            total=progress_total,
+                        )
+                    )
+                )
+
+        async def _heartbeat() -> None:
+            # Covers the gaps no session frame fills: enumeration and slow reads.
+            while True:
+                await asyncio.sleep(_IMPORT_PROGRESS_INTERVAL_S)
+                try:
+                    await _send_progress()
+                except ConnectionClosed:
+                    return  # dead tunnel: the import handler owns recovery
+                except Exception:  # noqa: BLE001 - a heartbeat must not end the import
+                    _logger.debug("import heartbeat send failed", exc_info=True)
+
+        current = asyncio.current_task()
+        if current is not None:
+            self._import_tasks[frame.request_id] = current
+        heartbeat = asyncio.create_task(_heartbeat()) if frame.progress else None
+        # Summary for the import_local_finished event (the server only sees
+        # what arrives, not why the host stopped).
+        outcome = "failed"
+        failures: list[dict[str, object]] = []
+        sent_count = 0
+        chunked_count = 0
+        started_at = time.monotonic()
+        _logger.info(
+            "import_local started",
+            extra=debug_event(
+                "import_local_started",
+                request_id=frame.request_id,
+                source=frame.source,
+                limit=getattr(frame, "limit", None),
+                exact=isinstance(frame, HostImportLocalByIdFrame),
+                progress=frame.progress,
+                allow_session_chunks=frame.allow_session_chunks,
+            ),
+        )
         try:
+            await _send_progress()
             targets, enum_error = await asyncio.to_thread(_targets)
             if enum_error is not None:
                 await ws.send(
@@ -2649,8 +2711,10 @@ class HostProcess:
             # Oldest first so the server imports newest last → newest sits atop the sidebar.
             ordered = list(reversed(targets))
             total = len(ordered)
-            failures: list[dict[str, object]] = []
+            progress_total = total
             for source, session_id in ordered:
+                # Before each session so a failed one advances the count too.
+                await _send_progress()
                 try:
                     session, reason = await asyncio.to_thread(_load, source, session_id)
                     if session is None:
@@ -2668,6 +2732,7 @@ class HostProcess:
                     # Oversized sessions are sliced into chunk frames; a single
                     # whole-session frame past the tunnel's message cap would
                     # drop the host connection and kill the rest of the batch.
+                    frames_sent = 0
                     for text in encode_import_local_session_frames(
                         frame.request_id,
                         total,
@@ -2675,6 +2740,10 @@ class HostProcess:
                         allow_chunks=frame.allow_session_chunks,
                     ):
                         await ws.send(text)
+                        frames_sent += 1
+                    sent_count += 1
+                    if frames_sent > 1:
+                        chunked_count += 1
                 except ImportSessionChunkingUnsupportedError:
                     failures.append(
                         {
@@ -2707,6 +2776,8 @@ class HostProcess:
                         }
                     )
                     continue
+                finally:
+                    progress_done += 1
             await ws.send(
                 encode_host_frame(
                     HostImportLocalDoneFrame(
@@ -2717,8 +2788,13 @@ class HostProcess:
                     )
                 )
             )
+            outcome = "ok"
         except ConnectionClosed:
+            outcome = "connection_closed"
             raise  # tunnel died mid-stream; _run_frame_handler owns recovery
+        except asyncio.CancelledError:
+            outcome = "cancelled"  # the server sent host.import_local_cancel
+            raise
         except Exception as exc:
             # Send a terminal failure so the server fails fast instead of waiting
             # out its per-frame timeout on an unanswered request.
@@ -2731,6 +2807,26 @@ class HostProcess:
                         )
                     )
                 )
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+            if self._import_tasks.get(frame.request_id) is current:
+                self._import_tasks.pop(frame.request_id, None)
+            _logger.info(
+                "import_local finished (%s)",
+                outcome,
+                extra=debug_event(
+                    "import_local_finished",
+                    request_id=frame.request_id,
+                    source=frame.source,
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                    status=outcome,
+                    sent=sent_count,
+                    chunked=chunked_count,
+                    failed=len(failures),
+                    total=progress_total,
+                ),
+            )
 
     def _handle_list_dir(self, frame: HostListDirFrame) -> HostListDirResultFrame:
         """Handle a ``host.list_dir`` request from the server.
@@ -4778,6 +4874,10 @@ class HostProcess:
             # Streams one host.import_local_session per session (reads run off the
             # event loop inside), then a terminal host.import_local_done.
             await self._handle_import_local(ws, frame)
+        elif isinstance(frame, HostImportLocalCancelFrame):
+            import_task = self._import_tasks.get(frame.request_id)
+            if import_task is not None:
+                import_task.cancel()
 
 
 def _generate_ucode_configs() -> None:

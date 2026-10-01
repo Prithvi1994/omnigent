@@ -1,9 +1,10 @@
-"""Host side of local-session import: failure codes and hosts without SQLite."""
+"""Host side of local-session import: heartbeats, cancel, failure codes, missing SQLite."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -12,10 +13,19 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from websockets.exceptions import ConnectionClosedError
 
+from omnigent.host import connect as host_connect
 from omnigent.host.frames import (
+    HostImportLocalByIdFrame,
+    HostImportLocalCancelFrame,
     HostImportLocalDoneFrame,
     HostImportLocalFrame,
+    HostImportLocalProgressFrame,
+    HostImportLocalSessionChunkFrame,
+    HostImportLocalSessionFrame,
+    decode_host_frame,
+    encode_host_frame,
 )
 from omnigent.session_import import local as local_import
 from omnigent.session_import.errors import (
@@ -29,6 +39,7 @@ from tests.server.import_tunnel_harness import (
     local_session,
     make_host,
     serve_local_sessions,
+    wait_until,
 )
 
 _MISSING_SQLITE = "No module named '_sqlite3'"
@@ -37,6 +48,85 @@ _MISSING_SQLITE = "No module named '_sqlite3'"
 def _done(ws: RecordingWs) -> HostImportLocalDoneFrame:
     (done,) = [f for f in ws.frames() if isinstance(f, HostImportLocalDoneFrame)]
     return done
+
+
+def _host_events(caplog: pytest.LogCaptureFixture, name: str) -> list[dict[str, Any]]:
+    return [
+        dict(getattr(record, "attributes", {}))
+        for record in caplog.records
+        if record.name == host_connect.__name__ and getattr(record, "event_name", None) == name
+    ]
+
+
+def test_request_frames_round_trip_the_progress_flag() -> None:
+    """Both import request frames carry the server's heartbeat capability."""
+    recent = HostImportLocalFrame(request_id="r", source="all", limit=5, progress=True)
+    assert decode_host_frame(encode_host_frame(recent)) == recent
+    by_id = HostImportLocalByIdFrame(request_id="r", source="codex", session_id="s", progress=True)
+    assert decode_host_frame(encode_host_frame(by_id)) == by_id
+
+
+def test_request_without_progress_flag_decodes_as_unsupported() -> None:
+    """A request from a server that predates heartbeats decodes with progress off."""
+    legacy = decode_host_frame(
+        json.dumps({"kind": "host.import_local", "request_id": "r", "source": "all", "limit": 5})
+    )
+    assert legacy == HostImportLocalFrame(request_id="r", source="all", limit=5, progress=False)
+
+
+def test_progress_and_cancel_frames_round_trip() -> None:
+    """Heartbeat (with and without a total) and cancel frames survive encode/decode."""
+    for frame in (
+        HostImportLocalProgressFrame(request_id="r", done=2, total=None),
+        HostImportLocalProgressFrame(request_id="r", done=2, total=7),
+        HostImportLocalCancelFrame(request_id="r"),
+    ):
+        assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+async def test_host_omits_heartbeats_for_a_server_that_did_not_ask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the progress flag the host sends only session and done frames."""
+    serve_local_sessions(monkeypatch, {"s0": local_session("s0")})
+    ws = RecordingWs()
+    await make_host()._handle_import_local(
+        ws.as_ws(), HostImportLocalFrame(request_id="r", source="all", limit=5)
+    )
+    assert [json.loads(text)["kind"] for text in ws.sent] == [
+        "host.import_local_session",
+        "host.import_local_done",
+    ]
+
+
+async def test_heartbeats_count_sessions_done_of_total(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Heartbeats start before enumeration (no total) and advance before each session."""
+    sessions: dict[str, Any] = {"s0": local_session("s0"), "bad": OSError("disk")}
+    serve_local_sessions(monkeypatch, sessions)
+    ws = RecordingWs()
+    await make_host()._handle_import_local(
+        ws.as_ws(), HostImportLocalFrame(request_id="r", source="all", limit=5, progress=True)
+    )
+    beats = [(f.done, f.total) for f in ws.frames() if isinstance(f, HostImportLocalProgressFrame)]
+    # A failed session advances the count too.
+    assert beats == [(0, None), (0, 2), (1, 2)]
+
+
+async def test_heartbeats_cover_a_slow_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transcript read slower than the heartbeat interval keeps sending heartbeats."""
+    monkeypatch.setattr(host_connect, "_IMPORT_PROGRESS_INTERVAL_S", 0.05)
+    serve_local_sessions(monkeypatch, {"s0": local_session("s0")}, load_delay_s=0.4)
+    ws = RecordingWs()
+    await make_host()._handle_import_local(
+        ws.as_ws(), HostImportLocalFrame(request_id="r", source="all", limit=5, progress=True)
+    )
+    beats = [f for f in ws.frames() if isinstance(f, HostImportLocalProgressFrame)]
+    # Start, before the session, and several during the 0.4 s read.
+    assert len(beats) >= 4
+    # Heartbeats stop with the import.
+    sent = len(ws.sent)
+    await asyncio.sleep(0.15)
+    assert len(ws.sent) == sent
 
 
 class _HeartbeatFailingWs(RecordingWs):
@@ -54,6 +144,66 @@ class _HeartbeatFailingWs(RecordingWs):
             self.heartbeat_attempts += 1
             raise self.exc
         await super().send(text)
+
+
+@pytest.mark.parametrize(
+    ("exc", "stops"),
+    [(ConnectionClosedError(None, None), True), (RuntimeError("send failed"), False)],
+    ids=["connection-closed", "other-error"],
+)
+async def test_heartbeat_stops_on_a_closed_tunnel_and_survives_other_errors(
+    monkeypatch: pytest.MonkeyPatch, exc: Exception, stops: bool
+) -> None:
+    """A heartbeat on a closed tunnel gives up after one try; other send errors keep it going."""
+    monkeypatch.setattr(host_connect, "_IMPORT_PROGRESS_INTERVAL_S", 0.02)
+    serve_local_sessions(monkeypatch, {"s0": local_session("s0")}, load_delay_s=0.3)
+    ws = _HeartbeatFailingWs(exc)
+    request = HostImportLocalFrame(request_id="r", source="all", limit=5, progress=True)
+    task = asyncio.create_task(make_host()._handle_import_local(ws.as_ws(), request))
+    ws.handler_task = task
+    await task
+    # The import itself still finishes; only the background beats failed.
+    assert _done(ws).status == "ok"
+    if stops:
+        assert ws.heartbeat_attempts == 1
+    else:
+        assert ws.heartbeat_attempts >= 3
+
+
+async def test_cancel_frame_stops_the_named_import(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A cancel frame stops its in-flight import, which records itself as cancelled."""
+    serve_local_sessions(monkeypatch, {"s0": local_session("s0")}, load_delay_s=1.0)
+    host = make_host()
+    ws = RecordingWs()
+    request = HostImportLocalFrame(request_id="req-2", source="all", limit=5)
+    with caplog.at_level(logging.INFO, logger=host_connect.__name__):
+        task = asyncio.create_task(host._handle_import_local(ws.as_ws(), request))
+        await wait_until(lambda: "req-2" in host._import_tasks)
+        await host._handle_raw_message(
+            ws.as_ws(), encode_host_frame(HostImportLocalCancelFrame(request_id="req-2"))
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert host._import_tasks == {}
+    # Cancelled before the done frame: nothing terminal is sent.
+    assert not [f for f in ws.frames() if isinstance(f, HostImportLocalDoneFrame)]
+    (finished,) = _host_events(caplog, "import_local_finished")
+    assert finished["status"] == "cancelled"
+
+
+async def test_unknown_frame_and_unmatched_cancel_are_ignored() -> None:
+    """An unknown kind and a cancel for no in-flight import are dropped silently."""
+    host = make_host()
+    ws = RecordingWs()
+    await host._handle_raw_message(
+        ws.as_ws(), json.dumps({"kind": "host.import_local_future", "request_id": "r"})
+    )
+    await host._handle_raw_message(
+        ws.as_ws(), encode_host_frame(HostImportLocalCancelFrame(request_id="nope"))
+    )
+    assert ws.sent == []
 
 
 async def test_unexpected_session_error_is_generic(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -142,6 +292,43 @@ async def test_listing_error_is_reported_without_its_text(
     assert not any("/Users/alice" in text for text in ws.sent)
 
 
+async def test_host_logs_start_and_finish_with_counts(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The host records each import's start and its sent, chunked, and failed counts."""
+    monkeypatch.setattr("omnigent.host.frames.IMPORT_SESSION_CHUNK_CHARS", 256)
+    sessions: dict[str, Any] = {
+        "ok": local_session("ok"),
+        "unreadable": OSError("disk"),
+        "huge": local_session("huge", items=20, text="z" * 50),
+    }
+    serve_local_sessions(monkeypatch, sessions)
+    ws = RecordingWs()
+    request = HostImportLocalFrame(
+        request_id="req-1", source="all", limit=5, progress=True, allow_session_chunks=True
+    )
+    with caplog.at_level(logging.INFO, logger=host_connect.__name__):
+        await make_host()._handle_import_local(ws.as_ws(), request)
+    (started,) = _host_events(caplog, "import_local_started")
+    assert (started["request_id"], started["source"], started["progress"]) == (
+        "req-1",
+        "all",
+        True,
+    )
+    assert started["allow_session_chunks"] is True
+    (finished,) = _host_events(caplog, "import_local_finished")
+    assert finished["status"] == "ok"
+    assert (finished["total"], finished["sent"], finished["chunked"], finished["failed"]) == (
+        3,
+        2,
+        1,
+        1,
+    )
+    assert isinstance(finished["duration_ms"], int)
+    assert any(isinstance(f, HostImportLocalSessionChunkFrame) for f in ws.frames())
+    assert any(isinstance(f, HostImportLocalSessionFrame) for f in ws.frames())
+
+
 def test_missing_sqlite_message_is_actionable_and_short() -> None:
     """The missing-SQLite message names the module and comes with pasteable per-OS fixes."""
     assert len(MISSING_SQLITE_MESSAGE) < 450
@@ -199,3 +386,14 @@ def test_host_import_modules_load_without_sqlite(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr[-4000:]
     assert result.stdout.strip().endswith("ok")
+
+
+@pytest.mark.parametrize("total", [True, -1, "3"], ids=["bool", "negative", "string"])
+def test_progress_total_that_is_not_a_count_decodes_as_unknown(total: object) -> None:
+    """A heartbeat whose total isn't a non-negative int reads as an unknown total."""
+    raw = json.dumps(
+        {"kind": "host.import_local_progress", "request_id": "r", "done": 1, "total": total}
+    )
+    frame = decode_host_frame(raw)
+    assert isinstance(frame, HostImportLocalProgressFrame)
+    assert (frame.done, frame.total) == (1, None)

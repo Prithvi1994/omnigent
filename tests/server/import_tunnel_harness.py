@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import threading
 import time
@@ -29,6 +30,7 @@ from omnigent.host.frames import (
     HOST_CAPABILITIES,
     HostHelloFrame,
     HostImportLocalByIdFrame,
+    HostImportLocalCancelFrame,
     HostImportLocalFrame,
     decode_host_frame,
 )
@@ -237,8 +239,9 @@ def make_host(name: str = "laptop") -> HostProcess:
 class TunnelPair:
     """A registered host connection whose far end is a real ``HostProcess``.
 
-    ``legacy_host=True`` simulates an older host build: it advertises no
-    capabilities and handles only the import request frames.
+    ``legacy_host=True`` simulates a host build that predates import
+    heartbeats: it advertises no capabilities, ignores the request's
+    ``progress`` flag, and drops the cancel frame.
     """
 
     def __init__(self, *, host_name: str = "laptop", legacy_host: bool = False) -> None:
@@ -300,9 +303,14 @@ class TunnelPair:
         frame = decode_host_frame(text)
         if not isinstance(frame, (HostImportLocalFrame, HostImportLocalByIdFrame)):
             return  # an older host drops every frame kind it doesn't know
-        task = asyncio.create_task(self.host._handle_import_local(cast(Any, self.host_ws), frame))
+        legacy = dataclasses.replace(frame, progress=False)
+        task = asyncio.create_task(self.host._handle_import_local(cast(Any, self.host_ws), legacy))
         self.host._frame_tasks.add(cast(Any, task))
         task.add_done_callback(self.host._frame_tasks.discard)
+
+    def cancel_frames(self) -> list[HostImportLocalCancelFrame]:
+        """Every cancel frame the server sent the host."""
+        return [f for f in self.to_host if isinstance(f, HostImportLocalCancelFrame)]
 
     def host_frames(self) -> list[Any]:
         """Every host -> server frame the host sent, decoded."""
@@ -344,6 +352,43 @@ def serve_local_sessions(
     monkeypatch.setattr(f"{local}.list_recent_sessions_across_harnesses", _across)
     monkeypatch.setattr(f"{local}.list_recent_local_session_ids", _recent)
     monkeypatch.setattr(f"{local}.load_local_session", _load)
+
+
+class JumpingClock:
+    """A ``time`` module stand-in for the imports route whose monotonic clock can jump.
+
+    Jumping past the stream deadline expires it at the next check, so deadline
+    tests end on an event (e.g. the first persisted session), not wall time.
+    """
+
+    def __init__(self) -> None:
+        self.offset = 0.0
+        self.time = time.time
+
+    def monotonic(self) -> float:
+        return time.monotonic() + self.offset
+
+    def expire_deadline(self) -> None:
+        """Move the clock past any stream deadline."""
+        self.offset += 10 * imports_module._LOCAL_IMPORT_STREAM_DEADLINE_S
+
+
+def expire_deadline_after_first_append(
+    monkeypatch: pytest.MonkeyPatch, store: FakeConversationStore
+) -> JumpingClock:
+    """Make the stream deadline pass once the first session's items are written."""
+    clock = JumpingClock()
+    monkeypatch.setattr(imports_module, "time", clock)
+    previous = store.on_append
+
+    def on_append(conversation_id: str, items: list[NewConversationItem]) -> None:
+        if previous is not None:
+            previous(conversation_id, items)
+        if not clock.offset:
+            clock.expire_deadline()
+
+    store.on_append = on_append
+    return clock
 
 
 def imports_app(
