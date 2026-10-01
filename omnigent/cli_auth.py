@@ -258,6 +258,9 @@ def store_databricks_auth(
         if existing_org_id is not None:
             entry["org_id"] = existing_org_id
     _store_entry(server_url, entry)
+    # Replacing the entry supersedes any stored OIDC login, so forget its
+    # recorded renewal refusal (mirrors store_token / clear_token).
+    _renewal_refusals.pop(_normalize_server_url(server_url), None)
 
 
 def store_databricks_org_id(server_url: str, org_id: str) -> None:
@@ -545,13 +548,15 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
         return None
     if resp.status_code != 200:
         # 401/403 are definitive credential rejections. A 400 counts only when
-        # the body is OAuth ``invalid_grant``; other 400s (malformed request or
-        # an incompatible server) are not the stored login's fault.
+        # the body names an unrenewable grant (``invalid_grant`` or an aged-out
+        # ``expired_token``); other 400s (malformed request or an incompatible
+        # server) are not the stored login's fault.
         definitive = resp.status_code in (401, 403)
         if resp.status_code == 400:
             with contextlib.suppress(ValueError):
                 body = resp.json()
-                definitive = isinstance(body, dict) and body.get("error") == "invalid_grant"
+                error = body.get("error") if isinstance(body, dict) else None
+                definitive = error in ("invalid_grant", "expired_token")
         if definitive:
             _renewal_refusals[normalized] = f"refresh refused with HTTP {resp.status_code}"
         _logger.warning(

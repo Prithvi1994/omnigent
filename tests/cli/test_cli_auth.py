@@ -787,8 +787,16 @@ def test_refresh_stored_token_refused_leaves_entry(token_dir, monkeypatch) -> No
     assert entry["refresh_token"] == "refresh-1"
 
 
-@pytest.mark.parametrize("status", [400, 401, 403])
-def test_refused_refresh_records_renewal_refusal(token_dir, monkeypatch, status) -> None:
+@pytest.mark.parametrize(
+    "status, error",
+    [
+        (400, "invalid_grant"),
+        (400, "expired_token"),
+        (401, "invalid_grant"),
+        (403, "invalid_grant"),
+    ],
+)
+def test_refused_refresh_records_renewal_refusal(token_dir, monkeypatch, status, error) -> None:
     """A definitive refusal is queryable until a fresh credential is stored."""
     import httpx
 
@@ -810,9 +818,7 @@ def test_refused_refresh_records_renewal_refusal(token_dir, monkeypatch, status)
     assert stored_login_renewal_refusal("http://localhost:6767") is None
 
     def _fake_post(url, *, data=None, timeout=None):
-        return httpx.Response(
-            status, json={"error": "invalid_grant"}, request=httpx.Request("POST", url)
-        )
+        return httpx.Response(status, json={"error": error}, request=httpx.Request("POST", url))
 
     monkeypatch.setattr(httpx, "post", _fake_post)
     assert refresh_stored_token("http://localhost:6767") is None
@@ -896,6 +902,41 @@ def test_transient_refresh_failure_records_no_renewal_refusal(
         ),
     )
     assert refresh_stored_token("http://localhost:6767") is None
+    assert stored_login_renewal_refusal("http://localhost:6767") is None
+
+
+def test_store_databricks_auth_clears_renewal_refusal(token_dir, monkeypatch) -> None:
+    """Switching a server to Databricks auth replaces the stored OIDC login, so
+    its recorded renewal refusal must be forgotten."""
+    import httpx
+
+    from omnigent import cli_auth
+    from omnigent.cli_auth import (
+        refresh_stored_token,
+        store_databricks_auth,
+        store_token,
+        stored_login_renewal_refusal,
+    )
+
+    monkeypatch.setattr(cli_auth, "_renewal_refusals", {})
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, *, data=None, timeout=None: httpx.Response(
+            403, json={"error": "invalid_grant"}, request=httpx.Request("POST", url)
+        ),
+    )
+    assert refresh_stored_token("http://localhost:6767") is None
+    assert stored_login_renewal_refusal("http://localhost:6767") == "refresh refused with HTTP 403"
+
+    store_databricks_auth("http://localhost:6767", "https://example.databricks.com")
     assert stored_login_renewal_refusal("http://localhost:6767") is None
 
 
