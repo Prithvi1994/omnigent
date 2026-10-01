@@ -1,29 +1,18 @@
-"""E2E regression: a steady-state MCP auth failure must not permanently
-wedge the connection.
+"""E2E regression: a steady-state MCP auth failure must not wedge the connection.
 
-Reproduces two linked failure modes:
-
-* ``omnigent.tools.mcp`` / ``_run_lifecycle`` logs ``MCP server
-  'enterprise-context' lifecycle task failed during steady state`` when
-  the streamable-HTTP transport raises ``httpx.HTTPStatusError: 401
-  Unauthorized`` mid-session (an upstream gateway bearer token expiring
-  while the connection is live).
-* Every subsequent tool dispatch then raises ``RuntimeError: MCP server
-  'enterprise-context' has no live session -- call connect() before
-  call_tool()`` and never reconnects.
-
-The chain is real end to end: a streamable-HTTP MCP subprocess
+A streamable-HTTP MCP subprocess
 (``tests/tools/fixtures/expiring_auth_http_mcp_server.py``) serves an
-``ask`` tool normally until it is *armed*, after which every request
-returns ``401 Unauthorized``. The test drives a real
-:class:`omnigent.tools.mcp.McpServerConnection` to a live session, arms
-the server so a mid-session tool call crashes the lifecycle task and
-clears the session, then *recovers* the server (token refreshed) and
-asserts the next tool call self-heals and succeeds.
+``ask`` tool until it is *armed*, after which every request returns
+``401 Unauthorized``: the shape of an upstream gateway bearer expiring
+while a connection is live. The test drives a real
+:class:`omnigent.tools.mcp.McpServerConnection` through that outage and
+asserts the next call after recovery reconnects and succeeds.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -34,7 +23,7 @@ import pytest
 
 from omnigent.spec.types import MCPServerConfig, RetryPolicy
 from omnigent.tools.mcp import McpServerConnection
-from tests.tools.conftest import _free_port, _wait_for_listen
+from tests.tools.net_helpers import free_port, wait_for_listen
 
 _EXPIRING_AUTH_SERVER = str(
     Path(__file__).parent / "fixtures" / "expiring_auth_http_mcp_server.py"
@@ -60,14 +49,14 @@ def expiring_auth_http_mcp(
     and ``base_url`` is the origin the test hits ``/arm`` and ``/reset``
     on to toggle the 401 outage.
     """
-    port = _free_port()
+    port = free_port()
     server = subprocess.Popen(
         [sys.executable, _EXPIRING_AUTH_SERVER, str(port)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     try:
-        _wait_for_listen(port)
+        wait_for_listen(port)
         base_url = f"http://127.0.0.1:{port}"
         config = MCPServerConfig(
             name="enterprise-context",
@@ -129,7 +118,11 @@ async def test_mcp_reconnects_after_steady_state_auth_expiry(
             await conn.call_tool("ask", {"question": "during-outage"})
 
         # Precondition for the wedge: the steady-state crash left the
-        # connection with no live session.
+        # connection with no live session. Its teardown runs on the
+        # lifecycle task, so let that task finish first.
+        if conn._lifecycle_task is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(asyncio.shield(conn._lifecycle_task), timeout=5)
         assert conn._session is None, (
             "expected the mid-session 401 to clear the live session "
             "(the wedged state); connection still has a session"

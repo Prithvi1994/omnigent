@@ -667,6 +667,8 @@ class McpServerConnection:
         name: str,
         arguments: dict[str, Any],  # JSON values — see call_tool
         session_id: str | None = None,
+        *,
+        used_session: list[ClientSession | None] | None = None,
     ) -> str:
         """
         Send a single ``tools/call`` request to the MCP session.
@@ -687,21 +689,25 @@ class McpServerConnection:
         :param arguments: The tool arguments dict.
         :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
             Set on the connection for the inline elicitation handler.
+        :param used_session: Optional one-slot list that receives the
+            session this attempt ran against, captured under
+            ``_call_lock`` so the retry loop can mark exactly it dead.
         :returns: The formatted tool result string.
         :raises McpElicitationRequired: When the MCP server returns
             an ``InputRequiredResult`` requiring user input before
             the tool can execute.
         """
-        if self._session is None:
-            raise RuntimeError("MCP session not initialized — call connect() first")
         async with self._call_lock:
-            # The lifecycle may have died while this call queued for the
-            # lock; a ConnectionError lets the retry loop rebuild it.
+            # call_tool() already rejected never-connected misuse, so a None
+            # session here died before or while this call queued; the
+            # ConnectionError lets the retry loop rebuild it.
             session = self._session
             if session is None:
                 raise ConnectionError(
                     f"MCP server {self.config.name!r} session died before the call was sent"
                 )
+            if used_session is not None:
+                used_session[0] = session
             self._active_session_id = session_id
             # Scope the unhealthy-transport signal to this attempt:
             # bumping the serial invalidates recordings from any
@@ -1725,7 +1731,7 @@ async def _call_tool_with_reconnect(
     dead_session: ClientSession | None = None
 
     for attempt in range(total_tries):
-        attempt_session: ClientSession | None = None
+        used_session: list[ClientSession | None] = [None]
         try:
             # Reconnect first when the previous attempt broke the
             # session. Inside the try so a reconnect that fails on a
@@ -1735,17 +1741,18 @@ async def _call_tool_with_reconnect(
             if needs_reconnect:
                 await conn._reconnect(dead_session=dead_session)
                 needs_reconnect = False
-            attempt_session = conn._session
-            return await conn._invoke_tool(name, arguments, session_id=session_id)
+            return await conn._invoke_tool(
+                name, arguments, session_id=session_id, used_session=used_session
+            )
         except Exception as exc:
             if not (_is_connection_error(exc) or _is_dead_session_timeout(exc, conn)):
                 raise
             last_exc = exc
             needs_reconnect = True
-            # Only a session this attempt actually ran against can be
+            # Only the session this attempt actually ran against can be
             # marked dead; a failed reconnect leaves the token as-is.
-            if attempt_session is not None:
-                dead_session = attempt_session
+            if used_session[0] is not None:
+                dead_session = used_session[0]
             # Last attempt — don't reconnect, just raise.
             if attempt + 1 >= total_tries:
                 break

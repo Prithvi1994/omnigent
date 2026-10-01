@@ -39,7 +39,7 @@ import pytest
 
 from omnigent.spec.types import MCPServerConfig, RetryPolicy
 from omnigent.tools.mcp import McpServerConnection
-from tests.tools.conftest import _free_port, _wait_for_listen
+from tests.tools.net_helpers import free_port, wait_for_listen
 
 _ECHO_HTTP_SERVER = str(Path(__file__).parent / "fixtures" / "echo_http_mcp_server.py")
 
@@ -193,7 +193,7 @@ def flaky_http_mcp(_no_env_proxy: None) -> Iterator[tuple[MCPServerConfig, _Blip
     at the proxy's listen port, and the test triggers the outage via
     ``proxy.blip(seconds)``.
     """
-    server_port = _free_port()
+    server_port = free_port()
     server = subprocess.Popen(
         [sys.executable, _ECHO_HTTP_SERVER, str(server_port)],
         stdout=subprocess.DEVNULL,
@@ -201,7 +201,7 @@ def flaky_http_mcp(_no_env_proxy: None) -> Iterator[tuple[MCPServerConfig, _Blip
     )
     proxy: _BlipProxy | None = None
     try:
-        _wait_for_listen(server_port)
+        wait_for_listen(server_port)
         proxy = _BlipProxy(server_port)
         config = MCPServerConfig(
             name="flaky-http-echo",

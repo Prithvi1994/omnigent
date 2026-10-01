@@ -428,20 +428,35 @@ async def test_call_tool_raises_without_connect() -> None:
 
 
 @pytest.mark.asyncio()
+async def test_call_tool_after_failed_initial_connect_raises_without_reconnect() -> None:
+    """
+    A connection whose first ``connect()`` failed is never-connected:
+    ``call_tool`` raises the no-live-session error and does not try
+    to rebuild a session that never existed.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as mock_session:
+        mock_session.initialize = AsyncMock(side_effect=httpx.ConnectError("refused"))
+        conn = McpServerConnection(config=config)
+        with pytest.raises(httpx.ConnectError):
+            await conn.connect()
+        assert conn._connected is False
+
+        with patch.object(conn, "_reconnect", new_callable=AsyncMock) as mock_reconnect:
+            with pytest.raises(RuntimeError, match="has no live session"):
+                await conn.call_tool("test_tool", {"query": "hi"})
+        mock_reconnect.assert_not_awaited()
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
 async def test_call_tool_reconnects_when_session_died_after_connect() -> None:
     """
-    A session lost *after* a successful connect must reconnect, not
-    wedge.
-
-    When a transport fault (e.g. a steady-state 401 from an expired
-    bearer) crashes the lifecycle task, its ``finally`` nulls
-    ``_session``. On the next call the connection has already
-    connected once, so ``call_tool`` must rebuild the session via
-    the reconnect path and let the call round-trip — rather than
-    short-circuiting on the None-session guard and raising
-    ``has no live session`` forever (the steady-state-401 wedge).
-    This fails on the unfixed tree, where the guard raises before
-    ``_reconnect`` is ever attempted.
+    A previously established connection rebuilds its session after
+    the lifecycle task cleared it, instead of raising the
+    never-connected guard on every later call.
     """
     config = _make_http_config()
 
@@ -509,6 +524,50 @@ async def test_call_tool_reconnects_when_session_dies_while_waiting_for_call_loc
                 call = asyncio.create_task(conn.call_tool("test_tool", {"query": "hi"}))
                 await asyncio.sleep(0)
                 conn._session = None
+                conn._call_lock.release()
+                result = await call
+
+        assert result == "recovered"
+        mock_reconnect.assert_awaited_once()
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_marks_dead_the_session_the_attempt_ran_against() -> None:
+    """
+    The dead-session token names the session used under the lock.
+
+    A caller queued behind ``_call_lock`` may run against a session a
+    concurrent caller rebuilt meanwhile. If that session fails, the
+    reconnect must be told about *it*, not the one seen before the
+    lock; otherwise ``_reconnect`` mistakes the broken session for a
+    fresh rebuild and skips it.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as first_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        ok_result = MagicMock()
+        ok_result.content = [TextContent(type="text", text="recovered")]
+        ok_result.isError = False
+        first_session.call_tool.return_value = ok_result
+        replacement = AsyncMock()
+        replacement.call_tool.side_effect = httpx.ReadError("connection reset")
+
+        async def _rebuild(*, dead_session: object) -> None:
+            assert dead_session is replacement, "reconnect was told about the wrong session"
+            conn._session = first_session
+
+        with patch.object(conn, "_reconnect", side_effect=_rebuild) as mock_reconnect:
+            with patch("omnigent.tools.mcp._sleep", new_callable=AsyncMock):
+                await conn._call_lock.acquire()
+                call = asyncio.create_task(conn.call_tool("test_tool", {"query": "hi"}))
+                await asyncio.sleep(0)
+                # A concurrent caller rebuilt the session while this one queued.
+                conn._session = replacement
                 conn._call_lock.release()
                 result = await call
 
