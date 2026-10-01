@@ -1125,7 +1125,7 @@ def _create_verbatim_child(
     session_fixture: _Fixture,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
-    title: str,
+    title: str | None,
 ) -> tuple[str, str]:
     """
     Seed an unstamped child the way ``sys_session_create`` stores it.
@@ -1150,10 +1150,14 @@ def _create_verbatim_child(
     return child_agent.name, child.id
 
 
+@pytest.mark.parametrize(
+    "title", ["research:pricing", "auth refactor"], ids=["colon", "colonless"]
+)
 def test_session_list_keeps_verbatim_colon_title_whole(
     session_fixture: _Fixture,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    title: str,
 ) -> None:
     """
     A ``sys_session_create`` child is listed by its bound agent with its
@@ -1161,44 +1165,49 @@ def test_session_list_keeps_verbatim_colon_title_whole(
 
     ``sys_session_create`` stores the caller's title as-is and binds the
     child to an ``agent_id``; the first colon in ``"research:pricing"`` is
-    part of the title, not the framework's ``"<agent>:<title>"`` separator.
+    part of the title, not the framework's ``"<agent>:<title>"`` separator,
+    and a colon-free title is identified the same way.
     """
-    agent_store = SqlAlchemyAgentStore(db_uri)
-    child_agent = agent_store.create(
-        "b" * 32, "pricing_probe_child", "bundles/pricing_probe_child"
-    )
-    monkeypatch.setattr("omnigent.runtime.get_agent_store", lambda: agent_store)
-    verbatim_child = session_fixture.conv_store.create_conversation(
-        kind="sub_agent",
-        title="research:pricing",
-        parent_conversation_id=session_fixture.parent_conv_id,
-        agent_id=child_agent.id,
-    )
+    agent_name, child_id = _create_verbatim_child(session_fixture, db_uri, monkeypatch, title)
 
     raw = SysSessionListTool().invoke("{}", session_fixture.ctx)
+
     by_id = {entry["conversation_id"]: entry for entry in json.loads(raw)["sub_agents"]}
-    assert by_id[verbatim_child.id] == {
-        "agent": child_agent.name,
-        "title": "research:pricing",
-        "conversation_id": verbatim_child.id,
-    }
+    assert by_id[child_id] == {"agent": agent_name, "title": title, "conversation_id": child_id}
 
 
+def test_session_list_decomposes_ui_added_title(
+    session_fixture: _Fixture,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Add-agent ``ui:<agent>:<label>`` row lists as agent + label, like the server."""
+    _, child_id = _create_verbatim_child(session_fixture, db_uri, monkeypatch, "ui:codex:reviewer")
+
+    raw = SysSessionListTool().invoke("{}", session_fixture.ctx)
+
+    by_id = {entry["conversation_id"]: entry for entry in json.loads(raw)["sub_agents"]}
+    assert by_id[child_id] == {"agent": "codex", "title": "reviewer", "conversation_id": child_id}
+
+
+@pytest.mark.parametrize("title", ["research:pricing", None], ids=["colon", "untitled"])
 def test_close_keeps_verbatim_colon_title_whole(
     session_fixture: _Fixture,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    title: str | None,
 ) -> None:
     """
     Closing a ``sys_session_create`` child tombstones its verbatim title whole.
 
     The child has no ``sub_agent_name`` stamp, so the colon in
     ``"research:pricing"`` is punctuation: the marker is appended to the
-    full title and the result names the bound agent.
+    full title and the result names the bound agent. A child created
+    without a title gets the store's ``untitled:<id>`` default, another
+    colon title that must stay whole.
     """
-    agent_name, child_id = _create_verbatim_child(
-        session_fixture, db_uri, monkeypatch, "research:pricing"
-    )
+    agent_name, child_id = _create_verbatim_child(session_fixture, db_uri, monkeypatch, title)
+    expected_title = title or f"untitled:{child_id}"
 
     payload = json.loads(
         SysSessionCloseTool().invoke(
@@ -1210,11 +1219,11 @@ def test_close_keeps_verbatim_colon_title_whole(
         "closed": True,
         "conversation_id": child_id,
         "agent": agent_name,
-        "title": "research:pricing",
+        "title": expected_title,
     }
     refreshed = session_fixture.conv_store.get_conversation(child_id)
     assert refreshed is not None
-    assert refreshed.title == f"research:pricing{_CLOSED_TITLE_INFIX}{child_id}"
+    assert refreshed.title == f"{expected_title}{_CLOSED_TITLE_INFIX}{child_id}"
 
 
 def test_get_history_keeps_verbatim_colon_title_whole(
@@ -1235,26 +1244,6 @@ def test_get_history_keeps_verbatim_colon_title_whole(
 
     assert (payload["agent"], payload["title"]) == (agent_name, "research:pricing")
     assert payload["items"] == []
-
-
-def test_session_list_includes_colonless_verbatim_child(
-    session_fixture: _Fixture,
-    db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An unstamped child is listed whether or not its verbatim title has a colon."""
-    agent_name, child_id = _create_verbatim_child(
-        session_fixture, db_uri, monkeypatch, "auth refactor"
-    )
-
-    raw = SysSessionListTool().invoke("{}", session_fixture.ctx)
-
-    by_id = {entry["conversation_id"]: entry for entry in json.loads(raw)["sub_agents"]}
-    assert by_id[child_id] == {
-        "agent": agent_name,
-        "title": "auth refactor",
-        "conversation_id": child_id,
-    }
 
 
 def test_session_list_schema_exposes_bounded_pagination() -> None:

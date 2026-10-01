@@ -9,6 +9,7 @@ sub-agent. See designs/STEERABLE_SUBAGENTS.md for the full design.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -63,6 +64,8 @@ _HISTORY_MAX_TOTAL_CHARS = _HISTORY_MAX_TAIL * _ACTIVITY_MAX_CHARS
 # the DB's ``(parent_conversation_id, title)`` unique slot. API display
 # paths strip this marker and expose ``omnigent.closed=true`` instead.
 _CLOSED_TITLE_INFIX = CLOSED_TITLE_INFIX
+
+_logger = logging.getLogger(__name__)
 
 
 class SysSessionSendTool(Tool):
@@ -634,7 +637,12 @@ class SysSessionListTool(Tool):
         )
         result: list[dict[str, str]] = []
         agent_names = _bound_agent_names(
-            [child for child in children.data if child.sub_agent_name is None]
+            [
+                child
+                for child in children.data
+                if child.sub_agent_name is None
+                and not is_session_closed(child.labels, child.title)
+            ]
         )
         for child in children.data:
             # Skip untitled rows, stamped rows missing their "<agent>:<title>"
@@ -1239,8 +1247,9 @@ def _agent_title_from_conversation(
     Named sub-agents persist ``"<agent>:<title>"`` in
     ``Conversation.title`` next to a ``sub_agent_name`` stamp (and
     internally rewrite to ``"<agent>:<title>:closed:<conv_id>"`` when
-    closed); those split on the first ``":"``, as does the Web UI's
-    reserved ``"ui:<agent>:<label>"`` form. An unstamped row carries the
+    closed); those split on the first ``":"``. The Web UI's reserved
+    ``"ui:<agent>:<label>"`` form yields its middle segment as the agent,
+    matching the server's child summary. An unstamped row carries the
     caller's verbatim ``sys_session_create`` title, so any colon in it is
     punctuation: the agent is the bound agent's name and the title stays
     whole.
@@ -1269,6 +1278,9 @@ def _agent_title_from_conversation(
             f"{child.title!r} — expected '<agent>:<title>' format"
         )
     sa_agent, _, sa_title = display_title.partition(":")
+    if sa_agent == "ui" and ":" in sa_title:
+        # Add-agent sentinel "ui:<agent>:<label>": the agent is the middle segment.
+        sa_agent, _, sa_title = sa_title.partition(":")
     return _AgentTitle(agent=sa_agent, title=sa_title)
 
 
@@ -1287,8 +1299,8 @@ def _bound_agent_names(children: list[Conversation]) -> dict[str, str]:
     """
     Resolve the bound agent name for each distinct ``agent_id`` in ``children``.
 
-    One store read per distinct id; ids whose agent no longer resolves are
-    omitted so callers fall back to the ``"agent"`` label.
+    One batched store read; ids whose agent no longer resolves are omitted
+    (and logged) so callers fall back to the ``"agent"`` label.
 
     :param children: Child conversations to resolve.
     :returns: ``{agent_id: agent.name}`` for every binding that resolves.
@@ -1298,12 +1310,9 @@ def _bound_agent_names(children: list[Conversation]) -> dict[str, str]:
     agent_ids = {child.agent_id for child in children if child.agent_id}
     if not agent_ids:
         return {}
-    store = get_agent_store()
-    names: dict[str, str] = {}
-    for agent_id in agent_ids:
-        agent = store.get(agent_id)
-        if agent is not None:
-            names[agent_id] = agent.name
+    names = get_agent_store().get_names(sorted(agent_ids))
+    for agent_id in sorted(agent_ids - names.keys()):
+        _logger.debug("sub-agent child agent binding %s no longer resolves", agent_id)
     return names
 
 
@@ -1835,7 +1844,7 @@ class SysSessionCloseTool(Tool):
         labelled = _agent_title_from_conversation(resolution.child)
         # The marker goes on the display title so a verbatim title is
         # tombstoned whole.
-        display_title = title_without_closed_marker(resolution.child.title)
+        display_title = title_without_closed_marker(resolution.child.title) or ""
         new_title = f"{display_title}{_CLOSED_TITLE_INFIX}{resolution.child.id}"
         resolution.conv_store.update_conversation(resolution.child.id, title=new_title)
         resolution.conv_store.set_labels(

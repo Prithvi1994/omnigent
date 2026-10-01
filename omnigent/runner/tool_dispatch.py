@@ -3192,8 +3192,8 @@ async def _send_to_existing_session(
                 "message": "target sub-agent session is closed; create a new session to continue.",
             }
         )
-    display_title = title_without_closed_marker(_optional_string(snap_data.get("title")))
     parsed = _parse_snapshot_identity(snap_data)
+    display_title = parsed.display_title
     # A stamped child whose title was renamed no longer parses as
     # "<agent>:<title>", so its identity falls back to the snapshot's
     # agent fields instead.

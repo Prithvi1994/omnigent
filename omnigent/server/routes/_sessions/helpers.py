@@ -10433,9 +10433,9 @@ def _bound_agent_names(convs: list[Conversation]) -> dict[str, str]:
     Resolve the bound agent name for each distinct ``agent_id`` in ``convs``.
 
     A child whose title is verbatim (no ``sub_agent_name`` stamp) takes its
-    ``tool`` from this binding instead of its title. One store read per
-    distinct id; unresolvable ids are omitted and an uninitialized runtime
-    yields an empty map.
+    ``tool`` from this binding instead of its title. One batched store
+    read; unresolvable ids are omitted and an uninitialized runtime yields
+    an empty map.
 
     :param convs: Child conversation rows about to be summarised.
     :returns: ``{agent_id: agent.name}`` for every binding that resolves.
@@ -10449,12 +10449,7 @@ def _bound_agent_names(convs: list[Conversation]) -> dict[str, str]:
         store = get_agent_store()
     except RuntimeError:
         return {}
-    names: dict[str, str] = {}
-    for agent_id in agent_ids:
-        agent = store.get(agent_id)
-        if agent is not None:
-            names[agent_id] = agent.name
-    return names
+    return store.get_names(sorted(agent_ids))
 
 
 def _child_session_summary_from_conversation(

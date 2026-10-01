@@ -1,18 +1,10 @@
 """UI journey: a ``sys_session_create`` child keeps its verbatim colon title.
 
-``sys_session_create`` stores the caller's title verbatim, so a legitimate
-title such as ``"research:pricing"`` must not be read back through the
-framework's ``"<agent>:<title>"`` convention. The orchestrator's scripted
-turn creates the child from a local ``config_path`` with that title and then
-calls ``sys_session_list``; the parent's Agents rail and the list result must
-both show the full title and the child's real agent, not ``research`` /
-``pricing``.
-
-Fixture shape mirrors ``test_spawn_bounds_fanout_cap.py`` (strict
-``config.yaml`` bundle, per-run mock model keys). The parent spec pins an
-absolute ``os_env.cwd`` because neither the e2e runner nor the prepared repro
-runner sets ``OMNIGENT_RUNNER_WORKSPACE``, and a relative cwd would be
-replaced by a per-conversation tmpdir where ``config_path`` cannot resolve.
+The orchestrator's scripted turn creates a child titled ``"research:pricing"``
+from a local ``config_path`` and then calls ``sys_session_list``; the parent's
+Agents rail and the list result must show the full title under the child's
+real agent, not ``research`` / ``pricing``. Fixture details, including why the
+parent pins an absolute ``os_env.cwd``, live on ``verbatim_title_session``.
 """
 
 from __future__ import annotations
@@ -112,7 +104,10 @@ def verbatim_title_session(
 
     The child agent config lives under a per-run directory inside the repo
     (the runner may not share this process's ``/tmp``), and that directory is
-    the parent's absolute ``os_env.cwd`` so ``config_path`` resolves against it.
+    the parent's absolute ``os_env.cwd`` so ``config_path`` resolves against it;
+    a relative cwd would be replaced by a per-conversation tmpdir because
+    neither the e2e runner nor the prepared repro runner sets
+    ``OMNIGENT_RUNNER_WORKSPACE``.
 
     :param live_server: Server fixture from the parent conftest.
     :param mock_llm_server_url: Mock LLM server used by credential-free runs.
