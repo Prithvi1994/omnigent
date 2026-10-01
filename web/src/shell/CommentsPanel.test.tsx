@@ -493,7 +493,17 @@ describe("CommentsPanel resize affordance", () => {
       expect(handle()).toBeNull();
       expect(panel.style.getPropertyValue("--comments-panel-width")).toBe("200px");
 
-      // Space returns: the handle is back and the default width is restored.
+      // The 28rem (448px) boundary shared with the container query.
+      rowWidth = 447;
+      act(() => observers.forEach((cb) => cb([], {} as ResizeObserver)));
+      expect(handle()).toBeNull();
+      expect(panel.style.getPropertyValue("--comments-panel-width")).toBe("207px");
+      rowWidth = 448;
+      act(() => observers.forEach((cb) => cb([], {} as ResizeObserver)));
+      expect(handle()).not.toBeNull();
+      expect(panel.style.getPropertyValue("--comments-panel-width")).toBe("208px");
+
+      // Space returns: the default width is restored.
       rowWidth = 800;
       act(() => observers.forEach((cb) => cb([], {} as ResizeObserver)));
       expect(handle()).not.toBeNull();

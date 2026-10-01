@@ -7,7 +7,16 @@
 // The toolbar keeps to a single row: buttons that don't fit the available width
 // fold into a trailing "⋯" menu, lowest priority first (see useToolbarOverflow).
 
-import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  Fragment,
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useEditorState } from "@tiptap/react";
 import {
@@ -52,6 +61,9 @@ const TOOLBAR_BTN_CLASS = "min-w-[1.75rem] rounded px-1.5 py-0.5 text-sm transit
 const TOOLBAR_BTN_IDLE_CLASS = "text-muted-foreground hover:bg-muted hover:text-foreground";
 const TOOLBAR_BTN_ACTIVE_CLASS = "bg-accent text-accent-foreground";
 
+/** Closes the enclosing "⋯" menu once a folded tool has run. */
+const ToolbarMenuContext = createContext<(() => void) | null>(null);
+
 export function ToolbarBtn({
   children,
   active = false,
@@ -65,6 +77,7 @@ export function ToolbarBtn({
   onClick: () => void;
   className?: string;
 }) {
+  const closeMenu = useContext(ToolbarMenuContext);
   return (
     <button
       type="button"
@@ -72,7 +85,10 @@ export function ToolbarBtn({
       aria-label={title}
       // Prevent the mousedown from stealing focus away from the editor.
       onMouseDown={(e) => e.preventDefault()}
-      onClick={onClick}
+      onClick={() => {
+        onClick();
+        closeMenu?.();
+      }}
       className={cn(
         TOOLBAR_BTN_CLASS,
         active ? TOOLBAR_BTN_ACTIVE_CLASS : TOOLBAR_BTN_IDLE_CLASS,
@@ -90,6 +106,7 @@ export function Divider() {
 
 function TableBtn({ editor }: { editor: Editor | null }) {
   const [open, setOpen] = useState(false);
+  const closeMenu = useContext(ToolbarMenuContext);
   const [hovered, setHovered] = useState({ rows: 0, cols: 0 });
   const MAX = 6;
 
@@ -139,6 +156,7 @@ function TableBtn({ editor }: { editor: Editor | null }) {
                       })
                       .run();
                     setOpen(false);
+                    closeMenu?.();
                   }}
                   className={cn(
                     "h-5 w-5 cursor-pointer rounded-sm border transition-colors",
@@ -319,8 +337,12 @@ function useToolbarOverflow(items: readonly ToolbarItem[]) {
           total += widths.get(MEASURE_MORE) ?? 0;
           children += 1;
         }
-        const copyWidth = hidden.has("copy") ? 0 : (widths.get("copy") ?? 0) + clusterGap;
-        total += statusWidth + copyWidth + Math.max(0, children - 1) * gap;
+        for (const item of current) {
+          if (item.group === "copy" && !hidden.has(item.key)) {
+            total += (widths.get(item.key) ?? 0) + clusterGap;
+          }
+        }
+        total += statusWidth + Math.max(0, children - 1) * gap;
         return total + FIT_SLACK_PX <= available;
       };
 
@@ -340,7 +362,10 @@ function useToolbarOverflow(items: readonly ToolbarItem[]) {
     };
 
     evaluate();
-    if (typeof ResizeObserver === "undefined") return;
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", evaluate);
+      return () => window.removeEventListener("resize", evaluate);
+    }
     const ro = new ResizeObserver(evaluate);
     ro.observe(row);
     ro.observe(measure);
@@ -359,6 +384,7 @@ function ToolbarOverflowMenu({
   items: readonly ToolbarItem[];
 }) {
   const [open, setOpen] = useState(false);
+  const close = useCallback(() => setOpen(false), []);
   const groups: ToolbarItem[][] = [];
   for (const item of items) {
     const last = groups[groups.length - 1];
@@ -384,13 +410,15 @@ function ToolbarOverflowMenu({
           if (editor?.isFocused) e.preventDefault();
         }}
       >
-        {groups.map((group) => (
-          <div key={group[0].group} role="group" className="flex items-center gap-0.5">
-            {group.map((item) => (
-              <Fragment key={item.key}>{item.node}</Fragment>
-            ))}
-          </div>
-        ))}
+        <ToolbarMenuContext.Provider value={close}>
+          {groups.map((group) => (
+            <div key={group[0].key} role="group" className="flex items-center gap-0.5">
+              {group.map((item) => (
+                <Fragment key={item.key}>{item.node}</Fragment>
+              ))}
+            </div>
+          ))}
+        </ToolbarMenuContext.Provider>
       </PopoverContent>
     </Popover>
   );
@@ -446,6 +474,8 @@ export function ToolbarPlugin({
 
   const handleCopy = useCallback(() => {
     const md = getMarkdown();
+    // Keep the caret in the document, also when Copy ran from the "⋯" menu.
+    editor?.commands.focus();
     if (!navigator?.clipboard?.writeText) return;
     navigator.clipboard
       .writeText(md)
@@ -457,7 +487,7 @@ export function ToolbarPlugin({
       .catch(() => {
         // ignore clipboard errors
       });
-  }, [getMarkdown]);
+  }, [editor, getMarkdown]);
 
   const handleSave = useCallback(() => {
     if (!isDirty || saveDisabled || hasExternalUpdate) return;
@@ -742,7 +772,7 @@ export function ToolbarPlugin({
 
   const { rowRef, measureRef, clusterRef, statusRef, folded } = useToolbarOverflow(items);
   const foldedItems = items.filter((item) => folded.has(item.key));
-  const copyItem = items.find((item) => item.key === "copy");
+  const clusterItems = items.filter((item) => item.group === "copy" && !folded.has(item.key));
 
   return (
     <div className="relative shrink-0 border-b border-border bg-card">
@@ -761,7 +791,9 @@ export function ToolbarPlugin({
         )}
         {foldedItems.length > 0 && <ToolbarOverflowMenu editor={editor} items={foldedItems} />}
         <div ref={clusterRef} className="ml-auto flex items-center gap-2">
-          {copyItem && !folded.has(copyItem.key) && copyItem.node}
+          {clusterItems.map((item) => (
+            <Fragment key={item.key}>{item.node}</Fragment>
+          ))}
           <button
             ref={statusRef}
             data-slot="save-status"
@@ -797,7 +829,7 @@ export function ToolbarPlugin({
         className="pointer-events-none invisible absolute left-[-9999px] top-0 flex flex-nowrap items-center gap-0.5"
       >
         {items.map((item) => (
-          <span key={item.key} data-measure={item.key} className="inline-flex">
+          <span key={item.key} data-measure={item.key} className="inline-flex items-center gap-0.5">
             {item.node}
           </span>
         ))}

@@ -120,6 +120,12 @@ function chainRecordingEditor(): { editor: Editor; calls: string[] } {
   const editor = {
     getMarkdown: () => MARKDOWN,
     chain: () => chain,
+    commands: {
+      focus: () => {
+        calls.push("commands.focus");
+        return true;
+      },
+    },
     isFocused: false,
   } as unknown as Editor;
   return { editor, calls };
@@ -172,6 +178,20 @@ describe("MarkdownEditorToolbar overflow", () => {
     expect(screen.getByRole("toolbar", { name: "Formatting" })).not.toContainElement(folded);
     fireEvent.click(folded);
     expect(calls).toEqual(["focus", "toggleBulletList", "run"]);
+    // The menu closes once the command has run.
+    expect(screen.queryByRole("button", { name: "Bullet list" })).toBeNull();
+  });
+
+  it("closes the ⋯ menu after a folded Copy and hands focus back to the editor", () => {
+    installToolbarWidths(212);
+    const { editor, calls } = chainRecordingEditor();
+    renderToolbar({ editor });
+    fireEvent.click(screen.getByRole("button", { name: "More formatting" }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+    // Copy has no editor chain of its own, so it refocuses the editor explicitly.
+    expect(calls).toEqual(["commands.focus"]);
+    expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
+    expect(screen.getByRole("button", { name: "More formatting" })).toBeInTheDocument();
   });
 });
 

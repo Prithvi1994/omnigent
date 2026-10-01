@@ -292,44 +292,26 @@ def _report_for(
 
 
 @pytest.mark.parametrize(("width", "height"), _VIEWPORTS, ids=_VIEWPORT_IDS)
-def test_comments_panel_controls_stay_inside_rail(
+def test_comments_panel_layout_in_narrow_rail(
     browser: Browser,
     seeded_agents_md_session: tuple[str, str],
     output_path: str,
     width: int,
     height: int,
 ) -> None:
-    """Panel controls stay inside the rail and window and clear of the toolbar."""
-    report = _report_for(browser, seeded_agents_md_session, output_path, "controls", width, height)
-    violations = _control_violations(report)
-    assert not violations, f"at {width}x{height}:\n" + "\n".join(violations)
-
-
-@pytest.mark.parametrize(("width", "height"), _VIEWPORTS, ids=_VIEWPORT_IDS)
-def test_editor_toolbar_keeps_one_row_beside_comments_panel(
-    browser: Browser,
-    seeded_agents_md_session: tuple[str, str],
-    output_path: str,
-    width: int,
-    height: int,
-) -> None:
-    """The formatting toolbar keeps one row of buttons inside the toolbar."""
-    report = _report_for(browser, seeded_agents_md_session, output_path, "toolbar", width, height)
-    violations = _toolbar_violations(report)
-    assert not violations, f"at {width}x{height}:\n" + "\n".join(violations)
-
-
-@pytest.mark.parametrize(("width", "height"), _VIEWPORTS, ids=_VIEWPORT_IDS)
-def test_workspace_tabs_stay_reachable_beside_comments_panel(
-    browser: Browser,
-    seeded_agents_md_session: tuple[str, str],
-    output_path: str,
-    width: int,
-    height: int,
-) -> None:
-    """No Workspace tab is clipped out of reach when the rail is narrow."""
-    report = _report_for(browser, seeded_agents_md_session, output_path, "tabs", width, height)
-    violations = _tab_strip_violations(report)
+    """One journey per viewport: panel controls stay inside the rail and window and
+    clear of the toolbar, the toolbar keeps one row inside its box, and every
+    Workspace tab stays reachable."""
+    report = _report_for(browser, seeded_agents_md_session, output_path, "layout", width, height)
+    violations = [
+        f"{group}: {violation}"
+        for group, found in (
+            ("comments panel controls", _control_violations(report)),
+            ("editor toolbar", _toolbar_violations(report)),
+            ("workspace tabs", _tab_strip_violations(report)),
+        )
+        for violation in found
+    ]
     assert not violations, f"at {width}x{height}:\n" + "\n".join(violations)
 
 
@@ -354,5 +336,7 @@ def test_folded_toolbar_menu_inserts_table(
 
         expect(editor.locator("table")).to_be_visible()
         expect(editor.locator("table tr")).to_have_count(2)
+        # The "⋯" menu closes once the tool has run.
+        expect(page.get_by_role("button", name="Insert table")).to_have_count(0)
     finally:
         page.context.close()
