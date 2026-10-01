@@ -554,9 +554,7 @@ async def test_snapshot_metadata_carries_compaction_aggregate(
     ``sys_session_get_info`` tool) with ``include_items=false``, so a
     session stalled at repeated compactions must be visible without the
     transcript: ``compaction_count`` climbs and ``last_compaction_at``
-    marks the newest compaction. Before this signal existed, such a
-    session was metadata-indistinguishable from a healthy one and
-    orchestrators waited on it indefinitely.
+    marks the newest compaction.
     """
     agent = await create_test_agent(client)
     sid = await _create_session(client, agent["id"])

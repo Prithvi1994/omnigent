@@ -8027,9 +8027,8 @@ async def test_sys_session_get_info_projects_compaction_aggregate() -> None:
 
     A session parked at repeated context compactions is only detectable
     from metadata if ``compaction_count`` / ``last_compaction_at``
-    survive the runner's snapshot→tool projection. If the projection
-    dropped them, orchestrators polling ``sys_session_get_info`` would
-    again see a healthy-looking session and wait indefinitely.
+    survive the runner's snapshot→tool projection. Dropping these fields
+    would hide the stall signal from metadata pollers.
     """
     from omnigent.runner.tool_dispatch import execute_tool
 

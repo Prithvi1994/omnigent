@@ -2273,8 +2273,6 @@ def test_list_items_type_filter_returns_only_matching_type(
     list_items(type=...) returns only items of the specified type,
     while list_items() without a filter returns all types.
     """
-    from omnigent.entities import CompactionData
-
     conv = conversation_store.create_conversation()
 
     # Append a mix of message and compaction items
@@ -2349,8 +2347,6 @@ def test_list_items_type_filter_with_order_and_limit(
     list_items(type="compaction", order="desc", limit=1) returns only
     the most recently appended compaction item.
     """
-    from omnigent.entities import CompactionData
-
     conv = conversation_store.create_conversation()
 
     # Append two compaction items
@@ -2409,8 +2405,6 @@ def test_get_compaction_stats_counts_compactions_and_tracks_latest(
     alone. Messages must not count, and the timestamp must follow the
     newest compaction item.
     """
-    from omnigent.entities import CompactionData
-
     conv = conversation_store.create_conversation()
 
     # No items at all → zero aggregate, no timestamp.
@@ -2471,8 +2465,6 @@ def test_get_compaction_stats_is_scoped_per_conversation(
     snapshot would report the workspace-wide compaction total and the
     stall signal would fire on healthy sessions.
     """
-    from omnigent.entities import CompactionData
-
     compacted = conversation_store.create_conversation()
     quiet = conversation_store.create_conversation()
 
@@ -2508,7 +2500,6 @@ def test_get_compaction_stats_reads_a_bounded_page(
     count saturates at the cap while the timestamp still follows the newest
     item.
     """
-    from omnigent.entities import CompactionData
     from omnigent.stores.conversation_store import sqlalchemy_store as store_module
 
     monkeypatch.setattr(store_module, "COMPACTION_COUNT_CAP", 3)
@@ -4607,60 +4598,11 @@ def test_fork_remaps_compaction_boundary_to_copied_item(
     assert isinstance(fork_compaction.data, CompactionData)
     assert fork_compaction.data.last_item_id != boundary.id
     assert fork_compaction.data.last_item_id == fork_items[0].id
-
-
-def test_fork_compaction_stats_count_only_copied_items(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    """
-    A fork's aggregate reflects the compaction items it copied.
-
-    A cutoff before the source's compaction must leave the fork reporting
-    none, while a full fork reports the copied compaction.
-    """
-    source = conversation_store.create_conversation()
-    [boundary] = conversation_store.append(
-        source.id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id="resp_001",
-                data=MessageData(role="user", content=[{"type": "input_text", "text": "old"}]),
-            )
-        ],
-    )
-    conversation_store.append(
-        source.id,
-        [
-            NewConversationItem(
-                type="compaction",
-                response_id="compact_001",
-                data=CompactionData(
-                    summary="The user said old.",
-                    last_item_id=boundary.id,
-                    token_count=6,
-                ),
-            )
-        ],
-    )
-    conversation_store.append(
-        source.id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id="resp_002",
-                data=MessageData(role="user", content=[{"type": "input_text", "text": "recent"}]),
-            )
-        ],
-    )
-
-    full = conversation_store.fork_conversation(source.id)
-    partial = conversation_store.fork_conversation(source.id, up_to_response_id="resp_001")
-
-    full_stats = conversation_store.get_compaction_stats(full.id)
+    # The fork's aggregate counts the copied compaction; a cutoff before it copies none.
+    full_stats = conversation_store.get_compaction_stats(fork.id)
     assert full_stats.count == 1
-    copied = next(i for i in conversation_store.list_items(full.id).data if i.type == "compaction")
-    assert full_stats.last_compaction_at == copied.created_at
+    assert full_stats.last_compaction_at == fork_compaction.created_at
+    partial = conversation_store.fork_conversation(source.id, up_to_response_id="resp_001")
     partial_stats = conversation_store.get_compaction_stats(partial.id)
     assert partial_stats.count == 0
     assert partial_stats.last_compaction_at is None

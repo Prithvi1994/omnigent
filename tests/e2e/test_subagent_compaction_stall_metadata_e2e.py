@@ -309,8 +309,12 @@ def _read_call(workspace: Path, index: int, usage: dict[str, int]) -> dict[str, 
     }
 
 
-def _configure_child_model(mock_url: str, workspace: Path) -> None:
-    """Script the read phase: reads, compaction, read, compaction, then a held reply."""
+def _configure_child_model(mock_url: str, workspace: Path) -> int:
+    """Script the read phase: reads, compaction, read, compaction, then a held reply.
+
+    :returns: Number of scripted replies; tool-bearing requests beyond it would fall
+        through to the non-blocking fallback and end the park.
+    """
     responses = [_read_call(workspace, i, _SMALL_USAGE) for i in range(1, _DOC_COUNT - 1)]
     responses += [
         _read_call(workspace, _DOC_COUNT - 1, _NEAR_FULL_USAGE),
@@ -318,7 +322,8 @@ def _configure_child_model(mock_url: str, workspace: Path) -> None:
         _read_call(workspace, _DOC_COUNT, _NEAR_FULL_USAGE),
         {"text": "Summary after the second compaction: guides 1-6 were read verbatim."},
     ]
-    responses += [{"text": _HELD_REPLY, "block": True}] * 6
+    # A long blocking tail keeps the park alive even if the CLI retries the held call.
+    responses += [{"text": _HELD_REPLY, "block": True}] * 30
     # Claude's title/background requests advertise no tools; keep them off this queue.
     _mock_post(
         mock_url,
@@ -327,6 +332,7 @@ def _configure_child_model(mock_url: str, workspace: Path) -> None:
     )
     _mock_post(mock_url, "/mock/set_fallback", {"key": _CHILD_MODEL, "text": _HELD_REPLY})
     _mock_post(mock_url, "/mock/set_fallback", {"key": "default", "text": "ok"})
+    return len(responses)
 
 
 def _dispatch_prompt() -> str:
@@ -453,6 +459,15 @@ def _compaction_items(client: httpx.Client, session_id: str) -> list[dict[str, A
     return [item for item in _items(client, session_id) if _item_type(item) == "compaction"]
 
 
+def _child_tool_requests(mock_url: str) -> int:
+    """Count the child's model calls that advertised tools, i.e. consumed the scripted queue."""
+    resp = httpx.get(
+        f"{mock_url}/mock/requests", params={"key": _CHILD_MODEL}, timeout=10, trust_env=False
+    )
+    resp.raise_for_status()
+    return sum(1 for r in resp.json()["requests"] if isinstance(r, dict) and r.get("tools"))
+
+
 def _gate_pending(mock_url: str) -> bool:
     resp = httpx.get(f"{mock_url}/gate/pending", timeout=5, trust_env=False)
     resp.raise_for_status()
@@ -512,13 +527,15 @@ class StallObservation:
     head_before: str
     head_after: str
     gate_pending: bool
+    scripted_child_replies: int
+    child_tool_requests: int
 
 
 @pytest.fixture(scope="module")
 def stalled_subagent(rig: Rig) -> Iterator[StallObservation]:
     """Drive the journey once and keep the orchestrator's observations."""
     client, mock_url, workspace = rig.client, rig.mock_url, rig.workspace
-    _configure_child_model(mock_url, workspace)
+    scripted_child_replies = _configure_child_model(mock_url, workspace)
     _configure_parent_dispatch(mock_url)
     agent_id = _register_parent(client, mock_url)
     create = client.post("/v1/sessions", json={"agent_id": agent_id})
@@ -539,7 +556,10 @@ def stalled_subagent(rig: Rig) -> Iterator[StallObservation]:
         resp = client.get(f"/v1/sessions/{parent_id}/child_sessions")
         if resp.status_code == 200 and resp.json().get("data"):
             row = resp.json()["data"][0]
-            child_id = str(row.get("session_id") or row.get("id"))
+            raw_id = row.get("session_id") or row.get("id")
+            if raw_id is None:
+                return False
+            child_id = str(raw_id)
             return True
         return False
 
@@ -571,6 +591,8 @@ def stalled_subagent(rig: Rig) -> Iterator[StallObservation]:
             head_before=head_before,
             head_after=_git(workspace, "rev-parse", "HEAD"),
             gate_pending=_gate_pending(mock_url),
+            scripted_child_replies=scripted_child_replies,
+            child_tool_requests=_child_tool_requests(mock_url),
         )
         print("STALL_OBSERVATION " + json.dumps(asdict(observation), default=str)[:20000])
         yield observation
@@ -588,6 +610,9 @@ def test_parked_subagent_metadata_reports_compactions(stalled_subagent: StallObs
     # Parked state: two compactions, the model reply still held, no writes, no inbox notice.
     assert len(obs.compaction_items) == 2, obs.compaction_items
     assert obs.gate_pending, "child turn should still be held open"
+    assert obs.child_tool_requests <= obs.scripted_child_replies, (
+        "scripted child replies exhausted; the held reply fell through to the fallback"
+    )
     # The runner leaves its own startup probe dir in the workspace; only new paths count.
     new_paths = set(obs.git_status_after.splitlines()) - set(obs.git_status_before.splitlines())
     assert not new_paths, f"sub-agent wrote to the workspace: {sorted(new_paths)}"

@@ -449,9 +449,10 @@ def anthropic_sse_text_response(
     ``message_delta``, ``message_stop``.
 
     :param usage: Optional prompt-usage overrides merged into the
-        ``message_start`` event's ``message.usage`` (e.g.
-        ``{"input_tokens": 50000}``), so tests can script the observed
-        context size. Defaults keep the historical fixed values.
+        ``message_start`` event's ``message.usage`` and repeated in the
+        final ``message_delta`` usage (e.g. ``{"input_tokens": 50000}``),
+        so tests can script the context size Claude Code observes.
+        Defaults keep the historical fixed values.
     """
     msg_id = f"msg_{_uuid_mod.uuid4().hex[:12]}"
     output_tokens = max(5, len(text.split()))
