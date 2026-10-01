@@ -84,7 +84,7 @@ def _setup_overview_row(env: dict[str, str], name: str) -> str:
             try:
                 collected += child.read_nonblocking(size=65536, timeout=1)
             except pexpect.TIMEOUT:
-                pass
+                pass  # no new output this second; re-scan what was collected
             except pexpect.EOF:
                 break
             text = _ANSI_RE.sub(b"", collected).decode("utf-8", "replace")
@@ -97,7 +97,7 @@ def _setup_overview_row(env: dict[str, str], name: str) -> str:
             time.sleep(0.5)
             child.sendcontrol("c")
         except Exception:
-            pass
+            pass  # best-effort teardown; the PTY may already be gone
         child.close(force=True)
     assert rows, f"omni setup never rendered a {name} row"
     return rows[-1]
