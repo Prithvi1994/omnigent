@@ -50,6 +50,7 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
+from omnigent.util.server_url import display_server_url_without_userinfo
 
 # Force-load the MCP streamable-http client before any test monkeypatches
 # httpx.AsyncClient: the MCP SDK evaluates `httpx.AsyncClient | None` eagerly at
@@ -476,10 +477,11 @@ def test_rejected_bootstrap_diagnosis_names_refused_stored_login_renewal(
         assert factory() is None
 
     messages = [record.getMessage() for record in caplog.records]
+    # The hint must name the exact credential-free login command, never userinfo.
+    safe_url = display_server_url_without_userinfo("https://user:s3cret@srv.example.com")
     assert any(
         "stored login could not renew it (refresh refused with HTTP 403)" in message
-        and "`omnigent login " in message
-        and "srv.example.com" in message
+        and f"`omnigent login {safe_url}`" in message
         for message in messages
     ), messages
     assert not any("no SDK/OIDC credential is available" in m for m in messages), messages
