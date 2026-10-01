@@ -677,9 +677,10 @@ class SysSessionGetInfoTool(Tool):
     the count of outstanding approval prompts. Comparing
     ``last_activity_at`` across polls distinguishes a running session that
     is advancing from one whose persisted output has stalled; a
-    ``last_activity_at`` stuck at ``last_compaction_at`` means the session
-    has done nothing since it compacted, and a ``compaction_count`` that
-    keeps rising with no tool output in between marks a context thrash.
+    ``last_activity_at`` that stays at ``last_compaction_at`` across repeated
+    polls indicates the session has done nothing since it compacted, and a
+    ``compaction_count`` that keeps rising with no tool output in between
+    marks a context thrash.
     For the conversation transcript, use
     ``sys_session_get_history`` instead.
 
@@ -707,8 +708,9 @@ class SysSessionGetInfoTool(Tool):
             "host + configured harness readiness, reasoning effort, model, "
             "parent session, workspace, "
             "persisted last-activity time, compaction count + last "
-            "compaction time (last_activity_at stuck at last_compaction_at "
-            "means nothing happened since the session compacted), and "
+            "compaction time (last_activity_at staying at last_compaction_at "
+            "across polls indicates nothing happened since the session "
+            "compacted), and "
             "outstanding approval "
             "prompts. Global read — any "
             "session you can access. Pass session_id to target another "

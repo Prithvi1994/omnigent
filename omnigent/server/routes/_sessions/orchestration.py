@@ -1269,9 +1269,7 @@ def _build_session_response(
         background_tasks=background_tasks,
         created_at=conv.created_at,
         updated_at=conv.updated_at,
-        # Metadata-level compaction signal: lets an orchestrator polling
-        # snapshots spot a session repeatedly compacting with no progress,
-        # which the transcript-free projection otherwise cannot see.
+        # Compaction aggregate for metadata pollers; see the compaction_stats parameter.
         compaction_count=compaction_stats.count if compaction_stats else 0,
         last_compaction_at=(compaction_stats.last_compaction_at if compaction_stats else None),
         title=title_without_closed_marker(conv.title),

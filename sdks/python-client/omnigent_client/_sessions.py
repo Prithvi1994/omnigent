@@ -140,15 +140,6 @@ class Session:
         resets the clock — treat it as a session-write heartbeat, not a pure
         item-append signal. ``None`` when connected to an older server that
         does not return the field.
-    :param compaction_count: Context compactions persisted to this
-        session's transcript, e.g. ``2``; ``0`` when the session has never
-        compacted or the server predates the field. Exact up to the
-        server's cap of 1000 newest compaction items.
-    :param last_compaction_at: Unix epoch seconds of the most recent
-        persisted compaction item, or ``None`` when the session has never
-        compacted (or the server predates the field). An ``updated_at``
-        that stops at this value means nothing was written since the last
-        compaction.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
     :param labels: Session-scoped guardrails labels. Empty dict
@@ -191,6 +182,15 @@ class Session:
         returned with ``visibility="archived"`` or with
         ``visibility="all", include_archived=True``. ``False`` for normal
         sessions.
+    :param compaction_count: Context compactions persisted to this
+        session's transcript, e.g. ``2``; ``0`` when the session has never
+        compacted or the server predates the field. Exact up to the
+        server's cap of 1000 newest compaction items.
+    :param last_compaction_at: Unix epoch seconds of the most recent
+        persisted compaction item, or ``None`` when the session has never
+        compacted (or the server predates the field). An ``updated_at``
+        that stays at this value across repeated polls indicates nothing
+        was written since the last compaction.
     """
 
     id: str
@@ -198,8 +198,6 @@ class Session:
     status: str
     created_at: int
     updated_at: int | None = None
-    compaction_count: int = 0
-    last_compaction_at: int | None = None
     agent_name: str | None = None
     title: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
@@ -214,6 +212,8 @@ class Session:
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     archived: bool = False
+    compaction_count: int = 0
+    last_compaction_at: int | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Session:

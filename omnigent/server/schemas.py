@@ -2183,8 +2183,10 @@ class SessionResponse(BaseModel):
         compactions without scraping transcript items.
     :param last_compaction_at: Unix epoch seconds of the most recent
         persisted compaction item, or ``None`` when the session has never
-        compacted. An ``updated_at`` that stops at this value means the
-        session has written nothing since it last compacted.
+        compacted. An ``updated_at`` that stays at this value across
+        repeated polls indicates the session has written nothing since it
+        last compacted; both are whole seconds, so one equal reading alone
+        is not proof.
     """
 
     id: str
