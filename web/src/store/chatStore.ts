@@ -1274,6 +1274,8 @@ const sessionUsageRevisions = new WeakMap<ConversationEntry, { cost: number; mod
 // Snapshot reconciliation must teach the already-running stream pump which
 // native preview messages have finalized, including warm session revisits.
 const nativePreviewTombstonesByController = new WeakMap<AbortController, Set<string>>();
+// Catch-up already acknowledged these inputs; a delayed receipt must not pop another send.
+const recoveredInputsByController = new WeakMap<AbortController, Set<string>>();
 
 /**
  * Evict a conversation from the live registry.
@@ -3973,6 +3975,9 @@ async function bindStream(
   get: Getter,
   hydratePending = false,
 ): Promise<void> {
+  if (queryClient === null) {
+    throw new Error("chatStore.bindStream: queryClient not initialized");
+  }
   racedNativeModelOptions.delete(id);
   const controller = new AbortController();
   const ignoredNativeMessageIds = new Set<string>();
@@ -4078,9 +4083,6 @@ async function bindStream(
   // until the reader scrolls up (`loadMoreHistory`).
   // `retry: false` because the most common failure here is "invalid conv
   // id in URL" (not transient).
-  if (queryClient === null) {
-    throw new Error("chatStore.bindStream: queryClient not initialized");
-  }
   const stateBeforeFetch = get();
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, stateBeforeFetch);
   try {
@@ -4325,6 +4327,9 @@ async function reconcileInitialHistory(
     get().abortController !== controller ||
     get().historyGeneration !== generation;
   const pendingAtConnect = new Set(get().pendingUserMessages.map((p) => p.tempId));
+  const recoveredInputs = new Set<string>();
+  recoveredInputsByController.set(controller, recoveredInputs);
+  let failures = 0;
   let cursor = lastItemId;
   let anchorId = lastVisibleItemId;
   // Pages form a cursor chain; the pump continues consuming events concurrently.
@@ -4333,8 +4338,14 @@ async function reconcileInitialHistory(
     let page: SessionItemsPage;
     try {
       page = await fetchSessionItemsPage(id, { newerThan: cursor, signal: controller.signal });
-    } catch {
-      return;
+      failures = 0;
+    } catch (error) {
+      if (stale()) return;
+      failures += 1;
+      console.warn(`Session ${id}: initial history catch-up failed (attempt ${failures})`, error);
+      if (failures >= 2) return;
+      await abortableDelay(250, controller.signal);
+      continue;
     }
     if (stale()) return;
     const nativeIds = nativeCompletedMessageIds(page.items);
@@ -4345,19 +4356,45 @@ async function reconcileInitialHistory(
       const seen = new Set(current.map((b) => b.ctx.itemId).filter(Boolean));
       const unseen = recovered.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
       if (unseen.length === 0) return current === state.blocks ? {} : { blocks: current };
-      const blocks = [...withoutRebuiltUserInputCards(current, unseen)];
-      // Everything in this page follows the snapshot cursor and precedes the
-      // unpersisted live tail. Keep the server's order even if replies won the race.
+      const kept = withoutRebuiltUserInputCards(current, unseen);
+      const firstIndex = new Map<string, number>();
+      const lastIndex = new Map<string, number>();
+      kept.forEach((b, i) => {
+        if (!b.ctx.itemId) return;
+        if (!firstIndex.has(b.ctx.itemId)) firstIndex.set(b.ctx.itemId, i);
+        lastIndex.set(b.ctx.itemId, i);
+      });
+      const anchor = anchorId === null ? undefined : lastIndex.get(anchorId);
+      const successor = recovered.find((b) => b.ctx.itemId && firstIndex.has(b.ctx.itemId));
+      const liveStart = kept.findIndex(
+        (b) =>
+          isLiveProvisionalBlock(b) ||
+          (!b.ctx.itemId && b.ctx.responseId === state.activeResponse?.responseId),
+      );
       let insertAt =
-        anchorId === null ? 0 : blocks.findLastIndex((b) => b.ctx.itemId === anchorId) + 1;
+        anchorId === null
+          ? 0
+          : anchor !== undefined
+            ? anchor + 1
+            : successor?.ctx.itemId
+              ? firstIndex.get(successor.ctx.itemId)!
+              : liveStart >= 0
+                ? liveStart
+                : kept.length;
+      const additions = new Map<number, AnyBlock[]>();
       for (const block of recovered) {
         if (block.ctx.itemId && seen.has(block.ctx.itemId)) {
-          insertAt = blocks.findLastIndex((b) => b.ctx.itemId === block.ctx.itemId) + 1;
+          const at = lastIndex.get(block.ctx.itemId);
+          if (at !== undefined) insertAt = at + 1;
         } else if (block.ctx.itemId) {
-          blocks.splice(insertAt, 0, block);
-          insertAt += 1;
+          const bucket = additions.get(insertAt) ?? [];
+          bucket.push(block);
+          additions.set(insertAt, bucket);
+          if (block.type === "user_message") recoveredInputs.add(block.ctx.itemId);
         }
       }
+      const blocks = kept.flatMap((block, i) => [...(additions.get(i) ?? []), block]);
+      blocks.push(...(additions.get(kept.length) ?? []));
       const acknowledged = unseen.filter(
         (b) => b.type === "user_message" && !isSystemUserContent(b.content),
       ).length;
@@ -7069,6 +7106,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       //      client).
       applyToConversation((s) => {
         if (hasCommittedItem(s.blocks, event.itemId)) {
+          if (
+            s.abortController &&
+            recoveredInputsByController.get(s.abortController)?.has(event.itemId)
+          )
+            return {};
           // The committed copy is already in `blocks` — the forwarder-mirrored
           // item beat this event through the stream, or a snapshot merge
           // inserted it. Still ack the optimistic bubble: returning without

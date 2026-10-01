@@ -1301,6 +1301,9 @@ export async function fetchSessionItemsPage(
     signal,
   }: { olderThan?: string; newerThan?: string | null; limit?: number; signal?: AbortSignal } = {},
 ): Promise<SessionItemsPage> {
+  if (newerThan !== undefined && olderThan !== undefined) {
+    throw new Error("Pass either olderThan or newerThan, not both");
+  }
   const ascending = newerThan !== undefined;
   const params = new URLSearchParams({ limit: String(limit), order: ascending ? "asc" : "desc" });
   const cursor = ascending ? newerThan : olderThan;
