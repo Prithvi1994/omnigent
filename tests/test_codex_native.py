@@ -10218,6 +10218,75 @@ def test_usage_coalescer_flush_attaches_model_to_every_post() -> None:
     assert posted[1]["data"]["cumulative_output_tokens"] == 600
 
 
+def test_usage_coalescer_flush_keeps_unchanged_cached_tokens_with_token_counts() -> None:
+    """
+    ``flush`` re-posts the cumulative cached count whenever token counts change.
+
+    A cache-miss turn leaves Codex's cumulative ``cachedInputTokens`` unchanged;
+    dropping it from that post makes the server bill the earlier cache reads at
+    the full input rate.
+    """
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Capture Omnigent usage posts from the coalescer.
+
+        :param request: HTTP request sent by the coalescer.
+        :returns: Accepted response.
+        """
+        posted.append(json.loads(request.content))
+        return httpx.Response(202, json={"queued": False})
+
+    async def run() -> None:
+        """
+        Flush a cache-heavy frame, then a cache-miss frame, then nothing new.
+
+        :returns: None.
+        """
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            coalescer = _usage_coalescer(client)
+            coalescer.record(
+                {
+                    "tokenUsage": {
+                        "total": {
+                            "inputTokens": 100_000,
+                            "cachedInputTokens": 90_000,
+                            "outputTokens": 200,
+                        }
+                    }
+                },
+                model="gpt-5.1-codex",
+            )
+            await coalescer.flush()
+            # Cache-miss turn: input and output grow, the cached total does not.
+            coalescer.record(
+                {
+                    "tokenUsage": {
+                        "total": {
+                            "inputTokens": 200_000,
+                            "cachedInputTokens": 90_000,
+                            "outputTokens": 400,
+                        }
+                    }
+                },
+            )
+            await coalescer.flush()
+            await coalescer.flush()
+
+    asyncio.run(run())
+
+    # Two posts: the unchanged third flush is still deduped away entirely.
+    assert len(posted) == 2
+    assert posted[0]["data"]["cumulative_cache_read_input_tokens"] == 90_000
+    assert posted[1]["data"]["cumulative_input_tokens"] == 200_000
+    assert posted[1]["data"]["cumulative_output_tokens"] == 400
+    assert posted[1]["data"]["cumulative_cache_read_input_tokens"] == 90_000
+
+
 # ── Codex subagent tracking and dedup ────────────────────────────────────────
 
 

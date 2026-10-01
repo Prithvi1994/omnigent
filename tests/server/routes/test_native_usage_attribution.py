@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pytest
 
+from omnigent.llms.context_window import ModelPricing
 from omnigent.server.routes._sessions.orchestration import (
     _persist_native_cumulative_usage,
 )
@@ -216,6 +217,55 @@ def test_token_priced_bucket_matches_flat_cost(
     # total_tokens = 200 (input) + 0 (cache) + 50 (output) = 250; cost = 2.50.
     assert usage["total_cost_usd"] == pytest.approx(2.50)
     assert usage["by_model"]["gpt-5.6"]["total_cost_usd"] == pytest.approx(2.50)
+
+
+def test_token_report_without_cache_field_keeps_persisted_cache_split(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="codex-cache-miss", agent_id=_AGENT_ID)
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(
+            input_per_token=2.5e-6,
+            output_per_token=10e-6,
+            cache_read_per_token=0.25e-6,
+            cache_write_per_token=None,
+        ),
+    )
+
+    # Cache-heavy turn: 100K cumulative input, 90K of them cache reads.
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            "cumulative_input_tokens": 100_000,
+            "cumulative_cache_read_input_tokens": 90_000,
+            "cumulative_output_tokens": 200,
+            "model": "gpt-5.6",
+        },
+        store,
+    )
+    # Cache-miss turn: the cumulative cached count is unchanged, and the
+    # report omits it. The persisted split must carry forward rather than
+    # re-billing the 90K cache reads at the full input rate.
+    _persist_native_cumulative_usage(
+        conv.id,
+        {"cumulative_input_tokens": 200_000, "cumulative_output_tokens": 400, "model": "gpt-5.6"},
+        store,
+    )
+
+    usage = _usage(store, conv.id)
+    expected_cost = (110_000 * 2.5 + 90_000 * 0.25 + 400 * 10) / 1_000_000
+    assert usage["cache_read_input_tokens"] == 90_000
+    assert usage["input_tokens"] == 110_000
+    assert usage["total_tokens"] == 200_400
+    assert usage["total_cost_usd"] == pytest.approx(expected_cost)
+    bucket = usage["by_model"]["gpt-5.6"]
+    assert bucket["input_tokens"] == 110_000
+    assert bucket["cache_read_input_tokens"] == 90_000
+    assert bucket["total_cost_usd"] == pytest.approx(expected_cost)
 
 
 def _conversation_point_reads(statements: list[str]) -> list[str]:
