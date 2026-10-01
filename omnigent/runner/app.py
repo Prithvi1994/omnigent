@@ -9797,13 +9797,9 @@ def create_runner_app(
                 tmux_start_on_attach=bool(spec.get("tmux_start_on_attach", False)),
             )
 
-        # The web client resolves its terminal theme (Match app / Light /
-        # Dark) to a concrete light/dark at create time and sends it as
-        # ``terminal_theme``; translate it into a COLORFGBG launch-env hint
-        # so the process in the pane knows which background the canvas
-        # renders it against. A spec that already pins COLORFGBG wins, and
-        # the spec is cloned rather than mutated — a declared spec object
-        # is shared across launches.
+        # The client sends its resolved pane theme as ``terminal_theme``; turn it
+        # into a COLORFGBG hint so the pane's process knows its background. A spec
+        # that pins COLORFGBG wins, and the shared declared spec is never mutated.
         from omnigent.inner.terminal import terminal_theme_env_hint
 
         theme_hint = terminal_theme_env_hint(body.get("terminal_theme"))
