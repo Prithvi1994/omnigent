@@ -29,6 +29,7 @@ import {
   SESSION_HISTORY_PAGE_SIZE,
   stopSession,
   updateSession,
+  validationDetailMessage,
 } from "./sessionsApi";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "./backgroundSessionTitlesPreferences";
 import { getSessionHost, setSessionHost } from "./sessionHost";
@@ -102,6 +103,75 @@ describe("apiErrorFromResponse", () => {
     expect(err.message).toBe("Workspace items cannot contain the '/' character");
     expect(err.code).toBe("INVALID_PARAMETER_VALUE");
     expect(err.status).toBe(400);
+  });
+
+  it("reads a FastAPI 422 validation list as its first readable message", async () => {
+    const err = await apiErrorFromResponse(
+      mockJsonResponse(
+        {
+          detail: [
+            { type: "missing", loc: ["body", "host_id"], msg: "Field required" },
+            { type: "int_parsing", loc: ["body", "limit"], msg: "Input should be an integer" },
+          ],
+        },
+        { ok: false, status: 422, statusText: "Unprocessable Entity" },
+      ),
+    );
+    expect(err.message).toBe("host_id: Field required");
+    expect(err.code).toBeNull();
+    expect(err.status).toBe(422);
+  });
+
+  it("keeps the AP error envelope ahead of a 422 detail list", async () => {
+    const err = await apiErrorFromResponse(
+      mockJsonResponse(
+        { error: { code: "invalid_input", message: "Too many items." }, detail: [{ msg: "x" }] },
+        { ok: false, status: 422 },
+      ),
+    );
+    expect(err.message).toBe("Too many items.");
+  });
+
+  it("falls back to the status line for a 422 list with no readable message", async () => {
+    const err = await apiErrorFromResponse(
+      mockJsonResponse(
+        { detail: [{ loc: ["body"] }, null, { msg: "  " }] },
+        { ok: false, status: 422, statusText: "Unprocessable Entity" },
+      ),
+    );
+    expect(err.message).toBe("422 Unprocessable Entity");
+  });
+
+  it("exposes the remaining error-envelope fields as details", async () => {
+    const err = await apiErrorFromResponse(
+      mockJsonResponse(
+        {
+          error: {
+            code: "conflict",
+            message: "Already imported.",
+            import_code: "already_imported",
+            retryable: false,
+            session_id: "conv_1",
+          },
+        },
+        { ok: false, status: 409 },
+      ),
+    );
+    expect(err.importCode).toBe("already_imported");
+    expect(err.retryable).toBe(false);
+    expect(err.details).toEqual({ session_id: "conv_1" });
+  });
+
+  it("leaves import fields null for an error without them", async () => {
+    const err = await apiErrorFromResponse(
+      mockJsonResponse(
+        { error: { code: "conflict", message: "Busy." } },
+        { ok: false, status: 409 },
+      ),
+    );
+    expect(err.importCode).toBeNull();
+    expect(err.retryable).toBeNull();
+    expect(err.details).toEqual({});
   });
 
   it("falls back to the status line when the body is not an error shape", async () => {
@@ -1827,5 +1897,36 @@ describe("importLocalSessions", () => {
     // First the stream endpoint (404), then the buffered fallback.
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/imports/local/stream");
     expect(fetchMock.mock.calls[1][0]).toBe("/v1/imports/local");
+  });
+});
+
+describe("validationDetailMessage", () => {
+  it.each([
+    [
+      [{ loc: ["body", "limit"], msg: "Input should be less than or equal to 100" }],
+      "limit: Input should be less than or equal to 100",
+    ],
+    // A model-level validator has no field: no prefix, and pydantic's kind prefix is dropped.
+    [
+      [{ loc: ["body"], msg: "Value error, an exact session import requires a specific harness" }],
+      "an exact session import requires a specific harness",
+    ],
+    [
+      [{ loc: ["query", "source"], msg: "Input should be 'claude' or 'codex'" }],
+      "source: Input should be 'claude' or 'codex'",
+    ],
+    // Nested paths join with dots; an overlong one is dropped rather than shown.
+    [
+      [{ loc: ["body", "items", 3, "type"], msg: "Field required" }],
+      "items.3.type: Field required",
+    ],
+    [[{ loc: ["body", "a_very_long_field_name", "another_long_segment"], msg: "Bad" }], "Bad"],
+    [[{ msg: "No location" }], "No location"],
+  ])("formats %j", (detail, expected) => {
+    expect(validationDetailMessage(detail)).toBe(expected);
+  });
+
+  it.each([null, "text", {}, [], [{ loc: ["body"] }]])("returns null for %j", (detail) => {
+    expect(validationDetailMessage(detail)).toBeNull();
   });
 });

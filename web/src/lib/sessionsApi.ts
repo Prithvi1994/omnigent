@@ -394,12 +394,67 @@ async function readJsonOrThrow<T>(res: Response): Promise<T> {
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string | null;
-  constructor(message: string, status: number, code: string | null) {
+  /**
+   * Import routes' finer-grained `error.import_code` (e.g. ``host_offline``);
+   * null elsewhere and from servers that predate import codes.
+   */
+  readonly importCode: string | null;
+  /** The server's `error.retryable` hint; null when it sent none. */
+  readonly retryable: boolean | null;
+  /** The `error` object's other fields (e.g. ``host_name``, ``error_id``). */
+  readonly details: Readonly<Record<string, unknown>>;
+  constructor(
+    message: string,
+    status: number,
+    code: string | null,
+    extra: {
+      importCode?: string | null;
+      retryable?: boolean | null;
+      details?: Record<string, unknown>;
+    } = {},
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.importCode = extra.importCode ?? null;
+    this.retryable = extra.retryable ?? null;
+    this.details = extra.details ?? {};
   }
+}
+
+// Keys of the AP `error` envelope that ApiError exposes as named fields; the
+// rest of the object is passed through as `details`.
+const API_ERROR_ENVELOPE_KEYS = new Set(["code", "message", "import_code", "retryable"]);
+
+// Pydantic prefixes custom-validator messages with the error kind, which reads
+// as noise next to the sentence the validator wrote.
+const PYDANTIC_MESSAGE_PREFIX_RE = /^(?:Value error|Assertion failed), /;
+
+// Request sections FastAPI puts first in `loc`; they say where, not what.
+const VALIDATION_LOC_SECTIONS = new Set(["body", "query", "path", "header", "cookie"]);
+
+// A field path longer than this (deeply nested) is dropped rather than shown.
+const MAX_VALIDATION_PATH_CHARS = 32;
+
+/**
+ * The first readable message of a FastAPI 422 `detail: [{loc, msg}, ...]`
+ * list, prefixed with its field path when that is short (``limit: Input
+ * should be less than or equal to 100``). Null when no entry has a message.
+ */
+export function validationDetailMessage(detail: unknown): string | null {
+  if (!Array.isArray(detail)) return null;
+  for (const entry of detail) {
+    if (entry === null || typeof entry !== "object") continue;
+    const { msg, loc } = entry as { msg?: unknown; loc?: unknown };
+    if (typeof msg !== "string" || !msg.trim()) continue;
+    const text = msg.trim().replace(PYDANTIC_MESSAGE_PREFIX_RE, "");
+    const parts = Array.isArray(loc) ? loc.map(String) : [];
+    if (parts.length > 0 && VALIDATION_LOC_SECTIONS.has(parts[0])) parts.shift();
+    const path = parts.join(".");
+    return path && path.length <= MAX_VALIDATION_PATH_CHARS ? `${path}: ${text}` : text;
+  }
+  return null;
 }
 
 /**
@@ -417,28 +472,47 @@ export class ApiError extends Error {
  * Databricks-backed stores propagate rejections as a top-level
  * `{"error_code": "…", "message": "…"}` envelope (e.g. a title the
  * workspace storage refuses), so that shape is read as well.
+ *
+ * A 422 request-validation error (`detail: [{loc, msg}, ...]`) reads as its
+ * first message (see {@link validationDetailMessage}) instead of the bare
+ * "422 Unprocessable Entity". Import routes add `import_code` / `retryable`
+ * and per-code fields to the `error` object; those land on the ApiError.
  */
 export async function apiErrorFromResponse(res: Response): Promise<ApiError> {
   let message = `${res.status} ${res.statusText}`.trim();
   let code: string | null = null;
+  let importCode: string | null = null;
+  let retryable: boolean | null = null;
+  const details: Record<string, unknown> = {};
   try {
     const body = (await res.json()) as {
-      error?: { code?: string; message?: string };
+      error?: { code?: string; message?: string; import_code?: unknown; retryable?: unknown };
       detail?: unknown;
       message?: unknown;
       error_code?: unknown;
     };
-    // FastAPI's validation errors put a list in `detail`; only a plain
-    // string is a message meant for the user.
+    if (body.error !== null && typeof body.error === "object") {
+      if (typeof body.error.import_code === "string" && body.error.import_code) {
+        importCode = body.error.import_code;
+      }
+      if (typeof body.error.retryable === "boolean") retryable = body.error.retryable;
+      for (const [key, value] of Object.entries(body.error)) {
+        if (!API_ERROR_ENVELOPE_KEYS.has(key)) details[key] = value;
+      }
+    }
+    // FastAPI request validation: only a 422 list is a validation error, so
+    // other statuses keep ignoring list-shaped details.
+    const validationMessage = res.status === 422 ? validationDetailMessage(body.detail) : null;
     if (body.error?.message) message = body.error.message;
     else if (typeof body.detail === "string" && body.detail) message = body.detail;
+    else if (validationMessage !== null) message = validationMessage;
     else if (typeof body.message === "string" && body.message) message = body.message;
     if (body.error?.code) code = body.error.code;
     else if (typeof body.error_code === "string" && body.error_code) code = body.error_code;
   } catch {
     // Non-JSON / empty body — keep the status-line fallback.
   }
-  return new ApiError(message, res.status, code);
+  return new ApiError(message, res.status, code, { importCode, retryable, details });
 }
 
 function postEventResponseFromWire(wire: {
