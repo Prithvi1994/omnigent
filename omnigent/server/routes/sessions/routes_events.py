@@ -234,6 +234,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _persist_host_launch_failure_turn,
     _persist_native_terminal_failure,
     _resolve_elicitation,
+    _runner_live_on_another_replica_from_conversations,
     _wait_for_host_bound_runner_client,
     ensure_runner_connected,
 )
@@ -462,20 +463,19 @@ async def _raise_if_runner_re_tunnelled_to_another_replica(
     if runner_id is None:
         return
     fresh = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-    if fresh is None or fresh.runner_id != runner_id:
-        # The row was rebound (or is gone); its stamp is not this runner's.
+    if fresh is None:
         return
-    stamp = fresh.runner_last_seen
-    if stamp is None or not runner_seen_is_fresh(stamp):
-        return
-    own_stamp = last_liveness_stamp(runner_id)
-    if own_stamp is not None and stamp <= own_stamp:
-        # This replica wrote the stamp — not evidence of a live sibling.
-        return
-    raise OmnigentError(
-        "session runner re-tunnelled to another replica; retry",
-        code=ErrorCode.WRONG_REPLICA,
-    )
+    # Reuse the shared freshness+binding classifier: it only counts the row when
+    # it is still bound to ``runner_id`` (a concurrent relaunch rebinds without
+    # clearing the stamp) and the stamp is fresh and newer than this replica's
+    # own last write — i.e. written by a live sibling.
+    if _runner_live_on_another_replica_from_conversations(
+        [fresh], runner_id, last_liveness_stamp(runner_id)
+    ):
+        raise OmnigentError(
+            "session runner re-tunnelled to another replica; retry",
+            code=ErrorCode.WRONG_REPLICA,
+        )
 
 
 async def _recover_retry_session(
