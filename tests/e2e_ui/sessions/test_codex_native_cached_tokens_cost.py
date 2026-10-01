@@ -10,9 +10,10 @@ mock ``/v1/responses``): send a cache-heavy turn (100K input, 90K cached), then
 a cache-miss turn (100K input, 0 cached), then open the agent-info popover and
 check the Session cost and the per-model Input / Cache read split.
 
-Pricing comes from the mock codex provider written by
-``temp_omnigent_mock_config``; ``OMNIGENT_E2E_CODEX_PRICING_PER_MILLION``
-(``input,output,cache_read``) overrides it for a workflow-owned provider.
+Pricing comes from the mock codex provider: ``temp_omnigent_mock_config`` writes
+it for standalone runs and ``dev.repro_env`` for workflow-owned ones, both from
+``_CODEX_MOCK_PRICING_PER_MILLION``. ``OMNIGENT_E2E_CODEX_PRICING_PER_MILLION``
+(``input,output,cache_read``) overrides the expected rates for another provider.
 """
 
 from __future__ import annotations
@@ -70,8 +71,8 @@ _TURN_USAGE = (
 
 
 def _pricing_per_million() -> tuple[float, float, float]:
-    # Expected rates must match the fixture-owned mock provider's pricing; the
-    # env override only changes test expectations, not the server's rates.
+    # Expected rates must match the mock codex provider's pricing; the env
+    # override only changes test expectations, not the server's rates.
     default = ",".join(str(rate) for rate in _CODEX_MOCK_PRICING_PER_MILLION)
     raw = os.environ.get("OMNIGENT_E2E_CODEX_PRICING_PER_MILLION", default)
     parts = raw.split(",")
