@@ -27,6 +27,11 @@ What each test claims to prove (and what failure indicates):
   schema drift between server and SDK silently drops events.
 * ``test_*_404``: that the namespace propagates :class:`OmnigentError`
   for non-2xx responses; failure means errors are silently swallowed.
+* ``test_get_preserves_cost_usage_and_lineage_fields`` /
+  ``test_set_labels_*`` / ``test_delete_*``: that the cost, usage, lineage,
+  and kind metadata the server returns reaches the typed :class:`Session`,
+  and that label updates and session deletion have public methods. Failure
+  means consumers must fall back to raw HTTP for those operations.
 """
 
 from __future__ import annotations
@@ -45,8 +50,11 @@ from omnigent_client._sessions import (
 
 from omnigent.server.schemas import (
     CompletedEvent,
+    ConversationDeleted,
+    ModelUsage,
     OutputTextDeltaEvent,
     SessionInputConsumedEvent,
+    SessionResponse,
     SessionStatusEvent,
 )
 
@@ -247,8 +255,8 @@ async def test_get_returns_typed_session() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_updated_at_defaults_to_none_when_omitted() -> None:
-    """Older session responses without ``updated_at`` remain parseable."""
+async def test_get_optional_fields_default_when_omitted() -> None:
+    """Older session responses without the newer optional fields remain parseable."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         del request
@@ -263,6 +271,14 @@ async def test_get_updated_at_defaults_to_none_when_omitted() -> None:
         await client.aclose()
 
     assert session.updated_at is None
+    # No cost/usage/lineage keys reads as an unpriced top-level session.
+    assert session.total_cost_usd is None
+    assert session.usage_by_model is None
+    assert session.usage_included is True
+    assert session.kind == "default"
+    assert session.parent_session_id is None
+    assert session.root_conversation_id is None
+    assert session.sub_agent_name is None
 
 
 @pytest.mark.asyncio
@@ -1468,3 +1484,115 @@ async def test_list_preserves_host_id_on_rows() -> None:
     assert by_id["conv_unbound"].parent_session_id is None
     assert by_id["conv_child"].host_id is None
     assert by_id["conv_child"].parent_session_id == "conv_host_bound"
+
+
+# ── session metadata, label updates, deletion ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_preserves_cost_usage_and_lineage_fields() -> None:
+    """Cost, usage, lineage, and kind fields of ``SessionResponse`` survive ``get()``."""
+    body = SessionResponse(
+        id="conv_child",
+        agent_id="ag_abc",
+        status="idle",
+        created_at=1700000000,
+        total_cost_usd=0.0042,
+        usage_included=True,
+        usage_by_model={
+            "gpt-4o-mini": ModelUsage(
+                input_tokens=10, output_tokens=13, total_tokens=23, total_cost_usd=0.0042
+            )
+        },
+        parent_session_id="conv_parent",
+        root_conversation_id="conv_root",
+        kind="sub_agent",
+        sub_agent_name="researcher",
+    ).model_dump(mode="json")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "http://srv/v1/sessions/conv_child"
+        return httpx.Response(200, json=body)
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.get("conv_child")
+    finally:
+        await client.aclose()
+
+    assert session.total_cost_usd == 0.0042
+    assert session.usage_included is True
+    assert set(session.usage_by_model) == {"gpt-4o-mini"}
+    assert session.usage_by_model["gpt-4o-mini"]["total_tokens"] == 23
+    assert session.parent_session_id == "conv_parent"
+    assert session.root_conversation_id == "conv_root"
+    assert session.kind == "sub_agent"
+    assert session.sub_agent_name == "researcher"
+
+
+@pytest.mark.asyncio
+async def test_set_labels_patches_labels_and_returns_snapshot() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content)
+        payload = _session_response_body()
+        payload["labels"] = {"existing": "1", "team": "platform"}
+        return httpx.Response(200, json=payload)
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.set_labels("conv_abc", labels={"team": "platform"})
+    finally:
+        await client.aclose()
+
+    assert seen["method"] == "PATCH"
+    assert seen["url"] == "http://srv/v1/sessions/conv_abc"
+    assert seen["body"] == {"labels": {"team": "platform"}}
+    assert session.labels == {"existing": "1", "team": "platform"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("delete_branch", "expected_url"),
+    [
+        (False, "http://srv/v1/sessions/conv_abc"),
+        (True, "http://srv/v1/sessions/conv_abc?delete_branch=true"),
+    ],
+)
+async def test_delete_sends_delete_to_session_url(delete_branch: bool, expected_url: str) -> None:
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json=ConversationDeleted(id="conv_abc").model_dump(mode="json"))
+
+    ns, client = _make_namespace(handler)
+    try:
+        await ns.delete("conv_abc", delete_branch=delete_branch)
+    finally:
+        await client.aclose()
+
+    assert seen == {"method": "DELETE", "url": expected_url}
+
+
+@pytest.mark.asyncio
+async def test_delete_404_raises() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            404,
+            json={"error": {"code": "not_found", "message": "no session"}},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        with pytest.raises(OmnigentError) as exc_info:
+            await ns.delete("conv_gone")
+    finally:
+        await client.aclose()
+
+    assert exc_info.value.status_code == 404
