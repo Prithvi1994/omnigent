@@ -880,47 +880,6 @@ async def test_child_sessions_parses_ui_added_agent_title(
     assert row["session_name"] == expected_session_name
 
 
-async def test_child_sessions_keeps_verbatim_colon_title_whole(
-    client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    """
-    A verbatim colon-bearing title on an unstamped child is not split.
-
-    A ``sys_session_create`` child stores the caller's title verbatim
-    and carries no ``sub_agent_name``, so a colon in it is punctuation,
-    not the ``"<agent>:<title>"`` spawn convention. The route must keep
-    the whole title in ``session_name`` (the Agents rail's row label)
-    and leave ``tool`` unset instead of surfacing a bogus agent handle
-    with a truncated name.
-
-    :param client: The test HTTP client.
-    :param db_uri: Per-test SQLite database URI.
-    """
-    session = await _create_parent_session(client)
-    conv_store = SqlAlchemyConversationStore(db_uri)
-
-    child = _seed_child(
-        conv_store=conv_store,
-        parent_id=session["id"],
-        title="research:pricing",
-        agent_id=session["agent_id"],
-        sub_agent_name=None,
-    )
-
-    resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
-    assert resp.status_code == 200
-    rows = resp.json()["data"]
-    assert len(rows) == 1
-    row = rows[0]
-    assert row["id"] == child.id
-    assert row["title"] == "research:pricing"
-    # No bogus handle: attribution comes from the agent binding.
-    assert row["tool"] is None
-    # The row label carries the full verbatim title, not the tail.
-    assert row["session_name"] == "research:pricing"
-
-
 async def test_child_sessions_splits_stamped_child_with_colon_in_name(
     client: httpx.AsyncClient,
     db_uri: str,
@@ -2301,4 +2260,49 @@ async def test_fork_of_child_promotes_it_into_the_sidebar(
     child_ids = {row["id"] for row in children.json()["data"]}
     assert child_ids == {child.id}, (
         f"parent's children must be exactly the untouched source, got {child_ids}"
+    )
+
+
+# ── sys_session_create child with a verbatim colon title ──────────
+
+
+@pytest.mark.parametrize("title", ["research:pricing", "deploy: prod"])
+async def test_child_sessions_keeps_verbatim_colon_title_whole(
+    client: httpx.AsyncClient,
+    title: str,
+) -> None:
+    """
+    A child created the way ``sys_session_create`` creates it (JSON
+    ``POST /v1/sessions`` with ``agent_id`` + ``parent_session_id`` and the
+    caller's verbatim ``title``, no ``sub_agent_name``) is summarised with
+    its bound agent as ``tool`` and the untouched title as ``session_name``.
+    The first colon of a verbatim title is not the framework's
+    ``"<agent>:<title>"`` separator, so it must not be split on.
+
+    :param client: The test HTTP client.
+    :param title: Verbatim caller title containing a colon.
+    """
+    parent = await _create_parent_session(client, agent_name="orchestrator-verbatim")
+    child_agent = await create_test_agent(client, name="pricing_probe_child")
+
+    created = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": child_agent["id"],
+            "parent_session_id": parent["id"],
+            "title": title,
+        },
+    )
+    assert created.status_code == 201, created.text
+    child_id = created.json()["id"]
+
+    resp = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
+    assert resp.status_code == 200, resp.text
+    rows = {row["id"]: row for row in resp.json()["data"]}
+    row = rows[child_id]
+    assert row["title"] == title
+    assert row["agent_id"] == child_agent["id"]
+    assert (row["tool"], row["session_name"]) == (child_agent["name"], title), (
+        f"verbatim title {title!r} was split into tool={row['tool']!r} "
+        f"session_name={row['session_name']!r}"
     )

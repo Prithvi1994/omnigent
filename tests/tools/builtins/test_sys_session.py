@@ -23,6 +23,7 @@ from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.runtime import pending_elicitations
 from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -112,6 +113,7 @@ def session_fixture(
         kind="sub_agent",
         title="researcher:auth",
         parent_conversation_id=parent_conv.id,
+        sub_agent_name="researcher",
     )
     conv_store.append(
         child_conv.id,
@@ -910,6 +912,7 @@ def test_peek_out_of_tree_conversation_is_rejected(
         kind="sub_agent",
         title="other:secret",
         parent_conversation_id=other_parent.id,
+        sub_agent_name="other",
     )
 
     tool = SysSessionGetHistoryTool()
@@ -1118,6 +1121,81 @@ def test_session_list_skips_label_closed_child_with_original_title(
     assert payload["sub_agents"] == []
 
 
+def test_session_list_keeps_verbatim_colon_title_whole(
+    session_fixture: _Fixture,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``sys_session_create`` child is listed by its bound agent with its
+    verbatim title intact.
+
+    ``sys_session_create`` stores the caller's title as-is and binds the
+    child to an ``agent_id``; the first colon in ``"research:pricing"`` is
+    part of the title, not the framework's ``"<agent>:<title>"`` separator.
+    """
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    child_agent = agent_store.create(
+        "b" * 32, "pricing_probe_child", "bundles/pricing_probe_child"
+    )
+    monkeypatch.setattr("omnigent.runtime.get_agent_store", lambda: agent_store)
+    verbatim_child = session_fixture.conv_store.create_conversation(
+        kind="sub_agent",
+        title="research:pricing",
+        parent_conversation_id=session_fixture.parent_conv_id,
+        agent_id=child_agent.id,
+    )
+
+    raw = SysSessionListTool().invoke("{}", session_fixture.ctx)
+    by_id = {entry["conversation_id"]: entry for entry in json.loads(raw)["sub_agents"]}
+    assert by_id[verbatim_child.id] == {
+        "agent": child_agent.name,
+        "title": "research:pricing",
+        "conversation_id": verbatim_child.id,
+    }
+
+
+def test_close_keeps_verbatim_colon_title_whole(
+    session_fixture: _Fixture,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Closing a ``sys_session_create`` child tombstones its verbatim title whole.
+
+    The child has no ``sub_agent_name`` stamp, so the colon in
+    ``"research:pricing"`` is punctuation: the marker is appended to the
+    full title and the result names the bound agent.
+    """
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    child_agent = agent_store.create(
+        "b" * 32, "pricing_probe_child", "bundles/pricing_probe_child"
+    )
+    monkeypatch.setattr("omnigent.runtime.get_agent_store", lambda: agent_store)
+    verbatim_child = session_fixture.conv_store.create_conversation(
+        kind="sub_agent",
+        title="research:pricing",
+        parent_conversation_id=session_fixture.parent_conv_id,
+        agent_id=child_agent.id,
+    )
+
+    payload = json.loads(
+        SysSessionCloseTool().invoke(
+            json.dumps({"conversation_id": verbatim_child.id}), session_fixture.ctx
+        )
+    )
+
+    assert payload == {
+        "closed": True,
+        "conversation_id": verbatim_child.id,
+        "agent": child_agent.name,
+        "title": "research:pricing",
+    }
+    refreshed = session_fixture.conv_store.get_conversation(verbatim_child.id)
+    assert refreshed is not None
+    assert refreshed.title == f"research:pricing{_CLOSED_TITLE_INFIX}{verbatim_child.id}"
+
+
 def test_session_list_schema_exposes_bounded_pagination() -> None:
     """The harness can discover the same pagination inputs the runner accepts."""
 
@@ -1161,6 +1239,7 @@ def test_close_out_of_tree_conversation_is_rejected(
         kind="sub_agent",
         title="other:secret",
         parent_conversation_id=other_parent.id,
+        sub_agent_name="other",
     )
 
     raw = SysSessionCloseTool().invoke(

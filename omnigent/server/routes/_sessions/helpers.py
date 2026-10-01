@@ -4648,6 +4648,7 @@ def _publish_child_status_to_parent(session_id: str, status: str) -> None:
             parent_id,
             _latest_message_preview(items_by_child.get(conv.id, [])),
             cached_status=status,
+            agent_names=_bound_agent_names([conv]),
         )
         event = SessionChildSessionUpdatedEvent(
             type="session.child_session.updated",
@@ -10416,12 +10417,37 @@ def _child_session_current_task_status_from_cached_status(status: object) -> str
     return None
 
 
+def _bound_agent_names(convs: list[Conversation]) -> dict[str, str]:
+    """
+    Resolve the bound agent name for each distinct ``agent_id`` in ``convs``.
+
+    A child whose title is verbatim (no ``sub_agent_name`` stamp) takes its
+    ``tool`` from this binding instead of its title. One store read per
+    distinct id; unresolvable ids are omitted and an uninitialized runtime
+    yields an empty map.
+
+    :param convs: Child conversation rows about to be summarised.
+    :returns: ``{agent_id: agent.name}`` for every binding that resolves.
+    """
+    from omnigent.runtime._globals import _agent_store
+
+    if _agent_store is None:
+        return {}
+    names: dict[str, str] = {}
+    for agent_id in {conv.agent_id for conv in convs if conv.agent_id}:
+        agent = _agent_store.get(agent_id)
+        if agent is not None:
+            names[agent_id] = agent.name
+    return names
+
+
 def _child_session_summary_from_conversation(
     conv: Conversation,
     parent_session_id: str,
     last_message_preview: str | None,
     *,
     cached_status: str | None = None,
+    agent_names: dict[str, str] | None = None,
 ) -> ChildSessionSummary:
     """
     Build a :class:`ChildSessionSummary` from a child conversation.
@@ -10437,8 +10463,8 @@ def _child_session_summary_from_conversation(
     and the ``sys_session_create`` JSON body cannot set. A child whose
     title is the caller's verbatim string keeps it whole: a colon in
     ``"research:pricing"`` is title punctuation, not an agent handle,
-    so ``tool`` stays ``None`` (attribution comes from the agent
-    binding) and ``session_name`` carries the full title. Tolerates
+    so ``tool`` is the bound agent's name (looked up through
+    ``agent_names``) and ``session_name`` carries the full title. Tolerates
     malformed/legacy rows: if the title is ``None`` or has no colon,
     ``tool`` falls back to the raw title and ``session_name`` is
     ``None`` — the row is still surfaced so debug views can
@@ -10467,6 +10493,9 @@ def _child_session_summary_from_conversation(
         live ``_session_status_cache``; a status-edge publisher passes the
         edge's own value so a burst of transitions fans out one summary per
         edge instead of the latest status repeated.
+    :param agent_names: Bound agent names keyed by ``agent_id`` (see
+        :func:`_bound_agent_names`); supplies ``tool`` for a child whose
+        title is verbatim. ``None`` leaves such a child's ``tool`` unset.
     :returns: A populated :class:`ChildSessionSummary`.
     """
     display_title = title_without_closed_marker(conv.title)
@@ -10513,8 +10542,8 @@ def _child_session_summary_from_conversation(
             session_name = tail
         else:
             # Verbatim caller title (``sys_session_create``): the colon is
-            # punctuation, not an agent handle -- keep the title whole.
-            tool = None
+            # punctuation, so identity comes from the agent binding.
+            tool = agent_names.get(conv.agent_id) if agent_names and conv.agent_id else None
             session_name = display_title
     else:
         tool = display_title or None
@@ -11468,6 +11497,7 @@ __all__ = [
     "_authorize_bundled_parent_and_inherit_runner",
     "_await_settled_managed_launch",
     "_background_task_delivery_status",
+    "_bound_agent_names",
     "_build_actor",
     "_build_evaluation_context",
     "_build_new_item",

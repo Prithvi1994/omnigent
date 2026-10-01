@@ -3193,10 +3193,10 @@ async def _send_to_existing_session(
             }
         )
     display_title = title_without_closed_marker(_optional_string(snap_data.get("title")))
-    parsed = _parse_session_title(display_title)
+    parsed = _parse_snapshot_identity(snap_data)
     # A sys_session_create child keeps its verbatim title and has no
-    # sub_agent_name, so when the title does not parse as "<agent>:<title>"
-    # the identity comes from the snapshot's agent fields instead.
+    # sub_agent_name, so when the parse yields no agent the identity comes
+    # from the snapshot's agent fields instead.
     agent_label = (
         parsed.agent
         or _optional_string(snap_data.get("sub_agent_name"))
@@ -4695,6 +4695,35 @@ def _parse_session_title(raw_title: str | None) -> _ParsedTitle:
         agent, _, label = tail.partition(":")
         return _ParsedTitle(agent=agent, title=label)
     return _ParsedTitle(agent=head, title=tail)
+
+
+def _parse_snapshot_identity(snapshot: _JsonObject) -> _ParsedTitle:
+    """
+    Resolve a child's agent + instance label from its session snapshot.
+
+    Framework-named children carry a ``sub_agent_name`` stamp next to
+    their ``"<agent>:<title>"`` title and parse like
+    :func:`_parse_session_title`, as does the reserved
+    ``"ui:<agent>:<label>"`` form. A ``sys_session_create`` child has no
+    stamp and a verbatim title, so a colon in it is punctuation: the
+    agent is the snapshot's bound ``agent_name`` and the title stays whole.
+
+    :param snapshot: A ``GET /v1/sessions/{id}`` body, e.g.
+        ``{"title": "research:pricing", "sub_agent_name": None,
+        "agent_name": "pricing_probe_child"}``.
+    :returns: The parsed agent/title pair.
+    """
+    display_title = title_without_closed_marker(_optional_string(snapshot.get("title")))
+    if (
+        display_title
+        and ":" in display_title
+        and snapshot.get("sub_agent_name") is None
+        and not display_title.startswith("ui:")
+    ):
+        return _ParsedTitle(
+            agent=_optional_string(snapshot.get("agent_name")), title=display_title
+        )
+    return _parse_session_title(display_title)
 
 
 def _truncate_activity(
@@ -6355,10 +6384,12 @@ async def _session_close_via_rest(
     )
     if scope_error is not None:
         return scope_error
-    parsed = _parse_session_title(_optional_string(target_snap.get("title")))
-    if parsed.agent is None or parsed.title is None:
+    parsed = _parse_snapshot_identity(target_snap)
+    display_title = title_without_closed_marker(_optional_string(target_snap.get("title")))
+    if parsed.title is None or not display_title:
         return json.dumps({"error": "session_not_a_sub_agent", "conversation_id": target_id})
-    new_title = f"{parsed.agent}:{parsed.title}{_CLOSED_TITLE_INFIX}{target_id}"
+    # The marker goes on the display title so a verbatim title is tombstoned whole.
+    new_title = f"{display_title}{_CLOSED_TITLE_INFIX}{target_id}"
     try:
         patch = await server_client.patch(
             f"/v1/sessions/{target_id}",
@@ -6391,10 +6422,11 @@ class _PeekMeta:
     """
     Session metadata peek reads off the target's ``GET /v1/sessions/{id}``.
 
-    :param agent: Parsed agent/tool segment of the title, e.g.
-        ``"researcher"``; ``None`` when the title isn't sub-agent-shaped.
-    :param title: Parsed instance label segment, e.g. ``"auth"``;
-        ``None`` in the same case.
+    :param agent: The child's agent label per
+        :func:`_parse_snapshot_identity`, e.g. ``"researcher"``; ``None``
+        when the snapshot yields none.
+    :param title: The child's instance label, e.g. ``"auth"`` (a verbatim
+        title is kept whole); ``None`` in the same case.
     :param pending_elicitations: Outstanding
         ``response.elicitation_request`` event payloads the target is
         parked on, replayed on the snapshot from the Omnigent server's
@@ -6434,7 +6466,7 @@ async def _fetch_peek_meta(
     body = _string_object_dict(snap.json())
     if body is None:
         return _PeekMeta(agent=None, title=None, pending_elicitations=[])
-    parsed = _parse_session_title(_optional_string(body.get("title")))
+    parsed = _parse_snapshot_identity(body)
     raw_pending = body.get("pending_elicitations")
     pending = _json_object_list(raw_pending)
     return _PeekMeta(agent=parsed.agent, title=parsed.title, pending_elicitations=pending)

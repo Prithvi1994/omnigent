@@ -1,151 +1,242 @@
-"""E2E: a ``sys_session_create`` child's verbatim colon title survives listings.
+"""UI journey: a ``sys_session_create`` child keeps its verbatim colon title.
 
-``sys_session_create`` stores the caller's title verbatim on the child
-conversation, but the listing paths treat any ``:`` in a child's title as
-the framework's ``"<agent>:<title>"`` spawn convention and split on the
-first colon. A legitimate verbatim title like ``"research:pricing"`` is
-therefore misreported as a bogus agent handle (``"research"``) with a
-truncated title (``"pricing"``):
+``sys_session_create`` stores the caller's title verbatim, so a legitimate
+title such as ``"research:pricing"`` must not be read back through the
+framework's ``"<agent>:<title>"`` convention. The orchestrator's scripted
+turn creates the child from a local ``config_path`` with that title and then
+calls ``sys_session_list``; the parent's Agents rail and the list result must
+both show the full title and the child's real agent, not ``research`` /
+``pricing``.
 
-* ``_child_session_summary_from_conversation`` (server) surfaces
-  ``tool="research"`` / ``session_name="pricing"`` on
-  ``GET /v1/sessions/{parent}/child_sessions``;
-* the web Agents rail renders that truncated name as the child row's
-  label, so the user sees ``pricing`` instead of ``research:pricing``;
-* the runner's ``sys_session_list`` (``_child_rows_to_entries``) relays
-  the same bogus agent/title pair to the orchestrating LLM.
-
-The child here is created exactly the way the runner's
-``sys_session_create`` does — ``POST /v1/sessions`` with ``agent_id`` +
-``parent_session_id`` + verbatim ``title`` (the body built by
-``_build_session_create_body`` in ``omnigent/runner/tool_dispatch.py``) —
-so both tests exercise the same stored conversation row the tool
-produces, with no LLM turn required.
+Fixture shape mirrors ``test_spawn_bounds_fanout_cap.py`` (strict
+``config.yaml`` bundle, per-run mock model keys). The parent spec pins an
+absolute ``os_env.cwd`` because neither the e2e runner nor the prepared repro
+runner sets ``OMNIGENT_RUNNER_WORKSPACE``, and a relative cwd would be
+replaced by a per-conversation tmpdir where ``config_path`` cannot resolve.
 """
 
 from __future__ import annotations
 
+import json
 import re
+import shutil
+import subprocess
+import uuid
+from collections.abc import Iterator
+from dataclasses import dataclass
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.conftest import (
+    _REPO_ROOT,
+    _create_bundled_session,
+    _ensure_runner_online,
+    _server_state,
+    configure_mock_llm,
+    open_right_rail,
+    set_fallback_mock_llm,
+)
 
-_VERBATIM_TITLE = "research:pricing"
+_ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _SUBAGENT_ROW = '[data-testid="subagent-row"]'
 
+_CHILD_AGENT_NAME = "pricing_probe_child"
+_CHILD_CONFIG_DIR = "pricing_probe_child"
+_VERBATIM_TITLE = "research:pricing"
+_TURN_DONE = "VERBATIM_TITLE_LIST_TURN_DONE"
+_TURN_TIMEOUT_MS = 240_000
 
-def _create_colon_titled_child(base_url: str, parent_id: str) -> str:
-    """Create a child session the way ``sys_session_create`` does.
+_PARENT_YAML = """\
+spec_version: 1
+name: {name}
+prompt: |
+  You are an orchestrator. When asked, create a research child session with
+  sys_session_create and then list your sessions with sys_session_list.
 
-    Binds the child to the parent's own agent row (fetched via
-    ``GET /v1/sessions/{id}/agent``) and passes the caller's verbatim
-    colon-bearing title — the same ``agent_id`` + ``parent_session_id``
-    + ``title`` JSON body the runner's ``sys_session_create`` posts.
+executor:
+  model: {parent_model}
+  config:
+    harness: openai-agents
 
-    :param base_url: Spawned server base URL, e.g. ``"http://127.0.0.1:51234"``.
-    :param parent_id: The parent session id the child hangs under.
-    :returns: The new child session id.
+spawn: true
+
+os_env:
+  type: caller_process
+  cwd: {cwd}
+"""
+
+_CHILD_YAML = """\
+spec_version: 1
+name: {name}
+prompt: |
+  You are a research worker. Acknowledge the task you were given and finish.
+
+executor:
+  model: {child_model}
+  config:
+    harness: openai-agents
+
+os_env:
+  type: caller_process
+  cwd: .
+"""
+
+
+@pytest.fixture
+def browser_context_args(browser_context_args: dict) -> dict:
+    """Record ``--video on`` at the viewport size so the rail label stays legible."""
+    return {**browser_context_args, "record_video_size": {"width": 1280, "height": 720}}
+
+
+@dataclass(frozen=True)
+class VerbatimTitleSession:
+    """Handle for the spawning orchestrator session.
+
+    :param base_url: Server base URL, e.g. ``"http://127.0.0.1:51234"``.
+    :param session_id: The runner-bound parent session id.
     """
-    agent_resp = httpx.get(
-        f"{base_url}/v1/sessions/{parent_id}/agent",
-        timeout=10.0,
-    )
-    agent_resp.raise_for_status()
-    agent_id = agent_resp.json()["id"]
 
-    child_resp = httpx.post(
-        f"{base_url}/v1/sessions",
-        json={
-            "agent_id": agent_id,
-            "parent_session_id": parent_id,
-            "title": _VERBATIM_TITLE,
-        },
-        timeout=10.0,
-    )
-    child_resp.raise_for_status()
-    return str(child_resp.json()["id"])
+    base_url: str
+    session_id: str
 
 
-@pytest.mark.timeout(300)
-def test_child_summary_keeps_verbatim_colon_title(
-    seeded_session: tuple[str, str],
-) -> None:
-    """The child-summary route must not split a verbatim title on ``:``.
+@pytest.fixture
+def verbatim_title_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[VerbatimTitleSession]:
+    """Create a ``spawn: true`` parent whose turn creates a ``research:pricing`` child.
 
-    ``GET /v1/sessions/{parent}/child_sessions`` is the row the web
-    Agents rail and the runner's ``sys_session_list`` both consume, so
-    this pins the contract at its source: a verbatim colon-bearing title
-    must not be reported as agent ``"research"`` / name ``"pricing"``.
+    The child agent config lives under a per-run directory inside the repo
+    (the runner may not share this process's ``/tmp``), and that directory is
+    the parent's absolute ``os_env.cwd`` so ``config_path`` resolves against it.
 
-    :param seeded_session: ``(base_url, parent_session_id)`` bound to the
-        spawned server's runner.
-    :returns: None.
+    :param live_server: Server fixture from the parent conftest.
+    :param mock_llm_server_url: Mock LLM server used by credential-free runs.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: A :class:`VerbatimTitleSession` handle.
     """
-    base_url, parent_id = seeded_session
-    child_id = _create_colon_titled_child(base_url, parent_id)
-
-    resp = httpx.get(
-        f"{base_url}/v1/sessions/{parent_id}/child_sessions",
-        timeout=10.0,
-    )
-    resp.raise_for_status()
-    rows = {row["id"]: row for row in resp.json()["data"]}
-    assert child_id in rows, f"child {child_id} missing from child_sessions: {sorted(rows)}"
-    row = rows[child_id]
-
-    # Sanity (holds before and after the fix): the stored title itself is
-    # the caller's verbatim string.
-    assert row["title"] == _VERBATIM_TITLE, f"stored title mutated: {row['title']!r}"
-
-    # The bug: the first-colon split reports the title's head as a bogus
-    # agent handle and its tail as the child's name.
-    assert row["tool"] != "research", (
-        "child summary reports the bogus agent handle split from the "
-        f"verbatim title: tool={row['tool']!r} (title={row['title']!r})"
-    )
-    assert row["session_name"] != "pricing", (
-        "child summary truncates the verbatim title to its post-colon "
-        f"tail: session_name={row['session_name']!r} (title={row['title']!r})"
+    uid = uuid.uuid4().hex[:8]
+    parent_model = f"verbatim-title-parent-{uid}"
+    child_model = f"verbatim-title-child-{uid}"
+    work_dir = _REPO_ROOT / ".omnigent" / "e2e-verbatim-title" / uid
+    (work_dir / _CHILD_CONFIG_DIR).mkdir(parents=True)
+    (work_dir / _CHILD_CONFIG_DIR / "config.yaml").write_text(
+        _CHILD_YAML.format(name=_CHILD_AGENT_NAME, child_model=child_model)
     )
 
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_create_research_child",
+                        "name": "sys_session_create",
+                        "arguments": json.dumps(
+                            {
+                                "config_path": _CHILD_CONFIG_DIR,
+                                "title": _VERBATIM_TITLE,
+                                "message": "Research the pricing page and summarize it.",
+                            }
+                        ),
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_list_children",
+                        "name": "sys_session_list",
+                        "arguments": "{}",
+                    }
+                ]
+            },
+            {"text": _TURN_DONE},
+        ],
+        key=parent_model,
+        required_tools=["sys_session_create"],
+    )
+    set_fallback_mock_llm(mock_llm_server_url, parent_model, "PARENT_WAKE_DONE")
+    set_fallback_mock_llm(mock_llm_server_url, child_model, "CHILD_RESEARCH_DONE")
 
-@pytest.mark.timeout(300)
-def test_agents_rail_shows_full_verbatim_colon_title(
+    respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_bundled_session(
+        live_server,
+        runner_id,
+        _PARENT_YAML.format(
+            name=f"verbatim_title_probe_{uid}", parent_model=parent_model, cwd=work_dir
+        ),
+    )
+    try:
+        yield VerbatimTitleSession(base_url=live_server, session_id=session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        shutil.rmtree(work_dir, ignore_errors=True)
+        if respawned_runner is not None:
+            respawned_runner.terminate()
+            try:
+                respawned_runner.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned_runner.kill()
+                respawned_runner.wait(timeout=5)
+
+
+def _session_list_output(base_url: str, session_id: str) -> dict:
+    """Return the parsed ``sys_session_list`` tool result from the parent transcript."""
+    items = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/items", params={"limit": 100}, timeout=30.0
+    ).json()["data"]
+    outputs = [
+        item
+        for item in items
+        if item.get("type") == "function_call_output"
+        and item.get("call_id") == "call_list_children"
+    ]
+    assert outputs, "sys_session_list tool result missing from the parent transcript"
+    return json.loads(outputs[-1]["output"])
+
+
+@pytest.mark.timeout(600)
+def test_sys_session_create_child_keeps_verbatim_colon_title(
     page: Page,
-    seeded_session: tuple[str, str],
+    verbatim_title_session: VerbatimTitleSession,
 ) -> None:
-    """The Agents rail row shows the full verbatim title, not the tail.
+    """The child is listed as its real agent with the full ``research:pricing`` title."""
+    chat = verbatim_title_session
+    page.goto(f"{chat.base_url}/c/{chat.session_id}")
 
-    User journey: create a child via the ``sys_session_create`` shape with
-    ``title="research:pricing"``, open the parent session, open the
-    right-rail Agents tab. The child's row label must carry the full
-    verbatim title — before the fix it shows only ``"pricing"``, the tail
-    left behind by the first-colon split.
+    composer = page.get_by_label("Message the agent")
+    expect(composer).to_be_visible(timeout=30_000)
+    composer.fill(
+        "Create a research child session titled research:pricing, then list your sessions."
+    )
+    page.get_by_role("button", name="Send", exact=True).click()
+    expect(page.locator(_ASSISTANT, has_text=_TURN_DONE).first).to_be_visible(
+        timeout=_TURN_TIMEOUT_MS
+    )
 
-    :param page: Playwright page fixture.
-    :param seeded_session: ``(base_url, parent_session_id)`` bound to the
-        spawned server's runner.
-    :returns: None.
-    """
-    base_url, parent_id = seeded_session
-    child_id = _create_colon_titled_child(base_url, parent_id)
-
-    page.goto(f"{base_url}/c/{parent_id}")
-
-    # Scope every lookup to the desktop "Workspace" rail so it never
-    # matches the hidden mobile drawer that mirrors the same testids.
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("tab", name=re.compile("^Agents")).click()
+    rows = rail.locator(_SUBAGENT_ROW)
+    expect(rows.first).to_be_visible(timeout=60_000)
+    page.wait_for_timeout(2_000)
+    rail_label = rows.first.inner_text().splitlines()[0]
 
-    agents_tab = rail.get_by_role("tab", name=re.compile("^Agents"))
-    expect(agents_tab).to_be_visible(timeout=30_000)
-    agents_tab.click()
+    listed = _session_list_output(chat.base_url, chat.session_id)["sub_agents"]
+    assert len(listed) == 1, f"expected exactly one listed child, got {listed!r}"
+    entry = listed[0]
 
-    row = rail.locator(f'{_SUBAGENT_ROW}[data-child-session-id="{child_id}"]')
-    expect(row).to_be_visible(timeout=30_000)
-    # The row label must carry the FULL verbatim title; before the fix the
-    # first-colon split leaves only the truncated tail "pricing".
-    expect(row).to_contain_text(_VERBATIM_TITLE)
+    assert rail_label == _VERBATIM_TITLE, (
+        f"Agents rail labels the child {rail_label!r}; expected the verbatim title "
+        f"{_VERBATIM_TITLE!r}"
+    )
+    assert (entry["agent"], entry["title"]) == (_CHILD_AGENT_NAME, _VERBATIM_TITLE), (
+        f"sys_session_list reported agent={entry['agent']!r} title={entry['title']!r}; "
+        f"expected the bound agent {_CHILD_AGENT_NAME!r} with title {_VERBATIM_TITLE!r}"
+    )

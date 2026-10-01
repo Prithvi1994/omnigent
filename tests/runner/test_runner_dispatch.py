@@ -4620,6 +4620,16 @@ _BY_ID_CHILD_IDENTITY_SCENARIOS = [
     # A sys_session_create child: verbatim title, no sub_agent_name, and
     # agent_name is the child's own agent.
     pytest.param("wake-check", "responder", None, "responder", "wake-check", id="verbatim-title"),
+    # A sys_session_create child whose verbatim title contains a colon: no
+    # sub_agent_name stamp, so the colon is punctuation and the title stays whole.
+    pytest.param(
+        "research:pricing",
+        "pricing_probe_child",
+        None,
+        "pricing_probe_child",
+        "research:pricing",
+        id="verbatim-colon-title",
+    ),
     # A named child continued by id: the "<agent>:<title>" parse wins, so
     # the parent's agent_name never leaks into the label.
     pytest.param(
@@ -6590,7 +6600,14 @@ async def test_session_peek_returns_chronological_projected_items() -> None:
                 },
             )
         if request.url.path == "/v1/sessions/conv_target":
-            return httpx.Response(200, json={"id": "conv_target", "title": "researcher:auth"})
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_target",
+                    "title": "researcher:auth",
+                    "sub_agent_name": "researcher",
+                },
+            )
         raise AssertionError(f"unexpected path {request.url.path}")
 
     async with _session_query_client(handler) as client:
@@ -6665,7 +6682,14 @@ async def test_session_peek_rest_content_limit_scenario(
                 },
             )
         if request.url.path == "/v1/sessions/conv_target":
-            return httpx.Response(200, json={"id": "conv_target", "title": "researcher:auth"})
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_target",
+                    "title": "researcher:auth",
+                    "sub_agent_name": "researcher",
+                },
+            )
         raise AssertionError(f"unexpected path {request.url.path}")
 
     async with _session_query_client(handler) as client:
@@ -6716,7 +6740,14 @@ async def test_session_peek_rest_offset_pages_through_long_item() -> None:
                 },
             )
         if request.url.path == "/v1/sessions/conv_target":
-            return httpx.Response(200, json={"id": "conv_target", "title": "researcher:auth"})
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_target",
+                    "title": "researcher:auth",
+                    "sub_agent_name": "researcher",
+                },
+            )
         raise AssertionError(f"unexpected path {request.url.path}")
 
     window = 12000
@@ -6842,6 +6873,44 @@ async def test_session_peek_appends_pending_elicitation_from_snapshot() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_peek_names_verbatim_colon_child_from_snapshot() -> None:
+    """
+    ``sys_session_get_history`` labels a ``sys_session_create`` child from its binding.
+
+    The snapshot carries no ``sub_agent_name``, so ``"research:pricing"`` is
+    a verbatim title: the result reports the bound ``agent_name`` and the
+    whole title instead of splitting on the first colon.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target/items":
+            return httpx.Response(200, json={"object": "list", "data": []})
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_target",
+                    "title": "research:pricing",
+                    "sub_agent_name": None,
+                    "agent_name": "pricing_probe_child",
+                },
+            )
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps({"conversation_id": "conv_target"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert (out["agent"], out["title"]) == ("pricing_probe_child", "research:pricing")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "status,expected_error",
     [(404, "session_not_found"), (403, "session_out_of_tree")],
@@ -6896,6 +6965,7 @@ async def test_session_close_patches_tombstoned_title() -> None:
                 json={
                     "id": "conv_target",
                     "title": "researcher:auth",
+                    "sub_agent_name": "researcher",
                     "root_conversation_id": "conv_root",
                     "parent_session_id": "conv_caller",
                 },
@@ -6929,6 +6999,61 @@ async def test_session_close_patches_tombstoned_title() -> None:
         "conversation_id": "conv_target",
         "agent": "researcher",
         "title": "auth",
+    }
+
+
+@pytest.mark.asyncio
+async def test_session_close_keeps_verbatim_colon_title_whole() -> None:
+    """
+    Closing a ``sys_session_create`` child tombstones its verbatim title whole.
+
+    The target has no ``sub_agent_name`` stamp, so the colon in
+    ``"research:pricing"`` is punctuation: the tombstone appends the marker
+    to the full title and the result names the bound agent, not a bogus
+    ``"research"`` handle with a truncated title.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    patched: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_target",
+                    "title": "research:pricing",
+                    "sub_agent_name": None,
+                    "agent_name": "pricing_probe_child",
+                    "root_conversation_id": "conv_root",
+                    "parent_session_id": "conv_caller",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(
+                200,
+                json={"id": "conv_caller", "root_conversation_id": "conv_root"},
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_target":
+            patched.update(json.loads(request.content))
+            return httpx.Response(200, json={"id": "conv_target"})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_close",
+                json.dumps({"conversation_id": "conv_target"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert patched["title"] == "research:pricing:closed:conv_target"
+    assert out == {
+        "closed": True,
+        "conversation_id": "conv_target",
+        "agent": "pricing_probe_child",
+        "title": "research:pricing",
     }
 
 
