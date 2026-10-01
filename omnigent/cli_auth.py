@@ -214,8 +214,10 @@ def store_token(
     existing_org_id = load_databricks_org_id(server_url)
     if existing_org_id is not None:
         entry["org_id"] = existing_org_id
-    _renewal_refusals.pop(_normalize_server_url(server_url), None)
     _store_entry(server_url, entry)
+    # Drop the recorded refusal only after persisting succeeds, so a failed
+    # write leaves the still-unrenewable login's reason intact.
+    _renewal_refusals.pop(_normalize_server_url(server_url), None)
 
 
 def store_databricks_auth(
@@ -349,17 +351,17 @@ def load_token(server_url: str, *, min_remaining_seconds: float = 0.0) -> str | 
 # loop doesn't repeat the warning every few seconds.
 _warned_expired_servers: set[str] = set()
 
-# Definitive ``/oauth/token`` refusals (OAuth ``invalid_grant`` and auth
-# rejections) per normalized server URL; other statuses may be transient.
-_DEFINITIVE_REFUSAL_STATUSES = frozenset({400, 401, 403})
+# Why the stored login's last ``/oauth/token`` renewal was definitively
+# refused, per normalized server URL; transient statuses are not recorded.
 _renewal_refusals: dict[str, str] = {}
 
 
 def stored_login_renewal_refusal(server_url: str) -> str | None:
     """Return why the stored login's last renewal was refused, or ``None``.
 
-    Cleared when a credential is stored or removed for that server, so a
-    caller can tell "no credential existed" from "its renewal was rejected".
+    Tracked per process in memory and cleared when this process stores or
+    removes a credential for that server, so a caller can tell "no credential
+    existed" from "its renewal was rejected".
 
     :param server_url: The server URL, e.g. ``"http://localhost:6767"``.
     :returns: A short, token-free reason string, or ``None``.
@@ -542,7 +544,15 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
             )
         return None
     if resp.status_code != 200:
-        if resp.status_code in _DEFINITIVE_REFUSAL_STATUSES:
+        # 401/403 are definitive credential rejections. A 400 counts only when
+        # the body is OAuth ``invalid_grant``; other 400s (malformed request or
+        # an incompatible server) are not the stored login's fault.
+        definitive = resp.status_code in (401, 403)
+        if resp.status_code == 400:
+            with contextlib.suppress(ValueError):
+                body = resp.json()
+                definitive = isinstance(body, dict) and body.get("error") == "invalid_grant"
+        if definitive:
             _renewal_refusals[normalized] = f"refresh refused with HTTP {resp.status_code}"
         _logger.warning(
             "Token refresh against %s refused (HTTP %d) — run `omnigent login %s` "

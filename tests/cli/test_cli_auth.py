@@ -899,6 +899,38 @@ def test_transient_refresh_failure_records_no_renewal_refusal(
     assert stored_login_renewal_refusal("http://localhost:6767") is None
 
 
+def test_non_grant_400_refresh_records_no_renewal_refusal(token_dir, monkeypatch) -> None:
+    """A 400 that is not OAuth ``invalid_grant`` (a malformed request or an
+    incompatible server) is not the stored login's fault, so it must not make
+    later diagnostics blame the login or advise re-authentication."""
+    import httpx
+
+    from omnigent import cli_auth
+    from omnigent.cli_auth import (
+        refresh_stored_token,
+        store_token,
+        stored_login_renewal_refusal,
+    )
+
+    monkeypatch.setattr(cli_auth, "_renewal_refusals", {})
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, *, data=None, timeout=None: httpx.Response(
+            400, json={"error": "invalid_request"}, request=httpx.Request("POST", url)
+        ),
+    )
+    assert refresh_stored_token("http://localhost:6767") is None
+    assert stored_login_renewal_refusal("http://localhost:6767") is None
+
+
 def test_missing_refresh_endpoint_records_no_renewal_refusal(token_dir, monkeypatch) -> None:
     """A 404 (server without /oauth/token) is not a credential refusal, so it
     must not make later diagnostics blame the stored login."""

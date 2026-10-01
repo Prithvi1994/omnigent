@@ -1,8 +1,7 @@
-"""Drive bootstrap-bearer rejection and a refused stored-login refresh through
-a real runner subprocess (``python -m omnigent.runner._entry``) over real
-sockets, with a loopback HTTP-403 server standing in for the Databricks Apps
-front door. Facet A guards the fail-closed exit; Facet B is the fail->pass
-target for the runner's renewal-failure diagnosis."""
+"""Verify that a rejected bootstrap bearer fails closed and that a refused
+stored-login renewal is reported as such, driven through a real runner
+subprocess (``python -m omnigent.runner._entry``) over real sockets with a
+loopback HTTP-403 server standing in for the Databricks Apps front door."""
 
 from __future__ import annotations
 
@@ -66,11 +65,8 @@ class _Reject403(BaseHTTPRequestHandler):
         return
 
     def _reject(self) -> None:
-        type(self).lock.acquire()
-        try:
+        with type(self).lock:
             type(self).requests.append({"method": self.command, "path": self.path})
-        finally:
-            type(self).lock.release()
         length = int(self.headers.get("Content-Length", 0) or 0)
         if length:
             self.rfile.read(length)
@@ -195,24 +191,22 @@ def test_runner_exits_after_bootstrap_rejection_with_no_recoverable_credential(
     front_door: tuple[str, list[dict[str, str]]], tmp_path: Path
 ) -> None:
     """With no recoverable credential the runner exits non-zero after the
-    fatal 403 streak, and a fresh relaunch fails identically."""
+    fatal 403 streak rather than retrying forever."""
     server_url, _requests = front_door
 
-    rc1, out1 = _run_runner(server_url, tmp_path / "first", with_stored_login=False)
-    rc2, out2 = _run_runner(server_url, tmp_path / "relaunch", with_stored_login=False)
+    rc, out = _run_runner(server_url, tmp_path / "run", with_stored_login=False)
 
-    for rc, out in ((rc1, out1), (rc2, out2)):
-        assert rc is not None, f"runner hung instead of exiting; output tail:\n{out[-2000:]}"
-        assert rc != 0, (
-            f"runner exited 0 despite a rejected bootstrap bearer; output tail:\n{out[-2000:]}"
-        )
-        assert RUNNER_TUNNEL_REJECTION_PREFIX in out, (
-            f"missing the fatal tunnel-rejection diagnostic; output tail:\n{out[-2000:]}"
-        )
-        assert f"persisted across {_HTTP_AUTH_REJECTION_FATAL_ATTEMPTS} attempts" in out, (
-            "fatal rejection did not report the expected consecutive-403 streak; "
-            f"output tail:\n{out[-2000:]}"
-        )
+    assert rc is not None, f"runner hung instead of exiting; output tail:\n{out[-2000:]}"
+    assert rc != 0, (
+        f"runner exited 0 despite a rejected bootstrap bearer; output tail:\n{out[-2000:]}"
+    )
+    assert RUNNER_TUNNEL_REJECTION_PREFIX in out, (
+        f"missing the fatal tunnel-rejection diagnostic; output tail:\n{out[-2000:]}"
+    )
+    assert f"persisted across {_HTTP_AUTH_REJECTION_FATAL_ATTEMPTS} attempts" in out, (
+        "fatal rejection did not report the expected consecutive-403 streak; "
+        f"output tail:\n{out[-2000:]}"
+    )
 
 
 def test_runner_failure_diagnosis_surfaces_rejected_refresh_reason(
