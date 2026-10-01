@@ -27,6 +27,7 @@ import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
+from urllib.parse import quote
 
 import httpx
 from pydantic import TypeAdapter
@@ -59,6 +60,20 @@ _log = logging.getLogger("omnigent_client.sessions")
 # kept as a module-level constant so :meth:`SessionsNamespace.interrupt`
 # matches a single named symbol rather than an inline string.
 _INTERRUPT_TYPE: str = "interrupt"
+
+
+def _session_url(base_url: str, session_id: str) -> str:
+    """
+    Build ``{base_url}/v1/sessions/{session_id}`` with the id confined to
+    one path segment, so a caller-supplied value such as
+    ``"../projects/p"`` or ``"conv_x?delete_branch=true"`` cannot reach
+    another route or add query parameters.
+
+    :param base_url: Server base URL without a trailing slash.
+    :param session_id: Session/conversation identifier.
+    :returns: The percent-encoded session URL.
+    """
+    return f"{base_url}/v1/sessions/{quote(session_id, safe='')}"
 
 
 @dataclass(frozen=True)
@@ -936,10 +951,8 @@ class SessionsNamespace:
         and keys not mentioned keep their current value. Nothing is
         removed by this call — an empty-string value is stored as
         ``""``, not treated as a delete (only the server's own project
-        and pin keys clear on ``""``). Server-internal keys are rejected
-        with 400; the advisor-owned ``cost_control.*`` family is rejected
-        with 403 unless the caller is the session's bound runner. An
-        empty mapping leaves the session unchanged.
+        and pin keys clear on ``""``). An empty mapping leaves the
+        session unchanged.
 
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -947,12 +960,14 @@ class SessionsNamespace:
             ``{"team": "platform"}``.
         :returns: The updated :class:`Session` snapshot; its
             ``labels`` carry the merged result.
-        :raises OmnigentError: On non-2xx status (400 for a
-            server-internal key, 403 for a ``cost_control.*`` key or
-            without edit access, 404 when the session does not exist).
+        :raises OmnigentError: On non-2xx status: 400 for a
+            server-internal key, 403 for an advisor-owned
+            ``cost_control.*`` key written by anyone but the session's
+            bound runner or without edit access, 404 when the session
+            does not exist.
         """
         resp = await self._http.patch(
-            f"{self._base}/v1/sessions/{session_id}",
+            _session_url(self._base, session_id),
             json={"labels": labels},
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -1159,7 +1174,7 @@ class SessionsNamespace:
             the host is offline so worktree cleanup cannot run).
         """
         resp = await self._http.delete(
-            f"{self._base}/v1/sessions/{session_id}",
+            _session_url(self._base, session_id),
             params={"delete_branch": "true"} if delete_branch else None,
         )
         raise_for_status(resp.status_code, response_body(resp))

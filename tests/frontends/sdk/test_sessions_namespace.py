@@ -1544,14 +1544,35 @@ async def test_set_labels_patches_labels_and_returns_snapshot() -> None:
 
     ns, client = _make_namespace(handler)
     try:
-        session = await ns.set_labels("conv_abc", labels={"team": "platform"})
+        # An empty value is a legitimate stored value, so it must reach the wire.
+        session = await ns.set_labels("conv_abc", labels={"team": "platform", "stale": ""})
     finally:
         await client.aclose()
 
     assert seen["method"] == "PATCH"
     assert seen["url"] == "http://srv/v1/sessions/conv_abc"
-    assert seen["body"] == {"labels": {"team": "platform"}}
+    assert seen["body"] == {"labels": {"team": "platform", "stale": ""}}
     assert session.labels == {"existing": "1", "team": "platform"}
+
+
+@pytest.mark.asyncio
+async def test_set_labels_403_raises() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            403,
+            json={"error": {"code": "forbidden", "message": "cost_control.plan is runner-owned"}},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        with pytest.raises(OmnigentError) as exc_info:
+            await ns.set_labels("conv_abc", labels={"cost_control.plan": "{}"})
+    finally:
+        await client.aclose()
+
+    assert exc_info.value.status_code == 403
+    assert str(exc_info.value) == "cost_control.plan is runner-owned"
 
 
 @pytest.mark.asyncio
@@ -1577,6 +1598,34 @@ async def test_delete_sends_delete_to_session_url(delete_branch: bool, expected_
         await client.aclose()
 
     assert seen == {"method": "DELETE", "url": expected_url}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("hostile_id", "expected_url"),
+    [
+        ("../projects/proj_1", "http://srv/v1/sessions/..%2Fprojects%2Fproj_1"),
+        ("conv_x?delete_branch=true", "http://srv/v1/sessions/conv_x%3Fdelete_branch%3Dtrue"),
+    ],
+)
+async def test_delete_and_set_labels_confine_id_to_session_path(
+    hostile_id: str, expected_url: str
+) -> None:
+    """A caller-supplied id cannot reach another route or smuggle query parameters."""
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, str(request.url)))
+        return httpx.Response(200, json=_session_response_body())
+
+    ns, client = _make_namespace(handler)
+    try:
+        await ns.delete(hostile_id)
+        await ns.set_labels(hostile_id, labels={"team": "platform"})
+    finally:
+        await client.aclose()
+
+    assert seen == [("DELETE", expected_url), ("PATCH", expected_url)]
 
 
 @pytest.mark.asyncio

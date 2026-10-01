@@ -365,7 +365,9 @@ class OmnigentClient:
             return UsageReport.model_validate(body)
         except ValidationError as exc:
             raise OmnigentError(
-                f"GET /v1/usage returned an unexpected body: {exc}", resp.status_code
+                f"GET /v1/usage returned an unexpected body "
+                f"({exc.error_count()} validation error(s))",
+                resp.status_code,
             ) from exc
 
     async def list_hosts(self) -> list[dict[str, Any]]:
