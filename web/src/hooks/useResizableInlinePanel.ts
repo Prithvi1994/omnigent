@@ -339,5 +339,5 @@ export function useResizableInlinePanel(
     [onMouseDown, onKeyDown, persistEnabled],
   );
 
-  return { panelWidth: resolvedWidth, handleProps };
+  return { panelWidth: resolvedWidth, handleProps, isDragging };
 }

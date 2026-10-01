@@ -82,6 +82,48 @@ def test_review_output_preserves_final_review(tmp_path: Path, raw: str, expected
     assert payload == f"{expected}{delimiter}\n"
 
 
+@pytest.mark.parametrize(
+    ("stderr_log", "at_capacity"),
+    [
+        pytest.param("Error: Selected model is at capacity.", True, id="at-capacity"),
+        pytest.param('inner executor error: {"type": "overloaded_error"}', True, id="overloaded"),
+        pytest.param("Traceback: some unrelated crash", False, id="other-failure"),
+    ],
+)
+def test_empty_review_flags_model_capacity(
+    tmp_path: Path, stderr_log: str, at_capacity: bool
+) -> None:
+    """An empty review from a model-capacity failure is flagged; other empties aren't."""
+    workflow = yaml.safe_load(_WORKFLOW.read_text())
+    step = next(s for s in workflow["jobs"]["review"]["steps"] if s.get("id") == "polly")
+    script = step["run"][step["run"].index('python3 -c "') :]
+    output = tmp_path / "polly_output.txt"
+    review = tmp_path / "polly_review.txt"
+    output.write_text("Waiting for results.\n")
+    (tmp_path / "polly-stderr.log").write_text(stderr_log)
+    script = script.replace("/tmp/polly_output.txt", str(output))
+    script = script.replace("/tmp/polly_review.txt", str(review))
+    github_output = tmp_path / "github_output"
+    (tmp_path / "python3").symlink_to(sys.executable)
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", script],
+        cwd=tmp_path,
+        env={"PATH": f"{tmp_path}{os.pathsep}{os.defpath}", "GITHUB_OUTPUT": str(github_output)},
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert not review.exists()
+    if at_capacity:
+        assert "at capacity" in result.stderr
+        assert "model_at_capacity=true" in github_output.read_text()
+    else:
+        assert "Polly produced no publishable review" in result.stderr
+        assert not github_output.exists()
+
+
 @pytest.mark.parametrize("gateway_path", ["", "/serving-endpoints"])
 def test_failure_diagnostics_preserves_logs_without_gateway_secrets(
     tmp_path: Path, gateway_path: str
@@ -135,10 +177,23 @@ def test_failure_diagnostics_preserves_logs_without_gateway_secrets(
 
 
 @pytest.mark.parametrize("failure_step", ["secret-scan", "posting", None])
-def test_review_diagnostics_retain_raw_stdout(tmp_path: Path, failure_step: str | None) -> None:
+@pytest.mark.parametrize(
+    "scope_suffix",
+    [
+        "",
+        "<!-- POLLY_SCOPE_START -->\n{malformed\n<!-- POLLY_SCOPE_END -->\n",
+        "<!-- POLLY_SCOPE_START -->\n{}\n<!-- POLLY_SCOPE_END --> (see above)\n" * 2,
+    ],
+    ids=["plain-prose", "malformed-legacy-scope", "duplicate-legacy-scope"],
+)
+def test_review_diagnostics_retain_raw_stdout(
+    tmp_path: Path, failure_step: str | None, scope_suffix: str
+) -> None:
     workflow = yaml.safe_load(_WORKFLOW.read_text())
     steps = {step["name"]: step for step in workflow["jobs"]["review"]["steps"]}
-    review = _REVIEW + ("test-api-secret\n" if failure_step == "secret-scan" else "")
+    review = (
+        _REVIEW + scope_suffix + ("test-api-secret\n" if failure_step == "secret-scan" else "")
+    )
     raw = f"Starting review: test-api-secret at https://gateway.test\n{_MARKER}\n{review}"
     (tmp_path / "stdout.txt").write_text(raw)
     (tmp_path / "review_prompt.txt").write_text("Synthetic review; no model calls.")
@@ -163,6 +218,8 @@ def test_review_diagnostics_retain_raw_stdout(tmp_path: Path, failure_step: str 
         "REPO": "test/repo",
         "HEAD_SHA": "test-sha",
         "RUN_URL": "https://example.test/run",
+        "GITHUB_RUN_ID": "10",
+        "GITHUB_RUN_ATTEMPT": "1",
     }
 
     def run_step(name: str) -> subprocess.CompletedProcess[str]:
@@ -198,6 +255,10 @@ def test_review_diagnostics_retain_raw_stdout(tmp_path: Path, failure_step: str 
         assert result.returncode == (42 if failure_step else 0)
         if failure_step:
             assert "Forced posting failure" in result.stderr
+        assert (tmp_path / "polly-completed-sha.txt").exists() is not bool(failure_step)
+        if not failure_step:
+            assert (tmp_path / "polly-completed-sha.txt").read_text().strip() == "test-sha"
+            assert "<!-- polly-review-run:10-1 -->" in (tmp_path / "comment.md").read_text()
         assert review in (tmp_path / "comment.md").read_text()
         assert "Starting review" not in (tmp_path / "comment.md").read_text()
     result = run_step("Prepare Polly diagnostics")
