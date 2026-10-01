@@ -1198,23 +1198,17 @@ def _claude_managed_gateway_label() -> str | None:
 
 
 def _codex_own_config_status(config: dict[str, Any]) -> str | None:  # type: ignore[explicit-any]  # config is a yaml-boundary mapping
-    """Status label for a Codex whose own config authenticates its provider.
+    """Return a ready label for Codex's effective config provider, or ``None``.
 
-    The harness overview reads omnigent's ``providers:`` config, but codex's
-    effective provider can be configured — and authenticated — entirely by the
-    user's own ``config.toml``: an ``env_key`` provider, which ambient adoption
-    deliberately skips (see ``provider_table_has_self_contained_auth``). A bare
-    ``codex`` is ready there, so the overview must not report "Not configured".
     Asks the question host readiness asks (:func:`codex_config_effective_auth`
-    against the env the launch actually receives), so the row and the picker
-    agree.
+    against the env the launch receives), so the row and the picker agree.
 
     :param config: The parsed global config mapping (for the dismissal check —
-        a Removed config provider is pinned away at launch, so its config no
-        longer routes and must not read as configured).
+        a Removed config provider is pinned away at launch and must not read
+        as configured).
     :returns: A ready-row label naming the config's effective provider, e.g.
-        ``"My Proxy (Codex config)"``, or ``None`` when codex's own config does
-        not authenticate its effective provider.
+        ``"My Proxy (Codex config)"``, or ``None`` when it is dismissed or not
+        authenticated.
     """
     from omnigent.inner.codex_executor import (
         _clean_codex_env,

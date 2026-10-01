@@ -3798,6 +3798,19 @@ def test_harness_overview_credits_codex_own_env_key_config(isolated_config, monk
 # ── Pi native login (Pi original auth) ──────────────────────────────────────
 
 
+def _rendered_row(output: str, name: str) -> str:
+    """Return the status text of the *name* row in a rendered (non-TTY) setup overview."""
+    import re
+
+    rows = [
+        line.strip()
+        for line in output.splitlines()
+        if re.search(rf"(^|\s){re.escape(name)}\s{{2,}}\S", line)
+    ]
+    assert rows, f"omnigent setup never rendered a {name} row:\n{output}"
+    return re.split(r"\s{2,}", rows[0], maxsplit=1)[1]
+
+
 def _seed_pi_native_login(home: str) -> None:
     """Write the auth.json a completed ``pi`` login leaves under ``~/.pi/agent``."""
     import json
@@ -3834,7 +3847,12 @@ def test_harness_overview_credits_pi_native_login(isolated_config, monkeypatch) 
 
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
     assert result.exit_code == 0, result.output
+    # The one-time adoption callout names the credential it just configured.
+    assert "Found existing credentials" in result.output
     assert "Pi original auth" in result.output
+    row = _rendered_row(result.output, "Pi")
+    assert "Not configured" not in row, row
+    assert "✓ Pi original auth" in row, row
 
     cfg = _config_yaml(isolated_config)
     entry = cfg["providers"]["pi"]
@@ -3842,23 +3860,6 @@ def test_harness_overview_credits_pi_native_login(isolated_config, monkeypatch) 
     assert entry["cli"] == "pi"
     # The gap-filling pi-scope default (nothing else serves pi here).
     assert entry["default"] == "pi"
-
-
-def test_overview_credits_pi_native_login(isolated_config, monkeypatch) -> None:
-    """A Pi signed in through its own CLI is a configured Pi harness.
-
-    ``pi`` runs on the login in ``~/.pi/agent/auth.json`` without any Omnigent
-    provider, so the overview must not tell that user Pi is ``Not configured``.
-    """
-    _seed_pi_native_login(isolated_config)
-
-    options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
-        monkeypatch
-    )
-
-    status = _overview_status(options, selectable, "Pi")
-    assert "Not configured" not in status, status
-    assert "✓" in status, status
 
 
 def test_pi_login_adoption_preserves_existing_pi_routing(isolated_config, monkeypatch) -> None:

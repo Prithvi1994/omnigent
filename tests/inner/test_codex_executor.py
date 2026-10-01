@@ -4469,37 +4469,28 @@ def _write_codex_env_key_config(home: Path, env_key: str) -> None:
     )
 
 
-def test_clean_codex_env_forwards_config_declared_env_key(tmp_path, monkeypatch) -> None:
-    """The env var codex's own config declares via ``env_key`` survives the scrub.
+@pytest.mark.parametrize("declared", [True, False])
+def test_clean_codex_env_forwards_only_a_config_declared_env_key(
+    tmp_path, monkeypatch, declared: bool
+) -> None:
+    """Only the env var codex's own config declares via ``env_key`` survives the scrub.
 
     A custom ``[model_providers.X]`` authenticating from ``env_key`` is the
     credential of the provider codex itself resolves; stripping it made an
     omnigent-managed codex fail auth on a config a bare ``codex`` runs fine
-    with (and made readiness/setup report it as needing auth).
+    with. Without such a declaration the same out-of-family var stays stripped.
     """
     from omnigent.inner.codex_executor import _clean_codex_env
 
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("CODEX_HOME", raising=False)
-    _write_codex_env_key_config(tmp_path, "MYPROXY_API_KEY")
+    if declared:
+        _write_codex_env_key_config(tmp_path, "MYPROXY_API_KEY")
     monkeypatch.setenv("MYPROXY_API_KEY", "populated-proxy-token")
 
     env = _clean_codex_env()
 
-    assert env.get("MYPROXY_API_KEY") == "populated-proxy-token"
-
-
-def test_clean_codex_env_without_config_strips_unrelated_vars(tmp_path, monkeypatch) -> None:
-    """With no codex config, an out-of-family var stays stripped."""
-    from omnigent.inner.codex_executor import _clean_codex_env
-
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv("CODEX_HOME", raising=False)
-    monkeypatch.setenv("MYPROXY_API_KEY", "populated-proxy-token")
-
-    env = _clean_codex_env()
-
-    assert "MYPROXY_API_KEY" not in env
+    assert env.get("MYPROXY_API_KEY") == ("populated-proxy-token" if declared else None)
 
 
 def test_clean_codex_env_declared_env_key_never_overrides_deny(tmp_path, monkeypatch) -> None:

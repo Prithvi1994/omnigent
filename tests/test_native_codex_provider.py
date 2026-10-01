@@ -793,6 +793,7 @@ def test_no_provider_but_codex_logged_in_is_not_login_required(
     launch = resolve_native_codex_launch(model=None)
 
     assert "Codex CLI login" in launch.summary
+    assert "sign-in screen" not in launch.summary
     assert launch.login_required is False
 
 
@@ -829,6 +830,36 @@ def test_no_provider_but_codex_config_env_key_populated_is_not_login_required(
     assert launch.config_overrides == []
     assert launch.profile is None
     assert "config.toml" in launch.summary
+    assert launch.login_required is False
+
+
+def test_no_provider_with_codex_config_env_key_beats_managed_broker(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex's own authenticated provider wins over a managed Databricks broker.
+
+    The broker is a last resort for a host that declares no credentials; the
+    setup row credits the config provider, so the launch must route through it
+    too, or setup and the launch disagree.
+    """
+    from omnigent.inner import databricks_executor
+
+    _write_codex_env_key_config(_isolated, "MYPROXY_API_KEY")
+    monkeypatch.setenv("MYPROXY_API_KEY", "populated-proxy-token")
+    monkeypatch.setattr(
+        databricks_executor, "_read_databrickscfg_host", lambda profile: "https://ws.example"
+    )
+    monkeypatch.setattr(
+        "omnigent.host.databricks_credential.broker_token_command",
+        lambda host, *a, **k: "python3 -m omnigent.host.databricks_credential token --coords /x",
+    )
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert launch.config_overrides == []
+    assert launch.profile is None
+    assert "config.toml" in launch.summary
+    assert "managed connect host" not in launch.summary
     assert launch.login_required is False
 
 
@@ -946,7 +977,35 @@ def test_default_provider_without_credential_logged_out_marks_login_required(
     launch = resolve_native_codex_launch(model=None)
 
     assert "no usable openai credential" in launch.summary
+    assert "sign-in screen" in launch.summary
     assert launch.login_required is True
+
+
+def test_default_provider_without_credential_logged_in_uses_codex_login(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unroutable default provider with a live Codex login is not doomed, and says so."""
+    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=True)))
+    monkeypatch.delenv("MISSING_CODEX_TEST_KEY", raising=False)
+    _seed(
+        _isolated,
+        {
+            "broken": {
+                "kind": "key",
+                "default": True,
+                "openai": {
+                    "base_url": "https://broken.example.com/v1",
+                    "api_key_ref": "env:MISSING_CODEX_TEST_KEY",
+                },
+            }
+        },
+    )
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert "no usable openai credential" in launch.summary
+    assert "sign-in screen" not in launch.summary
+    assert launch.login_required is False
 
 
 def test_default_provider_without_credential_defers_to_codex_config(

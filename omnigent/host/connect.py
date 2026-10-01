@@ -781,9 +781,9 @@ def codex_config_declared_env_vars() -> frozenset[str]:
 
     :returns: The declared name, or an empty set when the config declares none.
     """
-    from omnigent.inner.codex_executor import _codex_config_declared_env_key_allowance
+    from omnigent.inner.codex_executor import codex_config_declared_env_key_allowance
 
-    return frozenset(_codex_config_declared_env_key_allowance())
+    return frozenset(codex_config_declared_env_key_allowance())
 
 
 # HTTP statuses on the WebSocket upgrade that are worth retrying. Everything

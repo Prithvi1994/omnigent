@@ -661,7 +661,7 @@ async def _create_subprocess_exec(
     )
 
 
-def _codex_config_declared_env_key_allowance() -> tuple[str, ...]:
+def codex_config_declared_env_key_allowance() -> tuple[str, ...]:
     """Allowance for the env var codex's own config declares via ``env_key``.
 
     The user's ``config.toml`` can select a custom provider that
@@ -669,9 +669,9 @@ def _codex_config_declared_env_key_allowance() -> tuple[str, ...]:
     the credential of the provider codex itself resolves, so the scrubbed
     launch env must carry it — otherwise an omnigent-managed codex fails auth
     on a config a bare ``codex`` runs fine with. Names in
-    :data:`_CODEX_ENV_DENY_EXACT` still lose (the deny set wins in
-    :func:`clean_agent_env`). Never raises: env construction must survive a
-    broken config.
+    :data:`_CODEX_ENV_DENY_EXACT` are never returned, so neither the Codex
+    launch nor the daemon/runner hops forward them. Never raises: env
+    construction must survive a broken config.
 
     :returns: A tuple with the declared variable name, or empty when the
         effective provider declares none.
@@ -684,7 +684,7 @@ def _codex_config_declared_env_key_allowance() -> tuple[str, ...]:
         )
     except Exception:  # noqa: BLE001 - env building must never fail on config reads.
         return ()
-    return () if env_key is None else (env_key,)
+    return () if env_key is None or env_key in _CODEX_ENV_DENY_EXACT else (env_key,)
 
 
 def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
@@ -698,7 +698,7 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     auth (``auth.json``) rather than a developer API key that would charge
     separately. A variable the user's own ``config.toml`` declares as its
     effective provider's ``env_key`` credential is forwarded (see
-    :func:`_codex_config_declared_env_key_allowance`).
+    :func:`codex_config_declared_env_key_allowance`).
 
     The filtered dict is also the executor's own view of its launch, not just
     the subprocess env: the app-server session reads Omnigent's per-session
@@ -727,7 +727,7 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
             # here (they stay host secrets, gated behind env_passthrough).
             "DATABRICKS_CLIENT_ID",
             "DATABRICKS_CLIENT_SECRET",
-            *_codex_config_declared_env_key_allowance(),
+            *codex_config_declared_env_key_allowance(),
             *_CODEX_OMNIGENT_LAUNCH_ENV_VARS,
         ),
         deny_exact=_CODEX_ENV_DENY_EXACT,
