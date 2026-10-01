@@ -70,11 +70,8 @@ _TURN_USAGE = (
 
 
 def _pricing_per_million() -> tuple[float, float, float]:
-    # Rates the assertions EXPECT, matching the fixture-owned mock provider's
-    # configured pricing. This override only changes what the test expects, not
-    # the server's rates; running this journey against an environment whose
-    # provider is unpriced (the stock reproduction env) needs matching provider
-    # pricing configured there separately.
+    # Expected rates must match the fixture-owned mock provider's pricing; the
+    # env override only changes test expectations, not the server's rates.
     default = ",".join(str(rate) for rate in _CODEX_MOCK_PRICING_PER_MILLION)
     raw = os.environ.get("OMNIGENT_E2E_CODEX_PRICING_PER_MILLION", default)
     parts = raw.split(",")
