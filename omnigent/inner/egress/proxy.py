@@ -650,6 +650,13 @@ class EgressProxy:
                     return
 
                 if self._is_websocket_upgrade(inner_headers_raw):
+                    if content_length > 0 or "transfer-encoding" in self._parse_header_dict(
+                        inner_headers_raw
+                    ):
+                        await self._send_forbidden(
+                            tls_writer, "WebSocket upgrade request must not carry a body"
+                        )
+                        return
                     await self._forward_websocket(
                         tls_reader,
                         tls_writer,
@@ -809,15 +816,19 @@ class EgressProxy:
 
     @staticmethod
     def _is_websocket_upgrade(headers_raw: bytes) -> bool:
-        """Return whether the inner request asks to switch the tunnel to WebSocket."""
-        headers = EgressProxy._parse_header_dict(headers_raw)
+        """Return whether the inner request asks to switch the tunnel to WebSocket.
+
+        Ambiguous requests (several ``Upgrade`` headers) are not treated as an
+        upgrade and take the single-response path instead.
+        """
+        msg = _parse_http_headers(headers_raw)
+        upgrades = [value.strip().lower() for value in msg.get_all("Upgrade", [])]
         connection_tokens = {
-            token.strip().lower() for token in headers.get("connection", "").split(",")
+            token.strip().lower()
+            for value in msg.get_all("Connection", [])
+            for token in value.split(",")
         }
-        return (
-            headers.get("upgrade", "").strip().lower() == "websocket"
-            and "upgrade" in connection_tokens
-        )
+        return upgrades == ["websocket"] and "upgrade" in connection_tokens
 
     async def _forward_websocket(
         self,
@@ -890,15 +901,29 @@ class EgressProxy:
                     client_writer, f"upstream {host}:{port} closed without response"
                 )
                 return
-            client_writer.write(status_line)
-            client_writer.write(response_headers)
-            await client_writer.drain()
             if status_line.split()[1:2] == [b"101"]:
+                selected = self._parse_header_dict(response_headers).get("upgrade", "")
+                if selected.strip().lower() != "websocket":
+                    logger.warning(
+                        "Upstream %s:%d switched to %r instead of websocket", host, port, selected
+                    )
+                    await self._send_bad_gateway(
+                        client_writer,
+                        f"upstream {host}:{port} selected protocol {selected.strip() or 'none'!r}",
+                    )
+                    return
+                client_writer.write(status_line)
+                client_writer.write(response_headers)
+                await client_writer.drain()
                 logger.info("UPGRADE wss://%s%s", host, path)
                 await self._relay_bidirectional(
                     client_reader, client_writer, upstream_reader, upstream_writer
                 )
                 return
+            # The tunnel closes after this single response; say so to the client.
+            client_writer.write(status_line)
+            client_writer.write(self._force_connection_close(response_headers))
+            await client_writer.drain()
             logger.info(
                 "UPGRADE-REFUSED wss://%s%s %s",
                 host,
@@ -918,8 +943,10 @@ class EgressProxy:
                 elif "chunked" in refused.get("transfer-encoding", "").lower():
                     await self._relay_chunked_refusal(upstream_reader, client_writer)
                 else:
-                    await self._relay_response(upstream_reader, client_writer)
-            except (asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError) as exc:
+                    _, relay_exc = await self._relay_response(upstream_reader, client_writer)
+                    if relay_exc is not None:
+                        raise relay_exc
+            except (asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError, OSError) as exc:
                 logger.warning(
                     "Refused upgrade from %s:%d ended with a malformed or truncated body: %s",
                     host,
@@ -1368,8 +1395,10 @@ class EgressProxy:
             if size == 0:
                 while True:
                     trailer = await asyncio.wait_for(upstream_reader.readline(), timeout=60)
+                    if not trailer:
+                        raise asyncio.IncompleteReadError(partial=b"", expected=None)
                     client_writer.write(trailer)
-                    if trailer in (b"\r\n", b"\n", b""):
+                    if trailer in (b"\r\n", b"\n"):
                         break
                 await client_writer.drain()
                 return
@@ -1832,6 +1861,11 @@ class EgressProxy:
         either side closes.
         """
         msg = _parse_http_headers(headers_raw)
+        # Fields the client declared hop-by-hop travel no further (RFC 7230 §6.1).
+        for value in msg.get_all("Connection", []):
+            for token in value.split(","):
+                if token.strip() and token.strip().lower() != "upgrade":
+                    del msg[token.strip()]
         del msg["Connection"]
         del msg["Proxy-Connection"]
         del msg["Keep-Alive"]

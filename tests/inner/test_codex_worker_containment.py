@@ -703,11 +703,13 @@ async def test_spawn_failure_releases_launcher_and_private_home(
     assert session._worker_launch is None
 
 
+@pytest.mark.parametrize("hooks_staged_as", ["symlink", "copy"])
 async def test_session_disables_native_tools_for_unwrapped_no_route_worker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    hooks_staged_as: str,
 ) -> None:
-    """A worker that fell back to running unwrapped must not keep Codex's native shell tool."""
+    """A worker that fell back to running unwrapped keeps no native tools or inherited commands."""
     process = Mock(stdin=None, stdout=_Pipe(), stderr=_Pipe(), returncode=0, pid=123)
     process.wait = AsyncMock(return_value=0)
     monkeypatch.setattr(
@@ -728,7 +730,10 @@ async def test_session_disables_native_tools_for_unwrapped_no_route_worker(
             'model = "gpt-5.4-mini"\nnotify = ["touch", "notified"]\n'
             '[mcp_servers.probe]\ncommand = "touch"\nargs = ["mcp-started"]\n'
         )
-        (target_dir / "hooks.json").symlink_to(user_hooks)
+        if hooks_staged_as == "symlink":
+            (target_dir / "hooks.json").symlink_to(user_hooks)
+        else:
+            shutil.copy2(user_hooks, target_dir / "hooks.json")
 
     monkeypatch.setattr(
         "omnigent.inner.codex_executor._populate_codex_home_config", _inherit_user_config

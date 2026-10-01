@@ -1063,20 +1063,21 @@ def codex_minimal_config_requested() -> bool:
 def _strip_host_launched_config(codex_home: Path) -> None:
     """Drop inherited config that would start user commands beside an unwrapped app-server.
 
-    ``[mcp_servers.*]``, ``notify`` and a symlinked user ``hooks.json`` launch
-    processes the no-route fallback can no longer contain.
+    ``[mcp_servers.*]``, ``notify`` and the user ``hooks.json`` launch processes
+    the no-route fallback can no longer contain.
     """
     import tomlkit
 
     config_path = codex_home / "config.toml"
     if config_path.is_file():
-        document = tomlkit.parse(config_path.read_text())
+        document = tomlkit.parse(config_path.read_text(encoding="utf-8"))
         if "mcp_servers" in document or "notify" in document:
             document.pop("mcp_servers", None)
             document.pop("notify", None)
-            config_path.write_text(tomlkit.dumps(document))
+            config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+    # Staging symlinks the user's hooks but falls back to a copy; drop either.
     hooks_path = codex_home / _CODEX_HOOKS_FILENAME
-    if hooks_path.is_symlink():
+    if hooks_path.is_symlink() or hooks_path.exists():
         hooks_path.unlink()
 
 
@@ -2706,9 +2707,9 @@ class _PendingToolResult:
     duration_ms: float = 0.0
 
 
-# Codex-native capabilities an unwrapped no-route worker must not keep: the
-# same set omnigent/runner/background_titles/codex_native.py switches off.
-_UNWRAPPED_WORKER_NATIVE_FEATURES_OFF = (
+# ``-c`` overrides that switch off every Codex-native capability beyond the
+# model call; shared with the runner's background title worker.
+CODEX_NATIVE_FEATURES_OFF = (
     "features.unified_exec=false",
     "features.shell_tool=false",
     'web_search="disabled"',
@@ -3009,7 +3010,7 @@ class _CodexAppServerSession:
                 argv.extend(["-c", override])
             if not worker_launch.native_tools_allowed:
                 self._disable_native_tools = True
-                for override in _UNWRAPPED_WORKER_NATIVE_FEATURES_OFF:
+                for override in CODEX_NATIVE_FEATURES_OFF:
                     argv.extend(["-c", override])
                 _strip_host_launched_config(self._codex_home_dir)
                 if router_bridge_dir is not None:

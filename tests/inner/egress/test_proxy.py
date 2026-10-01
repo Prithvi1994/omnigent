@@ -3029,6 +3029,7 @@ def _websocket_echo_via_proxy(
     *,
     path: str = "/backend-api/codex/responses",
     follow_up: bytes | None = None,
+    body: bytes = b"",
 ) -> tuple[str, bytes]:
     """CONNECT through the proxy and request a WebSocket upgrade on *path*.
 
@@ -3053,11 +3054,13 @@ def _websocket_echo_via_proxy(
         with context.wrap_socket(raw, server_hostname="localhost") as tls:
             tls.settimeout(20)
             key = base64.b64encode(b"0123456789abcdef").decode()
+            framing = f"Content-Length: {len(body)}\r\n" if body else ""
             tls.sendall(
                 f"GET {path} HTTP/1.1\r\n"
                 f"Host: localhost:{upstream_port}\r\n"
                 "Upgrade: websocket\r\nConnection: Upgrade\r\n"
-                f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode()
+                f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n{framing}\r\n".encode()
+                + body
             )
             head = b""
             while b"\r\n\r\n" not in head:
@@ -3149,7 +3152,8 @@ async def test_refused_or_denied_websocket_upgrade_never_opens_an_opaque_tunnel(
     an upstream that declines the upgrade has its one response relayed after
     which the tunnel closes, so a follow-up request on it cannot skip the
     per-request policy check. Chunked and bodyless refusals from a keep-alive
-    upstream must close promptly too, without waiting for EOF.
+    upstream must close promptly too; a ``101`` that selects another protocol
+    is answered ``502``, and an upgrade request carrying a body is refused.
     """
     cert_path, key_path, bundle_path = ca_paths
     server_context = HostCertCache(cert_path, key_path).get_ssl_context("localhost")
@@ -3164,13 +3168,18 @@ async def test_refused_or_denied_websocket_upgrade_never_opens_an_opaque_tunnel(
                     pass
                 if b" /backend-api/bodyless " in request_line:
                     writer.write(b"HTTP/1.1 204 No Content\r\n\r\n")
+                elif b" /backend-api/other-protocol " in request_line:
+                    writer.write(
+                        b"HTTP/1.1 101 Switching Protocols\r\n"
+                        b"Upgrade: h2c\r\nConnection: Upgrade\r\n\r\n"
+                    )
                 elif b" /backend-api/chunked " in request_line:
                     writer.write(
                         b"HTTP/1.1 426 Upgrade Required\r\nTransfer-Encoding: chunked\r\n\r\n"
                         + chunked_body
                     )
                 else:
-                    writer.write(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\n\r\n")
+                    writer.write(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 4\r\n\r\nnope")
                 await writer.drain()
         finally:
             writer.close()
@@ -3230,6 +3239,28 @@ async def test_refused_or_denied_websocket_upgrade_never_opens_an_opaque_tunnel(
             ),
             timeout=60,
         )
+        other_protocol, _ = await asyncio.wait_for(
+            asyncio.to_thread(
+                _websocket_echo_via_proxy,
+                proxy_port,
+                upstream_port,
+                bundle_path,
+                b"x",
+                path="/backend-api/other-protocol",
+            ),
+            timeout=60,
+        )
+        with_body, _ = await asyncio.wait_for(
+            asyncio.to_thread(
+                _websocket_echo_via_proxy,
+                proxy_port,
+                upstream_port,
+                bundle_path,
+                b"x",
+                body=b"abc",
+            ),
+            timeout=60,
+        )
     finally:
         await proxy.stop()
         server.close()
@@ -3237,13 +3268,16 @@ async def test_refused_or_denied_websocket_upgrade_never_opens_an_opaque_tunnel(
 
     assert denied.startswith("HTTP/1.1 403"), denied
     assert declined.startswith("HTTP/1.1 426"), declined
-    assert tail == b"", tail
+    assert tail == b"nope", tail
     assert chunked.startswith("HTTP/1.1 426"), chunked
     assert chunked_tail == chunked_body, chunked_tail
     assert bodyless.startswith("HTTP/1.1 204"), bodyless
     assert bodyless_tail == b"", bodyless_tail
+    assert other_protocol.startswith("HTTP/1.1 502"), other_protocol
+    assert with_body.startswith("HTTP/1.1 403"), with_body
     assert upstream_requests == [
         b"GET /backend-api/codex/responses HTTP/1.1\r\n",
         b"GET /backend-api/chunked HTTP/1.1\r\n",
         b"GET /backend-api/bodyless HTTP/1.1\r\n",
+        b"GET /backend-api/other-protocol HTTP/1.1\r\n",
     ]
