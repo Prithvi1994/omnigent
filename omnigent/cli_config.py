@@ -3210,6 +3210,7 @@ def _remove_subscription(provider: str, family: str) -> str | None:
     """
     from omnigent.onboarding.harness_install import harness_install_spec, harness_logout
     from omnigent.onboarding.interactive import select
+    from omnigent.onboarding.provider_config import load_providers
 
     spec = harness_install_spec(family)
     disp = spec.display if spec is not None else family
@@ -3229,7 +3230,12 @@ def _remove_subscription(provider: str, family: str) -> str | None:
         )
         if choice != 0:
             return None
-        return _remove_credential(provider)
+        # Dismiss the CLI's detection even if its login is unusable right now,
+        # so a repaired login does not re-adopt what the user removed.
+        entry = load_providers(_load_global_config()).get(provider)
+        return _remove_credential(
+            provider, always_dismiss=entry.cli if entry is not None else None
+        )
     logout_cmd = f"{spec.binary} {' '.join(spec.logout_args)}"
     choice = select(
         f"Remove {disp} subscription?",
@@ -3374,13 +3380,15 @@ def _removal_signs_out(det: DetectedProvider) -> bool:
     return spec is not None and spec.logout_args is not None
 
 
-def _remove_credential(provider: str) -> str | None:
+def _remove_credential(provider: str, *, always_dismiss: str | None = None) -> str | None:
     """Remove the *provider* credential and persist wholesale.
 
     The stored secret (if any) is left in place — removing a credential does
     not assume its key is unwanted.
 
     :param provider: The provider id to remove, e.g. ``"openrouter"``.
+    :param always_dismiss: A detection name to dismiss even when nothing currently
+        detects it, e.g. ``"pi"`` for a login whose ``auth.json`` is unusable right now.
     :returns: A confirmation message for the caller to show as a transient
         status, or ``None`` when there was nothing to remove. Side effect:
         writes ``~/.omnigent/config.yaml`` (and, when the removed entry is
@@ -3424,12 +3432,13 @@ def _remove_credential(provider: str) -> str | None:
         (d for d in detect_providers() if _backs_entry(d) and not _removal_signs_out(d)),
         None,
     )
-    if backing is not None:
-        settings[DISMISSED_DETECTIONS_KEY] = sorted(
-            dismissed_detection_names(config) | {backing.name}
-        )
+    dismiss = {backing.name} if backing is not None else set()
+    if always_dismiss is not None:
+        dismiss.add(always_dismiss)
+    if dismiss:
+        settings[DISMISSED_DETECTIONS_KEY] = sorted(dismissed_detection_names(config) | dismiss)
     _save_global_config(settings)  # wholesale replace per key
-    if backing is not None:
+    if dismiss:
         return f"✓ Removed {label} — it stays on your machine but won't be auto-configured again"
     return f"✓ Removed {label}"
 

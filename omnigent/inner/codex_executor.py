@@ -207,6 +207,13 @@ _BROKERED_CODEX_PROVIDER_NAME = "omnigent_brokered"
 # developer API key that would charge separately.
 _CODEX_ENV_DENY_EXACT: frozenset[str] = frozenset({"OPENAI_API_KEY"})
 
+# Names a config.toml ``env_key`` can never pull into a Codex launch: the deny
+# set plus host secrets that stay gated behind sandbox.env_passthrough.
+_CODEX_ENV_KEY_NEVER_FORWARDED: frozenset[str] = _CODEX_ENV_DENY_EXACT | {
+    "DATABRICKS_TOKEN",
+    "DATABRICKS_CONFIG_PROFILE",
+}
+
 # Provider credentials the Codex launch env carries for a gateway auth command
 # or an env_key provider; credential-free model discovery strips them again.
 _CODEX_PROVIDER_CREDENTIAL_ENV_VARS: tuple[str, ...] = (
@@ -678,8 +685,9 @@ def codex_config_declared_env_key_allowance() -> tuple[str, ...]:
 
     The declared variable is the credential of the provider codex itself
     resolves, so the scrubbed launch env carries it. Never names an Omnigent
-    control-plane variable or a :data:`_CODEX_ENV_DENY_EXACT` entry, and never
-    raises: env construction must survive a broken config.
+    control-plane variable or a :data:`_CODEX_ENV_KEY_NEVER_FORWARDED` entry
+    (the Codex deny set and host secrets gated behind ``env_passthrough``), and
+    never raises: env construction must survive a broken config.
 
     :returns: A one-element tuple with the variable name, or empty.
     """
@@ -691,7 +699,7 @@ def codex_config_declared_env_key_allowance() -> tuple[str, ...]:
         )
     except Exception:  # noqa: BLE001 - env building must never fail on config reads.
         return ()
-    return () if env_key is None or env_key in _CODEX_ENV_DENY_EXACT else (env_key,)
+    return () if env_key is None or env_key in _CODEX_ENV_KEY_NEVER_FORWARDED else (env_key,)
 
 
 def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:

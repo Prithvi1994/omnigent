@@ -771,8 +771,9 @@ RUNNER_ENV_PASSTHROUGH_ENV_VAR: str = "OMNIGENT_RUNNER_ENV_PASSTHROUGH"
 
 
 # Harnesses whose runner launches the Codex CLI, the only consumer of the
-# variable Codex's own config.toml declares via env_key.
-_CODEX_RUNNER_HARNESSES: frozenset[str] = frozenset({"codex", "codex-native"})
+# variable Codex's own config.toml declares via env_key. ``native-codex`` is
+# an accepted spelling canonicalize_harness does not fold.
+_CODEX_RUNNER_HARNESSES: frozenset[str] = frozenset({"codex", "codex-native", "native-codex"})
 
 
 def codex_config_declared_env_vars() -> frozenset[str]:

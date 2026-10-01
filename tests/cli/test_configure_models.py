@@ -3951,6 +3951,43 @@ def test_remove_pi_subscription_dismisses_detection(isolated_config, monkeypatch
     assert "pi" in _config_yaml(isolated_config)["providers"]
 
 
+def test_remove_pi_subscription_with_unusable_login_still_dismisses(
+    isolated_config, monkeypatch
+) -> None:
+    """Removing Pi while its own login is unusable still records the dismissal.
+
+    Otherwise repairing ``auth.json`` later silently re-adopts the login the user
+    removed, contrary to the removal prompt's promise.
+    """
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    _seed_pi_native_login(isolated_config)
+    auth_path = os.path.join(isolated_config, ".pi", "agent", "auth.json")
+
+    # Open 1: adopt the detected login.
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+    assert result.exit_code == 0, result.output
+    assert "pi" in _config_yaml(isolated_config)["providers"]
+
+    # The login breaks (logged out / malformed), then the user removes the entry:
+    # L1 6=Pi → L2 1=the credential → L3 1=Remove → confirm 1=Yes → L2 q → L1 q.
+    with open(auth_path, "w") as f:
+        f.write("{}")
+    stdin = "\n".join(["6", "1", "1", "1", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+    cfg = _config_yaml(isolated_config)
+    assert cfg.get("providers", {}) == {}
+    assert cfg["dismissed_detections"] == ["pi"]
+
+    # The login works again; a plain reopen must still not re-adopt it.
+    os.remove(auth_path)
+    os.rmdir(os.path.dirname(auth_path))
+    _seed_pi_native_login(isolated_config)
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+    assert result.exit_code == 0, result.output
+    assert _config_yaml(isolated_config).get("providers", {}) == {}
+
+
 def test_remove_hand_named_pi_subscription_dismisses_by_detection_name(
     isolated_config, monkeypatch
 ) -> None:

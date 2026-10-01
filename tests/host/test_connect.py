@@ -3980,7 +3980,7 @@ def test_build_runner_env_passthrough_extends_forwarded_set() -> None:
     assert "UNLISTED_SECRET" not in env
 
 
-@pytest.mark.parametrize("harness", ["codex-native", "codex"])
+@pytest.mark.parametrize("harness", ["codex-native", "codex", "native-codex"])
 def test_build_runner_env_forwards_codex_config_declared_env_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str
 ) -> None:
@@ -4058,10 +4058,12 @@ def test_build_runner_env_does_not_forward_codex_declared_key_to_non_codex_harne
     assert "MYPROXY_API_KEY" not in env
 
 
-def test_build_runner_env_declared_env_key_cannot_forward_framework_token(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("env_key", ["OMNIGENT_HOST_TOKEN", "DATABRICKS_TOKEN"])
+def test_build_runner_env_declared_env_key_cannot_forward_protected_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_key: str
 ) -> None:
-    """A config.toml naming the host token as its ``env_key`` does not leak it to the runner."""
+    """A config.toml ``env_key`` naming the host token or a gated host secret does not
+    leak it to a Codex runner, whether or not an Omnigent provider routes the launch."""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("CODEX_HOME", raising=False)
     codex_dir = tmp_path / ".codex"
@@ -4070,13 +4072,13 @@ def test_build_runner_env_declared_env_key_cannot_forward_framework_token(
         'model_provider = "myproxy"\n'
         "[model_providers.myproxy]\n"
         'base_url = "https://myproxy.example.com/v1"\n'
-        'env_key = "OMNIGENT_HOST_TOKEN"\n',
+        f'env_key = "{env_key}"\n',
         encoding="utf-8",
     )
     base = {
         "PATH": "/usr/bin",
         "HOME": str(tmp_path),
-        "OMNIGENT_HOST_TOKEN": "framework-secret",
+        env_key: "protected-secret",
     }
 
     env = _build_runner_env(
@@ -4089,7 +4091,7 @@ def test_build_runner_env_declared_env_key_cannot_forward_framework_token(
         harness="codex-native",
     )
 
-    assert "OMNIGENT_HOST_TOKEN" not in env
+    assert env_key not in env
 
 
 def test_dispatch_trace_context_reaches_runner_but_not_daemon(

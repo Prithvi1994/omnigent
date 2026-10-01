@@ -244,15 +244,18 @@ def codex_cli_effective_auth_mode() -> str | None:
 def _pi_auth_path() -> Path:
     """Return the path to the Pi CLI's stored login credentials.
 
-    Reuses pi-native's agent-dir resolver (``PI_CODING_AGENT_DIR`` when set,
-    else ``~/.pi/agent``) so the check reads exactly the file a bare ``pi`` in
-    this shell would authenticate from.
+    Mirrors pi's own resolution (``PI_CODING_AGENT_DIR`` when set, else
+    ``~/.pi/agent``) so the check reads exactly the file a bare ``pi`` in this
+    shell would authenticate from. Kept local rather than imported from
+    pi-native's resolver: that module pulls psutil, and detection must stay
+    stdlib-light.
 
     :returns: Path to ``auth.json`` in pi's agent config dir.
     """
-    from omnigent.harnesses.pi_native.credentials import pi_agent_dir
-
-    return pi_agent_dir() / "auth.json"
+    env_dir = os.environ.get("PI_CODING_AGENT_DIR", "").strip()
+    if env_dir:
+        return Path(os.path.expanduser(env_dir)) / "auth.json"
+    return Path(os.path.expanduser("~")) / ".pi" / "agent" / "auth.json"
 
 
 def pi_auth_has_credential(auth_path: Path) -> bool:

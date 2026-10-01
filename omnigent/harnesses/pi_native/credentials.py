@@ -423,7 +423,7 @@ class PiProviderConfig:
         )
 
 
-def pi_agent_dir() -> Path:
+def _global_pi_agent_dir() -> Path:
     """Return Pi's own agent config root (``~/.pi/agent`` by default).
 
     Honours Pi's ``PI_CODING_AGENT_DIR`` override so the pre-launch catalog
@@ -458,7 +458,7 @@ def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, 
         qualified as ``provider/model`` — the reference form Pi's ``--model``
         resolves natively against its own providers.
     """
-    root = agent_dir if agent_dir is not None else pi_agent_dir()
+    root = agent_dir if agent_dir is not None else _global_pi_agent_dir()
     logged_in = set(_read_json_object(root / "auth.json"))
     if not logged_in:
         return []

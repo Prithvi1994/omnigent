@@ -407,9 +407,12 @@ def test_build_host_daemon_env_remote_declared_env_key_cannot_forward_protected_
 
 
 def test_build_host_daemon_env_remote_strips_provider_credentials(
-    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Remote daemon env remains allowlisted and does not carry LLM keys."""
+    # A developer's own ~/.codex/config.toml must not add a declared env_key here.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://example.databricks.com/serving-endpoints")
