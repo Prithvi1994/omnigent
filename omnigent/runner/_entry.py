@@ -521,7 +521,7 @@ class _InitialAuthTokenFactory:
                     from omnigent.util.server_url import display_server_url
 
                     _logger.error(
-                        "host bootstrap bearer expired and the stored login could not "
+                        "host bootstrap token expired and the stored login could not "
                         "renew it (%s); run `omnigent login %s` to re-authenticate",
                         refusal,
                         display_server_url(self._server_url),
@@ -529,7 +529,7 @@ class _InitialAuthTokenFactory:
                     )
                 else:
                     _logger.error(
-                        "host bootstrap bearer expired and no SDK/OIDC credential is available "
+                        "host bootstrap token expired and no SDK/OIDC credential is available "
                         "to renew it; run `databricks auth login` to re-authenticate",
                         extra={"session_id": runner_primary_session_id()},
                     )
@@ -582,7 +582,7 @@ class _InitialAuthTokenFactory:
                 return bool(invalidate()) if callable(invalidate) else False
             self._initial_token = None
             _logger.info(
-                "host bootstrap bearer rejected; resolving runner-local auth",
+                "host bootstrap token rejected; resolving runner-local auth",
                 extra={"session_id": runner_primary_session_id()},
             )
             return True

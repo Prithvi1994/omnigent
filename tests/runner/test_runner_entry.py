@@ -209,13 +209,16 @@ def test_make_auth_token_factory_returns_factory_when_databricks_creds_available
 
 def test_make_auth_token_factory_returns_none_without_databricks_creds(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Without Databricks credentials the factory is ``None``.
+    """Without Databricks credentials the factory is ``None`` and the
+    resolution failure's reason reaches the log.
 
     Local unauthenticated servers don't need auth — the runner
     connects over loopback without a bearer token.
 
     :param monkeypatch: Pytest environment patch fixture.
+    :param caplog: Pytest log capture fixture.
     :returns: None.
     """
     from omnigent.inner.databricks_executor import DatabricksAuthError
@@ -232,7 +235,14 @@ def test_make_auth_token_factory_returns_none_without_databricks_creds(
         _no_creds,
     )
 
-    assert _make_auth_token_factory() is None
+    with caplog.at_level(logging.INFO, logger="omnigent.inner.databricks_executor"):
+        assert _make_auth_token_factory() is None
+
+    assert any(
+        "Databricks SDK credential resolution failed: no Databricks credentials configured"
+        in record.getMessage()
+        for record in caplog.records
+    ), [r.getMessage() for r in caplog.records]
 
 
 def test_make_auth_token_factory_re_resolves_when_reused_sdk_auth_goes_stale(
@@ -488,38 +498,6 @@ def test_rejected_bootstrap_diagnosis_without_stored_login_reports_no_credential
     assert any(
         "no SDK/OIDC credential is available" in record.getMessage() for record in caplog.records
     )
-
-
-def test_sdk_credential_resolution_failure_reason_is_logged(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """The SDK resolution failure's reason reaches the runner log instead of
-    being swallowed on the way to a bare "no credential" outcome."""
-
-    def _no_sdk_auth(*_args: Any, **_kwargs: Any) -> tuple[None, None]:
-        from omnigent.inner.databricks_executor import DatabricksAuthError
-
-        raise DatabricksAuthError("cannot configure default credentials")
-
-    monkeypatch.setenv("RUNNER_SERVER_URL", "https://srv.example.com")
-    monkeypatch.delenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, raising=False)
-    monkeypatch.delenv("OMNIGENT_RUNNER_DELEGATED_AUTH", raising=False)
-    monkeypatch.delenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", raising=False)
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
-    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda _url, **_kw: None)
-    monkeypatch.setattr(
-        "omnigent.inner.databricks_executor._resolve_databricks_auth", _no_sdk_auth
-    )
-
-    with caplog.at_level(logging.INFO, logger="omnigent.inner.databricks_executor"):
-        assert _make_auth_token_factory() is None
-
-    assert any(
-        "Databricks SDK credential resolution failed: cannot configure default credentials"
-        in record.getMessage()
-        for record in caplog.records
-    ), [r.getMessage() for r in caplog.records]
 
 
 def test_delegated_factory_falls_back_when_apps_proxy_redirects_mint(

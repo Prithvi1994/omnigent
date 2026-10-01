@@ -787,11 +787,9 @@ def test_refresh_stored_token_refused_leaves_entry(token_dir, monkeypatch) -> No
     assert entry["refresh_token"] == "refresh-1"
 
 
-def test_refused_refresh_records_renewal_refusal(token_dir, monkeypatch) -> None:
-    """A definitive /oauth/token refusal is queryable afterwards, and a
-    freshly stored credential clears it — so a caller's failure diagnosis can
-    say a stored login existed and its renewal was refused, instead of
-    claiming no credential was available."""
+@pytest.mark.parametrize("status", [400, 401, 403])
+def test_refused_refresh_records_renewal_refusal(token_dir, monkeypatch, status) -> None:
+    """A definitive refusal is queryable until a fresh credential is stored."""
     import httpx
 
     from omnigent import cli_auth
@@ -813,14 +811,15 @@ def test_refused_refresh_records_renewal_refusal(token_dir, monkeypatch) -> None
 
     def _fake_post(url, *, data=None, timeout=None):
         return httpx.Response(
-            403, json={"error": "invalid_grant"}, request=httpx.Request("POST", url)
+            status, json={"error": "invalid_grant"}, request=httpx.Request("POST", url)
         )
 
     monkeypatch.setattr(httpx, "post", _fake_post)
     assert refresh_stored_token("http://localhost:6767") is None
     # Lookups normalize the URL, so a trailing-slash variant matches too.
     assert (
-        stored_login_renewal_refusal("http://localhost:6767/") == "refresh refused with HTTP 403"
+        stored_login_renewal_refusal("http://localhost:6767/")
+        == f"refresh refused with HTTP {status}"
     )
 
     store_token(
@@ -829,6 +828,74 @@ def test_refused_refresh_records_renewal_refusal(token_dir, monkeypatch) -> None
         user_id="a@x",
         expires_at=time.time() + 3600,
     )
+    assert stored_login_renewal_refusal("http://localhost:6767") is None
+
+
+def test_logout_clears_renewal_refusal(token_dir, monkeypatch) -> None:
+    """Removing the stored login also forgets its recorded refusal."""
+    import httpx
+
+    from omnigent import cli_auth
+    from omnigent.cli_auth import (
+        clear_token,
+        refresh_stored_token,
+        store_token,
+        stored_login_renewal_refusal,
+    )
+
+    monkeypatch.setattr(cli_auth, "_renewal_refusals", {})
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, *, data=None, timeout=None: httpx.Response(
+            403, json={"error": "invalid_grant"}, request=httpx.Request("POST", url)
+        ),
+    )
+    assert refresh_stored_token("http://localhost:6767") is None
+    assert stored_login_renewal_refusal("http://localhost:6767") == "refresh refused with HTTP 403"
+
+    clear_token("http://localhost:6767")
+    assert stored_login_renewal_refusal("http://localhost:6767") is None
+
+
+@pytest.mark.parametrize("status", [429, 500, 503])
+def test_transient_refresh_failure_records_no_renewal_refusal(
+    token_dir, monkeypatch, status
+) -> None:
+    """Rate limits and server errors may clear up on their own, so they must
+    not make later diagnostics blame the stored login."""
+    import httpx
+
+    from omnigent import cli_auth
+    from omnigent.cli_auth import (
+        refresh_stored_token,
+        store_token,
+        stored_login_renewal_refusal,
+    )
+
+    monkeypatch.setattr(cli_auth, "_renewal_refusals", {})
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, *, data=None, timeout=None: httpx.Response(
+            status, request=httpx.Request("POST", url)
+        ),
+    )
+    assert refresh_stored_token("http://localhost:6767") is None
     assert stored_login_renewal_refusal("http://localhost:6767") is None
 
 

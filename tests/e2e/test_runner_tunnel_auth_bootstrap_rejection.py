@@ -1,34 +1,8 @@
-"""E2E reproduction: runner tunnel auth after bootstrap-bearer rejection and
-failed local renewal.
-
-Reported journey (a ``cli`` surface — the ``omnigent`` runner process):
-
-1. ``omnigent host`` launches a fresh runner with a host-provided bootstrap
-   bearer (``OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN``) and delegated auth enabled.
-2. The server rejects that bootstrap bearer on the tunnel handshake (HTTP 403).
-3. The runner tries to renew locally — delegated managed-mint, then the stored
-   OIDC login (``auth_tokens.json``), then the Databricks SDK — and every path
-   is refused.
-4. The runner exits code 1 after the fatal 403 streak, and a fresh relaunch
-   fails identically. Its user-facing diagnosis says only that no credential is
-   available, hiding *why* renewal failed.
-
-Both facets are driven through the REAL runner process
-(``python -m omnigent.runner._entry``) over real sockets, with a local HTTP-403
-front door standing in for the Databricks Apps front door / Databricks-network
-host that rejects the bootstrap bearer and every renewal request. No runner
-transport or auth code is stubbed.
-
-Facet A (journey guard): with no recoverable credential, the runner cannot
-connect and exits non-zero after the fatal 403 streak; a fresh relaunch is
-identical.
-
-Facet B (fail->pass target): when a stored OIDC credential *exists* but its
-refresh grant is rejected (HTTP 403), the runner must not report "no SDK/OIDC
-credential is available to renew it" — an inaccurate diagnosis that hides the
-actionable reason. It must surface that a stored credential existed and its
-renewal was refused.
-"""
+"""Drive bootstrap-bearer rejection and a refused stored-login refresh through
+a real runner subprocess (``python -m omnigent.runner._entry``) over real
+sockets, with a loopback HTTP-403 server standing in for the Databricks Apps
+front door. Facet A guards the fail-closed exit; Facet B is the fail->pass
+target for the runner's renewal-failure diagnosis."""
 
 from __future__ import annotations
 
@@ -36,10 +10,8 @@ import json
 import os
 import re
 import secrets
-import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from collections.abc import Iterator
@@ -84,12 +56,7 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 class _Reject403(BaseHTTPRequestHandler):
-    """Front door that rejects every request with HTTP 403.
-
-    Stands in for the Databricks Apps front door rejecting the bootstrap
-    bearer on the tunnel handshake and refusing every runner-local renewal
-    request (the OIDC ``/oauth/token`` refresh and the delegated mint POST).
-    """
+    """Front door that answers HTTP 403 to every request and records them."""
 
     protocol_version = "HTTP/1.1"
     requests: list[dict[str, str]]
@@ -118,12 +85,6 @@ class _Reject403(BaseHTTPRequestHandler):
     do_POST = _reject
 
 
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 @pytest.fixture()
 def front_door() -> Iterator[tuple[str, list[dict[str, str]]]]:
     """Start the HTTP-403 front door; yield its URL and its request log."""
@@ -133,7 +94,7 @@ def front_door() -> Iterator[tuple[str, list[dict[str, str]]]]:
         lock = threading.Lock()
 
     Handler.requests = []
-    server = ThreadingHTTPServer(("127.0.0.1", _find_free_port()), Handler)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     host, port = server.server_address
@@ -148,12 +109,8 @@ def front_door() -> Iterator[tuple[str, list[dict[str, str]]]]:
 def _runner_env(
     server_url: str, state_dir: Path, workspace: Path, log_file: Path
 ) -> dict[str, str]:
-    """Build the exact host->runner launch env, from a clean omnigent context.
-
-    Mirrors ``omnigent host``: a host-provided bootstrap bearer plus delegated
-    auth, pointed at *server_url*. Any inherited ``OMNIGENT*`` / proxy context
-    is stripped so the spawned runner boots from a clean slate.
-    """
+    """Build the ``omnigent host`` runner launch env (bootstrap bearer plus
+    delegated auth), stripped of inherited ``OMNIGENT*``/proxy context."""
     env = {**os.environ}
     for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
         env.pop(name, None)
@@ -187,12 +144,7 @@ def _runner_env(
 
 
 def _write_expired_stored_login(state_dir: Path, server_url: str) -> None:
-    """Simulate a completed ``omnigent login`` whose grant is now invalid.
-
-    Writes an expired stored OIDC session (with a refresh token) so the runner
-    genuinely *has* a credential to renew — its refresh POST is what the front
-    door then rejects.
-    """
+    """Write an expired stored login with a refresh token for the runner to renew."""
     (state_dir / "auth_tokens.json").write_text(
         json.dumps(
             {
@@ -207,20 +159,15 @@ def _write_expired_stored_login(state_dir: Path, server_url: str) -> None:
 
 
 def _run_runner(
-    server_url: str, *, with_stored_login: bool
-) -> tuple[int | None, str, list[dict[str, str]]]:
-    """Launch the real runner once against *server_url*; return exit + output.
-
-    :returns: ``(returncode, combined_output, front_door_requests_snapshot)``
-        where combined_output is stderr + the runner process log (ANSI
-        stripped).
-    """
-    tmp = Path(tempfile.mkdtemp(prefix="runner-tunnel-auth-"))
-    state_dir = tmp / "state"
-    state_dir.mkdir()
-    workspace = tmp / "ws"
+    server_url: str, run_dir: Path, *, with_stored_login: bool
+) -> tuple[int | None, str]:
+    """Launch the real runner once; return its exit code and stderr plus the
+    process log (ANSI stripped)."""
+    state_dir = run_dir / "state"
+    state_dir.mkdir(parents=True)
+    workspace = run_dir / "ws"
     workspace.mkdir()
-    log_file = tmp / "runner.log"
+    log_file = run_dir / "runner.log"
     if with_stored_login:
         _write_expired_stored_login(state_dir, server_url)
     env = _runner_env(server_url, state_dir, workspace, log_file)
@@ -241,19 +188,18 @@ def _run_runner(
         rc = None
     log_text = log_file.read_text() if log_file.exists() else ""
     combined = _ANSI.sub("", f"{err}\n{log_text}")
-    return rc, combined, []
+    return rc, combined
 
 
 def test_runner_exits_after_bootstrap_rejection_with_no_recoverable_credential(
-    front_door: tuple[str, list[dict[str, str]]],
+    front_door: tuple[str, list[dict[str, str]]], tmp_path: Path
 ) -> None:
-    """Facet A journey guard: bootstrap 403 + no recoverable credential ->
-    runner cannot connect, exits non-zero after the fatal 403 streak, and a
-    fresh relaunch fails identically."""
+    """With no recoverable credential the runner exits non-zero after the
+    fatal 403 streak, and a fresh relaunch fails identically."""
     server_url, _requests = front_door
 
-    rc1, out1, _ = _run_runner(server_url, with_stored_login=False)
-    rc2, out2, _ = _run_runner(server_url, with_stored_login=False)
+    rc1, out1 = _run_runner(server_url, tmp_path / "first", with_stored_login=False)
+    rc2, out2 = _run_runner(server_url, tmp_path / "relaunch", with_stored_login=False)
 
     for rc, out in ((rc1, out1), (rc2, out2)):
         assert rc is not None, f"runner hung instead of exiting; output tail:\n{out[-2000:]}"
@@ -270,35 +216,24 @@ def test_runner_exits_after_bootstrap_rejection_with_no_recoverable_credential(
 
 
 def test_runner_failure_diagnosis_surfaces_rejected_refresh_reason(
-    front_door: tuple[str, list[dict[str, str]]],
+    front_door: tuple[str, list[dict[str, str]]], tmp_path: Path
 ) -> None:
-    """Facet B fail->pass target: a stored OIDC credential exists but its
-    refresh grant is rejected. The runner attempts the refresh (proving a
-    credential existed), so it must not claim "no SDK/OIDC credential is
-    available to renew it"; it must surface that the stored credential's
-    renewal was refused."""
+    """A stored login exists but its refresh is refused: the diagnosis must
+    name the refusal instead of claiming no credential was available."""
     server_url, requests = front_door
 
-    rc, out, _ = _run_runner(server_url, with_stored_login=True)
+    rc, out = _run_runner(server_url, tmp_path / "run", with_stored_login=True)
 
     assert rc is not None, f"runner hung instead of exiting; output tail:\n{out[-2000:]}"
     assert rc != 0, f"runner exited 0 despite rejected renewal; output tail:\n{out[-2000:]}"
 
-    # A stored credential existed: the runner attempted to refresh it, and the
-    # front door rejected that refresh (HTTP 403). This is what makes the
-    # "no credential is available" claim below inaccurate.
-    refresh_posts = [
-        r
-        for r in requests
-        if r["method"] == "POST" and ("oauth" in r["path"] or "token" in r["path"])
-    ]
+    # The stored-login refresh itself (not the delegated mint) must have been attempted.
+    refresh_posts = [r for r in requests if r["method"] == "POST" and r["path"] == "/oauth/token"]
     assert refresh_posts, (
-        "expected the runner to attempt a refresh of the stored OIDC login "
-        f"(POST /oauth/token); front-door requests were: {requests}"
+        "expected the runner to refresh the stored OIDC login via POST /oauth/token; "
+        f"front-door requests were: {requests}"
     )
 
-    # Fixed behaviour: because a stored credential existed and its renewal was
-    # rejected, the runner must not report that none was available.
     assert _NO_CREDENTIAL_CLAIM not in out, (
         "runner inaccurately claimed no credential was available even though a "
         "stored OIDC login existed and its refresh was rejected (HTTP 403); "
