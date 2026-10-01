@@ -348,12 +348,9 @@ def effective_config_with_detected(
                 merged = set_default_provider(merged, name, family)
                 break
 
-    # The pi scope auto-defaults only as a gap-filler, and only to pi's own
-    # login: when the cross-family fallback already routes pi (an anthropic /
-    # openai default a pi launch can consume), that routing is preserved.
-    # Only when nothing serves pi does a detected pi login become its explicit
-    # default — the "Pi original auth" state, under which a pi launch uses
-    # ``~/.pi/agent`` as-is.
+    # Default pi's own login for the pi scope only when nothing else serves
+    # pi: a working cross-family route (an anthropic / openai default a pi
+    # launch can consume) is preserved over the "Pi original auth" state.
     if default_provider_for_harness({**config, "providers": merged}, PI_SURFACE) is None:
         for det in detected:
             if det.name not in synthesized or det.name in explicit:

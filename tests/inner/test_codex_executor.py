@@ -4516,6 +4516,22 @@ def test_clean_codex_env_declared_env_key_never_overrides_deny(tmp_path, monkeyp
     assert "OPENAI_API_KEY" not in env
 
 
+def test_clean_codex_env_declared_env_key_never_forwards_framework_tokens(
+    tmp_path, monkeypatch
+) -> None:
+    """A config naming an Omnigent control-plane token cannot pull it into Codex's env."""
+    from omnigent.inner.codex_executor import _clean_codex_env
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    _write_codex_env_key_config(tmp_path, "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "framework-secret")
+
+    env = _clean_codex_env()
+
+    assert "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN" not in env
+
+
 def test_clean_codex_env_includes_omnigent_session_marker(monkeypatch) -> None:
     """The ``OMNIGENT`` session marker survives the codex env scrub.
 

@@ -6,9 +6,9 @@ pseudo-TTY with the real harness CLI on PATH and a fresh ``$HOME``:
 1. Pi is signed in through its own CLI (``~/.pi/agent/auth.json``); ``pi auth
    check`` reports ``ready``. The Pi row must not read ``Not configured``.
 2. Codex is configured through its own ``~/.codex/config.toml`` (a custom
-   ``model_provider`` authenticating via ``env_key``, variable exported); a
-   bare ``codex`` resolves that provider. The Codex row must not read ``Not
-   configured``.
+   ``model_provider`` authenticating via ``env_key`` against the repo's mock
+   OpenAI-compatible server); a bare ``codex exec`` answers through it only
+   when the variable is exported. The Codex row must not read ``Not configured``.
 
 Usage::
 
@@ -28,12 +28,15 @@ from pathlib import Path
 
 import pytest
 
+from tests.e2e.conftest import set_fallback_mock_llm
+
 pexpect = pytest.importorskip("pexpect")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]")
 _POINTER = "❯"
 _ROW_MARKERS = ("Not configured", "Not installed", "Needs upgrade", "✓")
+_MOCK_REPLY = "MOCK_PROXY_REPLY: hello from the mock provider"
 
 
 def _fresh_home(tmp_path: Path) -> Path:
@@ -144,28 +147,55 @@ def test_pi_native_login_is_not_reported_as_unconfigured(tmp_path: Path) -> None
 
 
 @pytest.mark.timeout(300)
-def test_codex_config_provider_is_not_reported_as_unconfigured(tmp_path: Path) -> None:
+def test_codex_config_provider_is_not_reported_as_unconfigured(
+    tmp_path: Path, isolated_mock_llm_server_url: str
+) -> None:
     if shutil.which("codex") is None:
         pytest.skip("codex CLI is required")
     home = _fresh_home(tmp_path)
     codex_dir = home / ".codex"
     codex_dir.mkdir()
     (codex_dir / "config.toml").write_text(
+        'model = "mock-model"\n'
         'model_provider = "myproxy"\n'
         "\n"
         "[model_providers.myproxy]\n"
         'name = "My Proxy"\n'
-        'base_url = "https://myproxy.example.com/v1"\n'
+        f'base_url = "{isolated_mock_llm_server_url}/v1"\n'
         'env_key = "MYPROXY_API_KEY"\n'
         'wire_api = "responses"\n'
     )
+    set_fallback_mock_llm(isolated_mock_llm_server_url, "mock-model", _MOCK_REPLY)
     env = _base_env(home)
-    env["MYPROXY_API_KEY"] = "populated-proxy-token"
+    env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost"
+    codex_exec = ["codex", "exec", "--skip-git-repo-check", "-s", "read-only", "Say hello"]
 
-    version = subprocess.run(
-        ["codex", "--version"], env=env, capture_output=True, text=True, timeout=60
+    # Control: without the variable codex itself refuses the provider — the
+    # env_key is what authenticates it.
+    unset = subprocess.run(
+        codex_exec,
+        env=env,
+        cwd=home / "work",
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
-    assert version.returncode == 0, version.stderr
+    assert unset.returncode != 0 and "MYPROXY_API_KEY" in unset.stderr, unset.stderr
+
+    env["MYPROXY_API_KEY"] = "populated-proxy-token"
+    answered = subprocess.run(
+        codex_exec,
+        env=env,
+        cwd=home / "work",
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert answered.returncode == 0, answered.stderr
+    assert "provider: myproxy" in answered.stderr, answered.stderr
+    assert _MOCK_REPLY in answered.stdout, answered.stdout
 
     row = _setup_overview_row(env, "Codex")
     assert "Not installed" not in row and "Needs upgrade" not in row, row

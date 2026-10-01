@@ -845,6 +845,9 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         # Subscription name is derived from the CLI — no prompt.
         name = f"{cli_name}-subscription"
         entry = build_subscription_provider_entry(cli_name)
+        # Re-adding the CLI's login drops any standing dismissal of its
+        # detection (pi's Remove records one), so it auto-adopts again later.
+        _clear_detection_dismissal(cli_name)
 
     elif kind == "gateway":
         name = prompt_text("Name for this gateway", default="gateway")
@@ -3217,10 +3220,8 @@ def _remove_subscription(provider: str, family: str) -> str | None:
     spec = harness_install_spec(family)
     disp = spec.display if spec is not None else family
     if spec is None or spec.logout_args is None:
-        # No logout command to drive (pi's login lives in its own
-        # ``~/.pi/agent``): removal can't sign the CLI out, so
-        # ``_remove_credential`` records a dismissal instead — otherwise the
-        # next configure open re-adopts the unchanged login.
+        # Pi has no logout command omnigent can drive, so removal records a
+        # dismissal instead — otherwise the next configure open re-adopts it.
         choice = select(
             f"Remove {disp} credential?",
             [f"Yes — remove it here (keeps {disp}'s own login)", "No — keep it"],
@@ -3423,13 +3424,8 @@ def _remove_credential(provider: str) -> str | None:
         )
 
     # If a live ambient detection backs this entry, removing the entry alone
-    # is a no-op: the next configure open re-detects and re-adopts it (the
-    # "Remove doesn't remove" bug). A subscription whose CLI has a logout
-    # command is exempt — its removal path signs out of the CLI instead, and
-    # a future re-login SHOULD re-adopt. Everything else (env API key, codex
-    # config.toml provider, local Ollama, a pi login omnigent can't sign out)
-    # gets a persisted dismissal that the add menu's detected option clears
-    # on re-add.
+    # is a no-op (the next configure open re-adopts it). Removals that sign the
+    # CLI out are exempt — re-login SHOULD re-adopt; the rest get a dismissal.
     backing = next(
         (d for d in detect_providers() if _backs_entry(d) and not _removal_signs_out(d)),
         None,

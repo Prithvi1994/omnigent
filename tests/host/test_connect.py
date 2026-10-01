@@ -4021,6 +4021,39 @@ def test_build_runner_env_forwards_codex_config_declared_env_key(
     assert "UNLISTED_SECRET" not in env
 
 
+def test_build_runner_env_declared_env_key_cannot_forward_framework_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config.toml naming the host token as its ``env_key`` does not leak it to the runner."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "config.toml").write_text(
+        'model_provider = "myproxy"\n'
+        "[model_providers.myproxy]\n"
+        'base_url = "https://myproxy.example.com/v1"\n'
+        'env_key = "OMNIGENT_HOST_TOKEN"\n',
+        encoding="utf-8",
+    )
+    base = {
+        "PATH": "/usr/bin",
+        "HOME": str(tmp_path),
+        "OMNIGENT_HOST_TOKEN": "framework-secret",
+    }
+
+    env = _build_runner_env(
+        base,
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    assert "OMNIGENT_HOST_TOKEN" not in env
+
+
 def test_dispatch_trace_context_reaches_runner_but_not_daemon(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -94,6 +94,10 @@ def isolated_config(tmp_path, monkeypatch):
     # Redirect CLI-detected credential homes so a developer's real
     # ~/.claude / ~/.codex logins don't leak into ambient detection.
     monkeypatch.setenv("HOME", str(tmp_path))
+    # The codex / pi detectors honor these relocation vars; a developer's
+    # shell value would bypass the tmp-HOME isolation.
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
     # Stub out the two ambient-detection helpers that read real machine
     # state regardless of HOME / env-var isolation:
     # - _ollama_reachable: TCP-probes localhost:11434; a running Ollama
@@ -3703,10 +3707,9 @@ def test_render_listing_default_marker_survives_non_utf8_console(
 
 
 # ── Codex configured by its own config.toml (env_key) ───────────────────────
-# An env_key custom provider is deliberately never adopted (its credential is
-# an environment variable, not a self-contained table), yet a bare `codex`
-# resolves it provider-ready — so the overview credits it via a row-level
-# fallback instead of reading "Not configured".
+# An env_key custom provider is never adopted (its credential is an env var),
+# yet a bare `codex` resolves it provider-ready — so the overview credits it
+# via a row-level fallback instead of reading "Not configured".
 
 
 def _seed_codex_env_key_provider(home: str) -> None:
@@ -3775,25 +3778,8 @@ def test_harness_overview_credits_codex_own_env_key_config(isolated_config, monk
     The reported bug: codex configured entirely through its own
     ``~/.codex/config.toml`` (custom provider + exported env_key token) ran
     fine as a bare ``codex`` but ``omni setup`` showed "Not configured".
-    The row must name the provider; no entry is adopted (the credential is an
-    env var, not a self-contained table).
-    """
-    monkeypatch.delenv("CODEX_HOME", raising=False)
-    _seed_codex_env_key_provider(isolated_config)
-    monkeypatch.setenv("MYPROXY_API_KEY", "populated-proxy-token")
-
-    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
-    assert result.exit_code == 0, result.output
-    assert "My Proxy (Codex config)" in result.output
-    # Nothing was adopted — the ready state is a readout of codex's own config.
-    assert _config_yaml(isolated_config).get("providers", {}) == {}
-
-
-def test_overview_credits_codex_config_env_key_provider(isolated_config, monkeypatch) -> None:
-    """A Codex configured by its own ``config.toml`` ``env_key`` provider is configured.
-
-    With the declared variable populated, a bare ``codex`` authenticates against
-    that provider, so the overview must not report Codex as ``Not configured``.
+    The Codex row must name the provider; no entry is adopted (the credential
+    is an env var, not a self-contained table).
     """
     _seed_codex_env_key_provider(isolated_config)
     monkeypatch.setenv("MYPROXY_API_KEY", "populated-proxy-token")
@@ -3804,7 +3790,9 @@ def test_overview_credits_codex_config_env_key_provider(isolated_config, monkeyp
 
     status = _overview_status(options, selectable, "Codex")
     assert "Not configured" not in status, status
-    assert "✓" in status, status
+    assert "✓ My Proxy (Codex config)" in status, status
+    # Nothing was adopted — the ready state is a readout of codex's own config.
+    assert _config_yaml(isolated_config).get("providers", {}) == {}
 
 
 # ── Pi native login (Pi original auth) ──────────────────────────────────────
@@ -3853,7 +3841,7 @@ def test_harness_overview_credits_pi_native_login(isolated_config, monkeypatch) 
     assert entry["kind"] == "subscription"
     assert entry["cli"] == "pi"
     # The gap-filling pi-scope default (nothing else serves pi here).
-    assert entry["default"] is True or entry.get("default") == "pi"
+    assert entry["default"] == "pi"
 
 
 def test_overview_credits_pi_native_login(isolated_config, monkeypatch) -> None:
@@ -3938,3 +3926,27 @@ def test_remove_pi_subscription_dismisses_detection(isolated_config, monkeypatch
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
     assert result.exit_code == 0, result.output
     assert "pi" not in _config_yaml(isolated_config).get("providers", {})
+
+    # Open 4: L1 6=Pi → L2 1=+ Add a credential → 3=Pi — original auth →
+    # L2 q → L1 q. Re-adding the login by hand is the user saying they want
+    # it after all, so the dismissal must go with it.
+    stdin = "\n".join(["6", "1", "3", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+    cfg = _config_yaml(isolated_config)
+    assert cfg["providers"]["pi-subscription"] == {
+        "kind": "subscription",
+        "cli": "pi",
+        "default": "pi",
+    }
+    assert "pi" not in cfg.get("dismissed_detections", [])
+
+    # Open 5: with the explicit entry gone again (hand-edited away), a plain
+    # reopen auto-adopts the login once more — the stale dismissal is not
+    # left behind to block it.
+    cfg["providers"].pop("pi-subscription")
+    with open(os.path.join(isolated_config, "config.yaml"), "w") as f:
+        yaml.safe_dump(cfg, f)
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+    assert result.exit_code == 0, result.output
+    assert "pi" in _config_yaml(isolated_config)["providers"]

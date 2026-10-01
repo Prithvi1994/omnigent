@@ -949,6 +949,42 @@ def test_default_provider_without_credential_logged_out_marks_login_required(
     assert launch.login_required is True
 
 
+def test_default_provider_without_credential_defers_to_codex_config(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unroutable default provider defers to Codex's own env_key provider.
+
+    Startup diagnostics surface the summary, so it must name the config.toml
+    provider that carries the launch rather than predict a sign-in screen the
+    TUI never shows.
+    """
+    _write_codex_login(_isolated, logged_in=False)
+    _write_codex_env_key_config(_isolated, "MYPROXY_API_KEY")
+    monkeypatch.setenv("MYPROXY_API_KEY", "populated-proxy-token")
+    monkeypatch.delenv("MISSING_CODEX_TEST_KEY", raising=False)
+    _seed(
+        _isolated,
+        {
+            "broken": {
+                "kind": "key",
+                "default": True,
+                "openai": {
+                    "base_url": "https://broken.example.com/v1",
+                    "api_key_ref": "env:MISSING_CODEX_TEST_KEY",
+                },
+            }
+        },
+    )
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert launch.config_overrides == []
+    assert "no usable openai credential" in launch.summary
+    assert "config.toml" in launch.summary
+    assert "sign-in screen" not in launch.summary
+    assert launch.login_required is False
+
+
 def test_global_api_key_routes_without_model_or_cli_login(
     _isolated: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

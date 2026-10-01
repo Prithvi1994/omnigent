@@ -381,6 +381,29 @@ def test_build_host_daemon_env_forwards_codex_config_declared_env_key(
     assert "UNLISTED_SECRET" not in env
 
 
+def test_build_host_daemon_env_remote_declared_env_key_cannot_forward_framework_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Remote mode: a config.toml naming a runner token as ``env_key`` does not forward it."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "config.toml").write_text(
+        'model_provider = "myproxy"\n'
+        "[model_providers.myproxy]\n"
+        'base_url = "https://myproxy.example.com/v1"\n'
+        'env_key = "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "framework-secret")
+
+    env = _build_host_daemon_env(server_url="https://example.databricksapps.com")
+
+    assert "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN" not in env
+
+
 def test_build_host_daemon_env_remote_strips_provider_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

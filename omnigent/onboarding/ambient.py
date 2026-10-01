@@ -915,12 +915,9 @@ def _detect_providers_now() -> list[DetectedProvider]:
             )
         )
 
-    # 5. Pi CLI login. Pi stores one credential per provider in its own
-    #    ``~/.pi/agent/auth.json`` (its ``/login``), so a usable entry means a
-    #    bare ``pi`` runs without omnigent managing a provider — the "Pi
-    #    original auth" state the setup menu offers manually. Detecting it
-    #    lets adoption credit that login instead of reporting Pi as not
-    #    configured.
+    # 5. Pi CLI login (``~/.pi/agent/auth.json``): a usable entry means a bare
+    #    ``pi`` runs on its own auth, so adoption credits it as "Pi original
+    #    auth" instead of reporting Pi as not configured.
     if pi_auth_has_credential(_pi_auth_path()):
         detected.append(
             DetectedProvider(

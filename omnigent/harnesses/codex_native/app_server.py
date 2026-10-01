@@ -3939,24 +3939,30 @@ def resolve_native_codex_launch(
             )
         return launch
     # Default provider can't route on its own (no openai surface / no usable
-    # credential / unresolvable secret) → Codex's own login.
+    # credential / unresolvable secret) → Codex's own config or login.
+    config_carries = _codex_own_config_carries_launch(no_provider_overrides)
     _logger.warning(
         "native-codex: provider %r is the Codex default but has no usable openai "
-        "credential — falling back to Codex's own login.",
+        "credential — falling back to Codex's own %s.",
         entry.name,
+        "config.toml provider" if config_carries else "login",
     )
+    unroutable = (
+        f"provider {entry.name!r} is the codex default but has no usable openai credential"
+    )
+    if config_carries:
+        summary = f"Codex's own config.toml provider ({unroutable})"
+    else:
+        summary = (
+            f"Codex CLI login ({unroutable}) — the TUI likely renders the sign-in screen "
+            "and never starts a thread"
+        )
     return NativeCodexLaunch(
         config_overrides=no_provider_overrides,
         model=model,
         profile=None,
-        summary=(
-            f"Codex CLI login (provider {entry.name!r} is the codex default but has no "
-            "usable openai credential) — the TUI likely renders the sign-in screen "
-            "and never starts a thread"
-        ),
-        login_required=not (
-            _codex_login_usable() or _codex_own_config_carries_launch(no_provider_overrides)
-        ),
+        summary=summary,
+        login_required=not (config_carries or _codex_login_usable()),
     )
 
 
