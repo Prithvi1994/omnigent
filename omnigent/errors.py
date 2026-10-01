@@ -606,11 +606,11 @@ def is_cancelled_rpc_error(exc: BaseException) -> bool:
     """Whether *exc* is a gRPC call cancelled by its peer or endpoint teardown.
 
     Matched structurally — an ``RpcError`` ancestor by class name plus a
-    ``code()`` whose status is named ``CANCELLED``, or ``UNAVAILABLE`` with
-    the GOAWAY details ``"Cancelling all calls"`` that an endpoint teardown
-    (e.g. a released channel lease) sends to in-flight calls — so a vendored
-    copy of grpc (a different class identity than pypi grpcio) still matches
-    and this module imports no grpc.
+    ``code()`` whose status is named ``CANCELLED``, or ``UNAVAILABLE`` whose
+    details carry the GOAWAY text ``Cancelling all calls`` that an endpoint
+    teardown (e.g. a released channel lease) sends to in-flight calls — so a
+    vendored copy of grpc (a different class identity than pypi grpcio) still
+    matches and this module imports no grpc.
 
     :param exc: The exception to inspect.
     :returns: ``True`` only for a cancellation-shaped RPC error.
@@ -633,9 +633,10 @@ def is_cancelled_rpc_error(exc: BaseException) -> bool:
     if not callable(details):
         return False
     try:
-        return details() == "Cancelling all calls"
+        text = details()
     except Exception:  # noqa: BLE001 — a details reader that itself fails is not a cancellation
         return False
+    return isinstance(text, str) and "Cancelling all calls" in text
 
 
 # EDQUOT is POSIX-only; Windows reports a full disk as ENOSPC.

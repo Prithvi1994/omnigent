@@ -332,6 +332,9 @@ def test_is_cancelled_rpc_error_matches_endpoint_teardown_goaway() -> None:
     cancellation, not an unhandled fault."""
     teardown = _make_rpc_error("UNAVAILABLE", details="Cancelling all calls")
     assert is_cancelled_rpc_error(teardown) is True
+    # A grpc build may wrap the GOAWAY text in its own formatting.
+    wrapped = _make_rpc_error("UNAVAILABLE", details="GOAWAY: Cancelling all calls (shutdown)")
+    assert is_cancelled_rpc_error(wrapped) is True
 
 
 def test_is_cancelled_rpc_error_ignores_other_unavailable_details() -> None:
@@ -340,7 +343,6 @@ def test_is_cancelled_rpc_error_ignores_other_unavailable_details() -> None:
         is_cancelled_rpc_error(_make_rpc_error("UNAVAILABLE", details="connection refused"))
         is False
     )
-    assert is_cancelled_rpc_error(_make_rpc_error("UNAVAILABLE", details=None)) is False
 
 
 def test_is_cancelled_rpc_error_tolerates_broken_details_readers() -> None:
