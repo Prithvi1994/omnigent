@@ -180,6 +180,7 @@ from omnigent.runtime.websocket_metrics import (
     websocket_close_code,
     websocket_close_reason,
 )
+from omnigent.session_import.errors import ImportErrorCode
 from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
@@ -2657,6 +2658,7 @@ class HostProcess:
                                 "This session is too large for the connected server. "
                                 "Upgrade the server and retry."
                             ),
+                            "code": ImportErrorCode.SESSION_TOO_LARGE,
                         }
                     )
                     continue
