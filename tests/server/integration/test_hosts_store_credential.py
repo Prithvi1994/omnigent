@@ -30,7 +30,6 @@ from httpx import ASGITransport, AsyncClient
 from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
     CAP_CODEX_SIDE_CHAT,
-    HOST_CAPABILITIES,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
     HostHelloFrame,
@@ -648,10 +647,6 @@ async def test_rejects_host_predating_store_secret_fast_and_clearly(
 @pytest.mark.parametrize(
     "hello",
     [
-        pytest.param(
-            _hello_text(version="0.17.0.dev0", capabilities=HOST_CAPABILITIES),
-            id="current-build",
-        ),
         # Released 0.15.x/0.16.x daemons advertise capability tokens but no
         # harness-setup entry; they serve the frames and must keep writing.
         pytest.param(

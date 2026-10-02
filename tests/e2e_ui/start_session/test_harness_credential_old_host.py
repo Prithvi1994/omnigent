@@ -276,8 +276,8 @@ def test_setup_dialog_save_against_old_host_gives_prompt_feedback(old_host_serve
 async def _drive_setup_dialog_save(base_url: str) -> None:
     async with _old_host(base_url) as host_id, async_playwright() as pw:
         browser = await pw.chromium.launch()
-        # Explicit context so a recorded video is finalized on context.close()
-        # even when the drive fails mid-way.
+        # Explicit context so a conftest-recorded video is finalized on
+        # context.close() even when the drive fails mid-way.
         context = await browser.new_context()
         page = await context.new_page()
         try:
@@ -314,8 +314,10 @@ async def _drive_setup_dialog_save(base_url: str) -> None:
             # … naming the remedy, never the misleading responsiveness blame.
             await expect(toast).to_contain_text("update omnigent on the host")
             await expect(toast).not_to_contain_text("did not respond")
-            # Hold the toast on screen so a recording ends on it.
-            await page.wait_for_timeout(3_000)
+            # The e2e_ui conftest films every context when OMNIGENT_E2E_RECORD_DIR is
+            # set; keep the toast on screen so that clip ends on it.
+            if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
+                await page.wait_for_timeout(3_000)
         finally:
             await context.close()
             await browser.close()
