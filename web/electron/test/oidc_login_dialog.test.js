@@ -389,6 +389,7 @@ describe("OIDC login modal", () => {
   it("resolves false immediately when opened with an already superseded attempt", async () => {
     const controller = new AbortController();
     controller.abort();
+    let attempted = false;
     const flow = runOidcLoginDialog({
       BrowserWindow: FakeBrowserWindow,
       ipcMain: new EventEmitter(),
@@ -397,10 +398,14 @@ describe("OIDC login modal", () => {
       pagePath: "/app/oidc_login.html",
       preloadPath: "/app/oidc_login_preload.js",
       signal: controller.signal,
-      runAttempt: async () => assert.fail("attempted a superseded sign-in"),
+      runAttempt: async () => {
+        attempted = true;
+        return { ok: false, error: "unexpected" };
+      },
     });
 
     assert.equal(await flow, false);
+    assert.equal(attempted, false);
     assert.equal(latestWindow().destroyed, true);
   });
 });

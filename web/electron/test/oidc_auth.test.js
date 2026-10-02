@@ -1132,3 +1132,26 @@ describe("OIDC server URL validation", () => {
     assert.equal(oidcServerUrlError("https://server.example/"), null);
   });
 });
+
+describe("OIDC ticket cancellation", () => {
+  it("does not open the browser when cancelled while the ticket arrives", async () => {
+    const controller = new AbortController();
+    const opened = [];
+    const result = await runOidcBrowserLogin(
+      {
+        fetch: async () => ({
+          status: 200,
+          json: async () => {
+            controller.abort();
+            return { ticket: "t", login_url: "/auth/login?ticket=t" };
+          },
+        }),
+      },
+      "https://server.example",
+      async (url) => opened.push(url),
+      { pollIntervalMs: 1, signal: controller.signal },
+    );
+    assert.deepEqual(result, { ok: false, reason: "cancelled" });
+    assert.deepEqual(opened, []);
+  });
+});

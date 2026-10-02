@@ -21,8 +21,8 @@ const OIDC_LOGIN_STATE_CHANNEL = "omnigent:oidc-login-state";
  *   }) => Promise<
  *     { ok: true } | { ok: false, error: string }
  *   >,
- *   signal?: AbortSignal, Closes the dialog when the connection attempt is superseded.
- * }} params
+ *   signal?: AbortSignal,
+ * }} params `signal` closes the dialog when the connection attempt is superseded.
  * @returns {Promise<boolean>} true after a verified login; false on cancel/close.
  */
 function runOidcLoginDialog({
@@ -155,6 +155,7 @@ function runOidcLoginDialog({
     loginWindow.webContents.on("will-navigate", (event) => event.preventDefault());
     loginWindow.webContents.on("will-redirect", (event) => event.preventDefault());
     loginWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    loginWindow.webContents.on("render-process-gone", () => finish(false));
     loginWindow.webContents.on("did-finish-load", () => {
       sendState();
       if (attemptNumber === 0) void attempt();

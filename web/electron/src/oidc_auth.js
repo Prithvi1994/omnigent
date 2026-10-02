@@ -101,8 +101,7 @@ function oidcServerUrlError(serverUrl) {
   if (
     (parsed.protocol !== "https:" && parsed.protocol !== "http:") ||
     parsed.username ||
-    parsed.password ||
-    parsed.hash
+    parsed.password
   ) {
     return "invalid_server_url";
   }
@@ -212,6 +211,7 @@ async function runOidcBrowserLogin(
     if (!ticket || !loginUrl) {
       return { ok: false, reason: "failed" };
     }
+    if (isUserAbort(signal)) return { ok: false, reason: "cancelled" };
     await openExternal(loginUrl);
   } catch {
     return { ok: false, reason: isUserAbort(signal) ? "cancelled" : "failed" };
