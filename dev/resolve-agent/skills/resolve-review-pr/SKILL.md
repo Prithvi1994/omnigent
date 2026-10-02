@@ -150,23 +150,25 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
 7. **Archive the copied repro test and clean the worktree before the final
    handoff.** The test at `test_path` — copied from the repro session,
    materialized from the CI bundle, or restored by CI before your session
-   started — is untracked scratch source. In comment-only review it never
-   becomes part of the PR, and the workflow's delivery check treats any
-   untracked test file as uncommitted source, so leaving it behind costs a
-   dirty-checkpoint correction turn whose only work is deleting it. Once Step 4
-   has settled and you no longer need to run it:
+   started — is scratch source: usually a new untracked file, sometimes a
+   reused repository test the repro modified in place. In comment-only review
+   it never becomes part of the PR, and the workflow's delivery check treats
+   any untracked or modified test file as uncommitted source, so leaving it
+   behind costs a dirty-checkpoint correction turn whose only work is removing
+   it. Once Step 4 has settled and you no longer need to run it:
    - Retain it under `.omnigent/repro-evidence/` with its original path,
      sha256, the exact command, the tested base and PR head SHAs, and the
      result, following the evidence retention rules in 2B.4.
-   - Then delete the worktree copy and any other reproduction-only files you
-     added, confirm `git status` reports a clean tree, and record the archive
-     location in `test_audit`.
+   - Then delete an untracked copy or restore a modified tracked test to the
+     PR's checked-out version (`git checkout -- <path>`); do the same for any
+     other reproduction-only files you added, confirm `git status` reports a
+     clean tree, and record the archive location in `test_audit`.
    - If a later turn needs the test again, restore it from the archive, rerun
      it, and remove it again before the next handoff.
 
    A test you deliberately selected as permanent coverage while pushing a fix to
    an in-repo PR (2B.4) is committed on the PR branch instead, not left
-   untracked.
+   uncommitted.
 
 **When the existing PR's *approach* is wrong, open your own fix instead.** The
 default above is for a sound PR. But if reviewing shows the PR is not a viable

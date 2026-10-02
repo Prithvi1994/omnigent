@@ -226,11 +226,13 @@ def test_review_path_archives_and_removes_the_copied_repro_test_before_handoff()
 
     for section in (recovery, reviewer, handoff):
         assert ".omnigent/repro-evidence/" in section
-        assert "delete the worktree copy" in section
+        assert "delete an untracked copy or restore a modified tracked test" in section
     assert "scratch source, not a deliverable" in recovery
     for requirement in (
         "restored by CI before your session",
+        "reused repository test the repro modified in place",
         "original path, sha256, the exact command, the tested base and PR head SHAs",
+        "`git checkout -- <path>`",
         "confirm `git status` reports a clean tree",
         "restore it from the archive, rerun it, and remove it again",
     ):

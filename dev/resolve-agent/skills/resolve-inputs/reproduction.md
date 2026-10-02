@@ -80,9 +80,10 @@ and fall back rather than assuming a fixed structure:
 
 **The recovered copy is scratch source, not a deliverable.** Whether you copied
 the test from the session workspace, materialized it from the CI bundle, or CI
-restored it before your session started, the file at `test_path` is untracked
-investigation source in your worktree. On the author path, 2B.4 decides whether
-it becomes permanent coverage or archived evidence. On the existing-PR review
-path, archive it under `.omnigent/repro-evidence/` and delete the worktree copy
-before the final handoff (2A.7); an untracked test left behind fails the
-delivery check and costs a correction turn.
+restored it before your session started, the file at `test_path` is
+investigation source in your worktree: a new untracked file, or a reused
+repository test the repro modified in place. On the author path, 2B.4 decides
+whether it becomes permanent coverage or archived evidence. On the existing-PR
+review path, archive it under `.omnigent/repro-evidence/`, then delete an
+untracked copy or restore a modified tracked test before the final handoff
+(2A.7); a test left behind fails the delivery check and costs a correction turn.
