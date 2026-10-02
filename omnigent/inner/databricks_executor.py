@@ -831,7 +831,9 @@ def _check_profile_still_names_host(cfg: Any) -> None:  # type: ignore[explicit-
     config = _read_databrickscfg_no_inheritance()
     if config is None or not config.has_section(cfg.profile):
         return
-    current = (config[cfg.profile].get("host") or "").strip()
+    # A section without its own host inherits [DEFAULT]'s, as the CLI reads it.
+    default_host = config["DEFAULT"].get("host", "") if config.has_section("DEFAULT") else ""
+    current = (config[cfg.profile].get("host") or default_host).strip()
     if current and _normalized_workspace_host(current) != _normalized_workspace_host(cfg.host):
         raise ValueError(
             f"profile {cfg.profile!r} now names {current}, not the resolved {cfg.host}; "
@@ -1026,6 +1028,7 @@ class _ReusedDatabricksTokenSource:
         try:
             return auth.current_token()
         except DatabricksAuthError:
+            self._auth = None
             return None
 
 

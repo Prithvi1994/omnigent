@@ -3290,5 +3290,8 @@ def test_get_openai_client_profile_without_env_fallback_defers_credential_failur
 
     assert captured["base_url"] == "https://profile-host.example.com/ai-gateway/openai/v1"
     assert isinstance(captured["http_client"], httpx.AsyncClient)
-    with pytest.raises(DatabricksAuthError, match="databricks auth login -p dogfood"):
-        captured["http_client"].auth.current_token()
+    try:
+        with pytest.raises(DatabricksAuthError, match="databricks auth login -p dogfood"):
+            captured["http_client"].auth.current_token()
+    finally:
+        _run(captured["http_client"].aclose())

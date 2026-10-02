@@ -2661,6 +2661,39 @@ def test_reused_token_source_retries_resolution_after_failure(monkeypatch):
     assert source.current_token() == "tok-late"
 
 
+def test_reused_token_source_drops_auth_whose_first_mint_fails(monkeypatch):
+    """A freshly resolved auth that cannot mint is not retried before re-resolving."""
+    from omnigent.inner.databricks_executor import (
+        _DatabricksBearerAuth,
+        _ReusedDatabricksTokenSource,
+    )
+
+    class _Cfg:
+        def __init__(self):
+            self.attempts = 0
+
+        def authenticate(self):
+            self.attempts += 1
+            raise ValueError("invalid_grant")
+
+    cfgs = []
+
+    def _fake_resolve(profile=None, *, host=None):
+        cfgs.append(_Cfg())
+        return _DatabricksBearerAuth(cfgs[-1], profile_name=None), "https://ex.test"
+
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _fake_resolve
+    )
+
+    source = _ReusedDatabricksTokenSource()
+    assert source.current_token() is None
+    assert source.current_token() is None
+    assert [cfg.attempts for cfg in cfgs] == [1, 1], (
+        "each call must resolve once and mint once, not retry the failed auth first"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Deferred SDK credential initialization (real databricks-sdk + fake CLI)
 # ---------------------------------------------------------------------------
@@ -2668,10 +2701,9 @@ def test_reused_token_source_retries_resolution_after_failure(monkeypatch):
 _HOST_A = "https://a.example.cloud.databricks.com"
 _HOST_B = "https://b.example.cloud.databricks.com"
 
-# Stand-in for a modern Databricks CLI: logs every invocation, reports a
-# version that makes newer SDKs mint with ``--profile`` (re-reading that
-# profile's host, like the real CLI), and mints a token naming the host it
-# was asked for unless ``invalid-grant`` exists.
+# Fake modern Databricks CLI: logs invocations, reports a version that makes
+# newer SDKs mint with ``--profile`` (re-reading the profile's host), and
+# mints a host-naming token unless the ``invalid-grant`` marker exists.
 _FAKE_DATABRICKS_CLI = """#!/usr/bin/env python3
 import configparser, json, os, sys
 from datetime import datetime, timedelta
@@ -2784,6 +2816,31 @@ def test_resolve_databricks_auth_keeps_deferred_credentials_bound_to_resolved_ho
     assert fake_databricks_cli.token_calls() == [], (
         "no bearer may be minted for the repointed profile"
     )
+
+
+def test_resolve_databricks_auth_refuses_when_inherited_default_host_is_repointed(
+    fake_databricks_cli: _FakeDatabricksCli, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A profile inheriting ``[DEFAULT]``'s host is guarded by that host too."""
+    from omnigent.inner.databricks_executor import _resolve_databricks_auth
+
+    fake_databricks_cli.cfg_path.write_text(
+        f"[DEFAULT]\nhost = {_HOST_A}\n\n[example]\nauth_type = databricks-cli\n"
+    )
+    # The SDK does not inherit [DEFAULT] into named profiles; the host arrives
+    # from the environment, as it does for the CLI-managed OAuth profiles.
+    monkeypatch.setenv("DATABRICKS_HOST", _HOST_A)
+
+    auth, host = _resolve_databricks_auth("example")
+    fake_databricks_cli.cfg_path.write_text(
+        f"[DEFAULT]\nhost = {_HOST_B}\n\n[example]\nauth_type = databricks-cli\n"
+    )
+
+    assert host == _HOST_A
+    with pytest.raises(DatabricksAuthError) as excinfo:
+        auth.current_token()
+    assert _HOST_B in str(excinfo.value.__cause__)
+    assert fake_databricks_cli.token_calls() == []
 
 
 def test_resolve_databricks_auth_reports_cli_failure_on_first_token_request(
