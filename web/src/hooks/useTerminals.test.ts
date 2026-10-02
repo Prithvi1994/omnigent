@@ -62,6 +62,14 @@ function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): 
 
 const fetchMock = vi.fn();
 
+// A fresh QueryClient per render so query cache never leaks between tests.
+// (Hooks that hard-code their own `retry` are not overridden by this default.)
+function makeWrapper() {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client }, children);
+}
+
 describe("terminalInfoFromResource", () => {
   it("lifts id, metadata.terminal_name, metadata.session_key, metadata.running", () => {
     const info = terminalInfoFromResource({
@@ -374,8 +382,7 @@ describe("createTerminal", () => {
     // idempotent per (terminal, session_key), so a fixed key would
     // return the SAME terminal on every click instead of a new one.
     expect(body.session_key).toMatch(/^u-/);
-    // No resolved theme: the optional field is omitted rather than sent
-    // as null/undefined, so older runners never see an unknown key.
+    // Omit the optional field when no resolved theme is provided.
     expect("terminal_theme" in body).toBe(false);
     // Mapped through terminalInfoFromResource — proves the POST
     // response shape lands as a usable TerminalInfo, not raw wire.
@@ -430,12 +437,6 @@ describe("useCreateTerminal — resolved theme rides the create request", () => 
     window.localStorage.removeItem("omnigent:terminal-theme");
     vi.unstubAllGlobals();
   });
-
-  function makeWrapper() {
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    return ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client }, children);
-  }
 
   const created = () =>
     mockResponse({
@@ -526,15 +527,7 @@ describe("useTerminals reconcile poll (stuck-spinner self-heal)", () => {
     vi.unstubAllGlobals();
   });
 
-  function makeWrapper() {
-    // A fresh client per render so query cache never leaks between tests.
-    // (The hook hard-codes retry:1, which this default does not override; the
-    // mocks below always resolve, so no retry/backoff fires under fake timers.)
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    return ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client }, children);
-  }
-
+  // The mocks below always resolve, so no retry/backoff fires under fake timers.
   const emptyList = () => mockResponse({ object: "list", data: [] });
   const oneShell = () =>
     mockResponse({

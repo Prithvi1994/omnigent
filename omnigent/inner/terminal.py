@@ -742,17 +742,11 @@ _COLORFGBG_BY_TERMINAL_THEME = {"dark": "15;0", "light": "0;15"}
 
 
 def terminal_theme_env_hint(theme: object) -> dict[str, str]:
-    """Translate a client-resolved terminal theme into a PTY background hint.
+    """Return a ``COLORFGBG`` hint for a resolved light/dark theme, else ``{}``.
 
-    The web UI's terminal theme setting repaints only the xterm.js canvas;
-    the process inside the pane picks its own ANSI colors and can pick
-    readable ones only when told what background it renders against. The
-    conventional carrier for that hint is the ``COLORFGBG`` environment
-    variable, which light/dark-adaptive TUIs read at startup.
-
-    :param theme: The resolved theme from the create request — ``"light"``
-        or ``"dark"``. Anything else (missing field, an unresolved
-        ``"auto"``, junk) yields no hint rather than a guess.
+    :param theme: ``"light"`` or ``"dark"`` from the create request. Anything
+        else (missing field, an unresolved ``"auto"``, junk) yields no hint
+        rather than a guess.
     :returns: ``{"COLORFGBG": ...}`` for a recognized theme, else ``{}``.
     """
     if not isinstance(theme, str):
