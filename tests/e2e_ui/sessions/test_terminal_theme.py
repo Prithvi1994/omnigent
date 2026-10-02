@@ -52,7 +52,9 @@ _PANE_BACKGROUND_PROBE = (
     "printf '\\e[30m  LIGHT-TUI DEMO: a light-background TUI paints this near-black  \\e[0m\\n'; "
     "printf 'PTY''BG=%s\\n' \"${COLORFGBG-UNSET}\""
 )
-_PANE_HINT_RE = re.compile(r"PTYBG=([0-9A-Za-z;]+)")
+# The trailing newline keeps the match atomic when the PTY output arrives
+# split across WebSocket frames.
+_PANE_HINT_RE = re.compile(r"PTYBG=([0-9A-Za-z;]+)\r?\n")
 _ANSI_RE = re.compile(
     r"\x1b\[[0-9;?]*[ -/]*[@-~]"  # CSI sequences (colors, cursor moves, modes)
     r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC sequences (titles, clipboard)

@@ -448,11 +448,12 @@ describe("useCreateTerminal — resolved theme rides the create request", () => 
       metadata: { terminal_name: "zsh", session_key: "u-abc123", running: true },
     });
 
-  async function mutateAndReadBody(): Promise<Record<string, unknown>> {
+  async function mutateAndReadBody(beforeMutate?: () => void): Promise<Record<string, unknown>> {
     fetchMock.mockResolvedValueOnce(created());
     const { result } = renderHook(() => useCreateTerminal("conv_abc"), {
       wrapper: makeWrapper(),
     });
+    beforeMutate?.();
     await act(async () => {
       await result.current.mutateAsync("zsh");
     });
@@ -466,8 +467,12 @@ describe("useCreateTerminal — resolved theme rides the create request", () => 
   });
 
   it("a pinned Light terminal theme wins over a dark app", async () => {
-    window.localStorage.setItem("omnigent:terminal-theme", "light");
-    expect((await mutateAndReadBody()).terminal_theme).toBe("light");
+    // Pin the mode after the hook has rendered: it must be read when the
+    // mutation fires, not captured at render time.
+    const body = await mutateAndReadBody(() =>
+      window.localStorage.setItem("omnigent:terminal-theme", "light"),
+    );
+    expect(body.terminal_theme).toBe("light");
   });
 });
 

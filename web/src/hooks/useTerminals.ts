@@ -229,12 +229,9 @@ export async function fetchTerminals(conversationId: string): Promise<TerminalIn
  * :param terminal: Declared terminal name from the agent spec,
  *     e.g. ``"shell"`` (or a shell basename like ``"zsh"`` for a native
  *     session offering the host's installed shells).
- * :param terminalTheme: The concrete light/dark palette the pane will
- *     render with (the terminal theme preference resolved against the
- *     app's appearance). Sent as ``terminal_theme`` so the runner can
- *     tell the pane's process which background it renders against
- *     (``COLORFGBG``) — the canvas repaint alone never reaches the PTY.
- *     Omitted from the body when not provided.
+ * :param terminalTheme: Optional resolved pane palette, sent as
+ *     ``terminal_theme`` so the runner can set ``COLORFGBG``. Omitted
+ *     from the body when not provided.
  * :returns: The created terminal mapped to :class:`TerminalInfo`.
  * :raises Error: When the server rejects the create (e.g. the agent
  *     has no terminal access) or the launch fails.
@@ -285,12 +282,8 @@ export async function createTerminal(
  * waiting for the ``session.resource.created`` SSE round-trip — which
  * still arrives and dedupes as a no-op.
  *
- * The created pane's PTY is told which background it renders against:
- * the terminal theme preference is resolved against the app's current
- * appearance at click time and rides the create request (see
- * :func:`createTerminal`'s ``terminalTheme``). The hint is fixed at
- * launch: a later appearance change repaints an existing pane but not
- * its process environment, so only a newly launched shell picks it up.
+ * Resolves the pane theme at mutation time for the new process; later
+ * theme changes repaint the pane without updating the PTY.
  *
  * :param conversationId: Session/conversation identifier.
  * :returns: TanStack mutation taking the declared terminal name.
