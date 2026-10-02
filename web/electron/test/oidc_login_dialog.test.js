@@ -69,8 +69,8 @@ describe("OIDC login modal", () => {
   it("keeps the sandboxed preload self-contained", () => {
     const source = readFileSync(path.join(__dirname, "../src/oidc_login_preload.js"), "utf8");
     assert.doesNotMatch(source, /require\(["']\.\//);
-    assert.match(source, /omnigent:oidc-login-action/);
-    assert.match(source, /omnigent:oidc-login-state/);
+    assert.ok(source.includes(OIDC_LOGIN_ACTION_CHANNEL));
+    assert.ok(source.includes(OIDC_LOGIN_STATE_CHANNEL));
   });
 
   it("uses a sandboxed isolated preload and cancels an in-flight login", async () => {
@@ -251,5 +251,99 @@ describe("OIDC login modal", () => {
     );
     ipcMain.emit(OIDC_LOGIN_ACTION_CHANNEL, { sender: loginWindow.webContents }, "cancel");
     assert.equal(await flow, false);
+  });
+
+  it("keeps the error state when a progress update arrives after the attempt failed", async () => {
+    const ipcMain = new EventEmitter();
+    let lateUpdate;
+    const flow = runOidcLoginDialog({
+      BrowserWindow: FakeBrowserWindow,
+      ipcMain,
+      parent: {},
+      serverUrl: "https://server.example",
+      pagePath: "/app/oidc_login.html",
+      preloadPath: "/app/oidc_login_preload.js",
+      runAttempt: async ({ updateMessage }) => {
+        lateUpdate = updateMessage;
+        return { ok: false, error: "The browser sign-in did not complete." };
+      },
+    });
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    const loginWindow = latestWindow();
+    lateUpdate("Still waiting…");
+
+    const last = loginWindow.webContents.sent.at(-1).payload;
+    assert.equal(last.phase, "error");
+    assert.equal(last.message, "The browser sign-in did not complete.");
+    ipcMain.emit(OIDC_LOGIN_ACTION_CHANNEL, { sender: loginWindow.webContents }, "cancel");
+    assert.equal(await flow, false);
+  });
+
+  it("resolves false when the window closes mid-attempt or its page fails to load", async () => {
+    const ipcMain = new EventEmitter();
+    let aborted = false;
+    const closing = runOidcLoginDialog({
+      BrowserWindow: FakeBrowserWindow,
+      ipcMain,
+      parent: {},
+      serverUrl: "https://server.example",
+      pagePath: "/app/oidc_login.html",
+      preloadPath: "/app/oidc_login_preload.js",
+      runAttempt: ({ signal }) =>
+        new Promise(() => {
+          signal.addEventListener("abort", () => {
+            aborted = true;
+          });
+        }),
+    });
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    latestWindow().close();
+    assert.equal(await closing, false);
+    assert.equal(aborted, true);
+
+    class BrokenWindow extends FakeBrowserWindow {
+      async loadFile() {
+        throw new Error("page missing");
+      }
+    }
+    const broken = runOidcLoginDialog({
+      BrowserWindow: BrokenWindow,
+      ipcMain,
+      parent: {},
+      serverUrl: "https://server.example",
+      pagePath: "/app/oidc_login.html",
+      preloadPath: "/app/oidc_login_preload.js",
+      runAttempt: async () => ({ ok: true }),
+    });
+    assert.equal(await broken, false);
+  });
+
+  it("closes when the connection attempt that opened it is superseded", async () => {
+    const ipcMain = new EventEmitter();
+    const controller = new AbortController();
+    const flow = runOidcLoginDialog({
+      BrowserWindow: FakeBrowserWindow,
+      ipcMain,
+      parent: {},
+      serverUrl: "https://server.example",
+      pagePath: "/app/oidc_login.html",
+      preloadPath: "/app/oidc_login_preload.js",
+      signal: controller.signal,
+      runAttempt: ({ signal }) =>
+        new Promise((resolve) => {
+          signal.addEventListener("abort", () => resolve({ ok: false, error: "cancelled" }));
+        }),
+    });
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    controller.abort();
+
+    assert.equal(await flow, false);
+    assert.equal(latestWindow().destroyed, true);
   });
 });

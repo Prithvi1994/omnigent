@@ -23,6 +23,7 @@ const OIDC_LOGIN_STATE_CHANNEL = "omnigent:oidc-login-state";
  *   }) => Promise<
  *     { ok: true } | { ok: false, error: string }
  *   >,
+ *   signal?: AbortSignal, Closes the dialog when the connection attempt is superseded.
  * }} params
  * @returns {Promise<boolean>} true after a verified login; false on cancel/close.
  */
@@ -34,6 +35,7 @@ function runOidcLoginDialog({
   pagePath,
   preloadPath,
   runAttempt,
+  signal,
 }) {
   return new Promise((resolve) => {
     const loginWindow = new BrowserWindow({
@@ -72,6 +74,7 @@ function runOidcLoginDialog({
     let inFlight = false;
     let controller = null;
     let settled = false;
+    const UNEXPECTED_ERROR = "Sign-in failed unexpectedly. Please try again.";
 
     const sendState = () => {
       if (!loginWindow.isDestroyed()) {
@@ -106,6 +109,7 @@ function runOidcLoginDialog({
       const updateMessage = (message) => {
         if (
           settled ||
+          !inFlight ||
           currentAttempt !== attemptNumber ||
           typeof message !== "string" ||
           message === ""
@@ -119,8 +123,9 @@ function runOidcLoginDialog({
       try {
         result = await runAttempt({ signal: controller.signal, updateMessage });
       } catch {
-        result = { ok: false, error: "Sign-in failed unexpectedly. Please try again." };
+        result = { ok: false, error: UNEXPECTED_ERROR };
       }
+      if (!result || typeof result !== "object") result = { ok: false, error: UNEXPECTED_ERROR };
       if (settled || currentAttempt !== attemptNumber) return;
       inFlight = false;
       controller = null;
@@ -128,7 +133,7 @@ function runOidcLoginDialog({
         finish(true);
         return;
       }
-      lastState = { phase: "error", host, message: result.error };
+      lastState = { phase: "error", host, message: result.error || UNEXPECTED_ERROR };
       sendState();
     };
 
@@ -142,6 +147,7 @@ function runOidcLoginDialog({
     }
 
     ipcMain.on(OIDC_LOGIN_ACTION_CHANNEL, onAction);
+    signal?.addEventListener("abort", () => finish(false), { once: true });
     loginWindow.webContents.on("will-navigate", (event, url) => {
       if (url !== allowedPageUrl) event.preventDefault();
     });

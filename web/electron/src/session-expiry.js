@@ -10,8 +10,7 @@
 //
 // Self-hosted OIDC has a second expiry signal: the SPA sends the main frame to
 // the server's own `/auth/login` after an API 401. The shell stops that
-// navigation before it can reach a third-party IdP, signs in through the
-// system browser, and restores the page the user was on.
+// navigation before it reaches a third-party IdP and signs in via the browser.
 //
 // Kept Electron-free at its core so the matching logic and event wiring are
 // unit-testable (test/session-expiry.test.js) without booting the app.
@@ -119,15 +118,21 @@ function registerOidcSessionExpiryHandoff(webContents, serverUrlForWindow, onExp
     event.preventDefault();
     if (inFlight) return;
 
+    // Return only to a page inside the server's mount, never to the login route.
     let returnUrl = serverUrl;
     try {
       const current = new URL(webContents.getURL());
-      if (current.origin === new URL(serverUrl).origin) returnUrl = current.toString();
+      const mount = new URL(joinServerUrl(serverUrl, "/"));
+      const insideMount =
+        current.origin === mount.origin &&
+        (current.pathname + "/").startsWith(mount.pathname) &&
+        !isOidcLoginNavigation(current.toString(), serverUrl);
+      if (insideMount) returnUrl = current.toString();
     } catch {
       // Fall back to the server URL when the current page is unavailable.
     }
     inFlight = Promise.resolve(onExpired({ serverUrl, returnUrl }))
-      .catch(() => {})
+      .catch((error) => console.error("[omnigent] session expiry handoff failed", error))
       .finally(() => {
         inFlight = null;
       });

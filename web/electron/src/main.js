@@ -770,21 +770,24 @@ const oidcLoginFlows = new WeakMap();
  *
  * @returns {Promise<boolean>} false when the user cancelled or sign-in failed.
  */
-async function ensureWindowOidcSession(win, serverUrl) {
+async function ensureWindowOidcSession(win, serverUrl, attempt) {
   if (oidcServerUrlError(serverUrl) === "invalid_server_url") return true;
   let probe;
   try {
-    probe = await probeServerAuth(session.defaultSession, serverUrl);
+    probe = await probeServerAuth(session.defaultSession, serverUrl, {
+      signal: attempt.controller.signal,
+    });
   } catch {
     // Unreachable or unknown: let the normal load surface the connection error.
     return true;
   }
   if (probe.kind !== "oidc") return true;
-  return runWindowOidcBrowserHandoff(win, serverUrl);
+  reportConnectionProgress(win, attempt, "authenticating");
+  return runWindowOidcBrowserHandoff(win, serverUrl, attempt.controller.signal);
 }
 
 /** Sign in through the system browser behind a cancellable status dialog. */
-async function runWindowOidcBrowserHandoff(win, serverUrl) {
+async function runWindowOidcBrowserHandoff(win, serverUrl, attemptSignal) {
   const existingFlow = oidcLoginFlows.get(win);
   if (existingFlow?.serverUrl === serverUrl) return existingFlow.promise;
 
@@ -795,6 +798,7 @@ async function runWindowOidcBrowserHandoff(win, serverUrl) {
     serverUrl,
     pagePath: OIDC_LOGIN_PAGE,
     preloadPath: OIDC_LOGIN_PRELOAD,
+    signal: attemptSignal,
     runAttempt: async ({ signal, updateMessage }) => {
       const result = await runOidcBrowserLogin(
         session.defaultSession,
@@ -817,8 +821,11 @@ async function runWindowOidcBrowserHandoff(win, serverUrl) {
         await installAndVerifySessionCookie(session.defaultSession, serverUrl, result.token, {
           signal,
           assertCanCommit: () => signal.throwIfAborted(),
+          expiresInSeconds: result.expiresIn,
         });
-      } catch {
+      } catch (error) {
+        if (signal.aborted) return { ok: false, error: "Sign-in was cancelled." };
+        console.error("[omnigent] oidc sign-in: could not install the session cookie", error);
         return {
           ok: false,
           error: "Sign-in completed, but the app could not install and verify the session cookie.",
@@ -840,7 +847,7 @@ function oidcLoginErrorMessage(reason) {
     case "invalid_server_url":
       return "The server address is invalid. Return to setup, correct it, and retry.";
     case "timed_out":
-      return "Sign-in timed out after 5 minutes. Complete the browser flow, then retry.";
+      return `Sign-in timed out after ${Math.round(OIDC_LOGIN_TIMEOUT_MS / 60_000)} minutes. Complete the browser flow, then retry.`;
     case "expired":
       return "The sign-in ticket expired. Retry to open a fresh browser sign-in.";
     default:
@@ -1793,11 +1800,21 @@ async function loadServerUrl(
         throw error;
       }
     } else if (!isDatabricksManagedServerUrl(serverUrl)) {
-      const signedIn = await ensureWindowOidcSession(win, serverUrl);
+      const signedIn = await ensureWindowOidcSession(win, serverUrl, attempt);
       assertCurrent();
       if (!signedIn) {
         pinWindow(win, null);
         setWindowServerUrl(win, null);
+        // Nothing was navigated, so the load-failure fallbacks never fire: a
+        // window that is not already on setup goes back there itself.
+        if (!isSetupPageUrl(win.webContents.getURL())) {
+          const params = new URLSearchParams({
+            error: "Sign-in did not complete.",
+            url: serverUrl,
+          });
+          if (windowState?.ephemeral) params.set("ephemeral", "1");
+          void loadSetupPage(win, params.toString());
+        }
         throw Object.assign(new Error("Sign-in was cancelled"), { name: "AbortError" });
       }
     }
@@ -2109,18 +2126,21 @@ function createWindow(targetUrl, opts = {}) {
     win.webContents,
     () => {
       const connectedUrl = windows.get(win)?.serverUrl ?? null;
-      return connectedUrl && !usesBrowserAuth(connectedUrl) ? connectedUrl : null;
+      const handsOff =
+        connectedUrl &&
+        !usesBrowserAuth(connectedUrl) &&
+        !isDatabricksManagedServerUrl(connectedUrl);
+      return handsOff ? connectedUrl : null;
     },
     async ({ serverUrl: expiredUrl, returnUrl }) => {
       if (connectionAttempts.get(win)?.pending) return;
       try {
         await loadServerUrl(win, expiredUrl, undefined, { loadUrl: returnUrl, interactive: true });
       } catch (error) {
-        if (error?.name !== "AbortError" || win.isDestroyed()) throw error;
-        if (connectionAttempts.get(win)?.pending) return;
-        const params = new URLSearchParams({ error: "Sign-in did not complete.", url: expiredUrl });
-        if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
-        await loadSetupPage(win, params.toString());
+        // A cancelled sign-in already returned the window to setup.
+        if (error?.name !== "AbortError") {
+          console.error("[omnigent] oidc session expiry: sign-in handoff failed", error);
+        }
       }
     },
   );

@@ -650,15 +650,7 @@ describe("joinServerUrl", () => {
     );
   });
 
-  it("can derive an origin-root route while preserving only Databricks o", () => {
-    assert.equal(
-      joinServerUrl(
-        "https://dbc-a.cloud.databricks.com/omnigent?o=team%2Fblue",
-        "/.well-known/omnigent.json",
-        { fromOrigin: true },
-      ),
-      "https://dbc-a.cloud.databricks.com/.well-known/omnigent.json?o=team%2Fblue",
-    );
+  it("keeps only a Databricks workspace's organization selector", () => {
     assert.equal(
       joinServerUrl("https://example.com/base?o=ignored", "/v1/me"),
       "https://example.com/base/v1/me",

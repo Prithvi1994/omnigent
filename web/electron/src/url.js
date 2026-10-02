@@ -169,15 +169,13 @@
    *
    * @param {string} serverUrl
    * @param {string} routePath
-   * @param {{ fromOrigin?: boolean }} [options] Join at the origin, ignoring the mount.
    * @returns {string}
    */
-  function joinServerUrl(serverUrl, routePath, { fromOrigin = false } = {}) {
+  function joinServerUrl(serverUrl, routePath) {
     const server = new URL(serverUrl);
     const route = new URL(routePath.startsWith("/") ? routePath : `/${routePath}`, server.origin);
     const destination = new URL(server.origin);
-    const basePath = fromOrigin ? "" : server.pathname.replace(/\/+$/, "");
-    destination.pathname = `${basePath}${route.pathname}` || "/";
+    destination.pathname = `${server.pathname.replace(/\/+$/, "")}${route.pathname}`;
 
     const organizations = new URLSearchParams();
     if (isDatabricksWorkspaceHost(server.hostname)) {

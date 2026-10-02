@@ -305,3 +305,79 @@ describe("self-hosted OIDC session expiry", () => {
     assert.equal(handoffs, 2);
   });
 });
+
+describe("self-hosted OIDC session expiry return page", () => {
+  const event = () => ({ preventDefault() {} });
+  const tick = () =>
+    new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+
+  it("returns to the server itself from pages outside the mount or on the login route", async () => {
+    const cases = [
+      [
+        "https://server.example/other/page",
+        "https://server.example/base",
+        "https://server.example/base",
+      ],
+      [
+        "https://server.example/base/auth/login?return_to=%2Fc",
+        "https://server.example/base",
+        "https://server.example/base",
+      ],
+      [
+        "https://server.example/base/c/current",
+        "https://server.example/base",
+        "https://server.example/base/c/current",
+      ],
+      ["https://server.example/base", "https://server.example/base", "https://server.example/base"],
+      ["https://elsewhere.example/c/current", "https://server.example", "https://server.example"],
+    ];
+    /* oxlint-disable no-await-in-loop -- each case drives its own handoff */
+    for (const [current, serverUrl, expected] of cases) {
+      class FakeWebContents extends EventEmitter {
+        getURL() {
+          return current;
+        }
+      }
+      const webContents = new FakeWebContents();
+      const handoffs = [];
+      registerOidcSessionExpiryHandoff(
+        webContents,
+        () => serverUrl,
+        async (params) => handoffs.push(params),
+      );
+      webContents.emit("will-navigate", event(), `${serverUrl}/auth/login`);
+      await tick();
+      assert.deepEqual(handoffs, [{ serverUrl, returnUrl: expected }], current);
+    }
+    /* oxlint-enable no-await-in-loop */
+  });
+
+  it("starts a new handoff after a failed one", async (t) => {
+    class FakeWebContents extends EventEmitter {
+      getURL() {
+        return "https://server.example/c/current";
+      }
+    }
+    const webContents = new FakeWebContents();
+    const error = t.mock.method(console, "error", () => {});
+    let handoffs = 0;
+    registerOidcSessionExpiryHandoff(
+      webContents,
+      () => "https://server.example",
+      async () => {
+        handoffs += 1;
+        throw new Error("reload failed");
+      },
+    );
+
+    webContents.emit("will-navigate", event(), "https://server.example/auth/login");
+    await tick();
+    webContents.emit("will-navigate", event(), "https://server.example/auth/login");
+    await tick();
+
+    assert.equal(handoffs, 2);
+    assert.equal(error.mock.callCount(), 2);
+  });
+});

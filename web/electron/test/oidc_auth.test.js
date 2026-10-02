@@ -231,7 +231,7 @@ describe("OIDC browser ticket flow", () => {
             { pollIntervalMs: 1, timeoutMs: 100 },
           );
 
-          assert.deepEqual(result, { ok: true, token: "session-jwt" });
+          assert.deepEqual(result, { ok: true, token: "session-jwt", expiresIn: null });
           assert.deepEqual(opened, [`${serverUrl}/auth/login?ticket=secret`]);
         },
       ),
@@ -257,7 +257,7 @@ describe("OIDC browser ticket flow", () => {
       },
     );
 
-    assert.deepEqual(result, { ok: true, token: "session-jwt" });
+    assert.deepEqual(result, { ok: true, token: "session-jwt", expiresIn: null });
     assert.deepEqual(statuses, [429, 502, 503, 504]);
   });
 
@@ -310,10 +310,7 @@ describe("OIDC browser ticket flow", () => {
       { pollIntervalMs: 1, timeoutMs: 100 },
     );
 
-    assert.deepEqual(result, {
-      ok: true,
-      token: "session-jwt",
-    });
+    assert.deepEqual(result, { ok: true, token: "session-jwt", expiresIn: 60 });
     assert.deepEqual(opened, ["https://server.example/base/auth/login?ticket=one-time"]);
     assert.equal(calls[0].url, "https://server.example/base/auth/cli-login");
     assert.equal(calls[0].init.method, "POST");
@@ -343,7 +340,7 @@ describe("OIDC browser ticket flow", () => {
       { pollIntervalMs: 1, timeoutMs: 100 },
     );
 
-    assert.deepEqual(result, { ok: true, token: "session-jwt" });
+    assert.deepEqual(result, { ok: true, token: "session-jwt", expiresIn: null });
     assert.equal(
       calls[0],
       "https://dbc-a.cloud.databricks.com/omnigent/auth/cli-login?o=team%2Fblue",
@@ -431,7 +428,7 @@ describe("OIDC browser ticket flow", () => {
       { pollIntervalMs: 1, timeoutMs: 100 },
     );
 
-    assert.deepEqual(result, { ok: true, token: "session-jwt" });
+    assert.deepEqual(result, { ok: true, token: "session-jwt", expiresIn: null });
     assert.deepEqual(opened, ["https://server.example/base/auth/login?ticket=special+%2F~%21%2A"]);
   });
 
@@ -526,7 +523,7 @@ describe("OIDC browser ticket flow", () => {
       },
     );
 
-    assert.deepEqual(result, { ok: true, token: "session-jwt" });
+    assert.deepEqual(result, { ok: true, token: "session-jwt", expiresIn: null });
     assert.deepEqual(statuses, [429, 502, 503, 504]);
   });
 
@@ -1088,5 +1085,56 @@ describe("OIDC session cookie installation", () => {
 
     await assert.rejects(verification, { name: "AbortError" });
     assert.equal(state.getStored(), null);
+  });
+});
+
+describe("OIDC session lifetime", () => {
+  it("carries the token lifetime from the poll response", async () => {
+    const responses = [
+      response(200, { ticket: "t", login_url: "/auth/login?ticket=t" }),
+      response(200, { token: "session-jwt", expires_in: 3600 }),
+    ];
+    const result = await runOidcBrowserLogin(
+      { fetch: async () => responses.shift() },
+      "https://server.example",
+      async () => {},
+      { pollIntervalMs: 1 },
+    );
+    assert.deepEqual(result, { ok: true, token: "session-jwt", expiresIn: 3600 });
+  });
+
+  it("reports a cancellation that lands while the token body is being read", async () => {
+    const controller = new AbortController();
+    const responses = [
+      response(200, { ticket: "t", login_url: "/auth/login?ticket=t" }),
+      {
+        status: 200,
+        json: async () => {
+          controller.abort();
+          throw new Error("aborted");
+        },
+      },
+    ];
+    const result = await runOidcBrowserLogin(
+      { fetch: async () => responses.shift() },
+      "https://server.example",
+      async () => {},
+      { pollIntervalMs: 1, signal: controller.signal },
+    );
+    assert.deepEqual(result, { ok: false, reason: "cancelled" });
+  });
+
+  it("gives the installed cookie the session's lifetime when one is known", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const details = sessionCookieDetails("https://server.example", "token", 3600);
+    assert.ok(details.expirationDate >= now + 3600 && details.expirationDate <= now + 3601);
+    assert.equal(
+      "expirationDate" in sessionCookieDetails("https://server.example", "token"),
+      false,
+    );
+    assert.equal(
+      "expirationDate" in sessionCookieDetails("https://server.example", "token", 0),
+      false,
+    );
   });
 });

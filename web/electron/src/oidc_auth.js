@@ -143,7 +143,6 @@ function oidcServerUrlError(serverUrl) {
 function encodeTicket(ticket) {
   return encodeURIComponent(ticket)
     .replace(/%20/g, "+")
-    .replace(/%7E/gi, "~")
     .replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
@@ -203,10 +202,7 @@ async function runOidcBrowserLogin(
     if (!response) return { ok: false, reason: "timed_out" };
     if (response.status !== 200) return { ok: false, reason: "failed" };
     const body = await response.json();
-    // Reading the ticket body can outlast the login window (slow-trickle
-    // response) — a ticket landing past the deadline belongs to an expired
-    // flow, and opening the system browser for it would start a login the
-    // shell has already abandoned. Same recheck as the token poll below.
+    // A ticket body that lands past the deadline belongs to an abandoned flow.
     if (monotonicNowMs() >= deadline) {
       return timedOutOrCancelled(signal);
     }
@@ -259,27 +255,31 @@ async function runOidcBrowserLogin(
 
     try {
       const body = await response.json();
-      // Reading the body can outlast the login window (slow-trickle response)
-      // — a token landing past the deadline is expired-flow output and must
-      // not install a session, matching the Android shell's late-token check.
+      // A token body that lands past the deadline must not become a session.
       if (monotonicNowMs() >= deadline) {
         return timedOutOrCancelled(signal);
       }
       if (!body || typeof body.token !== "string" || body.token === "") {
         return { ok: false, reason: "failed" };
       }
-      return { ok: true, token: body.token };
+      const expiresIn = body.expires_in;
+      return {
+        ok: true,
+        token: body.token,
+        expiresIn: Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn : null,
+      };
     } catch {
-      return { ok: false, reason: "failed" };
+      return { ok: false, reason: isUserAbort(signal) ? "cancelled" : "failed" };
     }
   };
   return pollForCompletion();
 }
 
-// __Host- cookies require Secure, Path=/, and no Domain attribute.
-function sessionCookieDetails(serverUrl, token) {
+// __Host- cookies require Secure, Path=/, and no Domain attribute. A lifetime
+// keeps the session across app restarts, like the cookie the server itself sets.
+function sessionCookieDetails(serverUrl, token, expiresInSeconds = null) {
   const isHttps = new URL(serverUrl).protocol === "https:";
-  return {
+  const details = {
     url: serverUrl,
     name: isHttps ? "__Host-ap_session" : "ap_session",
     value: token,
@@ -288,6 +288,10 @@ function sessionCookieDetails(serverUrl, token) {
     sameSite: "lax",
     path: "/",
   };
+  if (Number.isFinite(expiresInSeconds) && expiresInSeconds > 0) {
+    details.expirationDate = Math.floor(Date.now() / 1000) + expiresInSeconds;
+  }
+  return details;
 }
 
 function priorSessionCookie(cookies, serverUrl, details) {
@@ -371,7 +375,13 @@ async function installAndVerifySessionCookie(
   electronSession,
   serverUrl,
   token,
-  { verificationAttempts = 3, retryDelayMs = 250, signal, assertCanCommit = () => {} } = {},
+  {
+    verificationAttempts = 3,
+    retryDelayMs = 250,
+    signal,
+    assertCanCommit = () => {},
+    expiresInSeconds = null,
+  } = {},
 ) {
   const serverUrlError = oidcServerUrlError(serverUrl);
   if (serverUrlError) {
@@ -381,7 +391,7 @@ async function installAndVerifySessionCookie(
         : "The server URL is invalid.",
     );
   }
-  const details = sessionCookieDetails(serverUrl, token);
+  const details = sessionCookieDetails(serverUrl, token, expiresInSeconds);
   return serializeCookieMutation(electronSession, serverUrl, details, async () => {
     const existing = await electronSession.cookies.get({ url: serverUrl, name: details.name });
     const priorCookie = priorSessionCookie(existing, serverUrl, details);
