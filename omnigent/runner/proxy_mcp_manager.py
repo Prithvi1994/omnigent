@@ -53,6 +53,9 @@ _SERVER_RECONNECT_WAIT_S = 120.0
 # Pause between re-sends of a retained operation whose request was lost between
 # this runner and the server, so an unreachable server is not hammered.
 _REATTACH_RETRY_DELAY_S = 2.0
+# A re-send whose remaining read budget is below this cannot complete a round
+# trip, so the phase ends rather than making a guaranteed-futile attempt.
+_MIN_ATTEMPT_BUDGET_S = 1.0
 # A request open at least this long was being executed when it was lost (an
 # ingress cut a long-running tool, the tunnel dropped mid-execution), so it
 # does not start the reconnect-wait streak that fast refusals do.
@@ -60,6 +63,18 @@ _LONG_REQUEST_MIN_S = 30.0
 # Gateway-class statuses a proxy in front of the server returns when it gives
 # up on a request; the server itself answers tool calls with JSON-RPC errors.
 _GATEWAY_STATUS_CODES = frozenset({502, 503, 504})
+# A server without the detached-while-unbound reply answers a retained re-send
+# that reaches it before the tunnel rebinds with this message instead.
+_UNBOUND_RUNNER_MESSAGE_PREFIX = "No runner bound for session"
+
+
+def _is_unbound_runner_reply(code: object, message: object) -> bool:
+    """Report a legacy server's unbound-runner reply to a retained re-send."""
+    return (
+        code == -32000
+        and isinstance(message, str)
+        and message.startswith(_UNBOUND_RUNNER_MESSAGE_PREFIX)
+    )
 
 
 def _json_object(value: object) -> _JsonObject | None:
@@ -421,6 +436,11 @@ class ProxyMcpManager:
             if now >= phase_deadline:
                 raise _budget_exhausted(cause) from cause
             if cause is None:
+                # A detached reply arrives after the tool has run; a long
+                # execution must not count against the rebind window, exactly as
+                # a transport loss resets the streak below.
+                if now - sent_at >= _LONG_REQUEST_MIN_S:
+                    detached_since = None
                 if detached_since is None:
                     detached_since = now
                 rebind_deadline = detached_since + _SERVER_RECONNECT_WAIT_S
@@ -464,7 +484,7 @@ class ProxyMcpManager:
 
         while True:
             budget_left = MCP_PROXY_CALL_TIMEOUT_S - (monotonic() - phase_started)
-            if budget_left <= 0:
+            if budget_left <= _MIN_ATTEMPT_BUDGET_S:
                 raise _budget_exhausted(last_failure) from last_failure
             request_generation = pending_approvals.current_server_generation()
             sent_at = monotonic()
@@ -472,11 +492,9 @@ class ProxyMcpManager:
                 resp = await self._omnigent_client.post(
                     self._mcp_url,
                     json=payload,
-                    # Short connect timeout still fails fast on an unreachable
-                    # server; the read timeout covers ordinary proxy request
-                    # hangs and shrinks on re-sends so the phase stays within
-                    # the call budget. Sub-agent dispatch returns an async handle
-                    # immediately and no longer holds this call for a child turn.
+                    # Fail fast on an unreachable server; the read timeout covers
+                    # proxy request hangs and shrinks on re-sends so the phase
+                    # stays within the call budget.
                     timeout=httpx.Timeout(
                         connect=10.0,
                         read=budget_left,
@@ -519,14 +537,23 @@ class ProxyMcpManager:
                     )
                 code = err.get("code")
                 msg = err.get("message", "")
-                if code == RUNNER_MCP_EXECUTION_DETACHED_CODE:
+                registry = self._execution_registry
+                owns_operation = registry is not None and registry.has_operation(
+                    self._session_id, operation_id
+                )
+                if code == RUNNER_MCP_EXECUTION_DETACHED_CODE or (
+                    owns_operation and _is_unbound_runner_reply(code, msg)
+                ):
+                    # The detach code and a legacy server's unbound-runner reply
+                    # both mean the tunnel is unbound while this runner holds the
+                    # retained operation; wait for the rebind, then re-send.
                     last_failure = None
                     await _wait_before_reattach(request_generation, None, sent_at=sent_at)
                     request_id += 1
                     payload = cast("_JsonObject", {**payload, "id": request_id})
                     continue
                 # -32000 is the MCP convention for server-defined errors (tool
-                # denials, tool errors).  Return as a JSON error string so the
+                # denials, tool errors). Return as a JSON error string so the
                 # harness feeds the refusal back to the LLM rather than raising.
                 if code == -32000:
                     return json.dumps({"error": msg})

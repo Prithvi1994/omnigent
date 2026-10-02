@@ -167,6 +167,11 @@ def current_server_generation() -> int:
     return _server_generation
 
 
+def has_reconnect_waiters() -> bool:
+    """Report whether any call is waiting for the tunnel to rebind."""
+    return bool(_server_reconnect_waiters)
+
+
 async def wait_for_server_reconnect(
     after_generation: int,
     *,
