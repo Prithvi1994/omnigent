@@ -55,9 +55,8 @@ _HARNESS = "claude-native"
 # wider window than the shared fixture's 30s so CI can't flake on the spawn.
 _SERVER_BOOT_TIMEOUT_S = 180.0
 
-# The bug is a 30s dead wait (_STORE_SECRET_TIMEOUT_S in
-# omnigent/server/routes/hosts.py). "Prompt" feedback means well under that;
-# 20s leaves slack for CI scheduling while still failing the buggy build.
+# Feedback must land well before the route's 30 s store_secret timeout; 20 s
+# leaves slack for CI scheduling.
 _PROMPT_FEEDBACK_S = 20.0
 
 
@@ -258,16 +257,6 @@ def old_host_server(
         log_handle.close()
 
 
-def _video_kwargs() -> dict[str, Any]:
-    """Page kwargs that record a video when the recording lane asks for one.
-
-    :returns: ``record_video_dir`` kwargs when ``OMNI_E2E_VIDEO_DIR`` is set
-        (the repro/fix recording lanes), else no kwargs.
-    """
-    video_dir = os.environ.get("OMNI_E2E_VIDEO_DIR")
-    return {"record_video_dir": video_dir} if video_dir else {}
-
-
 # ── Tests ────────────────────────────────────────────────────────────────────
 
 
@@ -289,7 +278,7 @@ async def _drive_setup_dialog_save(base_url: str) -> None:
         browser = await pw.chromium.launch()
         # Explicit context so a recorded video is finalized on context.close()
         # even when the drive fails mid-way.
-        context = await browser.new_context(**_video_kwargs())
+        context = await browser.new_context()
         page = await context.new_page()
         try:
             await page.goto(f"{base_url}/")

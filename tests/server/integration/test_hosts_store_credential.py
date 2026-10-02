@@ -47,6 +47,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
+from omnigent.version import VERSION
 from tests.server.helpers import websocket_scope as _websocket_scope
 
 pytestmark = [
@@ -66,9 +67,10 @@ def _enable_flag(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _hello_text(
     name: str = _HOST_NAME,
-    version: str = "0.1.0-test",
+    version: str = VERSION,
     capabilities: list[str] | None = None,
 ) -> str:
+    """Hello from a current daemon; ``version`` is this tree's, well above the floor."""
     return encode_host_frame(
         HostHelloFrame(
             version=version,

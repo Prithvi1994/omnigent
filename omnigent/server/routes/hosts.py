@@ -1614,7 +1614,6 @@ def create_hosts_router(
         conn = host_registry.get(host.host_id)
         if conn is None:
             raise _host_absent_error(host)
-        # Reject before forwarding: a pre-0.7.0 daemon drops this frame without replying.
         _require_harness_setup_support(conn, "storing harness credentials")
 
         frame = HostStoreSecretFrame(
