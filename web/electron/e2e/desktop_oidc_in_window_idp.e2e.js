@@ -2,6 +2,8 @@
 // provider is `oidc`. The shell must hand the IdP sign-in to the system browser
 // (RFC 8252 §8.12) instead of rendering the third-party IdP page in its own
 // window, where a passkey (WebAuthn) ceremony has no authenticator to settle it.
+// On Linux a scripted xdg-open stands in for the browser and completes the
+// sign-in, so the handoff is also proven to land the app signed in.
 //
 // Run from web/electron after building the SPA (see e2e/README.md):
 //   OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_oidc_in_window_idp.e2e.js
@@ -20,11 +22,17 @@ const {
   launchDesktop,
   saveRecording,
 } = require("./desktopHarness");
-const { startFakeIdp, oidcServerEnv } = require("./fixtures/fakeOidcIdp");
+const { FAKE_IDP_EMAIL, startFakeIdp, oidcServerEnv } = require("./fixtures/fakeOidcIdp");
 
 const deps = desktopDepsAvailable();
 const RECORD_DIR = path.join(__dirname, "recordings", "desktop-oidc-in-window-idp");
+const FAKE_BROWSER_DIR = path.join(__dirname, "fixtures", "fakeSystemBrowser");
 const IDP_NAVIGATION_WINDOW_MS = 20_000;
+const SIGN_IN_WINDOW_MS = 30_000;
+// xdg-open is how Electron opens external links on Linux; elsewhere a real
+// browser would open and the scripted completion cannot run.
+const SIGN_IN_JOURNEY_SKIP =
+  process.platform === "linux" ? false : "the scripted system browser replaces xdg-open (Linux)";
 const PASSKEY_TIMEOUT_MS = 1_500;
 // Far past both the RP timeout and Chromium's 10s floor for WebAuthn timeouts.
 const PASSKEY_OBSERVATION_MS = 30_000;
@@ -50,6 +58,16 @@ describe(
       windowCount: 0,
       webauthn: null,
       recordings: [],
+      /** The second launch, whose system browser completes the sign-in. */
+      signIn: {
+        windowUrls: [],
+        dialogSeen: false,
+        dialogOpenAtEnd: null,
+        finalUrl: null,
+        meStatus: null,
+        meUser: null,
+        recordings: [],
+      },
     };
 
     async function driveConnectJourney() {
@@ -111,6 +129,61 @@ describe(
       }
     }
 
+    async function driveSignInJourney() {
+      const signIn = observed.signIn;
+      const originalPath = process.env.PATH;
+      process.env.PATH = `${FAKE_BROWSER_DIR}${path.delimiter}${originalPath}`;
+      let launched;
+      try {
+        launched = await launchDesktop({ recordDir: RECORD_DIR });
+      } finally {
+        process.env.PATH = originalPath;
+      }
+      const { electronApp, window, userDataDir, stopDisplayCapture } = launched;
+      const dialogOpen = () =>
+        electronApp.windows().some((page) => page.url().endsWith("/oidc_login.html"));
+      try {
+        const urlField = window.locator("#url");
+        await urlField.waitFor({ state: "visible", timeout: 15_000 });
+        await urlField.fill(server.serverUrl);
+        await window.locator("#connect").click();
+
+        const idpOrigin = new URL(idp.issuer).origin;
+        const deadline = Date.now() + SIGN_IN_WINDOW_MS;
+        /* oxlint-disable no-await-in-loop -- sequential observation of one window */
+        while (Date.now() < deadline) {
+          const url = window.url();
+          if (signIn.windowUrls.at(-1) !== url) signIn.windowUrls.push(url);
+          if (dialogOpen()) signIn.dialogSeen = true;
+          if (url.startsWith(idpOrigin)) break;
+          if (signIn.dialogSeen && !dialogOpen() && url.startsWith(server.serverUrl)) break;
+          await sleep(250);
+        }
+        /* oxlint-enable no-await-in-loop */
+        signIn.finalUrl = window.url();
+        if (signIn.finalUrl.startsWith(server.serverUrl)) {
+          const me = await window.evaluate(async () => {
+            const response = await fetch("/v1/me", { credentials: "include" });
+            return { status: response.status, body: await response.text() };
+          });
+          signIn.meStatus = me.status;
+          try {
+            signIn.meUser = JSON.parse(me.body).user_id ?? null;
+          } catch {
+            signIn.meUser = null;
+          }
+        }
+        // Hold the signed-in app so the recording ends on it.
+        await sleep(2_000);
+        signIn.dialogOpenAtEnd = dialogOpen();
+      } finally {
+        await electronApp.close();
+        await stopDisplayCapture();
+        signIn.recordings = saveRecording(RECORD_DIR, "after-oidc-system-browser-sign-in");
+        fs.rmSync(userDataDir, { recursive: true, force: true });
+      }
+    }
+
     before(async () => {
       tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "omni-desktop-oidc-"));
       idp = await startFakeIdp({ passkeyTimeoutMs: PASSKEY_TIMEOUT_MS });
@@ -118,6 +191,7 @@ describe(
         env: ({ serverUrl }) => oidcServerEnv(idp, serverUrl),
       });
       await driveConnectJourney();
+      if (!SIGN_IN_JOURNEY_SKIP) await driveSignInJourney();
       fs.writeFileSync(
         path.join(RECORD_DIR, "observed.json"),
         JSON.stringify(
@@ -135,25 +209,36 @@ describe(
     });
 
     it("keeps the third-party IdP sign-in page out of the shell window", () => {
+      const w = observed.webauthn;
+      const passkey = w
+        ? `\nin-window navigator.credentials.get({ timeout: ${PASSKEY_TIMEOUT_MS} }) was ` +
+          `${w.state} after ${w.observedMs} ms (isUserVerifyingPlatformAuthenticatorAvailable=` +
+          `${w.uvpaa}; status: "${w.statusText}")`
+        : "";
       assert.equal(
         observed.inWindowIdpUrl,
         null,
         `the Electron window itself navigated to the IdP: ${observed.inWindowIdpUrl}\n` +
           `window URLs after Connect: ${observed.windowUrls.join(" → ")}\n` +
-          `IdP /authorize fetched by: ${observed.idpAuthorizeAgents.join(" | ") || "(nobody)"}`,
+          `IdP /authorize fetched by: ${observed.idpAuthorizeAgents.join(" | ") || "(nobody)"}` +
+          passkey,
       );
     });
 
-    it("does not leave an in-window passkey ceremony pending past its timeout", () => {
-      if (!observed.inWindowIdpUrl) return;
-      const w = observed.webauthn ?? {};
-      assert.notEqual(
-        w.state,
-        "pending",
-        `navigator.credentials.get({ timeout: ${PASSKEY_TIMEOUT_MS} }) still pending after ` +
-          `${w.observedMs} ms with no prompt and no error ` +
-          `(isUserVerifyingPlatformAuthenticatorAvailable=${w.uvpaa}; status: "${w.statusText}")`,
-      );
-    });
+    it(
+      "completes sign-in through the system browser and loads the app signed in",
+      { skip: SIGN_IN_JOURNEY_SKIP },
+      () => {
+        const s = observed.signIn;
+        assert.equal(s.dialogSeen, true, "the shell's sign-in dialog never appeared");
+        assert.ok(
+          s.finalUrl?.startsWith(server.serverUrl),
+          `the window never loaded the server after sign-in; URLs: ${s.windowUrls.join(" → ")}`,
+        );
+        assert.equal(s.meStatus, 200, `/v1/me from the loaded app returned ${s.meStatus}`);
+        assert.equal(s.meUser, FAKE_IDP_EMAIL);
+        assert.equal(s.dialogOpenAtEnd, false, "the sign-in dialog stayed open");
+      },
+    );
   },
 );
