@@ -3019,6 +3019,125 @@ async def test_create_session_auto_create_guard_skips_rotation_targets(
         assert created == [], f"Auto-create must be skipped for {scenario.case_id}; got {created}"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_built_during_init", [False, True], ids=["before", "during"])
+async def test_create_session_rebuilds_only_claude_terminals_that_predate_init(
+    terminal_built_during_init: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Session init tears down a pending-rebuild Claude terminal only if it predates init.
+
+    A fork or agent switch into claude-native leaves the init snapshot with no
+    ``external_session_id`` plus the carry-history label. A terminal registered
+    before init started is the stale pre-switch one and must be rebuilt. One a
+    racing terminal-ensure (e.g. a side chat's first message) creates while init
+    runs was built from the current server state; tearing it down throws away a
+    live clone whose id the server already recorded.
+
+    :param terminal_built_during_init: Register the terminal mid-init (inside
+        spec resolution) instead of before the init request.
+    :param tmp_path: Temporary directory for bridge and terminal paths.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    session_id = "6a1f0c2e9b8d4f7a8c3e5d1b2a4f6e80"
+
+    terminal_registry = TerminalRegistry()
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "claude.sock",
+        private_dir=tmp_path / "claude",
+        running=True,
+    )
+
+    def _register_terminal() -> None:
+        """Register the live ``claude:main`` terminal for the session."""
+        terminal_registry._by_conversation[session_id] = {("claude", "main"): instance}
+
+    if not terminal_built_during_init:
+        _register_terminal()
+
+    created: list[str] = []
+
+    async def _recording_auto_create(
+        session_id: str, resource_registry: Any, publish_event: Any, **_kwargs: Any
+    ) -> None:
+        """
+        Record the auto-create call instead of launching a real Claude.
+
+        :param session_id: Session the rebuild auto-created for.
+        :param resource_registry: Unused — the real launch path is stubbed.
+        :param publish_event: Unused — the real launch path is stubbed.
+        :param _kwargs: Absorbs keyword args of the real function.
+        :returns: None.
+        """
+        del resource_registry, publish_event
+        created.append(session_id)
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _recording_auto_create
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Return the claude-native spec, optionally registering the racing terminal.
+
+        :param agent_id: Requested agent id (unused — fixed spec).
+        :param session_id: Requested session id (unused — fixed spec).
+        :returns: The claude-native :class:`AgentSpec`.
+        """
+        del agent_id, session_id
+        if terminal_built_during_init:
+            _register_terminal()
+        return native_spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_LabelsAndEmptyHistoryServerClient(session_id),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+    payload: dict[str, Any] = {
+        "session_id": session_id,
+        "agent_id": "3c9e7b1d5f2a4e6c8b0d2f4a6c8e0b1d",
+        "session_init": {
+            "protocol_version": 2,
+            "server_version": "0.6.0.dev0",
+            "session_id": session_id,
+            "agent_id": "3c9e7b1d5f2a4e6c8b0d2f4a6c8e0b1d",
+            "snapshot": {
+                "created_at": 10,
+                "updated_at": 11,
+                "workspace": str(tmp_path),
+                "labels": {BRIDGE_ID_LABEL_KEY: session_id, FORK_CARRY_HISTORY_LABEL_KEY: "1"},
+            },
+        },
+    }
+
+    async with _runner_client(app) as client:
+        resp = await client.post("/v1/sessions", json=payload)
+    assert resp.status_code == 201, resp.text
+
+    kept = terminal_registry.get(session_id, "claude", "main") is instance
+    if terminal_built_during_init:
+        assert kept and created == [], "a terminal built during init must not be torn down"
+    else:
+        assert not kept and created == [session_id], "a pre-init terminal must be rebuilt"
+
+
 @dataclass
 class _AntigravityAutoCreateScenario:
     """

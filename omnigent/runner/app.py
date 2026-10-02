@@ -2577,6 +2577,14 @@ def create_runner_app(
         # landing anywhere in init — including that probe — must fence the
         # memoizing writes at the end of init.
         spec_cache_generation = _session_cache_generation(session_id)
+        # A Claude terminal registered after this point was built from current
+        # server state (e.g. by a message's ensure racing init), so it isn't stale.
+        _terminal_registry = resource_registry.terminal_registry
+        claude_terminal_before_init = (
+            _terminal_registry.get(session_id, "claude", "main")
+            if _terminal_registry is not None
+            else None
+        )
 
         try:
             init_context = await _load_session_init_context(
@@ -2891,9 +2899,26 @@ def create_runner_app(
                     # session's terminal is rotating in, wins over create. So the
                     # combined rebuild+inbound case is teardown + wait-for-transfer,
                     # NOT teardown + fresh create (which would race the rotation).
-                    wants_rebuild = has_terminal and await _claude_native_session_wants_rebuild(
-                        server_client, session_id, init_context.envelope
+                    built_during_init = (
+                        has_terminal
+                        and _terminal_registry is not None
+                        and _terminal_registry.get(session_id, "claude", "main")
+                        is not claude_terminal_before_init
                     )
+                    wants_rebuild = (
+                        has_terminal
+                        and not built_during_init
+                        and await _claude_native_session_wants_rebuild(
+                            server_client, session_id, init_context.envelope
+                        )
+                    )
+                    if built_during_init:
+                        _logger.info(
+                            "Claude terminal created while session init ran; keeping it: "
+                            "session=%s",
+                            session_id,
+                            extra={"session_id": session_id},
+                        )
                     if wants_rebuild:
                         _logger.info(
                             "Claude terminal stale after agent switch; tearing it down to "
