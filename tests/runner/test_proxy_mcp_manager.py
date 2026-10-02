@@ -10,12 +10,15 @@ Covers:
 - ``call_tool`` -32000 RPC error → JSON error string (soft error, not raised)
 - ``call_tool`` non-32000 RPC error → raises RuntimeError
 - ``call_tool`` network failure → raises RuntimeError
+- ``call_tool`` request lost between runner and server (gateway 502/504,
+  dropped connection) → re-sends the retained operation without replaying it
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,6 +27,7 @@ import pytest
 
 from omnigent.runner import mcp_execution_registry as mcp_execution_registry_mod
 from omnigent.runner import pending_approvals
+from omnigent.runner import proxy_mcp_manager as proxy_mcp_manager_mod
 from omnigent.runner.mcp_execution_registry import (
     MCP_OPERATION_ID_PARAM,
     RUNNER_MCP_EXECUTION_DETACHED_CODE,
@@ -539,6 +543,212 @@ async def test_call_tool_reattaches_expired_execution_after_server_disconnect(
     first_params, retry_params = [call.body["params"] for call in transport.calls]
     assert retry_params == first_params
     assert first_params[MCP_OPERATION_ID_PARAM].startswith("mcpop_")
+
+
+class _DropFirstRequestTransport(httpx.AsyncBaseTransport):
+    """Server stand-in whose first ``tools/call`` is lost on the way back.
+
+    Every request starts or reattaches to the retained runner execution the
+    way ``/mcp/execute`` does, so a test can show the tool ran exactly once.
+
+    :param registry: The runner-side registry shared with the manager.
+    :param first_failure: Builds the status response to return, or the
+        transport error to raise, for the first request only.
+    """
+
+    def __init__(
+        self,
+        registry: McpExecutionRegistry,
+        first_failure: Callable[[], httpx.Response | Exception],
+    ) -> None:
+        self._registry = registry
+        self._first_failure = first_failure
+        self.calls: list[_Call] = []
+        self.external_invocations = 0
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        self.calls.append(_Call(url=str(request.url), body=body))
+
+        async def _retained_work() -> McpExecutionResult:
+            self.external_invocations += 1
+            return McpExecutionResult(status_code=200, content={"result": {"output": "done"}})
+
+        await self._registry.execute(
+            session_id="conv_test",
+            operation_id=body["params"][MCP_OPERATION_ID_PARAM],
+            step="initial",
+            params={"name": body["params"]["name"], "arguments": body["params"]["arguments"]},
+            run=_retained_work,
+        )
+        if len(self.calls) == 1:
+            failure = self._first_failure()
+            if isinstance(failure, Exception):
+                raise failure
+            return failure
+        return _json_resp(
+            {
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": {
+                    "content": [{"type": "text", "text": "poll finished"}],
+                    "isError": False,
+                },
+            }
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first_failure",
+    [
+        pytest.param(lambda: httpx.Response(502, text="502 Bad Gateway"), id="gateway-502"),
+        pytest.param(lambda: httpx.Response(504, text="504 Gateway Timeout"), id="gateway-504"),
+        pytest.param(
+            lambda: httpx.RemoteProtocolError("Server disconnected without sending a response."),
+            id="connection-dropped",
+        ),
+    ],
+)
+async def test_call_tool_reattaches_after_request_drops_while_server_stays_up(
+    monkeypatch: pytest.MonkeyPatch,
+    first_failure: Callable[[], httpx.Response | Exception],
+) -> None:
+    """A gateway cutoff or dropped connection must not lose a running command's result.
+
+    No server restart happens, so the call re-sends the retained operation
+    without waiting for a new server generation, and the runner-side registry
+    hands back the single execution instead of running the tool again.
+    """
+    # ``raising=False`` keeps the same assertions runnable on a tree without the
+    # reattach pause, so a failure there reports the lost result, not a missing name.
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_REATTACH_RETRY_DELAY_S", 0.01, raising=False)
+    # Keep a wait-for-reconnect failure short instead of hanging the run.
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_SERVER_RECONNECT_WAIT_S", 0.2)
+    registry = McpExecutionRegistry()
+    transport = _DropFirstRequestTransport(registry, first_failure)
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    pending_approvals.reset_for_tests()
+    try:
+        result = await manager.call_tool(
+            None, "sys_os_shell", {"command": "sleep 400; gh pr checks", "timeout": 600}
+        )
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert result == "poll finished"
+    assert transport.external_invocations == 1, "the shell command must not run twice"
+    assert [call.body["id"] for call in transport.calls] == [1, 2]
+    first_params, retry_params = [call.body["params"] for call in transport.calls]
+    assert retry_params == first_params
+
+
+@pytest.mark.asyncio
+async def test_call_tool_non_gateway_http_error_raises_without_retry() -> None:
+    """Only gateway statuses mean the request was lost; a 500 is a terminal failure."""
+    transport = _StubTransport([_json_resp({"detail": "boom"}, status=500)])
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=McpExecutionRegistry(),
+    )
+
+    with pytest.raises(RuntimeError, match="500"):
+        await manager.call_tool(None, "sys_os_shell", {"command": "true"})
+    await client.aclose()
+
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_call_tool_gateway_error_without_retained_operation_raises() -> None:
+    """Without a runner-side operation to reattach to, a gateway error is reported as-is."""
+    transport = _StubTransport([_json_resp({}, status=502)])
+    manager = _make_manager(transport)
+
+    with pytest.raises(RuntimeError, match="502"):
+        await manager.call_tool(None, "sys_os_shell", {"command": "true"})
+
+    assert len(transport.calls) == 1
+
+
+class _CountingFailureTransport(httpx.AsyncBaseTransport):
+    """Transport that fails every request the same way and counts attempts.
+
+    :param failure: Builds the status response to return, or the error to raise.
+    """
+
+    def __init__(self, failure: Callable[[], httpx.Response | Exception]) -> None:
+        self._failure = failure
+        self.attempts = 0
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        del request
+        self.attempts += 1
+        failure = self._failure()
+        if isinstance(failure, Exception):
+            raise failure
+        return failure
+
+
+@pytest.mark.asyncio
+async def test_call_tool_stops_reattaching_when_no_server_reconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fast refusals keep today's bounded reconnect window instead of the whole call budget."""
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_REATTACH_RETRY_DELAY_S", 0.01, raising=False)
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_SERVER_RECONNECT_WAIT_S", 0.1)
+    transport = _CountingFailureTransport(lambda: httpx.ConnectError("connection refused"))
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=McpExecutionRegistry(),
+    )
+    pending_approvals.reset_for_tests()
+    try:
+        with pytest.raises(RuntimeError, match="no replacement connected") as exc_info:
+            await manager.call_tool(None, "sys_os_shell", {"command": "true"})
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert "connection refused" in str(exc_info.value)
+    assert transport.attempts > 1, "the retained operation must be re-sent before giving up"
+
+
+@pytest.mark.asyncio
+async def test_call_tool_reattach_loop_is_bounded_by_the_call_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated cutoffs of long requests stop at the proxy call budget."""
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_REATTACH_RETRY_DELAY_S", 0.001, raising=False)
+    # Treat every drop as the cutoff of a long request so no reconnect window applies.
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_LONG_REQUEST_MIN_S", 0.0, raising=False)
+    monkeypatch.setattr(proxy_mcp_manager_mod, "MCP_PROXY_CALL_TIMEOUT_S", 0.05)
+    transport = _CountingFailureTransport(lambda: httpx.Response(502, text="502 Bad Gateway"))
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=McpExecutionRegistry(),
+    )
+    pending_approvals.reset_for_tests()
+    try:
+        with pytest.raises(RuntimeError, match="did not complete within"):
+            await manager.call_tool(None, "sys_os_shell", {"command": "true"})
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert transport.attempts > 1
 
 
 @pytest.mark.asyncio

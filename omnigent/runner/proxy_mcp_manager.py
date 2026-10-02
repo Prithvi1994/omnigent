@@ -25,10 +25,12 @@ When to use each implementation:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import uuid
 from collections.abc import Callable
+from time import monotonic
 from typing import cast
 
 import httpx
@@ -48,6 +50,16 @@ _logger = logging.getLogger(__name__)
 
 _EventPublisher = Callable[[str, _JsonObject], None]
 _SERVER_RECONNECT_WAIT_S = 120.0
+# Pause between re-sends of a retained operation whose request was lost between
+# this runner and the server, so an unreachable server is not hammered.
+_REATTACH_RETRY_DELAY_S = 2.0
+# A request open at least this long was being executed when it dropped (an
+# ingress cut a long-running tool, a connection reset), so it does not start
+# the reconnect-wait streak that fast refusals do.
+_LONG_REQUEST_MIN_S = 30.0
+# Gateway-class statuses a proxy in front of the server returns when it gives
+# up on a request; the server itself answers tool calls with JSON-RPC errors.
+_GATEWAY_STATUS_CODES = frozenset({502, 503, 504})
 
 
 def _json_object(value: object) -> _JsonObject | None:
@@ -356,34 +368,70 @@ class ProxyMcpManager:
                 },
             }
 
-        async def _wait_to_reattach(
+        def _call_failed(cause: BaseException) -> RuntimeError:
+            return RuntimeError(
+                f"MCP proxy call failed for tool {tool_name!r} in session "
+                f"{self._session_id!r}: {cause}"
+            )
+
+        def _no_replacement_server(cause: BaseException | None) -> RuntimeError:
+            detail = f" (last failure: {cause})" if cause is not None else ""
+            return RuntimeError(
+                f"MCP proxy call for tool {tool_name!r} in session "
+                f"{self._session_id!r} lost its server and no replacement "
+                f"connected within {_SERVER_RECONNECT_WAIT_S:.0f}s{detail}"
+            )
+
+        async def _pause_before_reattach(
             request_generation: int,
-            cause: BaseException | None = None,
+            cause: BaseException | None,
+            *,
+            detached_since: float | None,
         ) -> None:
+            """Pause briefly, then let the loop re-send the retained operation.
+
+            The execution keeps running on this runner and its registry attaches
+            the re-sent operation to it instead of running the tool again. The
+            server may still be the same generation (an ingress cut a long
+            request), so a reconnect is awaited only for the pause.
+            """
             registry = self._execution_registry
             if registry is None or not registry.has_operation(self._session_id, operation_id):
+                if cause is not None:
+                    raise _call_failed(cause) from cause
                 raise RuntimeError(
                     f"MCP proxy call for tool {tool_name!r} in session "
                     f"{self._session_id!r} lost its server without a reserved "
                     "runner operation"
-                ) from cause
-            try:
-                await pending_approvals.wait_for_server_reconnect(
-                    request_generation,
-                    timeout_seconds=_SERVER_RECONNECT_WAIT_S,
                 )
-            except asyncio.TimeoutError as reconnect_exc:
+            if monotonic() - call_started >= MCP_PROXY_CALL_TIMEOUT_S:
                 raise RuntimeError(
                     f"MCP proxy call for tool {tool_name!r} in session "
-                    f"{self._session_id!r} lost its server and no replacement "
-                    f"connected within {_SERVER_RECONNECT_WAIT_S:.0f}s"
-                ) from reconnect_exc
+                    f"{self._session_id!r} did not complete within "
+                    f"{MCP_PROXY_CALL_TIMEOUT_S:.0f}s (last failure: {cause})"
+                ) from cause
+            wait_s = _REATTACH_RETRY_DELAY_S
+            if detached_since is not None:
+                remaining = _SERVER_RECONNECT_WAIT_S - (monotonic() - detached_since)
+                if remaining <= 0:
+                    raise _no_replacement_server(cause) from cause
+                wait_s = min(wait_s, remaining)
+            with contextlib.suppress(asyncio.TimeoutError):
+                await pending_approvals.wait_for_server_reconnect(
+                    request_generation,
+                    timeout_seconds=wait_s,
+                )
 
         payload = _initial_payload()
         approval_retries = 0
+        call_started = monotonic()
+        # Start of the current streak of attempts the server could not route to
+        # this runner; ``None`` once an attempt shows the runner was reachable.
+        detached_since: float | None = None
 
         while True:
             request_generation = pending_approvals.current_server_generation()
+            sent_at = monotonic()
             try:
                 resp = await self._omnigent_client.post(
                     self._mcp_url,
@@ -401,19 +449,35 @@ class ProxyMcpManager:
                 )
                 resp.raise_for_status()
                 data = _response_json_object(resp)
-            except httpx.TransportError as exc:
-                await _wait_to_reattach(request_generation, exc)
-                # Reattach the new server generation to the same runner-owned
-                # operation. A fresh JSON-RPC id distinguishes this transport
-                # attempt; the operation id prevents external work from replaying.
+            except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+                if (
+                    isinstance(exc, httpx.HTTPStatusError)
+                    and exc.response.status_code not in _GATEWAY_STATUS_CODES
+                ):
+                    raise _call_failed(exc) from exc
+                # The request was lost between this runner and the server while
+                # the retained execution continues. A fresh JSON-RPC id marks the
+                # new transport attempt; the operation id prevents a replay.
+                if monotonic() - sent_at >= _LONG_REQUEST_MIN_S:
+                    detached_since = None
+                elif detached_since is None:
+                    detached_since = sent_at
+                _logger.warning(
+                    "MCP proxy call for tool %r in session %r dropped after %.0fs (%s); "
+                    "re-sending to reattach to the retained runner operation",
+                    tool_name,
+                    self._session_id,
+                    monotonic() - sent_at,
+                    exc,
+                )
+                await _pause_before_reattach(
+                    request_generation, exc, detached_since=detached_since
+                )
                 request_id += 1
                 payload = cast("_JsonObject", {**payload, "id": request_id})
                 continue
             except Exception as exc:
-                raise RuntimeError(
-                    f"MCP proxy call failed for tool {tool_name!r} in session "
-                    f"{self._session_id!r}: {exc}"
-                ) from exc
+                raise _call_failed(exc) from exc
 
             if "error" in data:
                 err = _json_object(data.get("error"))
@@ -424,7 +488,11 @@ class ProxyMcpManager:
                 code = err.get("code")
                 msg = err.get("message", "")
                 if code == RUNNER_MCP_EXECUTION_DETACHED_CODE:
-                    await _wait_to_reattach(request_generation)
+                    if detached_since is None:
+                        detached_since = sent_at
+                    await _pause_before_reattach(
+                        request_generation, None, detached_since=detached_since
+                    )
                     request_id += 1
                     payload = cast("_JsonObject", {**payload, "id": request_id})
                     continue
@@ -437,6 +505,7 @@ class ProxyMcpManager:
                     f"MCP proxy protocol error {code} for tool {tool_name!r}: {msg}"
                 )
 
+            detached_since = None
             result = _json_object(data.get("result"))
             if result is None:
                 raise RuntimeError(
