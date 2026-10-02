@@ -2822,6 +2822,27 @@ def test_resolve_databricks_auth_keeps_deferred_credentials_bound_to_resolved_ho
     )
 
 
+@pytest.mark.parametrize(
+    "spelling",
+    [f"{_HOST_A}:443", f"{_HOST_A}/?o=123", _HOST_A.removeprefix("https://") + "/"],
+)
+def test_resolve_databricks_auth_accepts_equivalent_profile_host_spellings(
+    fake_databricks_cli: _FakeDatabricksCli, spelling: str
+) -> None:
+    """Spellings the SDK canonicalizes (port 443, query selector, bare host) are not repoints."""
+    from omnigent.inner.databricks_executor import _resolve_databricks_auth
+
+    fake_databricks_cli.cfg_path.write_text(
+        f"[example]\nhost = {spelling}\nauth_type = databricks-cli\n"
+    )
+
+    auth, host = _resolve_databricks_auth("example")
+
+    assert host.startswith(_HOST_A)
+    assert auth.current_token().startswith("fake-token-for-")
+    assert len(fake_databricks_cli.token_calls()) == 1
+
+
 def test_resolve_databricks_auth_refuses_refresh_after_profile_repoint(
     fake_databricks_cli: _FakeDatabricksCli, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2860,9 +2881,9 @@ def test_resolve_databricks_auth_refuses_when_inherited_default_host_is_repointe
     )
 
     assert host == _HOST_A
-    with pytest.raises(DatabricksAuthError) as excinfo:
+    with pytest.raises(DatabricksAuthError, match="now names") as excinfo:
         auth.current_token()
-    assert _HOST_B in str(excinfo.value.__cause__)
+    assert _HOST_B in str(excinfo.value)
     assert fake_databricks_cli.token_calls() == []
 
 
@@ -2881,6 +2902,46 @@ def test_resolve_databricks_auth_reports_cli_failure_on_first_token_request(
         auth.current_token()
     assert "invalid_grant" in str(excinfo.value.__cause__)
     assert len(fake_databricks_cli.token_calls()) == 1
+
+
+def test_resolve_auth_for_host_without_matching_profile_defers_host_keyed_lookup(
+    fake_databricks_cli: _FakeDatabricksCli,
+) -> None:
+    """With no profile for the host, the host-keyed CLI lookup still runs on first use only."""
+    from omnigent.inner.databricks_executor import _resolve_databricks_auth
+
+    fake_databricks_cli.cfg_path.write_text(
+        f"[other]\nhost = {_HOST_B}\nauth_type = databricks-cli\n"
+    )
+
+    auth, host = _resolve_databricks_auth(host=_HOST_A)
+
+    assert host == _HOST_A
+    assert fake_databricks_cli.token_calls() == []
+    assert auth.current_token().startswith(f"fake-token-for-{_HOST_A}-")
+    (token_call,) = fake_databricks_cli.token_calls()
+    assert f"--host {_HOST_A}" in token_call
+    assert auth.profile_name is None
+
+
+def test_profile_cli_auth_config_refuses_a_repointed_profile(
+    tmp_path: _Path, monkeypatch: pytest.MonkeyPatch, clean_databricks_env: None
+) -> None:
+    """The profile-pinned CLI fallback does not mint for a profile that moved hosts."""
+    from omnigent.inner import databricks_executor
+
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(f"[fresh]\nhost = {_HOST_B}\nauth_type = databricks-cli\n")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setattr(
+        databricks_executor.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("the CLI must not run for a repointed profile"),
+    )
+
+    cfg = databricks_executor._DatabricksCliProfileAuthConfig(profile="fresh", host=_HOST_A)
+    with pytest.raises(databricks_executor._ProfileRepointedError, match=_HOST_B):
+        cfg.authenticate()
 
 
 def test_bearer_auth_failure_names_the_selected_profile_over_the_host_hint() -> None:

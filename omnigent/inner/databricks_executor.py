@@ -27,6 +27,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Generator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -500,6 +501,7 @@ class _DatabricksCliProfileAuthConfig:
         now = time.time()
         cached = self._cached_token
         if cached is None or cached.expires_at - now <= _CLI_TOKEN_REFRESH_MARGIN_SECONDS:
+            _check_profile_still_names_host(self)
             cached = _databricks_cli_profile_token(self.profile, now=now)
             self._cached_token = cached
         return {"Authorization": f"Bearer {cached.access_token}"}
@@ -602,6 +604,7 @@ class _DatabricksBearerAuth(httpx.Auth):
         self._profile_name = profile_name
         self._failure_message = failure_message
         self._recent_failure: tuple[float, DatabricksAuthError] | None = None
+        self._lock = threading.Lock()
 
     @property
     def profile_name(self) -> str | None:
@@ -623,17 +626,20 @@ class _DatabricksBearerAuth(httpx.Auth):
         :raises DatabricksAuthError: When the SDK cannot mint a token
             (expired refresh token, revoked credentials, etc.).
         """
-        recent = self._recent_failure
-        if recent is not None and time.monotonic() - recent[0] < _AUTH_FAILURE_REUSE_SECONDS:
-            raise DatabricksAuthError(str(recent[1])) from recent[1]
-        try:
-            headers = self._config.authenticate()
-        except Exception as exc:
-            error = self._auth_error(exc)
-            self._recent_failure = (time.monotonic(), error)
-            raise error from exc
-        self._recent_failure = None
-        return headers
+        # One mint at a time per auth object: concurrent requests wait for the
+        # bearer instead of each spawning their own CLI refresh.
+        with self._lock:
+            recent = self._recent_failure
+            if recent is not None and time.monotonic() - recent[0] < _AUTH_FAILURE_REUSE_SECONDS:
+                raise DatabricksAuthError(str(recent[1])) from recent[1]
+            try:
+                headers = self._config.authenticate()
+            except Exception as exc:
+                error = self._auth_error(exc)
+                self._recent_failure = (time.monotonic(), error)
+                raise error from exc
+            self._recent_failure = None
+            return headers
 
     def _auth_error(self, exc: Exception) -> DatabricksAuthError:
         """Translate a credential failure into the user-facing error."""
@@ -835,10 +841,12 @@ def _lazy_sdk_credentials_strategy() -> Any:  # type: ignore[explicit-any]  # SD
                 result = provider()
                 authorization = result.get("Authorization")
                 if authorization != self._last_authorization:
-                    # A new bearer was minted; a repointed profile would make it
-                    # belong to another workspace, so re-check before handing it out.
-                    _check_profile_still_names_host(cfg)
-                    self._last_authorization = authorization
+                    with self._lock:
+                        if authorization != self._last_authorization:
+                            # A new bearer was minted; a repointed profile would make
+                            # it belong to another workspace, so re-check first.
+                            _check_profile_still_names_host(cfg)
+                            self._last_authorization = authorization
                 return result
 
             return headers
@@ -846,12 +854,12 @@ def _lazy_sdk_credentials_strategy() -> Any:  # type: ignore[explicit-any]  # SD
     return _LazyDefaultCredentials()
 
 
-def _check_profile_still_names_host(cfg: Any) -> None:  # type: ignore[explicit-any]  # SDK Config
+def _check_profile_still_names_host(cfg: Any) -> None:  # type: ignore[explicit-any]  # SDK Config or _DatabricksCliProfileAuthConfig
     """Refuse to mint when ``cfg.profile`` was repointed since ``cfg.host`` resolved.
 
-    Newer SDKs mint with ``databricks auth token --profile``, and the CLI reads
-    the profile's host again, so a repointed profile would hand this host's
-    client a bearer for another workspace.
+    ``databricks auth token --profile`` (newer SDKs and the profile-pinned CLI
+    fallback) reads the profile's host again, so a repointed profile would
+    hand this host's client a bearer for another workspace.
 
     :raises _ProfileRepointedError: When the profile now names a different host.
     """
@@ -1069,9 +1077,21 @@ _NO_DEFAULT_INHERITANCE = "@omnigent-no-default-inheritance@"
 
 
 def _normalized_workspace_host(value: str) -> str:
-    """Compare workspace hosts ignoring scheme, trailing slashes and case."""
-    value = value.strip().rstrip("/")
-    return value.split("://", 1)[-1].lower()
+    """Canonical form for comparing workspace hosts, mirroring the SDK's host fix-up.
+
+    Ignores scheme, case, a ``:443`` port and trailing slashes; keeps other
+    ports, paths and query selectors such as ``?o=<workspace id>``.
+    """
+    value = value.strip()
+    parts = urlsplit(value if "://" in value else f"https://{value}")
+    netloc = parts.netloc.lower()
+    try:
+        if parts.port == 443:
+            netloc = netloc.rsplit(":", 1)[0]
+    except ValueError:  # non-numeric port: compare the spelling as written
+        pass
+    canonical = netloc + parts.path.rstrip("/")
+    return f"{canonical}?{parts.query}" if parts.query else canonical
 
 
 def _read_databrickscfg_no_inheritance() -> configparser.ConfigParser | None:
