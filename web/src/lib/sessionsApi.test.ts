@@ -164,6 +164,7 @@ describe("createSession", () => {
       reasoningEffort: undefined,
       pendingElicitations: [],
       pendingInputs: [],
+      unconsumedInputIds: [],
       permissionLevel: null,
       parentSessionId: null,
       subAgentName: null,

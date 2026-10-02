@@ -6229,8 +6229,14 @@ export async function pumpStreamEvents(
   }
 }
 
-function isHumanAuthoredInput(event: SessionInputConsumedEvent): boolean {
-  return Boolean(event.createdBy || event.data.user_authored === true || event.clearedPendingId);
+function isHumanAuthoredInput(
+  event: SessionInputConsumedEvent | SessionInputDeliveredEvent,
+): boolean {
+  return Boolean(
+    event.createdBy ||
+    event.data.user_authored === true ||
+    (event.type === "session_input_consumed" && event.clearedPendingId),
+  );
 }
 
 /**

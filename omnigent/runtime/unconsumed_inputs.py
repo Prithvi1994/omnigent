@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
@@ -23,8 +23,7 @@ def _now() -> float:
 @dataclass
 class _Entry:
     item: Any
-    # Resolve a monkeypatched clock when the entry is created.
-    recorded_at: float = field(default_factory=lambda: _now())
+    recorded_at: float
 
 
 _unconsumed: WorkspaceScopedCache[str, dict[str, _Entry]] = WorkspaceScopedCache()
@@ -51,7 +50,7 @@ def _evict_stale_locked(conversation_id: str, now: float) -> None:
 
 def record(conversation_id: str, item_id: str, item: Any) -> bool:
     """Return false when this item was already reported as drained."""
-    entry = _Entry(item=item)
+    entry = _Entry(item=item, recorded_at=_now())
     with _lock:
         _evict_stale_locked(conversation_id, entry.recorded_at)
         pre = _pre_drained.get(conversation_id)

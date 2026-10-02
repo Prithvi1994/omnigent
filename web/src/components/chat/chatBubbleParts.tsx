@@ -744,13 +744,16 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       data-user-message-id={bubble.itemId}
       data-pending={bubble.awaitingConsumption ? "true" : undefined}
       data-message-id={bubble.itemId}
-      className={cn(
-        "max-w-[640px]",
-        bubble.pending && "animate-user-message-enter",
-        bubble.awaitingConsumption && "opacity-60",
-      )}
+      className={cn("max-w-[640px]", bubble.pending && "animate-user-message-enter")}
     >
-      <div className="ml-auto flex w-fit max-w-full flex-col items-end">
+      <div
+        className={cn(
+          "ml-auto flex w-fit max-w-full flex-col items-end",
+          // The entrance animation's fill pins the outer element's opacity at 1,
+          // so the pending dim has to sit inside it.
+          bubble.awaitingConsumption && "opacity-60",
+        )}
+      >
         {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
             immediately left of the right-aligned bubble. */}
         <div className="flex w-fit max-w-full items-center gap-1.5">
