@@ -53,9 +53,9 @@ _SERVER_RECONNECT_WAIT_S = 120.0
 # Pause between re-sends of a retained operation whose request was lost between
 # this runner and the server, so an unreachable server is not hammered.
 _REATTACH_RETRY_DELAY_S = 2.0
-# A request open at least this long was being executed when it dropped (an
-# ingress cut a long-running tool, a connection reset), so it does not start
-# the reconnect-wait streak that fast refusals do.
+# A request open at least this long was being executed when it was lost (an
+# ingress cut a long-running tool, the tunnel dropped mid-execution), so it
+# does not start the reconnect-wait streak that fast refusals do.
 _LONG_REQUEST_MIN_S = 30.0
 # Gateway-class statuses a proxy in front of the server returns when it gives
 # up on a request; the server itself answers tool calls with JSON-RPC errors.
@@ -374,27 +374,39 @@ class ProxyMcpManager:
                 f"{self._session_id!r}: {cause}"
             )
 
+        def _failure_detail(cause: BaseException | None) -> str:
+            return f" (last failure: {cause})" if cause is not None else ""
+
         def _no_replacement_server(cause: BaseException | None) -> RuntimeError:
-            detail = f" (last failure: {cause})" if cause is not None else ""
             return RuntimeError(
                 f"MCP proxy call for tool {tool_name!r} in session "
                 f"{self._session_id!r} lost its server and no replacement "
-                f"connected within {_SERVER_RECONNECT_WAIT_S:.0f}s{detail}"
+                f"connected within {_SERVER_RECONNECT_WAIT_S:.0f}s{_failure_detail(cause)}"
             )
 
-        async def _pause_before_reattach(
+        def _budget_exhausted(cause: BaseException | None) -> RuntimeError:
+            return RuntimeError(
+                f"MCP proxy call for tool {tool_name!r} in session "
+                f"{self._session_id!r} did not complete within "
+                f"{MCP_PROXY_CALL_TIMEOUT_S:.0f}s{_failure_detail(cause)}"
+            )
+
+        async def _wait_before_reattach(
             request_generation: int,
             cause: BaseException | None,
             *,
-            detached_since: float | None,
+            sent_at: float,
         ) -> None:
-            """Pause briefly, then let the loop re-send the retained operation.
+            """Wait, then let the loop re-send the retained operation.
 
             The execution keeps running on this runner and its registry attaches
-            the re-sent operation to it instead of running the tool again. The
-            server may still be the same generation (an ingress cut a long
-            request), so a reconnect is awaited only for the pause.
+            the re-sent operation to it instead of running the tool again. A
+            request lost in transit (``cause`` set) may have met the same server
+            generation, so the loop re-sends after a short pause. A server that
+            reported the execution detached cannot reach this runner, so the loop
+            waits for the tunnel to rebind, which advances the server generation.
             """
+            nonlocal detached_since
             registry = self._execution_registry
             if registry is None or not registry.has_operation(self._session_id, operation_id):
                 if cause is not None:
@@ -404,32 +416,56 @@ class ProxyMcpManager:
                     f"{self._session_id!r} lost its server without a reserved "
                     "runner operation"
                 )
-            if monotonic() - call_started >= MCP_PROXY_CALL_TIMEOUT_S:
-                raise RuntimeError(
-                    f"MCP proxy call for tool {tool_name!r} in session "
-                    f"{self._session_id!r} did not complete within "
-                    f"{MCP_PROXY_CALL_TIMEOUT_S:.0f}s (last failure: {cause})"
-                ) from cause
+            now = monotonic()
+            phase_deadline = phase_started + MCP_PROXY_CALL_TIMEOUT_S
+            if now >= phase_deadline:
+                raise _budget_exhausted(cause) from cause
+            if cause is None:
+                if detached_since is None:
+                    detached_since = now
+                rebind_deadline = detached_since + _SERVER_RECONNECT_WAIT_S
+                if now >= rebind_deadline:
+                    raise _no_replacement_server(None)
+                try:
+                    await pending_approvals.wait_for_server_reconnect(
+                        request_generation,
+                        timeout_seconds=min(rebind_deadline, phase_deadline) - now,
+                    )
+                except asyncio.TimeoutError as exc:
+                    if monotonic() >= rebind_deadline:
+                        raise _no_replacement_server(None) from exc
+                return
+            if now - sent_at >= _LONG_REQUEST_MIN_S:
+                detached_since = None
+            elif detached_since is None:
+                detached_since = sent_at
             wait_s = _REATTACH_RETRY_DELAY_S
             if detached_since is not None:
-                remaining = _SERVER_RECONNECT_WAIT_S - (monotonic() - detached_since)
+                remaining = detached_since + _SERVER_RECONNECT_WAIT_S - now
                 if remaining <= 0:
                     raise _no_replacement_server(cause) from cause
                 wait_s = min(wait_s, remaining)
             with contextlib.suppress(asyncio.TimeoutError):
                 await pending_approvals.wait_for_server_reconnect(
                     request_generation,
-                    timeout_seconds=wait_s,
+                    timeout_seconds=min(wait_s, phase_deadline - now),
                 )
 
         payload = _initial_payload()
         approval_retries = 0
-        call_started = monotonic()
+        # Start of the current request phase. The call budget bounds sending one
+        # request and re-sending it after drops; waiting for a user's verdict is
+        # bounded by the ask gate instead and starts a new phase.
+        phase_started = monotonic()
+        last_failure: BaseException | None = None
         # Start of the current streak of attempts the server could not route to
         # this runner; ``None`` once an attempt shows the runner was reachable.
         detached_since: float | None = None
 
         while True:
+            budget_left = MCP_PROXY_CALL_TIMEOUT_S - (monotonic() - phase_started)
+            if budget_left <= 0:
+                raise _budget_exhausted(last_failure) from last_failure
             request_generation = pending_approvals.current_server_generation()
             sent_at = monotonic()
             try:
@@ -438,11 +474,12 @@ class ProxyMcpManager:
                     json=payload,
                     # Short connect timeout still fails fast on an unreachable
                     # server; the read timeout covers ordinary proxy request
-                    # hangs. Sub-agent dispatch returns an async handle
+                    # hangs and shrinks on re-sends so the phase stays within
+                    # the call budget. Sub-agent dispatch returns an async handle
                     # immediately and no longer holds this call for a child turn.
                     timeout=httpx.Timeout(
                         connect=10.0,
-                        read=MCP_PROXY_CALL_TIMEOUT_S,
+                        read=budget_left,
                         write=10.0,
                         pool=10.0,
                     ),
@@ -458,10 +495,7 @@ class ProxyMcpManager:
                 # The request was lost between this runner and the server while
                 # the retained execution continues. A fresh JSON-RPC id marks the
                 # new transport attempt; the operation id prevents a replay.
-                if monotonic() - sent_at >= _LONG_REQUEST_MIN_S:
-                    detached_since = None
-                elif detached_since is None:
-                    detached_since = sent_at
+                last_failure = exc
                 _logger.warning(
                     "MCP proxy call for tool %r in session %r dropped after %.0fs (%s); "
                     "re-sending to reattach to the retained runner operation",
@@ -470,9 +504,7 @@ class ProxyMcpManager:
                     monotonic() - sent_at,
                     exc,
                 )
-                await _pause_before_reattach(
-                    request_generation, exc, detached_since=detached_since
-                )
+                await _wait_before_reattach(request_generation, exc, sent_at=sent_at)
                 request_id += 1
                 payload = cast("_JsonObject", {**payload, "id": request_id})
                 continue
@@ -488,11 +520,8 @@ class ProxyMcpManager:
                 code = err.get("code")
                 msg = err.get("message", "")
                 if code == RUNNER_MCP_EXECUTION_DETACHED_CODE:
-                    if detached_since is None:
-                        detached_since = sent_at
-                    await _pause_before_reattach(
-                        request_generation, None, detached_since=detached_since
-                    )
+                    last_failure = None
+                    await _wait_before_reattach(request_generation, None, sent_at=sent_at)
                     request_id += 1
                     payload = cast("_JsonObject", {**payload, "id": request_id})
                     continue
@@ -550,11 +579,15 @@ class ProxyMcpManager:
                     # requestState and its elicitation id belong to the server
                     # generation that issued them. Re-run the original call so
                     # the connected generation can create an answerable gate.
+                    phase_started = monotonic()
                     request_id += 1
                     payload = _initial_payload()
                     continue
 
+                phase_started = monotonic()
                 request_id += 1
+                # The server consumes the approval when this retry first arrives,
+                # so a re-send after a lost response is not replay-safe yet.
                 payload = {
                     "jsonrpc": "2.0",
                     "id": request_id,  # MRTR retry MUST use a different id
