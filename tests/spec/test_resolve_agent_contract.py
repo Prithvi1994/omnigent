@@ -294,9 +294,21 @@ def test_written_evidence_is_limited_to_results_without_visible_interaction() ->
     assert "just a static line, value, or the absence of an error" not in normalized
     assert "For purely textual evidence" not in normalized
 
-    # Publication and final review restate the carve-out in their own resources;
-    # pin each so the combined text cannot mask one of them losing the rule.
+    # Each phase restates the carve-out in its own resource; pin each so the
+    # combined text cannot mask one of them losing the rule.
     for skill, name, phrase in (
+        (
+            "resolve-author-fix",
+            "SKILL.md",
+            "Judge visibility by what one user sees in one session after the fix, not by "
+            "the host-level symptom the ticket reports",
+        ),
+        (
+            "resolve-handoff",
+            "SKILL.md",
+            "a lifecycle change visible in the Terminal view, or a surface the repro "
+            "bundle already filmed, is not internal",
+        ),
         (
             "resolve-publish",
             "SKILL.md",

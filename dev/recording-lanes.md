@@ -270,9 +270,10 @@ The shortened window is not the whole wait. Recent pane output or viewer input
 counts as busy for two minutes, the reaper scans once a minute, and a newly idle
 pane gets one full window of grace, so even a 5-second window means a few
 minutes between the last output and the pane vanishing. Keep the Terminal view
-open while you wait (an idle viewer does not count as busy) but do not type into
-it, wait on the pane's disappearance rather than a fixed sleep, and give the
-before and after clips the same observation period.
+open while you wait (an idle viewer does not count as busy) but do not type
+into, click, focus, or resize it — the attach bridge counts every such client
+event as input — wait on the pane's disappearance rather than a fixed sleep, and
+give the before and after clips the same observation period.
 
 ## `cli` facets
 
