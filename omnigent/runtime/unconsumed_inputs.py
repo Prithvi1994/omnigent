@@ -81,6 +81,14 @@ def snapshot_for(conversation_id: str) -> list[str]:
         return list(entries) if entries else []
 
 
+def drain(conversation_id: str) -> list[Any]:
+    """Forget every tracked item of a conversation, returning them oldest first."""
+    with _lock:
+        entries = _unconsumed.pop(conversation_id, None)
+        _pre_drained.pop(conversation_id, None)
+        return [entry.item for entry in entries.values()] if entries else []
+
+
 def clear(conversation_id: str) -> None:
     with _lock:
         _unconsumed.pop(conversation_id, None)

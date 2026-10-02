@@ -33,6 +33,18 @@ def test_resolve_returns_recorded_item_exactly_once() -> None:
     assert unconsumed_inputs.snapshot_for("conv_a") == []
 
 
+def test_drain_returns_tracked_items_once_oldest_first() -> None:
+    first = {"id": "item_1"}
+    second = {"id": "item_2"}
+    unconsumed_inputs.record("conv_a", "item_1", first)
+    unconsumed_inputs.record("conv_a", "item_2", second)
+    unconsumed_inputs.record("conv_b", "item_9", {"id": "item_9"})
+
+    assert unconsumed_inputs.drain("conv_a") == [first, second]
+    assert unconsumed_inputs.drain("conv_a") == []
+    assert unconsumed_inputs.snapshot_for("conv_b") == ["item_9"]
+
+
 def test_clear_drops_one_conversation_only() -> None:
     unconsumed_inputs.record("conv_a", "item_1", {"id": "item_1"})
     unconsumed_inputs.record("conv_b", "item_2", {"id": "item_2"})

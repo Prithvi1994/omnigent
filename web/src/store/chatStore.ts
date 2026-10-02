@@ -6349,10 +6349,8 @@ function authorsCompatible(author: string | undefined, other: string | undefined
 }
 
 /**
- * Merge persisted-but-unconsumed entries recovered from a snapshot into the
- * pending lane: ids already tracked are kept, a local optimistic echo with
- * the same author and content is stamped, and anything else is prepended (a
- * persisted entry is older than anything merely queued or in flight).
+ * Merge snapshot-delivered items into pending state, matching local echoes
+ * by author and content; unmatched items go first (they are already persisted).
  */
 function absorbDelivered(
   pending: PendingUserMessage[],
@@ -7350,10 +7348,21 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             pendingUserMessages: [...s.pendingUserMessages, deliveredPendingFromBlock(block)],
           };
         }
+        const content = userContentFromEvent(event);
+        // Same eligibility as the consumed path: only a human-authored,
+        // non-system message may claim a local optimistic echo, and never an
+        // initial draft still waiting on model selection.
+        const canClaimEcho =
+          isHumanAuthoredInput(event) && (content === null || !isSystemUserContent(content));
         // FIFO is safe within one author; the guard separates concurrent viewers.
-        const at = s.pendingUserMessages.findIndex(
-          (p) => p.deliveredItemId === undefined && authorsCompatible(event.createdBy, p.author),
-        );
+        const at = canClaimEcho
+          ? s.pendingUserMessages.findIndex(
+              (p) =>
+                p.deliveredItemId === undefined &&
+                !p.initialDraft &&
+                authorsCompatible(event.createdBy, p.author),
+            )
+          : -1;
         if (at >= 0) {
           const entry = s.pendingUserMessages[at]!;
           return {
@@ -7364,8 +7373,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             ],
           };
         }
-        // Materialize messages steered by another client.
-        const content = userContentFromEvent(event);
+        // Materialize messages steered by another client, and system notices.
         if (content === null) return {};
         return {
           pendingUserMessages: [

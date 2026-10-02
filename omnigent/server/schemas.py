@@ -3611,8 +3611,9 @@ class SessionInputDeliveredEvent(_SSEEventBase):
     but the agent loop has verifiably NOT seen it yet. Clients render
     the message in an intermediate (pending) state until the follow-up
     ``session.input.consumed`` for the same ``item_id`` arrives — which
-    the server publishes only once the runner reports the buffered
-    message was actually drained into a turn.
+    the server publishes once the runner reports the buffered message
+    was drained into a turn, or when the session returns to ``idle``
+    with the item still tracked (its drain marker was lost).
 
     Wire shape uses the NESTED envelope with the same payload as
     :class:`SessionInputConsumedEvent` (``cleared_pending_id`` is always

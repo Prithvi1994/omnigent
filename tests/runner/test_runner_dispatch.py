@@ -11892,6 +11892,11 @@ async def test_continuation_drain_reports_buffered_message_drained() -> None:
                 if any(e.get("type") == "session.input.drained" for e in drained_events):
                     break
                 await asyncio.sleep(0.02)
+            # Settle, then drain once more so a duplicate marker would be seen.
+            await asyncio.sleep(0.2)
+            drained_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+            )
     finally:
         release.set()
 

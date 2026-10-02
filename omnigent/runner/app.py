@@ -8252,7 +8252,8 @@ def create_runner_app(
                                                     "content": _m.get("content", []),
                                                 }
                                             )
-                                            # The executor accepted this live injection.
+                                            # Marker now rather than at turn end: the
+                                            # item already entered this turn.
                                             _publish_input_drained(conv_id, _m)
                                     continue
                                 if _evt_type == "response.output_text.delta":

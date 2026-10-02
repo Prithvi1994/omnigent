@@ -4823,8 +4823,10 @@ def _publish_status(
     if status == "idle":
         # Only idle proves the turn buffer is empty: the runner publishes
         # `failed` before draining a buffered continuation, and `waiting`
-        # can be re-announced while a message is still buffered.
-        unconsumed_inputs.clear(session_id)
+        # can be re-announced while a message is still buffered. Anything
+        # still tracked lost its drain marker, so settle it for every client.
+        for drained_item in unconsumed_inputs.drain(session_id):
+            _publish_input_consumed(session_id, drained_item)
     if status == "idle" and _session_status_cache.get(session_id) == "failed":
         # Session stays ``failed`` (terminal); the turn is over, so drop any
         # tracked in-flight response id rather than leaving it for the

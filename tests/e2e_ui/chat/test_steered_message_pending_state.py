@@ -176,7 +176,7 @@ def test_steered_followup_looks_pending_until_the_agent_consumes_it(
         page.reload()
         expect(page.get_by_label(_COMPOSER_LABEL)).to_be_visible(timeout=30_000)
         expect(steered).to_be_visible(timeout=15_000)
-        page.wait_for_timeout(1_000)
+        expect(steered).to_have_attribute("data-pending", "true", timeout=15_000)
         assert _gate_pending(mock_url), "the turn ended before the reload comparison"
         consumed_look = _presentation(first, _FIRST_MSG)
         reloaded_look = _presentation(steered, _STEERED_MSG)

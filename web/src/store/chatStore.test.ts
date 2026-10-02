@@ -7673,7 +7673,11 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         type: "session_input_delivered",
         itemId: "msg_steered_1",
         itemType: "message",
-        data: { role: "user", content: [{ type: "input_text", text: "steer me" }] },
+        data: {
+          role: "user",
+          user_authored: true,
+          content: [{ type: "input_text", text: "steer me" }],
+        },
       });
 
       const state = useChatStore.getState();
@@ -7739,6 +7743,56 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(alice?.author).toBe("alice@example.com");
     });
 
+    it("does not let a delivered system notice claim a human echo or its attachments", () => {
+      // A sub-agent blocking notification is a non-meta `[System: …]` user
+      // message without an author; it must materialize on its own.
+      const humanContent = [
+        { type: "input_text" as const, text: "please review" },
+        { type: "input_image" as const, file_id: "file_shot_1" },
+      ];
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          { tempId: "pend_human", content: humanContent, author: "bob@example.com" },
+        ],
+      });
+
+      const notice = [{ type: "input_text", text: "[System: sub-agent worker is blocked]" }];
+      handleSessionEvent({
+        type: "session_input_delivered",
+        itemId: "msg_notice_1",
+        itemType: "message",
+        data: { role: "user", content: notice },
+      });
+
+      const delivered = useChatStore.getState();
+      expect(delivered.pendingUserMessages.map((p) => p.tempId)).toEqual([
+        "pend_human",
+        "delivered:msg_notice_1",
+      ]);
+      expect(delivered.pendingUserMessages[0]).toEqual({
+        tempId: "pend_human",
+        content: humanContent,
+        author: "bob@example.com",
+      });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_notice_1",
+        itemType: "message",
+        clearedPendingId: null,
+        data: { role: "user", content: notice },
+      });
+
+      const consumed = useChatStore.getState();
+      expect(consumed.pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_human"]);
+      expect(consumed.blocks).toHaveLength(1);
+      const committed = consumed.blocks[0] as UserMessageBlock;
+      expect(committed.ctx.itemId).toBe("msg_notice_1");
+      expect(committed.stableKey).toBe("delivered:msg_notice_1");
+      expect(committed.content).toEqual(notice);
+    });
+
     it("is idempotent across an SSE replay of the same delivered event", () => {
       useChatStore.setState({
         blocks: [],
@@ -7750,7 +7804,11 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         type: "session_input_delivered",
         itemId: "msg_steered_1",
         itemType: "message",
-        data: { role: "user", content: [{ type: "input_text", text: "steer me" }] },
+        data: {
+          role: "user",
+          user_authored: true,
+          content: [{ type: "input_text", text: "steer me" }],
+        },
       } as const;
 
       handleSessionEvent(event);

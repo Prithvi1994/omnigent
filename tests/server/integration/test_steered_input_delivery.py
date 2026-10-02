@@ -232,6 +232,7 @@ async def test_non_idle_status_keeps_unconsumed_snapshot(
     status: str,
 ) -> None:
     """The runner fails before draining a continuation; waiting can repeat mid-buffer."""
+    published = _capture_stream(monkeypatch)
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     fake_runner = _fake_runner("buffered")
@@ -240,6 +241,7 @@ async def test_non_idle_status_keeps_unconsumed_snapshot(
         ack = await _post_message(client, session["id"], f"steer then {status} edge")
     finally:
         await fake_runner.aclose()
+    published.clear()
 
     from omnigent.server.routes._sessions.helpers import _publish_status
 
@@ -247,11 +249,16 @@ async def test_non_idle_status_keeps_unconsumed_snapshot(
 
     snap = await client.get(f"/v1/sessions/{session['id']}")
     assert snap.json()["unconsumed_input_ids"] == [ack["item_id"]]
+    assert all(ev["type"] != "session.input.consumed" for _sid, ev in published)
 
+    # Idle with the item still tracked means its drain marker was lost, so
+    # the server settles it for every client instead of only forgetting it.
     _publish_status(session["id"], "idle")
 
     snap = await client.get(f"/v1/sessions/{session['id']}")
     assert snap.json()["unconsumed_input_ids"] == []
+    consumed = [ev for _sid, ev in published if ev["type"] == "session.input.consumed"]
+    assert [ev["data"]["item_id"] for ev in consumed] == [ack["item_id"]]
 
 
 async def test_drain_marker_racing_ahead_of_record_publishes_consumed(
