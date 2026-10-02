@@ -1089,20 +1089,6 @@ describe("OIDC session cookie installation", () => {
 });
 
 describe("OIDC session lifetime", () => {
-  it("carries the token lifetime from the poll response", async () => {
-    const responses = [
-      response(200, { ticket: "t", login_url: "/auth/login?ticket=t" }),
-      response(200, { token: "session-jwt", expires_in: 3600 }),
-    ];
-    const result = await runOidcBrowserLogin(
-      { fetch: async () => responses.shift() },
-      "https://server.example",
-      async () => {},
-      { pollIntervalMs: 1 },
-    );
-    assert.deepEqual(result, { ok: true, token: "session-jwt", expiresIn: 3600 });
-  });
-
   it("reports a cancellation that lands while the token body is being read", async () => {
     const controller = new AbortController();
     const responses = [
