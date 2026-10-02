@@ -32,9 +32,9 @@ Covered facets:
   surface feedback promptly instead of leaving the save spinning ~30s and then
   toasting the misleading timeout message.
 
-The async-in-a-fresh-thread shape is inherited from
-``test_windows_workspace_picker.py`` (pytest-asyncio can't start a loop on the
-main thread once a sync pytest-playwright test has run in the session).
+Browser journeys run on a fresh thread and loop (``tests._helpers.async_thread``)
+because pytest-asyncio can't start a loop on the main thread once a sync
+pytest-playwright test has run in the session.
 """
 
 from __future__ import annotations
@@ -46,10 +46,9 @@ import os
 import signal
 import subprocess
 import sys
-import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Coroutine, Iterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import httpx
@@ -70,6 +69,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
 from tests.e2e_ui.conftest import _BUILD_OUTPUT, _REPO_ROOT, _find_free_port
 
 _HOST_NAME = "old-host-0-6-0-e2e"
@@ -204,8 +204,7 @@ async def _old_host(base_url: str, dropped: list[str]) -> AsyncIterator[str]:
             yield rest_host_id
         finally:
             serve_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await serve_task
+            await asyncio.gather(serve_task, return_exceptions=True)
 
 
 # ── Dedicated server (harness_install on) ────────────────────────────────────
@@ -300,31 +299,6 @@ def old_host_server(
                 proc.kill()
                 proc.wait(timeout=10)
         log_handle.close()
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* to completion in a dedicated thread with its own event loop.
-
-    Same rationale as ``test_windows_workspace_picker.py``: once a
-    pytest-playwright sync test has run in the session, pytest-asyncio can't
-    start a loop on the main thread. Exceptions re-raise on the calling thread.
-
-    :param coro: The coroutine to run to completion.
-    :raises Exception: Whatever the coroutine raised, re-raised here.
-    """
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
 
 
 def _video_kwargs() -> dict[str, Any]:
@@ -444,8 +418,11 @@ async def _drive_setup_dialog_save(base_url: str) -> None:
             # nothing until the 30s server timeout lands.
             toast = page.get_by_test_id("toast").first
             await expect(toast).to_be_visible(timeout=int(_PROMPT_FEEDBACK_S * 1000))
-            # … and the message must not be the misleading responsiveness blame.
+            # … naming the remedy, never the misleading responsiveness blame.
+            await expect(toast).to_contain_text("update omnigent on the host")
             await expect(toast).not_to_contain_text("did not respond")
+            # Hold the toast on screen so a recording ends on it.
+            await page.wait_for_timeout(3_000)
         finally:
             await context.close()
             await browser.close()
