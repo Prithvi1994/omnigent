@@ -307,17 +307,12 @@ def _poll_for_token(origin: str, ticket: str) -> dict[str, object]:
 def _shell_session_cookie(origin: str, token: str, *, expires_in: int | None) -> dict[str, object]:
     """Build the persistent or session-only cookie for the restart test.
 
-    ``None`` is this test's control (no expiry, so WebKit/Chromium drop it); the
-    shell always sets an expiry, falling back to 8h only when the server omits one.
+    ``None`` is this test's control (no expiry, so Chromium drops it); the shell
+    always sets an expiry, falling back to 8h only when the server omits one. The
+    test server is http, so this uses the ``ap_session`` name; the HTTPS
+    ``__Host-ap_session`` naming is covered by the Swift unit tests.
     """
-    secure = urlparse(origin).scheme == "https"
-    cookie: dict[str, object] = {
-        "name": "__Host-ap_session" if secure else "ap_session",
-        "value": token,
-        "url": origin,
-    }
-    if secure:
-        cookie["secure"] = True
+    cookie: dict[str, object] = {"name": "ap_session", "value": token, "url": origin}
     if expires_in is not None:
         cookie["expires"] = time.time() + expires_in
     return cookie
@@ -409,8 +404,9 @@ class WebViewStandIn:
             boot.final_url = self.page.url
             boot.opening_sign_in_visible = self.page.get_by_text("Opening sign-in…").count() > 0
             for cookie in self.context.cookies(origin):
-                if cookie["name"] in {"ap_session", "__Host-ap_session"}:
+                if cookie["name"] == "ap_session":
                     boot.session_cookie_present = True
+                    # Playwright reports -1 (not absence) for a session-only cookie.
                     boot.session_cookie_expires = cookie.get("expires")
             self.page.screenshot(path=str(evidence_dir / f"{label}.png"))
         finally:
@@ -537,6 +533,10 @@ def test_shell_session_cookie_survives_cold_start(
     assert relaunch.session_cookie_present, (
         f"session cookie gone after relaunch; /v1/me -> {relaunch.me_status}, "
         f"login redirect -> {relaunch.login_redirect_url}"
+    )
+    assert relaunch.session_cookie_expires is not None
+    assert relaunch.session_cookie_expires > time.time(), (
+        f"surviving cookie is not persistent; expires -> {relaunch.session_cookie_expires}"
     )
     assert relaunch.me_status == 200
     assert relaunch.api_401_paths == []
