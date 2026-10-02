@@ -4614,6 +4614,7 @@ function SessionHarnessPicker({
     modelLabelLoading,
     modelLabelUnavailable,
     modelOptions,
+    modelDivergence,
     pickerSelectedModel,
   } = useResolvedComposerModel(
     modelPickerKind,
@@ -4626,6 +4627,12 @@ function SessionHarnessPicker({
     : modelLabelUnavailable
       ? "Model name unavailable"
       : modelLabel;
+  // The harness runs a different model than the picked one — name both so a
+  // silent reroute (e.g. a banned pick) can't pass unnoticed.
+  const divergenceNotice =
+    modelDivergence && !routingOn && !modelLabelLoading && !modelLabelUnavailable && modelSummary
+      ? `Running ${modelSummary} instead of the selected ${modelDivergence.selectedLabel}.`
+      : null;
   const nativeAgent =
     nativeCodingAgentForHarness(sessionHarness) ??
     (modelPickerKind ? nativeCodingAgentForHarness(modelPickerKind + "-native") : undefined);
@@ -4641,6 +4648,7 @@ function SessionHarnessPicker({
     effectiveModel,
     modelLabel: modelSummary,
     costRoutingEligible,
+    modelDivergence: divergenceNotice ? modelDivergence : null,
   });
   const configurable = hasSessionConfig({
     showModels,
@@ -4748,10 +4756,25 @@ function SessionHarnessPicker({
                 testId: "composer-agent-models",
                 header: "Models",
                 leading:
-                  (inferenceConfigured && inferenceError) || modelOptions.length === 0 ? (
-                    <div className="px-2 py-1 text-xs text-muted-foreground" role="status">
-                      {inferenceError ?? "No usable models are available for this session."}
-                    </div>
+                  divergenceNotice ||
+                  (inferenceConfigured && inferenceError) ||
+                  modelOptions.length === 0 ? (
+                    <>
+                      {divergenceNotice && (
+                        <div
+                          className="px-2 py-1 text-xs text-muted-foreground"
+                          role="status"
+                          data-testid="composer-model-divergence-notice"
+                        >
+                          {divergenceNotice}
+                        </div>
+                      )}
+                      {(inferenceConfigured && inferenceError) || modelOptions.length === 0 ? (
+                        <div className="px-2 py-1 text-xs text-muted-foreground" role="status">
+                          {inferenceError ?? "No usable models are available for this session."}
+                        </div>
+                      ) : null}
+                    </>
                   ) : undefined,
                 choices: [
                   ...(supportsModelReset &&
@@ -4928,6 +4951,7 @@ function useSessionConfigSummary({
   effectiveModel,
   modelLabel,
   costRoutingEligible,
+  modelDivergence,
 }: {
   harnessLabel: string | null;
   showModels: boolean;
@@ -4936,6 +4960,7 @@ function useSessionConfigSummary({
   effectiveModel: string | null;
   modelLabel: string | null;
   costRoutingEligible: boolean;
+  modelDivergence: { selectedLabel: string } | null;
 }): { label: string; value: string }[] {
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
@@ -4946,7 +4971,11 @@ function useSessionConfigSummary({
   if (showModels) {
     rows.push({
       label: "Model",
-      value: routingOn ? SMART_ROUTING_LABEL : (modelLabel ?? "Default"),
+      value: routingOn
+        ? SMART_ROUTING_LABEL
+        : modelDivergence
+          ? `${modelLabel ?? "Default"} (not the selected ${modelDivergence.selectedLabel})`
+          : (modelLabel ?? "Default"),
     });
   }
   // Suppress Effort while routing is on: the router picks the model and its
@@ -5044,6 +5073,27 @@ function useResolvedComposerModel(
     isReportedModelPicker && sessionModelOverride
       ? (findNativeModelOption(codexModelOptions, sessionModelOverride)?.id ?? sessionModelOverride)
       : null;
+  // A settled divergence between the user's pick and the model the harness
+  // actually runs — e.g. a banned pick the gateway silently reroutes, or a
+  // ``/model`` switch made inside the pane. Both sides resolve through the
+  // same catalog fold, so alias spellings never trip it; only a genuinely
+  // different model row does. A pending switch hasn't settled yet, so it
+  // waits for the harness's own report.
+  const pendingModelChange = useChatStore((s) => s.pendingModelChange);
+  const modelDivergence =
+    isReportedModelPicker &&
+    reportedRowId !== null &&
+    requestedRowId !== null &&
+    reportedRowId !== requestedRowId &&
+    pendingModelChange === null
+      ? {
+          selectedLabel: nativeModelLabel(
+            findNativeModelOption(codexModelOptions, sessionModelOverride) ?? {
+              id: requestedRowId,
+            },
+          ),
+        }
+      : null;
   // cursor mirrors its live TUI model into ``model_override``; kiro sets it
   // on a web pick (which also drives a live ``/model`` switch); opencode/pi
   // mirror both ways into ``model_override``. Those wrappers keep their
@@ -5085,6 +5135,7 @@ function useResolvedComposerModel(
     isNativeModelPicker,
     pickerSelectedModel,
     effectiveModel,
+    modelDivergence,
     modelLabel,
     modelLabelLoading,
     modelLabelUnavailable,
