@@ -1,29 +1,17 @@
 """E2E: the first web message of a fresh hermes-native session must survive a slow Hermes boot.
 
 A new Hermes TUI can take 15-25 s to become input-ready (plugin discovery,
-state.db init, MCP registration, agent init). A web message sent in that window
-is pasted into a pane nothing is reading yet, so the bridge
-(``omnigent/harnesses/hermes_native/bridge.py``) must keep re-delivering until
-Hermes accepts it - and must deliver it exactly once.
+state.db init, MCP registration, agent init); a web message sent in that window
+is pasted into a pane nothing is reading yet, so the bridge must keep delivering
+until Hermes accepts it - exactly once.
 
-What this test drives
----------------------
-The rig launches the session's Hermes TUI through a wrapper
-(``OMNIGENT_HERMES_PATH``, the documented harness-command override) that prints
-boot output, holds startup for :data:`_BOOT_DELAY_S` seconds, then exec's the
-real ``hermes`` CLI - so the TUI becomes ready late, modeling the reported
-15-25 s boot on a host where Hermes itself boots in a few seconds. The real
-``hermes`` runs against the mock LLM through a ``custom`` provider written into
-the rig's isolated ``HOME``.
-
-The journey: create a fresh hermes-native session (the runner launches the
-Hermes TUI on bind), open it in the web UI and send the first message from the
-composer while the TUI is still booting, then wait for the turn's outcome. The
-turn must not fail, Hermes's store must hold exactly one user row for it, and
-the reply must reach the chat.
-
-Set ``HERMES_BOOT_DELAY_S=0`` to drive the same journey against Hermes's real
-boot time (investigation only).
+The rig launches the session's Hermes TUI through a wrapper (``OMNIGENT_HERMES_PATH``)
+that holds startup for :data:`_BOOT_DELAY_S` seconds before exec'ing the real
+``hermes``, which talks to the mock LLM through a ``custom`` provider in the rig's
+isolated ``HOME``. The test creates a fresh hermes-native session, sends the first
+composer message while the TUI is still booting, and checks that the turn does not
+fail, Hermes's store holds exactly one user row, and the reply reaches the chat.
+``HERMES_BOOT_DELAY_S=0`` drives the same journey against Hermes's real boot time.
 """
 
 from __future__ import annotations
@@ -164,10 +152,8 @@ def _transcript(base_url: str, session_id: str) -> list[dict]:
 def _await_transcript_outcome(
     base_url: str, session_id: str, *, timeout_s: float = _TRANSCRIPT_SETTLE_S
 ) -> tuple[list[str], list[str]]:
-    """Poll until an error item or the echoed token is persisted.
-
-    :returns: ``(error_messages, assistant_texts)`` from the transcript.
-    """
+    """Poll until an error item or the echoed token is persisted; returns
+    ``(error_messages, assistant_texts)``."""
     deadline = time.monotonic() + timeout_s
     while True:
         data = _transcript(base_url, session_id)
@@ -273,13 +259,9 @@ def slow_boot_hermes_rig(
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[tuple[str, str, Path]]:
-    """A dedicated server + runner whose hermes-native TUI becomes ready late.
-
-    ``OMNIGENT_HERMES_PATH`` points the runner at the slow-boot wrapper; an
-    isolated ``HOME`` carries ``~/.hermes/config.yaml`` with a ``custom``
-    provider at the mock LLM, which the runner copies into each per-session
-    ``HERMES_HOME``. Yields ``(base_url, runner_id, work_dir)``.
-    """
+    """A dedicated server + runner whose hermes-native TUI becomes ready late: the
+    runner launches the slow-boot wrapper, and an isolated ``HOME`` carries a
+    ``custom``-provider config at the mock LLM. Yields ``(base_url, runner_id, work)``."""
     if shutil.which("tmux") is None:
         pytest.skip("tmux is required for the hermes-native terminal rig")
     real_hermes = _resolve_runnable_hermes()
@@ -410,13 +392,9 @@ def test_hermes_native_first_message_survives_slow_boot(
     slow_boot_hermes_rig: tuple[str, str, Path],
     mock_llm_server_url: str,
 ) -> None:
-    """The first message of a fresh hermes-native session is delivered exactly once.
-
-    Create a fresh Hermes session, open it and send the first message from the
-    web composer while the Hermes TUI is still booting, then wait for the turn:
-    no "did not accept" failure, exactly one user row in Hermes's store, and the
-    echoed reply in the chat.
-    """
+    """The first message of a fresh hermes-native session is delivered exactly once:
+    send it from the web composer while the Hermes TUI is still booting, then expect
+    no "did not accept" failure, one user row in Hermes's store, and the echoed reply."""
     from tests.e2e_ui.conftest import set_fallback_mock_llm
 
     base_url, runner_id, work = slow_boot_hermes_rig

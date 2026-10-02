@@ -65,24 +65,11 @@ _PASTE_COMMIT_TIMEOUT_S = 5.0
 # detected by the pane settling (no byte changes across consecutive captures).
 # This many stable polls in a row marks the input box ready.
 _SETTLE_STABLE_POLLS = 3
-# On a NEW session, Hermes blocks its prompt_toolkit input loop while it cold-
-# starts (plugin discovery, state.db init, MCP registration, agent init — 15-25 s
-# on a slow host). A paste delivered during that window is silently dropped — the
-# pane can look "settled" (a static banner) even though no widget is capturing
-# keys yet. A dropped first message is doubly bad: it not only loses the turn, it
-# permanently off-by-ones the server's pending-input FIFO (see
-# :mod:`omnigent.runtime.pending_inputs` — the i-th persisted user row drains the
-# i-th queued web message), scrambling EVERY later message's reconciliation.
-#
-# The settle heuristic cannot tell "static banner" from "ready prompt", so we
-# confirm delivery against Hermes' OWN store instead: an accepted turn writes a
-# new ``messages`` row (Hermes flushes a row per agentic step), so a new row
-# appearing is the authoritative "message accepted" signal. While none appears we
-# keep re-delivering, with backoff, until ``_DELIVERY_DEADLINE_S`` — safe against
-# double-delivery because the store confirmed nothing landed, and because a draft
-# that did commit is re-submitted with Enter alone rather than pasted again — and
-# then raise so the turn fails cleanly (its optimistic bubble rolls back) rather
-# than silently desyncing the FIFO.
+# A fresh Hermes TUI reads no input for 15-25 s while it boots (plugin discovery,
+# state.db init, MCP registration, agent init); a paste sent meanwhile is silently
+# dropped even though the pane looks settled. :func:`inject_user_message` therefore
+# confirms delivery against Hermes' own store and re-drives it until a deadline.
+# Pane-settle budget for each re-delivery (the first uses the caller's timeout).
 _RETRY_SETTLE_S = 10.0
 # How long to wait for Hermes to persist a new ``messages`` row confirming it
 # accepted the injected turn. Generous: assistant rows stream within seconds of
@@ -824,12 +811,14 @@ def inject_user_message(
 
     On a NEW session Hermes reads no input until its 15-25 s boot finishes, so the
     first paste can be silently dropped — and a dropped first message permanently
-    off-by-ones the server's pending-input FIFO, scrambling every later turn. To
-    prevent that, when Hermes' ``state.db`` is readable we confirm the turn landed
-    (a new ``messages`` row appears); until it does we keep re-delivering with
-    backoff (Enter alone when the pasted draft is already on screen, a fresh paste
-    otherwise) up to :data:`_DELIVERY_DEADLINE_S`, then raise so the turn fails
-    cleanly instead of desyncing the FIFO.
+    off-by-ones the server's pending-input FIFO (:mod:`omnigent.runtime.pending_inputs`:
+    the i-th persisted user row drains the i-th queued web message), scrambling every
+    later turn. To prevent that, when Hermes' ``state.db`` is readable we confirm the
+    turn landed (Hermes writes a ``messages`` row per agentic step, so a new row is
+    its own "accepted" signal); until it does we keep re-delivering with backoff —
+    Enter alone when the pasted draft is already on screen, a fresh paste otherwise —
+    up to :data:`_DELIVERY_DEADLINE_S`, then raise so the turn fails cleanly (its
+    optimistic bubble rolls back) instead of desyncing the FIFO.
 
     :param bridge_dir: The hermes-native bridge dir holding ``tmux.json``.
     :param content: User text (non-empty).

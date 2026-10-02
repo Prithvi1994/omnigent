@@ -146,10 +146,9 @@ class _FakeClock:
 
 
 class _FakeHermesPane:
-    """Hermes TUI behind tmux: a static boot banner that discards keystrokes until
-    ``ready_at``, then a prompt whose draft edits and submits like prompt_toolkit.
-    An Enter arriving within ``enter_folds_within`` seconds of a paste coalesces
-    into the draft as a newline (one pty burst) instead of submitting."""
+    """Hermes TUI behind tmux: a boot banner that discards keystrokes until ``ready_at``,
+    then a prompt_toolkit-like draft. An Enter within ``enter_folds_within`` seconds of a
+    paste coalesces into the draft as a newline (one pty burst) instead of submitting."""
 
     def __init__(
         self, clock: _FakeClock, *, ready_at: float = 0.0, enter_folds_within: float = 0.0
