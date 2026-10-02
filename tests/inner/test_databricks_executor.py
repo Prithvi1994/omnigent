@@ -2661,8 +2661,9 @@ def test_reused_token_source_retries_resolution_after_failure(monkeypatch):
     assert source.current_token() == "tok-late"
 
 
-def test_reused_token_source_drops_auth_whose_first_mint_fails(monkeypatch):
-    """A freshly resolved auth that cannot mint is not retried before re-resolving."""
+def test_reused_token_source_throttles_after_a_failed_mint(monkeypatch):
+    """Retries inside the reuse window neither re-run the chain nor re-resolve."""
+    from omnigent.inner import databricks_executor
     from omnigent.inner.databricks_executor import (
         _DatabricksBearerAuth,
         _ReusedDatabricksTokenSource,
@@ -2685,12 +2686,18 @@ def test_reused_token_source_drops_auth_whose_first_mint_fails(monkeypatch):
     monkeypatch.setattr(
         "omnigent.inner.databricks_executor._resolve_databricks_auth", _fake_resolve
     )
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(databricks_executor.time, "monotonic", lambda: clock["now"])
 
     source = _ReusedDatabricksTokenSource()
     assert source.current_token() is None
     assert source.current_token() is None
-    assert [cfg.attempts for cfg in cfgs] == [1, 1], (
-        "each call must resolve once and mint once, not retry the failed auth first"
+    assert [cfg.attempts for cfg in cfgs] == [1], "one chain run answers the whole window"
+
+    clock["now"] += databricks_executor._AUTH_FAILURE_REUSE_SECONDS + 1
+    assert source.current_token() is None
+    assert [cfg.attempts for cfg in cfgs] == [2, 1], (
+        "after the window a fresh failure re-resolves once"
     )
 
 
@@ -2853,6 +2860,7 @@ def test_resolve_databricks_auth_refuses_refresh_after_profile_repoint(
     monkeypatch.setenv("OMNIGENT_TEST_FAKE_CLI_TTL_S", "-60")
     auth, _host = _resolve_databricks_auth("example")
     assert auth.current_token().startswith(f"fake-token-for-{_HOST_A}-")
+    minted_before_repoint = len(fake_databricks_cli.token_calls())
 
     fake_databricks_cli.cfg_path.write_text(
         f"[example]\nhost = {_HOST_B}\nauth_type = databricks-cli\n"
@@ -2860,6 +2868,9 @@ def test_resolve_databricks_auth_refuses_refresh_after_profile_repoint(
 
     with pytest.raises(DatabricksAuthError, match="now names"):
         auth.current_token()
+    assert len(fake_databricks_cli.token_calls()) == minted_before_repoint, (
+        "no mint for the repointed profile"
+    )
 
 
 def test_resolve_databricks_auth_refuses_when_inherited_default_host_is_repointed(

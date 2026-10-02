@@ -474,6 +474,10 @@ class DatabricksAuthError(OSError):
     """
 
 
+class _ReplayedDatabricksAuthError(DatabricksAuthError):
+    """A recent credential failure answered again without re-running the chain."""
+
+
 class _ProfileRepointedError(ValueError):
     """The resolved profile now names a different workspace host."""
 
@@ -631,9 +635,12 @@ class _DatabricksBearerAuth(httpx.Auth):
         with self._lock:
             recent = self._recent_failure
             if recent is not None and time.monotonic() - recent[0] < _AUTH_FAILURE_REUSE_SECONDS:
-                raise DatabricksAuthError(str(recent[1])) from recent[1]
+                raise _ReplayedDatabricksAuthError(str(recent[1])) from recent[1].__cause__
             try:
                 headers = self._config.authenticate()
+            except _ProfileRepointedError as exc:
+                # A cheap config read whose remedy is to resolve again: never replay it.
+                raise self._auth_error(exc) from exc
             except Exception as exc:
                 error = self._auth_error(exc)
                 self._recent_failure = (time.monotonic(), error)
@@ -804,7 +811,8 @@ def _lazy_sdk_credentials_strategy() -> Any:  # type: ignore[explicit-any]  # SD
     provider shells out to ``databricks auth token`` right there. This one
     runs the SDK's default provider chain on the first header request,
     against the same ``Config``, and rejects a profile that no longer names
-    the resolved host before first use and whenever a new bearer is produced.
+    the resolved host before every header request, so a repointed profile
+    never reaches the CLI.
     """
     from databricks.sdk.credentials_provider import CredentialsStrategy, DefaultCredentials
 
@@ -813,7 +821,6 @@ def _lazy_sdk_credentials_strategy() -> Any:  # type: ignore[explicit-any]  # SD
             self._configured_auth_type: str | None = None
             self._chain: DefaultCredentials | None = None
             self._provider: Callable[[], dict[str, str]] | None = None
-            self._last_authorization: str | None = None
             self._lock = threading.Lock()
 
         def auth_type(self) -> str:
@@ -827,27 +834,18 @@ def _lazy_sdk_credentials_strategy() -> Any:  # type: ignore[explicit-any]  # SD
             self._configured_auth_type = cfg.auth_type or None
 
             def headers() -> dict[str, str]:
+                _check_profile_still_names_host(cfg)
                 provider = self._provider
                 if provider is None:
                     with self._lock:
                         provider = self._provider
                         if provider is None:
-                            _check_profile_still_names_host(cfg)
                             chain = DefaultCredentials()
                             provider = chain(cfg)
                             cfg.auth_type = chain.auth_type()
                             self._chain = chain
                             self._provider = provider
-                result = provider()
-                authorization = result.get("Authorization")
-                if authorization != self._last_authorization:
-                    with self._lock:
-                        if authorization != self._last_authorization:
-                            # A new bearer was minted; a repointed profile would make
-                            # it belong to another workspace, so re-check first.
-                            _check_profile_still_names_host(cfg)
-                            self._last_authorization = authorization
-                return result
+                return provider()
 
             return headers
 
@@ -1051,11 +1049,17 @@ class _ReusedDatabricksTokenSource:
             return None
 
     def current_token(self) -> str | None:
-        """Mint a token, resolving auth lazily and retrying once if it is stale."""
+        """Mint a token, resolving auth lazily and re-resolving after a fresh failure.
+
+        A failure replayed inside the auth's reuse window is not re-resolved: the
+        kept auth keeps answering retries without running the credential chain.
+        """
         cached = self._auth
         if cached is not None:
             try:
                 return cached.current_token()
+            except _ReplayedDatabricksAuthError:
+                return None
             except DatabricksAuthError:
                 self._auth = None
         auth = self._resolve()
@@ -1065,7 +1069,6 @@ class _ReusedDatabricksTokenSource:
         try:
             return auth.current_token()
         except DatabricksAuthError:
-            self._auth = None
             return None
 
 
