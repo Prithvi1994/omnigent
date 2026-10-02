@@ -7466,13 +7466,19 @@ async def _preset_fork_clone_external_session_id(
             exc_info=True,
         )
         return our_uuid, transcript
-    recorded = (
-        snap_resp.json().get("external_session_id") if snap_resp.status_code == 200 else None
-    )
-    if not isinstance(recorded, str) or recorded == our_uuid:
+    try:
+        snap = snap_resp.json() if snap_resp.status_code == 200 else None
+    except ValueError:
+        snap = None
+    recorded = snap.get("external_session_id") if isinstance(snap, dict) else None
+    if (
+        not isinstance(recorded, str)
+        or recorded == our_uuid
+        or not _CLAUDE_SESSION_ID_RE.fullmatch(recorded)
+    ):
         return our_uuid, transcript
     recorded_transcript = transcript.with_name(f"{recorded}.jsonl")
-    if not _CLAUDE_SESSION_ID_RE.fullmatch(recorded) or not recorded_transcript.is_file():
+    if not recorded_transcript.is_file():
         return our_uuid, transcript
     transcript.unlink(missing_ok=True)
     _logger.info(

@@ -85,3 +85,50 @@ async def test_rejected_id_keeps_our_clone_when_recorded_transcript_is_missing(
         result = await _preset_fork_clone_external_session_id(client, _SESSION_ID, _OURS, ours)
     assert result == (_OURS, ours)
     assert ours.is_file()
+
+
+def _failing_client(
+    *, patch: httpx.Response | None, get: httpx.Response | None
+) -> httpx.AsyncClient:
+    """
+    Build an AP client whose PATCH / GET answer *patch* / *get*, raising when ``None``.
+
+    :param patch: PATCH response, or ``None`` to raise a transport error.
+    :param get: GET response, or ``None`` to raise a transport error.
+    :returns: Client backed by a mock transport.
+    """
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        response = patch if request.method == "PATCH" else get
+        if response is None:
+            raise httpx.ConnectError("unreachable", request=request)
+        return response
+
+    return httpx.AsyncClient(base_url="http://ap.test", transport=httpx.MockTransport(_handler))
+
+
+@pytest.mark.parametrize(
+    ("patch", "get"),
+    [
+        pytest.param(None, None, id="patch-transport-error"),
+        pytest.param(httpx.Response(400, json={}), None, id="get-transport-error"),
+        pytest.param(
+            httpx.Response(400, json={}), httpx.Response(200, text="<html>"), id="non-json"
+        ),
+        pytest.param(
+            httpx.Response(400, json={}),
+            httpx.Response(200, json={"external_session_id": "../escape"}),
+            id="unsafe-recorded-id",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_recovery_failures_keep_our_clone(
+    tmp_path: Path, patch: httpx.Response | None, get: httpx.Response | None
+) -> None:
+    """A failed or unusable recovery keeps this launch's id and transcript."""
+    ours = _write(tmp_path / f"{_OURS}.jsonl")
+    async with _failing_client(patch=patch, get=get) as client:
+        result = await _preset_fork_clone_external_session_id(client, _SESSION_ID, _OURS, ours)
+    assert result == (_OURS, ours)
+    assert ours.is_file()

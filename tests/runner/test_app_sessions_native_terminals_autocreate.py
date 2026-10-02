@@ -3031,10 +3031,10 @@ async def test_create_session_rebuilds_only_claude_terminals_that_predate_init(
 
     A fork or agent switch into claude-native leaves the init snapshot with no
     ``external_session_id`` plus the carry-history label. A terminal registered
-    before init started is the stale pre-switch one and must be rebuilt. One a
-    racing terminal-ensure (e.g. a side chat's first message) creates while init
-    runs was built from the current server state; tearing it down throws away a
-    live clone whose id the server already recorded.
+    before init started is the stale pre-switch one and must be rebuilt. A
+    terminal that a racing terminal-ensure (e.g. a side chat's first message)
+    creates while init runs was built from the current server state; tearing it
+    down throws away a live clone whose id the server already recorded.
 
     :param terminal_built_during_init: Register the terminal mid-init (inside
         spec resolution) instead of before the init request.
