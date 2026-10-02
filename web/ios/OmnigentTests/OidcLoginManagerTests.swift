@@ -83,9 +83,15 @@ final class OidcLoginManagerTests: XCTestCase {
     let expiresDate = try XCTUnwrap(cookie.expiresDate)
     XCTAssertEqual(expiresDate.timeIntervalSince(issuedAt), expiresIn, accuracy: 5)
 
-    // A non-positive lifetime would expire the cookie on arrival; fall back instead.
-    let fallback = try OidcLoginManager.sessionCookie(
-      origin: origin, token: "aaa.bbb.ccc", expiresIn: 0)
-    XCTAssertGreaterThan(try XCTUnwrap(fallback.expiresDate), Date().addingTimeInterval(60 * 60))
+    // Without expires_in the cookie lasts the server's default 8h session TTL.
+    let fallback = try OidcLoginManager.sessionCookie(origin: origin, token: "aaa.bbb.ccc")
+    XCTAssertEqual(
+      try XCTUnwrap(fallback.expiresDate).timeIntervalSince(issuedAt), 8 * 60 * 60, accuracy: 5)
+
+    for expired: TimeInterval in [0, -60] {
+      XCTAssertThrowsError(
+        try OidcLoginManager.sessionCookie(origin: origin, token: "aaa.bbb.ccc", expiresIn: expired)
+      )
+    }
   }
 }

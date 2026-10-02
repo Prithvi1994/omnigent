@@ -71,15 +71,16 @@ final class OidcLoginManager {
     origin: URL, token: String, expiresIn: TimeInterval? = nil
   ) throws -> HTTPCookie {
     guard origin.host != nil, isJWTShaped(token) else { throw LoginError.invalidResponse }
+    // A session the server already reports as expired must not become a cookie.
+    if let expiresIn, expiresIn <= 0 { throw LoginError.invalidResponse }
     // Without an expiry the cookie is session-only and WebKit drops it when iOS
     // terminates the app, forcing the browser login again on every cold start.
-    let lifetime = expiresIn.flatMap { $0 > 0 ? $0 : nil } ?? defaultSessionLifetime
     var properties: [HTTPCookiePropertyKey: Any] = [
       .originURL: origin,
       .path: "/",
       .name: origin.scheme?.lowercased() == "https" ? "__Host-ap_session" : "ap_session",
       .value: token,
-      .expires: Date(timeIntervalSinceNow: lifetime),
+      .expires: Date(timeIntervalSinceNow: expiresIn ?? defaultSessionLifetime),
     ]
     if origin.scheme?.lowercased() == "https" {
       properties[.secure] = "TRUE"

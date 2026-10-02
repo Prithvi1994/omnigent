@@ -191,60 +191,59 @@ def oidc_server(mock_idp: str, tmp_path_factory: pytest.TempPathFactory) -> Iter
         "ANTHROPIC_API_KEY": "",
     }
     env.pop("OMNIGENT_AUTH_ENABLED", None)
-    log_handle = open(log_path, "w")  # noqa: SIM115
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "omnigent",
-            "server",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--database-uri",
-            f"sqlite:///{server_tmp / 'test.db'}",
-            "--artifact-location",
-            str(server_tmp / "artifacts"),
-            "--agent",
-            str(agent_yaml),
-        ],
-        env=env,
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-    )
-    try:
-        deadline = time.monotonic() + 120
-        last_error = "not polled yet"
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                last_error = f"exited with {proc.returncode}"
-                break
-            try:
-                info = httpx.get(f"{origin}/v1/info", timeout=2)
-                if info.status_code == 200 and info.json().get("login_url") == "/auth/login":
+    with open(log_path, "w") as log_handle:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "omnigent",
+                "server",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--database-uri",
+                f"sqlite:///{server_tmp / 'test.db'}",
+                "--artifact-location",
+                str(server_tmp / "artifacts"),
+                "--agent",
+                str(agent_yaml),
+            ],
+            env=env,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            deadline = time.monotonic() + 120
+            last_error = "not polled yet"
+            ready = False
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    last_error = f"exited with {proc.returncode}"
                     break
-                last_error = f"/v1/info {info.status_code}: {info.text[:200]}"
-            except httpx.HTTPError as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-            time.sleep(0.5)
-        else:
-            last_error = f"timed out ({last_error})"
-        if proc.poll() is not None or "timed out" in last_error:
-            log_handle.flush()
-            raise RuntimeError(
-                f"OIDC server not ready: {last_error}\n{log_path.read_text()[-3000:]}"
-            )
-        yield OidcServer(origin=origin, log_path=log_path)
-    finally:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
-        log_handle.close()
+                try:
+                    info = httpx.get(f"{origin}/v1/info", timeout=2)
+                    if info.status_code == 200 and info.json().get("login_url") == "/auth/login":
+                        ready = True
+                        break
+                    last_error = f"/v1/info {info.status_code}: {info.text[:200]}"
+                except httpx.HTTPError as exc:
+                    last_error = f"{type(exc).__name__}: {exc}"
+                time.sleep(0.5)
+            if not ready:
+                log_handle.flush()
+                raise RuntimeError(
+                    f"OIDC server not ready: {last_error}\n{log_path.read_text()[-3000:]}"
+                )
+            yield OidcServer(origin=origin, log_path=log_path)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
 
 
 # ── Shell re-enactment ────────────────────────────────────────────────────────
@@ -389,6 +388,8 @@ class WebViewStandIn:
                 boot.session_cookie_expires = cookie.get("expires")
         self.page.screenshot(path=str(evidence_dir / f"{label}.png"))
         self.context.unroute(f"{origin}/auth/login*")
+        # Stop the response listener from mutating the snapshot the caller owns.
+        self._boot = None
         return boot
 
     def close(self, clip_path: Path | None) -> None:
