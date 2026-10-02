@@ -2763,6 +2763,7 @@ def fake_databricks_cli(
     cli.chmod(0o755)
     monkeypatch.setenv("PATH", f"{root / 'bin'}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.delenv("DATABRICKS_CLI_PATH", raising=False)
+    monkeypatch.delenv("OMNIGENT_TEST_FAKE_CLI_TTL_S", raising=False)
     cfg_path = root / "databrickscfg"
     cfg_path.write_text(f"[example]\nhost = {_HOST_A}\nauth_type = databricks-cli\n")
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))

@@ -187,6 +187,7 @@ def _stage_profile(
         if name.startswith(("DATABRICKS", "OMNIGENT_RUNNER")):
             monkeypatch.delenv(name, raising=False)
     monkeypatch.delenv("RUNNER_SERVER_URL", raising=False)
+    monkeypatch.delenv(_FAKE_CLI_TTL_ENV, raising=False)
 
     import databricks.sdk.config as sdk_config
 
