@@ -266,6 +266,14 @@ Terminal view shown, and keep filming past that window until the pane is gone
 hours, or a symptom that takes days to pile up, does not make the per-pane
 behavior unfilmable. Name the shortened window in the clip's caption.
 
+The shortened window is not the whole wait. Recent pane output or viewer input
+counts as busy for two minutes, the reaper scans once a minute, and a newly idle
+pane gets one full window of grace, so even a 5-second window means a few
+minutes between the last output and the pane vanishing. Keep the Terminal view
+open while you wait (an idle viewer does not count as busy) but do not type into
+it, wait on the pane's disappearance rather than a fixed sleep, and give the
+before and after clips the same observation period.
+
 ## `cli` facets
 
 Author/replay a VHS tape (`recordings/<slug>/journey.tape`) that replays the SAME

@@ -22,6 +22,7 @@ def test_lane_rules_distinguish_cli_output_from_internal_results() -> None:
     )
     assert "Pane and process lifecycle changes are filmable here" in lanes
     assert "shorten the idle window by exporting `OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S`" in lanes
+    assert "The shortened window is not the whole wait" in lanes
     assert "an error string, a value, a log line" not in lanes
 
 

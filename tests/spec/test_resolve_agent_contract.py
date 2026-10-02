@@ -294,6 +294,24 @@ def test_written_evidence_is_limited_to_results_without_visible_interaction() ->
     assert "just a static line, value, or the absence of an error" not in normalized
     assert "For purely textual evidence" not in normalized
 
+    # Publication and final review restate the carve-out in their own resources;
+    # pin each so the combined text cannot mask one of them losing the rule.
+    for skill, name, phrase in (
+        (
+            "resolve-publish",
+            "SKILL.md",
+            "(as Step 2B.5 judges it), put the written before/after evidence in **Demo**",
+        ),
+        (
+            "resolve-drive-pr",
+            "final-review.md",
+            "a lifecycle change the Terminal view shows, or a surface the repro bundle "
+            "already filmed, is neither",
+        ),
+    ):
+        resource = (_RESOLVE_AGENT / "skills" / skill / name).read_text(encoding="utf-8")
+        assert phrase in " ".join(resource.split()), f"{skill}/{name} lost the recording rule"
+
 
 def test_cli_recording_covers_message_only_changes() -> None:
     normalized = _normalized_resolve_instructions()
