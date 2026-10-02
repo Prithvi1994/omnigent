@@ -2518,7 +2518,7 @@ describe("self-hosted OIDC system-browser sign-in wiring (src/main.js)", () => {
       oidcAuth: {
         ...require("../src/oidc_auth"),
         probeServerAuth: async (_ses, url) =>
-          url.startsWith(other)
+          new URL(url).origin === other
             ? { kind: "authenticated", status: 200 }
             : { kind: "oidc", status: 401 },
       },

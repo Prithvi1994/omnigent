@@ -2139,7 +2139,9 @@ function createWindow(targetUrl, opts = {}) {
       } catch (error) {
         // A cancelled sign-in already returned the window to setup.
         if (error?.name !== "AbortError") {
-          console.error("[omnigent] oidc session expiry: sign-in handoff failed", error);
+          console.error(
+            `[omnigent] oidc session expiry: sign-in handoff failed (${error?.name ?? "Error"})`,
+          );
         }
       }
     },
