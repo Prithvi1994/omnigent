@@ -136,6 +136,13 @@ class _Stage:
                 return ts
         return None
 
+    def exact(self, event: str) -> float | None:
+        """Time of the first event row equal to *event*, e.g. ``"resolve_done\\tpid=12"``."""
+        for ts, kind, rest in self.rows():
+            if kind == "event" and rest == event:
+                return ts
+        return None
+
     def cli_spawns_between(self, start: str, *ends: str) -> list[str]:
         """CLI refreshes logged after *start* and before the first of *ends*."""
         start_ts = self.first(start)
@@ -248,9 +255,17 @@ def _resolve_runner_auth(stage: _Stage, server_url: str):  # type: ignore[no-unt
     return factory
 
 
-def _first_authenticated_request(stage: _Stage, server_url: str, factory) -> httpx.Response:  # type: ignore[no-untyped-def]
+def _first_authenticated_request(  # type: ignore[no-untyped-def]
+    stage: _Stage, server_url: str, factory
+) -> tuple[httpx.Response, str | None]:
+    """GET /v1/me through the runner's auth; also return the ``Authorization`` header it sent."""
     from omnigent.cli_auth import open_server_client
     from omnigent.runner._entry import _RunnerDatabricksAuth
+
+    sent: list[str | None] = []
+
+    async def _record(request: httpx.Request) -> None:
+        sent.append(request.headers.get("Authorization"))
 
     async def _get() -> httpx.Response:
         client = open_server_client(
@@ -259,6 +274,7 @@ def _first_authenticated_request(stage: _Stage, server_url: str, factory) -> htt
             timeout=httpx.Timeout(10.0),
             follow_redirects=False,
         )
+        client.event_hooks["request"].append(_record)
         try:
             stage.mark("first_request_start")
             response = await client.get("/v1/me")
@@ -267,7 +283,8 @@ def _first_authenticated_request(stage: _Stage, server_url: str, factory) -> htt
         finally:
             await client.aclose()
 
-    return asyncio.run(_get())
+    response = asyncio.run(_get())
+    return response, sent[0] if sent else None
 
 
 @pytest.fixture(scope="module")
@@ -289,10 +306,11 @@ def test_profile_selector_defers_cli_refresh_until_bearer_requested(
     assert factory is not None, (
         f"runner auth factory did not resolve the profile\n{stage.render()}"
     )
-    response = _first_authenticated_request(stage, live_server, factory)
+    response, authorization = _first_authenticated_request(stage, live_server, factory)
     assert response.status_code == 200, response.text
     token = factory()
     assert token and token.startswith("fake-cli-token-"), token
+    assert authorization == f"Bearer {token}", authorization
 
     during_resolution = stage.cli_spawns_between("resolve_start", "resolve_done", "resolve_error")
     assert not during_resolution, (
@@ -314,10 +332,11 @@ def test_host_selector_defers_cli_refresh_until_bearer_requested(
     assert stage.first(f"resolve_start:profile=None:host={_WORKSPACE_HOST!r}") is not None, (
         f"the pointer record did not route resolution through the host selector\n{stage.render()}"
     )
-    response = _first_authenticated_request(stage, live_server, factory)
+    response, authorization = _first_authenticated_request(stage, live_server, factory)
     assert response.status_code == 200, response.text
     token = factory()
     assert token and token.startswith("fake-cli-token-"), token
+    assert authorization == f"Bearer {token}", authorization
 
     during_resolution = stage.cli_spawns_between("resolve_start", "resolve_done", "resolve_error")
     assert not during_resolution, (
@@ -360,8 +379,8 @@ def test_runners_sharing_a_profile_do_not_refresh_during_resolution(
         if kind != "cli" or "argv=auth token" not in rest:
             continue
         runner_pid = rest.split("ppid=")[1].split("\t")[0]
-        start = stage.first(f"resolve_start\tpid={runner_pid}")
-        done = stage.first(f"resolve_done\tpid={runner_pid}")
+        start = stage.exact(f"resolve_start\tpid={runner_pid}")
+        done = stage.exact(f"resolve_done\tpid={runner_pid}")
         if start is not None and done is not None and start <= ts <= done:
             eager_by_runner.setdefault(runner_pid, []).append((ts, rest))
     gap_ms = ""

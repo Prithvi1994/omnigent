@@ -3285,7 +3285,7 @@ def test_get_openai_client_profile_without_env_fallback_defers_credential_failur
 
     import openai as _openai_mod
 
-    with patch.object(_openai_mod, "AsyncOpenAI", _StubAsyncOpenAI, create=True):
+    with patch.object(_openai_mod, "AsyncOpenAI", _StubAsyncOpenAI):
         _get_openai_async_client(profile="dogfood")
 
     assert captured["base_url"] == "https://profile-host.example.com/ai-gateway/openai/v1"
@@ -3295,3 +3295,39 @@ def test_get_openai_client_profile_without_env_fallback_defers_credential_failur
             captured["http_client"].auth.current_token()
     finally:
         _run(captured["http_client"].aclose())
+
+
+def test_get_openai_client_profile_failure_is_not_minted_again_per_retry(monkeypatch):
+    """The OpenAI client's connection retries reuse one credential failure.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import openai
+
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    class _CountingBrokenConfig(_BrokenCredentialsConfig):
+        attempts = 0
+
+        def authenticate(self):
+            type(self).attempts += 1
+            return super().authenticate()
+
+    monkeypatch.setattr(_sdk_config_mod, "Config", lambda **_kw: _CountingBrokenConfig())
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    client = _get_openai_async_client(profile="dogfood")
+    client.max_retries = 2
+
+    async def _call() -> None:
+        try:
+            with pytest.raises(openai.APIConnectionError):
+                await client.chat.completions.create(
+                    model="databricks-test-model", messages=[{"role": "user", "content": "hi"}]
+                )
+        finally:
+            await client.close()
+
+    _run(_call())
+    assert _CountingBrokenConfig.attempts == 1, "each retry must not re-run the credential chain"

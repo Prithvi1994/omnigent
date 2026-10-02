@@ -64,6 +64,9 @@ _API_CALL_TIMEOUT_SECONDS = 30.0
 _STREAM_IDLE_TIMEOUT_SECONDS = 60.0
 _CLI_TOKEN_REFRESH_MARGIN_SECONDS = 90.0
 _CLI_TOKEN_DEFAULT_TTL_SECONDS = 50 * 60.0
+# HTTP clients retry a failed auth callback; one credential failure answers
+# the retries of that request instead of re-running the credential chain.
+_AUTH_FAILURE_REUSE_SECONDS = 30.0
 
 _SESSION_ONLY_EXECUTOR_EXTRA_KEYS = {
     "new_user_messages_flushed",
@@ -470,6 +473,10 @@ class DatabricksAuthError(OSError):
     """
 
 
+class _ProfileRepointedError(ValueError):
+    """The resolved profile now names a different workspace host."""
+
+
 class _DatabricksAuthConfig(Protocol):
     def authenticate(self) -> dict[str, str]:
         raise NotImplementedError
@@ -594,6 +601,7 @@ class _DatabricksBearerAuth(httpx.Auth):
         self._config = config
         self._profile_name = profile_name
         self._failure_message = failure_message
+        self._recent_failure: tuple[float, DatabricksAuthError] | None = None
 
     @property
     def profile_name(self) -> str | None:
@@ -615,17 +623,30 @@ class _DatabricksBearerAuth(httpx.Auth):
         :raises DatabricksAuthError: When the SDK cannot mint a token
             (expired refresh token, revoked credentials, etc.).
         """
+        recent = self._recent_failure
+        if recent is not None and time.monotonic() - recent[0] < _AUTH_FAILURE_REUSE_SECONDS:
+            raise DatabricksAuthError(str(recent[1])) from recent[1]
         try:
-            return self._config.authenticate()
+            headers = self._config.authenticate()
         except Exception as exc:
-            profile_name = self.profile_name
-            if profile_name is None and self._failure_message is not None:
-                raise DatabricksAuthError(self._failure_message) from exc
-            profile_flag = f" -p {profile_name}" if profile_name else ""
-            raise DatabricksAuthError(
-                f"Databricks authentication failed for profile {profile_name!r}. "
-                f"Run: databricks auth login{profile_flag}"
-            ) from exc
+            error = self._auth_error(exc)
+            self._recent_failure = (time.monotonic(), error)
+            raise error from exc
+        self._recent_failure = None
+        return headers
+
+    def _auth_error(self, exc: Exception) -> DatabricksAuthError:
+        """Translate a credential failure into the user-facing error."""
+        if isinstance(exc, _ProfileRepointedError):
+            return DatabricksAuthError(str(exc))
+        profile_name = self.profile_name
+        if profile_name is None and self._failure_message is not None:
+            return DatabricksAuthError(self._failure_message)
+        profile_flag = f" -p {profile_name}" if profile_name else ""
+        return DatabricksAuthError(
+            f"Databricks authentication failed for profile {profile_name!r}. "
+            f"Run: databricks auth login{profile_flag}"
+        )
 
     def current_token(self) -> str | None:
         """
@@ -776,8 +797,8 @@ def _lazy_sdk_credentials_strategy() -> Any:  # type: ignore[explicit-any]  # SD
     ``Config.__init__`` runs its strategy eagerly, and the ``databricks-cli``
     provider shells out to ``databricks auth token`` right there. This one
     runs the SDK's default provider chain on the first header request,
-    against the same ``Config``, so the credential stays bound to the
-    resolved host.
+    against the same ``Config``, and rejects a profile that no longer names
+    the resolved host before first use and whenever a new bearer is produced.
     """
     from databricks.sdk.credentials_provider import CredentialsStrategy, DefaultCredentials
 
@@ -786,6 +807,7 @@ def _lazy_sdk_credentials_strategy() -> Any:  # type: ignore[explicit-any]  # SD
             self._configured_auth_type: str | None = None
             self._chain: DefaultCredentials | None = None
             self._provider: Callable[[], dict[str, str]] | None = None
+            self._last_authorization: str | None = None
             self._lock = threading.Lock()
 
         def auth_type(self) -> str:
@@ -810,7 +832,14 @@ def _lazy_sdk_credentials_strategy() -> Any:  # type: ignore[explicit-any]  # SD
                             cfg.auth_type = chain.auth_type()
                             self._chain = chain
                             self._provider = provider
-                return provider()
+                result = provider()
+                authorization = result.get("Authorization")
+                if authorization != self._last_authorization:
+                    # A new bearer was minted; a repointed profile would make it
+                    # belong to another workspace, so re-check before handing it out.
+                    _check_profile_still_names_host(cfg)
+                    self._last_authorization = authorization
+                return result
 
             return headers
 
@@ -824,7 +853,7 @@ def _check_profile_still_names_host(cfg: Any) -> None:  # type: ignore[explicit-
     the profile's host again, so a repointed profile would hand this host's
     client a bearer for another workspace.
 
-    :raises ValueError: When the profile now names a different host.
+    :raises _ProfileRepointedError: When the profile now names a different host.
     """
     if not cfg.profile or not cfg.host:
         return
@@ -835,9 +864,9 @@ def _check_profile_still_names_host(cfg: Any) -> None:  # type: ignore[explicit-
     default_host = config["DEFAULT"].get("host", "") if config.has_section("DEFAULT") else ""
     current = (config[cfg.profile].get("host") or default_host).strip()
     if current and _normalized_workspace_host(current) != _normalized_workspace_host(cfg.host):
-        raise ValueError(
-            f"profile {cfg.profile!r} now names {current}, not the resolved {cfg.host}; "
-            "resolve credentials again"
+        raise _ProfileRepointedError(
+            f"Databricks profile {cfg.profile!r} now names {current}, not the resolved "
+            f"{cfg.host}; resolve credentials again"
         )
 
 
@@ -904,7 +933,7 @@ class _DeferredHostAuthConfig:
                 selected, self._profile_name, headers = _select_host_auth_config(self._host)
                 self._selected = selected
                 return headers
-        return selected.authenticate()
+            return selected.authenticate()
 
 
 def _select_host_auth_config(
