@@ -2727,13 +2727,20 @@ if args[:2] != ["auth", "token"]:
 if os.path.exists(os.path.join(stage, "invalid-grant")):
     sys.stderr.write('Error: oauth2: "invalid_grant" "Refresh token is invalid or expired"\\n')
     sys.exit(1)
+cfg_file = os.environ.get("DATABRICKS_CONFIG_FILE") or os.path.expanduser("~/.databrickscfg")
 if "--host" in args:
     host = args[args.index("--host") + 1]
 else:
     profiles = configparser.ConfigParser()
-    cfg_file = os.environ.get("DATABRICKS_CONFIG_FILE") or os.path.expanduser("~/.databrickscfg")
     profiles.read(cfg_file)
     host = profiles[args[args.index("--profile") + 1]]["host"]
+marker = os.path.join(stage, "repoint-on-mint")
+if os.path.exists(marker):
+    # The profile moves while the CLI is minting: mint for its new host.
+    host = open(marker).read().strip()
+    with open(cfg_file, "w") as fh:
+        fh.write("[example]\\nhost = " + host + "\\nauth_type = databricks-cli\\n")
+    os.remove(marker)
 ttl = int(os.environ.get("OMNIGENT_TEST_FAKE_CLI_TTL_S", "3600"))
 expiry = (datetime.now() + timedelta(seconds=ttl)).strftime("%Y-%m-%dT%H:%M:%S")
 token = {"access_token": f"fake-token-for-{host}-{os.getpid()}", "token_type": "Bearer"}
@@ -2871,6 +2878,60 @@ def test_resolve_databricks_auth_refuses_refresh_after_profile_repoint(
     assert len(fake_databricks_cli.token_calls()) == minted_before_repoint, (
         "no mint for the repointed profile"
     )
+
+
+def test_resolve_databricks_auth_drops_a_bearer_minted_while_the_profile_moved(
+    fake_databricks_cli: _FakeDatabricksCli,
+) -> None:
+    """A bearer minted as the profile moved is refused and never served later."""
+    from omnigent.inner.databricks_executor import _resolve_databricks_auth
+
+    auth, _host = _resolve_databricks_auth("example")
+    (fake_databricks_cli.root / "repoint-on-mint").write_text(_HOST_B)
+
+    with pytest.raises(DatabricksAuthError, match="now names"):
+        auth.current_token()
+
+    fake_databricks_cli.cfg_path.write_text(
+        f"[example]\nhost = {_HOST_A}\nauth_type = databricks-cli\n"
+    )
+    assert auth.current_token().startswith(f"fake-token-for-{_HOST_A}-"), (
+        "the rejected host-B bearer must not be reused once the profile names A again"
+    )
+    assert len(fake_databricks_cli.token_calls()) == 2
+
+
+def test_bearer_auth_serializes_concurrent_mints() -> None:
+    """Simultaneous requests on one auth object never run the credential chain concurrently."""
+    import time
+
+    class _SlowConfig:
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+            self.calls = 0
+            self._lock = threading.Lock()
+
+        def authenticate(self) -> dict[str, str]:
+            with self._lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                self.calls += 1
+            time.sleep(0.05)
+            with self._lock:
+                self.active -= 1
+            return {"Authorization": "Bearer tok"}
+
+    config = _SlowConfig()
+    auth = _DatabricksBearerAuth(config, profile_name="example")
+    threads = [threading.Thread(target=auth.current_token) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert config.calls == 4
+    assert config.max_active == 1, "mints on one auth object overlapped"
 
 
 def test_resolve_databricks_auth_refuses_when_inherited_default_host_is_repointed(

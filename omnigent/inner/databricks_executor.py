@@ -811,8 +811,9 @@ def _lazy_sdk_credentials_strategy() -> Any:  # type: ignore[explicit-any]  # SD
     provider shells out to ``databricks auth token`` right there. This one
     runs the SDK's default provider chain on the first header request,
     against the same ``Config``, and rejects a profile that no longer names
-    the resolved host before every header request, so a repointed profile
-    never reaches the CLI.
+    the resolved host before and after every mint, so a repointed profile
+    never reaches the CLI and a bearer minted as the profile moved is never
+    kept.
     """
     from databricks.sdk.credentials_provider import CredentialsStrategy, DefaultCredentials
 
@@ -845,7 +846,17 @@ def _lazy_sdk_credentials_strategy() -> Any:  # type: ignore[explicit-any]  # SD
                             cfg.auth_type = chain.auth_type()
                             self._chain = chain
                             self._provider = provider
-                return provider()
+                result = provider()
+                try:
+                    _check_profile_still_names_host(cfg)
+                except _ProfileRepointedError:
+                    # The profile moved while the CLI read it, so the provider now
+                    # caches a bearer for another workspace: rebuild it next time.
+                    with self._lock:
+                        self._chain = None
+                        self._provider = None
+                    raise
+                return result
 
             return headers
 
