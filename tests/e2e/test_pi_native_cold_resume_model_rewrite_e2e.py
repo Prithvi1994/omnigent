@@ -223,10 +223,10 @@ def _wait_for_host_online(client: httpx.Client, host_id: str, timeout: float = 4
             resp = client.get("/v1/hosts")
             if resp.status_code == 200:
                 for host in resp.json().get("hosts", []):
-                    if host["host_id"] == host_id and host["status"] == "online":
+                    if host.get("host_id") == host_id and host.get("status") == "online":
                         return
-        except httpx.ConnectError:
-            pass  # daemon not listening yet; keep polling until the deadline
+        except httpx.TransportError:
+            pass  # daemon not listening (or slow) yet; keep polling until the deadline
         time.sleep(POLL_INTERVAL_S)
     raise AssertionError(f"Host {host_id!r} did not appear online within {timeout}s")
 
@@ -366,9 +366,15 @@ def test_cold_resume_keeps_explicit_openai_codex_selection(
         resources = http_client.get(f"/v1/sessions/{session_id}/resources/terminals", timeout=30.0)
         resources.raise_for_status()
         terminal_id = next(
-            item["id"]
-            for item in resources.json().get("data", [])
-            if item.get("name") == "pi:main"
+            (
+                item["id"]
+                for item in resources.json().get("data", [])
+                if item.get("name") == "pi:main"
+            ),
+            None,
+        )
+        assert terminal_id is not None, (
+            f"no 'pi:main' terminal listed for session {session_id!r}: {resources.json()}"
         )
         deleted = http_client.delete(
             f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}", timeout=30.0

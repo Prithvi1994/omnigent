@@ -14,13 +14,16 @@ from omnigent.harnesses.pi_native import credentials as creds
 
 
 @pytest.fixture(autouse=True)
-def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolate_host_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(
         "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: SimpleNamespace(
             model_id=f"catalog-{provider_name}-{family}-default"
         ),
     )
+    # The resolver consults Pi's own login catalog (~/.pi/agent by default);
+    # point it at an empty dir so a developer's real login can't flip outcomes.
+    monkeypatch.setenv(creds.PI_CODING_AGENT_DIR_ENV_VAR, str(tmp_path / "pi-agent"))
 
 
 def _databricks_config() -> dict[str, object]:
@@ -808,6 +811,21 @@ def test_resolve_configured_provider_prefix_wins_over_pi_own_login(
 
     assert provider is not None
     assert provider.model == "gpt-4o-mini"
+
+
+def test_resolve_managed_selection_stays_managed_despite_pi_own_login_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit managed pick keeps managed routing even if Pi's login serves the same id."""
+    _seed_pi_login_catalog(tmp_path, "openai-codex", ["gpt-5.6-sol"])
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+
+    provider = creds.resolve_pi_native_provider(
+        model="omnigent/openai-codex/gpt-5.6-sol", config_loader=_openrouter_default_pi_config
+    )
+
+    assert provider is not None
+    assert provider.model == "openai-codex/gpt-5.6-sol"
 
 
 def test_subscription_default_returns_none() -> None:
