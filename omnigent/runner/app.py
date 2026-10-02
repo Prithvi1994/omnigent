@@ -2577,8 +2577,8 @@ def create_runner_app(
         # landing anywhere in init — including that probe — must fence the
         # memoizing writes at the end of init.
         spec_cache_generation = _session_cache_generation(session_id)
-        # A Claude terminal registered after this point was built from current
-        # server state (e.g. by a message's ensure racing init), so it isn't stale.
+        # A Claude terminal registered after this point (e.g. by a message's ensure
+        # racing init) postdates the init snapshot, so its rebuild check reads fresh state.
         _terminal_registry = resource_registry.terminal_registry
         claude_terminal_before_init = (
             _terminal_registry.get(session_id, "claude", "main")
