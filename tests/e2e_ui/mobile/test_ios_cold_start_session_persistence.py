@@ -159,8 +159,8 @@ def mock_idp() -> Iterator[str]:
     )
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
-    _wait_for_uvicorn(server, "mock IdP")
     try:
+        _wait_for_uvicorn(server, "mock IdP")
         yield issuer
     finally:
         server.should_exit = True
