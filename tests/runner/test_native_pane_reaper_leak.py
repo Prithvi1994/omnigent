@@ -25,7 +25,11 @@ from omnigent.native import native_cost_popup
 from omnigent.runner.app import create_runner_app
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.spec.types import AgentSpec, ExecutorSpec
-from omnigent.terminals.pane_reaper import NATIVE_PANE_TERMINAL_NAMES, PaneRef
+from omnigent.terminals.pane_reaper import (
+    NATIVE_PANE_TERMINAL_NAMES,
+    NativePaneReaper,
+    PaneRef,
+)
 from omnigent.terminals.registry import TerminalRegistry
 from tests.runner.conftest import (
     _FakeProcessManager,
@@ -95,8 +99,21 @@ async def _drive_finished_turn(
     await asyncio.sleep(0.3)
     gate.set()
     await asyncio.wait_for(task, timeout=10)
-    await asyncio.sleep(0.3)
     return turn["response"].status_code
+
+
+async def _wait_for_busy(
+    reaper: NativePaneReaper, pane: PaneRef, expected: bool, *, timeout: float = 5.0
+) -> None:
+    # The runner updates _native_pane_status in the background after the event
+    # POST returns, so poll the reaper's verdict to a deadline instead of
+    # racing it with a fixed sleep that flakes on a loaded host.
+    deadline = asyncio.get_running_loop().time() + timeout
+    while await reaper._is_busy(pane) != expected:
+        assert asyncio.get_running_loop().time() < deadline, (
+            f"reaper busy verdict never became {expected}"
+        )
+        await asyncio.sleep(0.05)
 
 
 @pytest.mark.parametrize(
@@ -130,7 +147,7 @@ async def test_finished_native_pane_reads_idle(
         # Before any idle is relayed the finished pane must still read busy:
         # codex/antigravity emit no local turn-end edge, so a passing final
         # assertion only means something if the pane was busy to begin with.
-        assert await reaper._is_busy(pane)
+        await _wait_for_busy(reaper, pane, True)
 
         # The turn is over; the harness reports idle only through the relayed
         # external_session_status event the server posts back to the runner.
@@ -139,11 +156,10 @@ async def test_finished_native_pane_reads_idle(
             json={"type": "external_session_status", "data": {"status": "idle"}},
         )
         assert r.status_code == 204, r.text
-        await asyncio.sleep(0.2)
 
         # A finished, quiet, unattended pane that has reported idle must NOT be
         # judged busy — otherwise its idle timer never fires and it leaks.
-        assert not await reaper._is_busy(pane)
+        await _wait_for_busy(reaper, pane, False)
 
 
 def test_devin_native_panes_are_reapable() -> None:
