@@ -949,7 +949,6 @@ class SessionsNamespace:
     async def set_labels(
         self,
         session_id: str,
-        *,
         labels: dict[str, str],
     ) -> Session:
         """
