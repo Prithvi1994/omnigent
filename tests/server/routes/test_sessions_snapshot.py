@@ -718,11 +718,14 @@ class _NotFoundRunnerClient:
 class _GatedRunnerClient:
     """Fake runner whose status GET blocks until released, so callers provably overlap."""
 
-    def __init__(self, *, status: str = "running", error: Exception | None = None) -> None:
+    def __init__(
+        self, *, status: str = "running", status_code: int = 200, error: Exception | None = None
+    ) -> None:
         self.get_calls: list[str] = []
         self.arrived = asyncio.Event()
         self.release = asyncio.Event()
         self.status = status
+        self.status_code = status_code
         self.error = error
 
     async def get(self, url: str, timeout: float) -> Any:
@@ -731,7 +734,7 @@ class _GatedRunnerClient:
         await self.release.wait()
         if self.error is not None:
             raise self.error
-        return SimpleNamespace(status_code=200, json=lambda: {"status": self.status})
+        return SimpleNamespace(status_code=self.status_code, json=lambda: {"status": self.status})
 
 
 def _use_runner_client(monkeypatch: pytest.MonkeyPatch, runner_client: object) -> None:
@@ -747,6 +750,8 @@ async def test_session_snapshot_transport_failure_is_shared_and_backed_off(
     from omnigent.server.routes._sessions import orchestration
 
     session_id = "probe_transport_failure"
+    _sessions_mod._session_status_cache.pop(session_id, None)
+    _sessions_mod._runner_status_probe_backoff.pop(session_id, None)
     runner_client = _GatedRunnerClient(error=httpx.ConnectError("runner disconnected"))
     _use_runner_client(monkeypatch, runner_client)
     first = asyncio.create_task(orchestration._probe_runner_live_status(runner_client, session_id))  # type: ignore[arg-type]
@@ -775,12 +780,12 @@ async def test_session_snapshot_transport_failure_is_shared_and_backed_off(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("old_finishes_first", [True, False])
-@pytest.mark.parametrize("old_fails", [True, False])
+@pytest.mark.parametrize("old_outcome", ["running", "transport_error", "not_found"])
 @pytest.mark.parametrize("new_fails", [True, False])
 async def test_session_snapshot_rebind_discards_inflight_old_runner(
     monkeypatch: pytest.MonkeyPatch,
     old_finishes_first: bool,
-    old_fails: bool,
+    old_outcome: str,
     new_fails: bool,
 ) -> None:
     """A retired probe cannot publish status, alter backoff, or clear its replacement."""
@@ -791,7 +796,13 @@ async def test_session_snapshot_rebind_discards_inflight_old_runner(
     _sessions_mod._runner_status_probe_backoff.pop(session_id, None)
     persist = Mock()
     monkeypatch.setattr(orchestration.session_live_state, "persist_live_status", persist)
-    old = _GatedRunnerClient(error=httpx.ConnectError("old runner") if old_fails else None)
+    old = _GatedRunnerClient(
+        error=httpx.ConnectError("old runner") if old_outcome == "transport_error" else None,
+        status_code=404 if old_outcome == "not_found" else 200,
+    )
+    # Only a 200 reaches the retired probe's caller; a transport error or a prompt
+    # 404 yields None either way.
+    old_result = "running" if old_outcome == "running" else None
     new = _GatedRunnerClient(
         status="idle", error=httpx.ConnectError("new runner") if new_fails else None
     )
@@ -808,7 +819,7 @@ async def test_session_snapshot_rebind_discards_inflight_old_runner(
             old.release.set()
             # The retired probe still returns the status it observed, but must
             # not publish it into the shared caches owned by its replacement.
-            assert await first == (None if old_fails else "running")
+            assert await first == old_result
             assert _sessions_mod._runner_status_probe_inflight.get(session_id) is not None
             assert _sessions_mod._session_status_cache.get(session_id) is None
             assert _sessions_mod._runner_status_probe_backoff.get(session_id) is None
@@ -816,7 +827,7 @@ async def test_session_snapshot_rebind_discards_inflight_old_runner(
         new.release.set()
         assert await replacement == (None if new_fails else "idle")
         old.release.set()
-        assert await first == (None if old_fails else "running")
+        assert await first == old_result
     finally:
         old.release.set()
         new.release.set()

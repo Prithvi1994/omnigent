@@ -11441,10 +11441,9 @@ async def _run_runner_status_probe(
         except (httpx.HTTPError, ConnectionError) as exc:
             failure = f"{type(exc).__name__}: {exc}"
         else:
-            # A rebind may have superseded this probe while its request was in
-            # flight. A superseded probe still returns the status it observed to
-            # its own caller, but must not publish into the shared caches now
-            # owned by its replacement.
+            # A rebind may have superseded this probe mid-flight: still return the
+            # observed status to this probe's caller, but leave the shared caches
+            # to the replacement that now owns them.
             owns_session = _runner_status_probe_inflight.get(session_id) == current_probe
             elapsed = time.monotonic() - started
             if resp.status_code == 200:
@@ -11474,6 +11473,12 @@ async def _run_runner_status_probe(
             else:
                 failure = f"HTTP {resp.status_code} after {elapsed:.1f}s"
         if _runner_status_probe_inflight.get(session_id) != current_probe:
+            _logger.debug(
+                "Superseded runner status probe for session=%s failed (%s)",
+                session_id,
+                failure,
+                extra={"session_id": session_id},
+            )
             return None
         previous = _runner_status_probe_backoff.get(session_id)
         failures = (previous.failures if previous is not None else 0) + 1
