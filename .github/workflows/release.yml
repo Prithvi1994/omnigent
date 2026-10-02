@@ -18,9 +18,13 @@
 #
 # `dry_run` defaults TRUE (repo convention, same as the vscode release
 # workflows): the plan job prints exactly what would happen; nothing is pushed.
+# Monday runs cut the final version from main's X.Y.Z.dev0 marker, preparing
+# draft notes and review PRs. Tag-push image publishing still runs as usual.
 name: Release
 
 on:
+  schedule:
+    - cron: "30 9 * * 1" # Monday, 09:30 UTC
   workflow_dispatch:
     inputs:
       version:
@@ -59,15 +63,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Releases are maintainer-only. `workflow_dispatch` is open to anyone with
-  # write access, so gate on the dispatcher's actual repo role instead of a
-  # hand-kept list. `github.actor` on a dispatch is the dispatcher.
+  # Manual releases are maintainer-only; schedules run from the default branch.
   authorize:
     if: github.repository == 'omnigent-ai/omnigent'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Require admin/maintain role
+        if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
           ACTOR: ${{ github.actor }}
@@ -100,9 +103,23 @@ jobs:
       - name: Validate version and derive names
         id: derive
         env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_SHA: ${{ github.sha }}
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            # The event SHA stays fixed on reruns, even after main's bump PR merges.
+            main_version="$(gh api -H "Accept: application/vnd.github.raw+json" \
+              "repos/${GITHUB_REPOSITORY}/contents/pyproject.toml?ref=${SOURCE_SHA}" \
+              | python3 -c 'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["project"]["version"])')"
+            if ! [[ "$main_version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.dev0$ ]]; then
+              echo "::error::Expected X.Y.Z.dev0 on main; found ${main_version}."
+              exit 1
+            fi
+            VERSION="${BASH_REMATCH[1]}"
+          fi
           # Final X.Y.Z or a PEP 440 pre-release (rc). No dev/post/alpha/beta here.
           if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(rc[0-9]+)?$ ]]; then
             echo "::error::Invalid release version: ${VERSION} (expect 0.6.0 or 0.6.0rc1)"; exit 1
@@ -124,7 +141,8 @@ jobs:
           VERSION: ${{ steps.derive.outputs.version }}
           TAG: ${{ steps.derive.outputs.tag }}
           BRANCH: ${{ steps.derive.outputs.branch }}
-          REF: ${{ inputs.ref }}
+          REF: ${{ inputs.ref || 'main' }}
+          SOURCE_REF: ${{ github.event_name == 'schedule' && github.sha || inputs.ref || 'main' }}
         run: |
           set -euo pipefail
 
@@ -145,7 +163,7 @@ jobs:
             fi
           else
             branch_exists=false
-            base_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${REF}" --jq .sha)"
+            base_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SOURCE_REF}" --jq .sha)"
           fi
 
           # Tag state: absent -> normal; at the converged release commit ->
@@ -226,7 +244,7 @@ jobs:
 
       - name: Write the plan
         env:
-          DRY_RUN: ${{ inputs.dry_run }}
+          DRY_RUN: ${{ github.event_name != 'schedule' && inputs.dry_run }}
           VERSION: ${{ steps.derive.outputs.version }}
           TAG: ${{ steps.derive.outputs.tag }}
           BRANCH: ${{ steps.derive.outputs.branch }}
@@ -269,7 +287,7 @@ jobs:
       - name: Check out release base
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ needs.plan.outputs.branch_exists == 'true' && needs.plan.outputs.branch || needs.plan.outputs.base_sha }}
+          ref: ${{ needs.plan.outputs.base_sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -395,7 +413,7 @@ jobs:
       - name: Check out release base
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ needs.plan.outputs.branch_exists == 'true' && needs.plan.outputs.branch || needs.plan.outputs.base_sha }}
+          ref: ${{ needs.plan.outputs.base_sha }}
           persist-credentials: false
 
       - name: Download seeded corpus
@@ -461,7 +479,7 @@ jobs:
       - name: Check out release base
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ needs.plan.outputs.branch_exists == 'true' && needs.plan.outputs.branch || needs.plan.outputs.base_sha }}
+          ref: ${{ needs.plan.outputs.base_sha }}
           persist-credentials: false
 
       - name: Set up Python
@@ -552,9 +570,11 @@ jobs:
     needs: [authorize, plan, benchmark-candidate, benchmark, benchmark-approve]
     # benchmark (compare) + benchmark-approve are skipped on the first cut (no
     # previous release to compare against); benchmark-candidate always runs and
-    # is the real gate. `!cancelled` lets the optional compare/approve jobs be
-    # skipped without blocking, while still failing the run if they actually fail.
-    if: ${{ !inputs.dry_run && needs.plan.outputs.already_done != 'true' && !cancelled() }}
+    # is the real gate. Allow optional skipped jobs, but never failed prerequisites.
+    if: >-
+      ${{ !cancelled() && !failure() && needs.authorize.result == 'success' &&
+          needs.plan.result == 'success' && !inputs.dry_run &&
+          needs.plan.outputs.already_done != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -575,8 +595,8 @@ jobs:
       - name: Checkout base
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          # Existing branch: its head. New branch: the resolved base commit.
-          ref: ${{ needs.plan.outputs.branch_exists == 'true' && needs.plan.outputs.branch || needs.plan.outputs.base_sha }}
+          # Build exactly the commit validated by the plan and benchmarks.
+          ref: ${{ needs.plan.outputs.base_sha }}
           persist-credentials: false
 
       - name: Set up Python
@@ -632,10 +652,10 @@ jobs:
           fi
 
           git tag "$TAG"
-          # One push for branch + tag, via the App token so the tag-push
-          # workflows fire. Non-fast-forward on the branch fails loudly.
+          # Publish branch + tag together; a concurrent cherry-pick rejects both.
+          # The App token ensures the tag-push workflows fire.
           push_url="https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git push "$push_url" "HEAD:refs/heads/${BRANCH}" "refs/tags/${TAG}"
+          git push --atomic "$push_url" "HEAD:refs/heads/${BRANCH}" "refs/tags/${TAG}"
           echo "Pushed ${BRANCH} + ${TAG} at $(git rev-parse HEAD)." | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Next steps

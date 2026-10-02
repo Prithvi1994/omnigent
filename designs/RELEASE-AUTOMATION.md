@@ -5,6 +5,60 @@ finalize-release.yml, homebrew-tap-pr.yml, bump-version App token, branch-CI
 triggers, lockstep CI check, RELEASING.md rewrite). Secure-repo restructure and
 the tag ruleset are follow-ups. Owner: @dhruv0811.
 
+## Weekly preparation
+
+`release.yml` runs every Monday at 09:30 UTC in `omnigent-ai/omnigent`.
+It derives the final version from the scheduled commit's `X.Y.Z.dev0` marker
+and cuts `release/vX.Y.0` from that commit, or reuses the existing release
+branch. Rerunning the same scheduled run retains that version even after
+main's next-version bump merges. CI and benchmark gates still apply; if CI is
+pending or failing, resolve it and use **Re-run failed jobs**.
+
+The final tag starts the existing GitHub draft and release-note generation,
+opens the CHANGELOG PR, and requests the next `.dev0` bump PR on a first cut.
+Merge the bump PR before the following Monday so the next cycle has a new
+version. Weekly preparation selects a **final tag**, bypassing the manual
+RC-first sequence below: RC tags do not generate draft notes today. Manual
+RC dispatches remain available.
+
+The tag also publishes Docker images and can update `:latest` immediately.
+PyPI publishing and `finalize-release.yml` remain coordinator actions. The
+website, docs-publish, and Homebrew PRs appear after finalization, not at the
+Monday cut.
+
+To preview a cut without writing anything:
+
+```bash
+gh workflow run release.yml --repo omnigent-ai/omnigent \
+  -f version=X.Y.0 -f dry_run=true
+```
+
+### Cherry-picking fixes
+
+For a merged squash PR, use its merge commit to open a normal PR against the
+release branch (replace the version, PR number, and commit below):
+
+```bash
+git fetch origin
+git switch -c backport/PR_NUMBER origin/release/vX.Y.0
+git cherry-pick -x MERGE_COMMIT_SHA
+git push -u origin HEAD
+gh pr create --repo omnigent-ai/omnigent --base release/vX.Y.0 --fill
+```
+
+After that PR merges and branch CI passes, dispatch `release.yml` with a
+**new version**: the next RC during RC testing, or the next patch version if
+the final tag has already been cut. Keep the default `ref=main`; an existing
+release branch supplies the source commit. No dedicated backport bot is needed.
+
+Rerunning the same version never moves its tag: an unchanged release is a
+no-op, while a branch advanced by cherry-picks fails with a tag conflict.
+Rerunning `draft-release-notes.yml` on the old tag also excludes those new
+commits. A fresh final tag generates notes covering the new commits; review
+any regenerated draft because drafting replaces unpublished note edits.
+
+## Original design
+
 Today a release is an LLM agent (or human) walking `RELEASING.md` step by step:
 ~15 CLI commands across two GitHub accounts, two repos, a hand-edited lockfile,
 and judgment calls interleaved with mechanical steps. Every step of that runbook
