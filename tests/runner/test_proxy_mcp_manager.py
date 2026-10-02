@@ -414,7 +414,7 @@ def _input_required(elicitation_id: str, request_state: str, rpc_id: int) -> htt
 async def _wait_until_registered(elicitation_id: str) -> None:
     """Yield until ``call_tool`` parks on the approval for ``elicitation_id``."""
     for _ in range(1000):
-        if elicitation_id in pending_approvals._pending:
+        if pending_approvals.has_pending_elicitation(elicitation_id):
             return
         await asyncio.sleep(0.001)
     raise AssertionError(f"approval {elicitation_id} was never registered")
@@ -1017,12 +1017,11 @@ async def test_call_tool_budget_restarts_after_user_approval(
     """Hours spent waiting for an approval leave the whole budget for the approved call."""
     clock = _FakeClock()
     monkeypatch.setattr(proxy_mcp_manager_mod, "monotonic", clock)
-    monkeypatch.setattr(proxy_mcp_manager_mod, "_REATTACH_RETRY_DELAY_S", 0.01)
     elicitation = "elicit_long_wait"
     registry = McpExecutionRegistry()
 
-    class _ApproveThenDropTransport(httpx.AsyncBaseTransport):
-        """Asks for approval, loses the approved request after it ran, then answers."""
+    class _ApproveAfterLongWaitTransport(httpx.AsyncBaseTransport):
+        """Asks for approval, then answers the approved call a full budget later."""
 
         def __init__(self) -> None:
             self.calls: list[_Call] = []
@@ -1045,9 +1044,6 @@ async def test_call_tool_budget_restarts_after_user_approval(
                 params={"name": body["params"]["name"], "arguments": body["params"]["arguments"]},
                 run=_retained_work,
             )
-            if len(self.calls) == 2:
-                clock.now += 300.0
-                return httpx.Response(502, text="502 Bad Gateway")
             return _json_resp(
                 {
                     "jsonrpc": "2.0",
@@ -1059,7 +1055,7 @@ async def test_call_tool_budget_restarts_after_user_approval(
                 }
             )
 
-    transport = _ApproveThenDropTransport()
+    transport = _ApproveAfterLongWaitTransport()
     client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
     manager = ProxyMcpManager(
         session_id="conv_test",
@@ -1083,8 +1079,93 @@ async def test_call_tool_budget_restarts_after_user_approval(
         pending_approvals.reset_for_tests()
 
     assert transport.external_invocations == 1, "the approved command must not run twice"
+    assert [call.body["id"] for call in transport.calls] == [1, 2]
+    _, approved_params = [call.body["params"] for call in transport.calls]
+    assert elicitation in approved_params["inputResponses"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_cannot_recover_an_approved_call_lost_after_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An approved call whose reply is lost cannot be replayed; the server rejects it.
+
+    The server consumes the elicitation on the first approved request, so a
+    re-send after a gateway drop gets ``Elicitation not found`` instead of the
+    retained result. This known limitation surfaces as a soft error, not a hang.
+    """
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_REATTACH_RETRY_DELAY_S", 0.01)
+    elicitation = "elicit_lost_reply"
+    registry = McpExecutionRegistry()
+
+    class _ApproveThenLoseReplyTransport(httpx.AsyncBaseTransport):
+        """Asks for approval, loses the approved reply, then rejects the re-send."""
+
+        def __init__(self) -> None:
+            self.calls: list[_Call] = []
+            self.external_invocations = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            self.calls.append(_Call(url=str(request.url), body=body))
+            if len(self.calls) == 1:
+                return _input_required(elicitation, "approved-state", body["id"])
+            if len(self.calls) == 2:
+
+                async def _retained_work() -> McpExecutionResult:
+                    self.external_invocations += 1
+                    return McpExecutionResult(
+                        status_code=200, content={"result": {"output": "ok"}}
+                    )
+
+                await registry.execute(
+                    session_id="conv_test",
+                    operation_id=body["params"][MCP_OPERATION_ID_PARAM],
+                    step="retry",
+                    params={
+                        "name": body["params"]["name"],
+                        "arguments": body["params"]["arguments"],
+                    },
+                    run=_retained_work,
+                )
+                return httpx.Response(502, text="502 Bad Gateway")
+            return _json_resp(
+                {
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "error": {
+                        "code": -32000,
+                        "message": "Elicitation not found or already resolved",
+                    },
+                }
+            )
+
+    transport = _ApproveThenLoseReplyTransport()
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    pending_approvals.reset_for_tests()
+    task = asyncio.create_task(
+        manager.call_tool(None, "sys_os_shell", {"command": "sleep 300; echo ok", "timeout": 600})
+    )
+    try:
+        await _wait_until_registered(elicitation)
+        assert pending_approvals.resolve(elicitation, approved=True)
+
+        result = await task
+    finally:
+        if not task.done():
+            task.cancel()
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert json.loads(result) == {"error": "Elicitation not found or already resolved"}
+    assert transport.external_invocations == 1, "the approved command must not run twice"
     assert [call.body["id"] for call in transport.calls] == [1, 2, 3]
-    _, approved_params, retry_params = [call.body["params"] for call in transport.calls]
+    approved_params, retry_params = [call.body["params"] for call in transport.calls[1:]]
     assert retry_params == approved_params
     assert elicitation in retry_params["inputResponses"]
 
@@ -1200,6 +1281,50 @@ async def test_call_tool_reattach_loop_is_bounded_by_the_call_budget(
 
     assert "502" in str(exc_info.value)
     assert transport.read_timeouts == [100.0, 60.0, 20.0]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_overall_deadline_bounds_a_slow_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single attempt that stays in flight past the budget still ends the call.
+
+    httpx's read timeout resets on every byte, so a slow-drip response that
+    never stalls long enough to trip it could outlive the budget; the overall
+    deadline must end such an attempt even though its read timeout never fires.
+    """
+    monkeypatch.setattr(proxy_mcp_manager_mod, "MCP_PROXY_CALL_TIMEOUT_S", 2.0)
+
+    class _NeverCompletingTransport(httpx.AsyncBaseTransport):
+        """Holds the response open past the budget without tripping a read timeout."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            self.calls += 1
+            await asyncio.sleep(30.0)
+            return _json_resp({"jsonrpc": "2.0", "id": 1, "result": {}})
+
+    transport = _NeverCompletingTransport()
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=McpExecutionRegistry(),
+    )
+    pending_approvals.reset_for_tests()
+    try:
+        with pytest.raises(RuntimeError, match="did not complete within"):
+            await asyncio.wait_for(
+                manager.call_tool(None, "sys_os_shell", {"command": "sleep 600"}),
+                timeout=10.0,
+            )
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert transport.calls == 1
 
 
 @pytest.mark.asyncio

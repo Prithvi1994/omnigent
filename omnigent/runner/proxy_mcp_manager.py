@@ -63,18 +63,17 @@ _LONG_REQUEST_MIN_S = 30.0
 # Gateway-class statuses a proxy in front of the server returns when it gives
 # up on a request; the server itself answers tool calls with JSON-RPC errors.
 _GATEWAY_STATUS_CODES = frozenset({502, 503, 504})
-# A server without the detached-while-unbound reply answers a retained re-send
-# that reaches it before the tunnel rebinds with this message instead.
-_UNBOUND_RUNNER_MESSAGE_PREFIX = "No runner bound for session"
 
 
-def _is_unbound_runner_reply(code: object, message: object) -> bool:
-    """Report a legacy server's unbound-runner reply to a retained re-send."""
-    return (
-        code == -32000
-        and isinstance(message, str)
-        and message.startswith(_UNBOUND_RUNNER_MESSAGE_PREFIX)
-    )
+def _is_unbound_runner_reply(code: object, message: object, session_id: str) -> bool:
+    """Report a legacy server's unbound-runner reply to a retained re-send.
+
+    Servers without the detached-while-unbound reply answer a retained re-send
+    that reaches them before the tunnel rebinds with this exact message; match
+    it in full so an unrelated -32000 cannot stall in the rebind wait, and
+    remove the shim once such servers are retired.
+    """
+    return code == -32000 and message == f"No runner bound for session {session_id!r}"
 
 
 def _json_object(value: object) -> _JsonObject | None:
@@ -489,21 +488,24 @@ class ProxyMcpManager:
             request_generation = pending_approvals.current_server_generation()
             sent_at = monotonic()
             try:
-                resp = await self._omnigent_client.post(
-                    self._mcp_url,
-                    json=payload,
-                    # Fail fast on an unreachable server; the read timeout covers
-                    # proxy request hangs and shrinks on re-sends so the phase
-                    # stays within the call budget.
-                    timeout=httpx.Timeout(
-                        connect=10.0,
-                        read=budget_left,
-                        write=10.0,
-                        pool=10.0,
-                    ),
-                )
-                resp.raise_for_status()
-                data = _response_json_object(resp)
+                # The read timeout resets on every byte, so a slow-drip response
+                # could outlive the budget; the overall deadline bounds the whole
+                # attempt. Connect fails fast; read shrinks on re-sends.
+                async with asyncio.timeout(budget_left):
+                    resp = await self._omnigent_client.post(
+                        self._mcp_url,
+                        json=payload,
+                        timeout=httpx.Timeout(
+                            connect=10.0,
+                            read=budget_left,
+                            write=10.0,
+                            pool=10.0,
+                        ),
+                    )
+                    resp.raise_for_status()
+                    data = _response_json_object(resp)
+            except TimeoutError as exc:
+                raise _budget_exhausted(last_failure) from exc
             except (httpx.TransportError, httpx.HTTPStatusError) as exc:
                 if (
                     isinstance(exc, httpx.HTTPStatusError)
@@ -542,7 +544,7 @@ class ProxyMcpManager:
                     self._session_id, operation_id
                 )
                 if code == RUNNER_MCP_EXECUTION_DETACHED_CODE or (
-                    owns_operation and _is_unbound_runner_reply(code, msg)
+                    owns_operation and _is_unbound_runner_reply(code, msg, self._session_id)
                 ):
                     # The detach code and a legacy server's unbound-runner reply
                     # both mean the tunnel is unbound while this runner holds the
@@ -562,6 +564,7 @@ class ProxyMcpManager:
                 )
 
             detached_since = None
+            last_failure = None
             result = _json_object(data.get("result"))
             if result is None:
                 raise RuntimeError(
