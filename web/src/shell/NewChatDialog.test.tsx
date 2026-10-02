@@ -43,6 +43,7 @@ import {
   deriveHomeDir,
   deriveRepoName,
   describeCreateError,
+  directoryConflictCandidates,
   displayNameForHost,
   harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
@@ -677,6 +678,30 @@ describe("sessionsSharingDirectory", () => {
     expect(
       sessionsSharingDirectory(sessions, hostId, workspace, isOnline).map((s) => s.id),
     ).toEqual(expected);
+  });
+});
+
+// The /health poll set shared by the landing, fork, and resume dialogs.
+describe("directoryConflictCandidates", () => {
+  const sessions: Conversation[] = [
+    conv({ id: "running", host_id: "host_1", workspace: "/repo", status: "running" }),
+    conv({ id: "failed", host_id: "host_1", workspace: "/repo", status: "failed" }),
+    conv({ id: "unknown", host_id: "host_1", workspace: "/repo", status: undefined }),
+    conv({ id: "idle", host_id: "host_1", workspace: "/repo", status: "idle" }),
+    conv({ id: "other_host", host_id: "host_2", workspace: "/repo", status: "running" }),
+    conv({ id: "no_workspace", host_id: "host_1", workspace: null, status: "running" }),
+  ];
+
+  it("keeps working host-bound sessions and drops idle, other-host, and workspace-less ones", () => {
+    expect(directoryConflictCandidates(sessions, "host_1").map((s) => s.id)).toEqual([
+      "running",
+      "failed",
+      "unknown",
+    ]);
+  });
+
+  it("returns [] before sessions load", () => {
+    expect(directoryConflictCandidates(undefined, "host_1")).toEqual([]);
   });
 });
 

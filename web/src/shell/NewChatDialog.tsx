@@ -671,6 +671,16 @@ export function isWorkingStatus(status: Conversation["status"]): boolean {
   return status !== "idle";
 }
 
+/** Working, host-bound sessions with a workspace: the directory-conflict poll set. */
+export function directoryConflictCandidates(
+  sessions: Conversation[] | undefined,
+  hostId: string | null,
+): Conversation[] {
+  return (sessions ?? []).filter(
+    (s) => s.host_id === hostId && s.workspace != null && isWorkingStatus(s.status),
+  );
+}
+
 /** Sessions actively using the same normalized directory on a host. */
 export function sessionsSharingDirectory(
   sessions: Conversation[],
@@ -4283,12 +4293,8 @@ export function NewChatLandingScreen() {
   const isCloudHost =
     sandboxSelected || (selectedHost?.name?.toLowerCase().includes("cloud") ?? false);
 
-  // Poll only working sessions on the selected host with a workspace.
   const conflictCandidates = useMemo(
-    () =>
-      (directorySessions ?? []).filter(
-        (s) => s.host_id === selectedHostId && s.workspace != null && isWorkingStatus(s.status),
-      ),
+    () => directoryConflictCandidates(directorySessions, selectedHostId),
     [directorySessions, selectedHostId],
   );
   const runnerHealth = useRunnerHealthRegistration(conflictCandidates);
