@@ -31,7 +31,17 @@ import pytest
 import uvicorn
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import FastAPI, Request
-from playwright.sync_api import Browser, BrowserContext, Page, Playwright, Route, expect
+from playwright.sync_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+    Route,
+    expect,
+)
+from playwright.sync_api import (
+    Error as PlaywrightError,
+)
 from starlette.responses import HTMLResponse
 
 from tests.e2e_ui.conftest import _find_free_port
@@ -168,8 +178,14 @@ class OidcServer:
 
 
 @pytest.fixture(scope="module")
-def oidc_server(mock_idp: str, tmp_path_factory: pytest.TempPathFactory) -> Iterator[OidcServer]:
-    """Spawn the real server with OIDC auth and a 720h session TTL."""
+def oidc_server(
+    mock_idp: str, tmp_path_factory: pytest.TempPathFactory, built_spa: None
+) -> Iterator[OidcServer]:
+    """Spawn the real server with OIDC auth and a 720h session TTL.
+
+    ``built_spa`` builds the SPA bundle the server serves (a no-op under
+    ``--ui-skip-build``), matching the shared OIDC login-flow test.
+    """
     port = _find_free_port()
     origin = f"http://127.0.0.1:{port}"
     server_tmp = tmp_path_factory.mktemp("ios_cold_start_server")
@@ -227,7 +243,8 @@ def oidc_server(mock_idp: str, tmp_path_factory: pytest.TempPathFactory) -> Iter
                         ready = True
                         break
                     last_error = f"/v1/info {info.status_code}: {info.text[:200]}"
-                except httpx.HTTPError as exc:
+                except (httpx.HTTPError, ValueError) as exc:
+                    # ValueError covers a 200 with a non-JSON body during boot.
                     last_error = f"{type(exc).__name__}: {exc}"
                 time.sleep(0.5)
             if not ready:
@@ -274,18 +291,26 @@ def _complete_login_in_system_browser(browser: Browser, login_url: str) -> None:
 
 def _poll_for_token(origin: str, ticket: str) -> dict[str, object]:
     deadline = time.monotonic() + _SHELL_POLL_TIMEOUT_S
+    last = "no response"
     while time.monotonic() < deadline:
         time.sleep(_SHELL_POLL_INTERVAL_S)
         response = httpx.get(f"{origin}/auth/cli-poll", params={"ticket": ticket}, timeout=10)
+        last = f"{response.status_code}: {response.text[:200]}"
         if response.status_code == 200:
             return response.json()
         if response.status_code == 410:
             raise AssertionError(f"ticket expired: {response.text}")
-    raise AssertionError("cli-poll never returned the token")
+        # cli-poll documents 202 as its only pending status; fail fast otherwise.
+        assert response.status_code == 202, f"unexpected cli-poll status {last}"
+    raise AssertionError(f"cli-poll never returned the token; last response {last}")
 
 
 def _shell_session_cookie(origin: str, token: str, *, expires_in: int | None) -> dict[str, object]:
-    """The cookie OidcLoginManager.sessionCookie installs; ``None`` leaves it session-only."""
+    """Build the persistent or session-only cookie for the restart test.
+
+    ``None`` is this test's control (no expiry, so WebKit/Chromium drop it); the
+    shell always sets an expiry, falling back to 8h only when the server omits one.
+    """
     secure = urlparse(origin).scheme == "https"
     cookie: dict[str, object] = {
         "name": "__Host-ap_session" if secure else "ap_session",
@@ -318,6 +343,7 @@ class AppBoot:
     login_redirect_url: str | None = None
     login_redirect_status: int | None = None
     login_redirect_location: str | None = None
+    login_redirect_error: str | None = None
     final_url: str = ""
     opening_sign_in_visible: bool = False
     session_cookie_present: bool = False
@@ -361,8 +387,8 @@ class WebViewStandIn:
                 real = route.fetch(max_redirects=0)
                 boot.login_redirect_status = real.status
                 boot.login_redirect_location = real.headers.get("location")
-            except Exception as exc:
-                boot.login_redirect_location = f"fetch failed: {exc}"
+            except PlaywrightError as exc:
+                boot.login_redirect_error = str(exc)
         route.fulfill(status=204)
 
     def open(self, origin: str, label: str, evidence_dir: Path) -> AppBoot:
@@ -370,26 +396,29 @@ class WebViewStandIn:
         boot = AppBoot(label=label)
         self._boot = boot
         self.context.route(f"{origin}/auth/login*", self._cancel_login_hop)
-        self.page.goto(f"{origin}/")
-        deadline = time.monotonic() + _BOOT_WINDOW_S
-        while time.monotonic() < deadline:
-            if boot.login_redirect_url is not None:
-                self.page.wait_for_timeout(3000)
-                break
-            if boot.me_status == 200 and self.page.get_by_label("Message the agent").count():
-                self.page.wait_for_timeout(3000)
-                break
-            self.page.wait_for_timeout(250)
-        boot.final_url = self.page.url
-        boot.opening_sign_in_visible = self.page.get_by_text("Opening sign-in…").count() > 0
-        for cookie in self.context.cookies(origin):
-            if cookie["name"] in {"ap_session", "__Host-ap_session"}:
-                boot.session_cookie_present = True
-                boot.session_cookie_expires = cookie.get("expires")
-        self.page.screenshot(path=str(evidence_dir / f"{label}.png"))
-        self.context.unroute(f"{origin}/auth/login*")
-        # Stop the response listener from mutating the snapshot the caller owns.
-        self._boot = None
+        try:
+            self.page.goto(f"{origin}/")
+            deadline = time.monotonic() + _BOOT_WINDOW_S
+            while time.monotonic() < deadline:
+                if boot.login_redirect_url is not None:
+                    self.page.wait_for_timeout(3000)
+                    break
+                if boot.me_status == 200 and self.page.get_by_label("Message the agent").count():
+                    self.page.wait_for_timeout(3000)
+                    break
+                self.page.wait_for_timeout(250)
+            boot.final_url = self.page.url
+            boot.opening_sign_in_visible = self.page.get_by_text("Opening sign-in…").count() > 0
+            for cookie in self.context.cookies(origin):
+                if cookie["name"] in {"ap_session", "__Host-ap_session"}:
+                    boot.session_cookie_present = True
+                    boot.session_cookie_expires = cookie.get("expires")
+            self.page.screenshot(path=str(evidence_dir / f"{label}.png"))
+        finally:
+            # Always drop the route handler and freeze the snapshot, so a failure
+            # mid-boot cannot leak the handler or let the listener mutate it.
+            self.context.unroute(f"{origin}/auth/login*")
+            self._boot = None
         return boot
 
     def close(self, clip_path: Path | None) -> None:
