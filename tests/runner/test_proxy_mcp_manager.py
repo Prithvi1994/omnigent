@@ -1102,6 +1102,86 @@ async def test_call_tool_resets_rebind_window_on_each_successful_rebind(
 
 
 @pytest.mark.asyncio
+async def test_call_tool_resets_rebind_window_on_each_rebind_after_transport_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The transport-loss retry window also restarts on each successful rebind.
+
+    Quick transport failures start the reconnect streak; the tunnel reconnects
+    near the original deadline and more quick failures follow. The window must
+    restart from the latest rebind, as the detached-reply branch does, so the
+    call recovers instead of expiring against the stale deadline. Without the
+    reset the window would run out after the sixth drop.
+    """
+    clock = _FakeClock()
+    monkeypatch.setattr(proxy_mcp_manager_mod, "monotonic", clock)
+    monkeypatch.setattr(proxy_mcp_manager_mod, "_REATTACH_RETRY_DELAY_S", 0.01)
+    registry = McpExecutionRegistry()
+    cycle_s = 20.0
+    drop_cycles = 8
+
+    class _FlappingDropTransport(httpx.AsyncBaseTransport):
+        """Rebinds then drops the next re-send in transit until the last call."""
+
+        def __init__(self) -> None:
+            self.calls: list[_Call] = []
+            self.external_invocations = 0
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            self.calls.append(_Call(url=str(request.url), body=body))
+
+            async def _retained_work() -> McpExecutionResult:
+                self.external_invocations += 1
+                return McpExecutionResult(status_code=200, content={"result": {"output": "ok"}})
+
+            await registry.execute(
+                session_id="conv_test",
+                operation_id=body["params"][MCP_OPERATION_ID_PARAM],
+                step="initial",
+                params={"name": body["params"]["name"], "arguments": body["params"]["arguments"]},
+                run=_retained_work,
+            )
+            if len(self.calls) <= drop_cycles:
+                # The tunnel rebinds right away, then the next re-send drops in
+                # transit; each flap stays under the long-run threshold so only
+                # a reset keeps the window alive.
+                clock.now += cycle_s
+                pending_approvals.notify_server_reconnect()
+                raise httpx.ReadError("brief drop")
+            return _json_resp(
+                {
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {
+                        "content": [{"type": "text", "text": "resumed"}],
+                        "isError": False,
+                    },
+                }
+            )
+
+    transport = _FlappingDropTransport()
+    client = httpx.AsyncClient(transport=transport, base_url="http://ap-server")
+    manager = ProxyMcpManager(
+        session_id="conv_test",
+        ap_client=client,
+        execution_registry=registry,
+    )
+    pending_approvals.reset_for_tests()
+    try:
+        result = await manager.call_tool(
+            None, "sys_os_shell", {"command": "sleep 400; gh pr checks", "timeout": 600}
+        )
+    finally:
+        await client.aclose()
+        pending_approvals.reset_for_tests()
+
+    assert result == "resumed"
+    assert transport.external_invocations == 1, "the shell command must not run twice"
+    assert len(transport.calls) == drop_cycles + 1
+
+
+@pytest.mark.asyncio
 async def test_call_tool_returns_unrelated_server_error_without_waiting_for_rebind() -> None:
     """A ``-32000`` that is not the unbound-runner reply is surfaced at once.
 

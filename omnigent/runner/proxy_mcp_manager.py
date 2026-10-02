@@ -25,7 +25,6 @@ When to use each implementation:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import uuid
@@ -453,6 +452,12 @@ class ProxyMcpManager:
                 except asyncio.TimeoutError as exc:
                     if monotonic() >= rebind_deadline:
                         raise _no_replacement_server(None) from exc
+                    # The rebind window still has room, so the call budget, not a
+                    # missing server, ended the wait; say so instead of a bare
+                    # "did not complete" at the loop top.
+                    raise _budget_exhausted(
+                        RuntimeError("call budget spent waiting for the server tunnel to rebind")
+                    ) from exc
                 else:
                     # The rebind completed, so the runner is reachable again; a
                     # later detach starts a fresh window instead of this streak.
@@ -468,11 +473,17 @@ class ProxyMcpManager:
                 if remaining <= 0:
                     raise _no_replacement_server(cause) from cause
                 wait_s = min(wait_s, remaining)
-            with contextlib.suppress(asyncio.TimeoutError):
+            try:
                 await pending_approvals.wait_for_server_reconnect(
                     request_generation,
                     timeout_seconds=min(wait_s, phase_deadline - now),
                 )
+            except asyncio.TimeoutError:
+                pass
+            else:
+                # The rebind completed, so the runner is reachable again; a
+                # later drop starts a fresh window instead of this streak.
+                detached_since = None
 
         payload = _initial_payload()
         approval_retries = 0
