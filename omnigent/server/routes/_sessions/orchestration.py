@@ -11441,9 +11441,11 @@ async def _run_runner_status_probe(
         except (httpx.HTTPError, ConnectionError) as exc:
             failure = f"{type(exc).__name__}: {exc}"
         else:
-            # A rebind may replace this probe while its request is in flight.
-            if _runner_status_probe_inflight.get(session_id) != current_probe:
-                return None
+            # A rebind may have superseded this probe while its request was in
+            # flight. A superseded probe still returns the status it observed to
+            # its own caller, but must not publish into the shared caches now
+            # owned by its replacement.
+            owns_session = _runner_status_probe_inflight.get(session_id) == current_probe
             elapsed = time.monotonic() - started
             if resp.status_code == 200:
                 try:
@@ -11452,14 +11454,16 @@ async def _run_runner_status_probe(
                     payload = None
                 if isinstance(payload, dict):
                     raw = str(payload.get("status", "idle"))
-                    _session_status_cache[session_id] = raw
-                    if raw in ("idle", "running", "waiting", "failed"):
-                        session_live_state.persist_live_status(session_id, raw)
-                    _runner_status_probe_backoff.pop(session_id, None)
+                    if owns_session:
+                        _session_status_cache[session_id] = raw
+                        if raw in ("idle", "running", "waiting", "failed"):
+                            session_live_state.persist_live_status(session_id, raw)
+                        _runner_status_probe_backoff.pop(session_id, None)
                     return raw
                 failure = "HTTP 200 with a malformed body"
             elif elapsed < _RUNNER_STATUS_PROBE_SLOW_S:
-                _runner_status_probe_backoff.pop(session_id, None)
+                if owns_session:
+                    _runner_status_probe_backoff.pop(session_id, None)
                 _logger.debug(
                     "Runner status probe for session=%s answered HTTP %s",
                     session_id,

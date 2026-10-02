@@ -806,7 +806,9 @@ async def test_session_snapshot_rebind_discards_inflight_old_runner(
         await asyncio.wait_for(new.arrived.wait(), timeout=1.0)
         if old_finishes_first:
             old.release.set()
-            assert await first is None
+            # The retired probe still returns the status it observed, but must
+            # not publish it into the shared caches owned by its replacement.
+            assert await first == (None if old_fails else "running")
             assert _sessions_mod._runner_status_probe_inflight.get(session_id) is not None
             assert _sessions_mod._session_status_cache.get(session_id) is None
             assert _sessions_mod._runner_status_probe_backoff.get(session_id) is None
@@ -814,7 +816,7 @@ async def test_session_snapshot_rebind_discards_inflight_old_runner(
         new.release.set()
         assert await replacement == (None if new_fails else "idle")
         old.release.set()
-        assert await first is None
+        assert await first == (None if old_fails else "running")
     finally:
         old.release.set()
         new.release.set()
