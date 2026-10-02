@@ -206,9 +206,9 @@ def test_kimi_is_exempt_from_pane_reaping() -> None:
 
 
 def test_every_native_harness_pane_is_reaper_covered() -> None:
-    # The name filter is hand-kept, so a native harness missing from it (as
-    # devin once was) leaks every finished session's pane. Only kimi may be
-    # absent — see test_kimi_is_exempt_from_pane_reaping.
+    # The name filter is hand-kept, so a native harness missing from it leaks
+    # every finished session's pane. Only kimi may be absent — see
+    # test_kimi_is_exempt_from_pane_reaping.
     from omnigent.harness_aliases import NATIVE_HARNESSES, native_terminal_name
     from omnigent.terminals.pane_reaper import NATIVE_PANE_TERMINAL_NAMES
 

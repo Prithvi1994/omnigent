@@ -96,7 +96,6 @@ async def _drive_finished_turn(
     gate.set()
     await asyncio.wait_for(task, timeout=10)
     await asyncio.sleep(0.3)
-    assert "response" in turn, "native turn task raised before responding"
     return turn["response"].status_code
 
 
@@ -107,10 +106,9 @@ async def _drive_finished_turn(
 async def test_finished_native_pane_reads_idle(
     harness: str, pane_name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Bound by name when the app is built, so stub before building: no tmux
-    # here. monkeypatch restores the module globals so a stray stub can't make
-    # a later test read a quiet pane as busy. With the pane quiet and
-    # unattended, the only thing that could read "busy" is a stale status.
+    # The reaper binds these by name at app build time, so stub first (no tmux).
+    # monkeypatch restores the globals so the stub can't leak into later tests;
+    # with the pane quiet and unattended, only a stale status could read "busy".
     monkeypatch.setattr(native_cost_popup, "_list_tmux_clients", lambda *_a, **_k: [])
     monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_a, **_k: None)
 
@@ -149,9 +147,7 @@ async def test_finished_native_pane_reads_idle(
 
 
 def test_devin_native_panes_are_reapable() -> None:
-    # devin-native is a real native harness (omnigent/harnesses/devin_native)
-    # that opens a TUI pane, so the reaper must be offered its panes; a missing
-    # name means every finished Devin session leaks. Contrast kimi, which is
-    # intentionally exempt.
+    # devin-native opens a TUI pane, so a missing name here leaks every
+    # finished Devin session; kimi is intentionally exempt.
     assert "devin" in NATIVE_PANE_TERMINAL_NAMES
     assert "kimi" not in NATIVE_PANE_TERMINAL_NAMES
