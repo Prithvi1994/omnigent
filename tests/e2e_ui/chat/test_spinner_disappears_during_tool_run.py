@@ -10,6 +10,7 @@ from playwright.sync_api import Page, expect
 _WORKING = '[data-testid="working-indicator"]'
 _COMPOSER = "Message the agent"
 _NARRATION = "let me look for universe repos around the file system"
+_SEARCH_COMMAND = "find / -type d -name '*universe*'"
 
 
 def _post_event(client: httpx.Client, session_id: str, event_type: str, data: dict) -> None:
@@ -25,7 +26,7 @@ def test_working_indicator_survives_false_idle_during_tool_call(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Keep Working visible when a bare idle arrives before a tool result."""
+    """Keep Working and the running tool card when a bare idle arrives before a tool result."""
     base_url, session_id = seeded_session
     response_id = f"resp_universe_{uuid.uuid4().hex[:8]}"
     call_id = f"call_{uuid.uuid4().hex[:8]}"
@@ -74,13 +75,15 @@ def test_working_indicator_survives_false_idle_during_tool_call(
                 "item_data": {
                     "agent": "e2e-universe-agent",
                     "name": "shell",
-                    "arguments": '{"command": "find / -type d -name \'*universe*\'"}',
+                    "arguments": f'{{"command": "{_SEARCH_COMMAND}"}}',
                     "call_id": call_id,
                 },
             },
         )
         expect(page.get_by_text(_NARRATION)).to_be_visible(timeout=15_000)
         expect(working).to_be_visible(timeout=15_000)
+        running_tool = page.locator(f'button[title="{_SEARCH_COMMAND}"]').first
+        expect(running_tool.locator(".animate-spin")).to_be_visible(timeout=10_000)
 
         # The idle watcher emits this bare status while the tool is still running.
         _post_event(client, session_id, "external_session_status", {"status": "idle"})
@@ -90,3 +93,6 @@ def test_working_indicator_survives_false_idle_during_tool_call(
     page.wait_for_timeout(2_500)
 
     expect(working).to_be_visible()
+    # The in-flight tool card keeps spinning instead of folding into a settled summary.
+    expect(page.locator('[data-testid="turn-worked-fold"]')).to_have_count(0)
+    expect(running_tool.locator(".animate-spin")).to_be_visible()
