@@ -2528,8 +2528,11 @@ describe("self-hosted OIDC system-browser sign-in wiring (src/main.js)", () => {
     });
     t.after(h.cleanup);
     h.api.createWindow(server);
-    // oxlint-disable-next-line no-await-in-loop -- wait for the cold load to be recorded
-    while (h.calls.loadURL.length === 0) await tick();
+    for (let waited = 0; h.calls.loadURL.length === 0; waited += 1) {
+      assert.ok(waited < 50, "the cold load was never recorded");
+      // oxlint-disable-next-line no-await-in-loop -- wait for the cold load to be recorded
+      await tick();
+    }
     h.calls.loadURL.length = 0;
     const originalLoadURL = h.win.loadURL;
     let releaseLoad;

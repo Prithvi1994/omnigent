@@ -209,7 +209,7 @@ describe("OIDC login modal", () => {
     assert.equal(await flow, false);
   });
 
-  it("allows only its exact local document and denies all window opens", async () => {
+  it("blocks navigation and redirects away from its page and denies all window opens", async () => {
     const ipcMain = new EventEmitter();
     const pagePath = "/app/oidc_login.html";
     const flow = runOidcLoginDialog({
@@ -242,9 +242,9 @@ describe("OIDC login modal", () => {
     };
 
     loginWindow.webContents.emit("will-navigate", localEvent, pathToFileURL(pagePath).toString());
-    loginWindow.webContents.emit("will-navigate", remoteEvent, "https://attacker.example/");
+    loginWindow.webContents.emit("will-redirect", remoteEvent, "https://attacker.example/");
 
-    assert.equal(localEvent.prevented, false);
+    assert.equal(localEvent.prevented, true);
     assert.equal(remoteEvent.prevented, true);
     assert.deepEqual(
       loginWindow.webContents.windowOpenHandler({ url: "https://attacker.example" }),
@@ -348,6 +348,38 @@ describe("OIDC login modal", () => {
 
     assert.equal(await flow, false);
     assert.equal(latestWindow().destroyed, true);
+  });
+
+  it("ignores actions from other senders and retry while an attempt is waiting", async () => {
+    const ipcMain = new EventEmitter();
+    let attempts = 0;
+    let settle;
+    const flow = runOidcLoginDialog({
+      BrowserWindow: FakeBrowserWindow,
+      ipcMain,
+      parent: {},
+      serverUrl: "https://server.example",
+      pagePath: "/app/oidc_login.html",
+      preloadPath: "/app/oidc_login_preload.js",
+      runAttempt: () => {
+        attempts += 1;
+        return new Promise((resolve) => {
+          settle = resolve;
+        });
+      },
+    });
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    const loginWindow = latestWindow();
+
+    ipcMain.emit(OIDC_LOGIN_ACTION_CHANNEL, { sender: {} }, "cancel");
+    ipcMain.emit(OIDC_LOGIN_ACTION_CHANNEL, { sender: loginWindow.webContents }, "retry");
+
+    assert.equal(loginWindow.destroyed, false);
+    assert.equal(attempts, 1);
+    settle({ ok: true });
+    assert.equal(await flow, true);
   });
 
   it("resolves false immediately when opened with an already superseded attempt", async () => {

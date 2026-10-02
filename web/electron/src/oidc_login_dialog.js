@@ -1,7 +1,5 @@
 "use strict";
 
-const { pathToFileURL } = require("node:url");
-
 const OIDC_LOGIN_ACTION_CHANNEL = "omnigent:oidc-login-action";
 const OIDC_LOGIN_STATE_CHANNEL = "omnigent:oidc-login-state";
 
@@ -64,12 +62,12 @@ function runOidcLoginDialog({
     } catch {
       // The attempt reports the actionable validation error.
     }
-    const allowedPageUrl = pathToFileURL(pagePath).toString();
-    let lastState = {
+    const waitingState = () => ({
       phase: "waiting",
       host,
       message: "Complete sign-in in the browser window that just opened.",
-    };
+    });
+    let lastState = waitingState();
     let attemptNumber = 0;
     let inFlight = false;
     let controller = null;
@@ -101,11 +99,7 @@ function runOidcLoginDialog({
       inFlight = true;
       const currentAttempt = ++attemptNumber;
       controller = new AbortController();
-      lastState = {
-        phase: "waiting",
-        host,
-        message: "Complete sign-in in the browser window that just opened.",
-      };
+      lastState = waitingState();
       sendState();
       const updateMessage = (message) => {
         if (
@@ -157,9 +151,9 @@ function runOidcLoginDialog({
       return;
     }
     signal?.addEventListener("abort", onAbort, { once: true });
-    loginWindow.webContents.on("will-navigate", (event, url) => {
-      if (url !== allowedPageUrl) event.preventDefault();
-    });
+    // The dialog never leaves its own page: block navigations and redirects alike.
+    loginWindow.webContents.on("will-navigate", (event) => event.preventDefault());
+    loginWindow.webContents.on("will-redirect", (event) => event.preventDefault());
     loginWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
     loginWindow.webContents.on("did-finish-load", () => {
       sendState();
