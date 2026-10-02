@@ -122,3 +122,35 @@ def test_claude_workspace_rejects_non_directory(
     with pytest.raises(OmnigentError) as failure:
         _claude_session_workspace(str(not_a_dir))
     assert failure.value.code == ErrorCode.WORKSPACE_MISSING
+
+
+def test_claude_workspace_dead_cwd_without_env_is_workspace_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A removed cwd with no configured workspace is still a WORKSPACE_MISSING
+    condition, not a bare RuntimeError that would surface as a generic 500."""
+    monkeypatch.delenv("OMNIGENT_RUNNER_WORKSPACE", raising=False)
+
+    def _dead_cwd() -> Path:
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(Path, "cwd", staticmethod(_dead_cwd))
+
+    with pytest.raises(OmnigentError) as failure:
+        _claude_session_workspace(None)
+    assert failure.value.code == ErrorCode.WORKSPACE_MISSING
+
+
+def test_claude_workspace_normalizes_padding_and_tilde(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A padded or ``~``-prefixed workspace that exists is launched, not misread
+    as missing (matching Codex workspace normalization)."""
+    monkeypatch.delenv("OMNIGENT_RUNNER_WORKSPACE", raising=False)
+    project = tmp_path / "project"
+    project.mkdir()
+
+    assert _claude_session_workspace(f"  {project}  ") == str(project)
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert _claude_session_workspace("~/project") == str(project)

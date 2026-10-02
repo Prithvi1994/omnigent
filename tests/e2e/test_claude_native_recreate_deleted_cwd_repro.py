@@ -31,6 +31,10 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omnigent.harnesses.claude_native.bridge import (
+    BRIDGE_ID_LABEL_KEY,
+    bridge_dir_for_bridge_id,
+)
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
 from tests._helpers.session import bundle_files, post_session_bundle
 from tests.server.integration.mock_llm_server import anthropic_sse_text_response
@@ -162,6 +166,7 @@ def test_claude_native_terminal_recreates_after_deleted_runner_cwd(
             stdout=log,
             stderr=subprocess.STDOUT,
         )
+        tmux_socket: str | None = None
         try:
             _wait(
                 lambda: client.get(f"/v1/runners/{runner_id}/status").json().get("online"),
@@ -220,6 +225,12 @@ os_env:
                 f"valid configured workspace {workspace}: "
                 f"HTTP {ensure_resp.status_code} {ensure_resp.text}"
             )
+            snapshot = client.get(f"/v1/sessions/{session_id}").json()
+            bridge_dir = bridge_dir_for_bridge_id(
+                snapshot.get("labels", {}).get(BRIDGE_ID_LABEL_KEY) or session_id
+            )
+            _wait(lambda: (bridge_dir / "tmux.json").exists(), "Claude tmux target")
+            tmux_socket = json.loads((bridge_dir / "tmux.json").read_text())["socket_path"]
         finally:
             try:
                 print("=== runner.log tail ===", flush=True)
@@ -232,4 +243,10 @@ os_env:
             except subprocess.TimeoutExpired:
                 runner.kill()
                 runner.wait(timeout=5)
-            subprocess.run(["tmux", "kill-server"], check=False, capture_output=True, timeout=5)
+            if tmux_socket is not None:
+                subprocess.run(
+                    ["tmux", "-S", tmux_socket, "kill-server"],
+                    check=False,
+                    capture_output=True,
+                    timeout=5,
+                )

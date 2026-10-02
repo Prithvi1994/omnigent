@@ -896,17 +896,23 @@ def _claude_session_workspace(session_workspace: str | None) -> str:
 
     The server-stored session ``workspace`` wins, then
     :func:`_runner_workspace_dir`, so the process cwd is consulted only when
-    neither is set. The path keeps its spelling (no symlink resolution) because
-    Claude keys resume transcripts by cwd. The selected directory must exist:
-    launching somewhere else would silently run the session in the wrong tree.
+    neither is set. Padding and a leading ``~`` are normalized (matching
+    :func:`_codex_session_workspace`) so a valid path isn't misread as missing,
+    but symlinks are left unresolved because Claude keys resume transcripts by
+    cwd. The selected directory must exist: launching somewhere else would
+    silently run the session in the wrong tree.
 
     :param session_workspace: The session's ``workspace`` from the init
         snapshot or ``GET /v1/sessions/{id}``; ``None`` when omitted.
     :returns: Workspace path used as the terminal's cwd.
-    :raises OmnigentError: ``WORKSPACE_MISSING`` when that path is not an
-        existing directory.
+    :raises OmnigentError: ``WORKSPACE_MISSING`` when no workspace resolves or
+        the resolved path is not an existing directory.
     """
-    workspace = session_workspace or _runner_workspace_dir()
+    try:
+        raw = session_workspace or _runner_workspace_dir()
+    except RuntimeError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.WORKSPACE_MISSING) from exc
+    workspace = str(Path(raw.strip()).expanduser())
     if not os.path.isdir(workspace):
         raise OmnigentError(workspace_missing_message(workspace), code=ErrorCode.WORKSPACE_MISSING)
     return workspace
@@ -7590,9 +7596,8 @@ def _native_terminal_start_error_payload(
             ),
         }
     if missing_workspace:
-        # Likewise a lifecycle condition, not a startup defect: the directory
-        # the session is bound to was removed, and no other directory may
-        # stand in for it.
+        # Lifecycle condition, not a startup defect: the bound workspace was
+        # removed and no substitute directory is allowed.
         _logger.warning(
             "Native %s terminal skipped; session workspace unavailable; error_id=%s: %s",
             runtime_name,
