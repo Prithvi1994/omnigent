@@ -133,6 +133,58 @@ async def test_single_subscriber_receives_events_in_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_publish_drops_closed_loop_without_disturbing_healthy_subscriber() -> None:
+    """A closed subscriber loop is removed while healthy peers still receive events."""
+    conversation_id = "conv_closed_loop"
+    stale_loop = asyncio.new_event_loop()
+    stale_queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
+    stale_subscriber = (stale_queue, stale_loop)
+    stale_loop.close()
+    session_stream._subscribers.setdefault(conversation_id, set()).add(stale_subscriber)
+
+    task = asyncio.create_task(_collect(conversation_id, expected=1))
+    await asyncio.sleep(0)
+
+    assert session_stream.publish(conversation_id, {"type": "event"}) == 1
+    assert stale_subscriber not in session_stream._subscribers[conversation_id]
+    assert await asyncio.wait_for(task, timeout=2.0) == [{"type": "event"}]
+
+
+@pytest.mark.asyncio
+async def test_close_drops_closed_loop_and_terminates_healthy_subscriber() -> None:
+    """Closing ignores a stale loop and still terminates healthy subscribers."""
+    conversation_id = "conv_close_closed_loop"
+    stale_loop = asyncio.new_event_loop()
+    stale_queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
+    stale_subscriber = (stale_queue, stale_loop)
+    stale_loop.close()
+    session_stream._subscribers.setdefault(conversation_id, set()).add(stale_subscriber)
+
+    task = asyncio.create_task(_collect(conversation_id, expected=0))
+    await asyncio.sleep(0)
+
+    session_stream.close(conversation_id)
+
+    assert await asyncio.wait_for(task, timeout=2.0) == []
+    assert conversation_id not in session_stream._subscribers
+
+
+def test_schedule_delivery_does_not_count_already_removed_subscriber() -> None:
+    """A slot removed after a publisher snapshot is no longer deliverable."""
+    conversation_id = "conv_removed_before_schedule"
+    loop = asyncio.new_event_loop()
+    queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
+    subscriber = (queue, loop)
+    try:
+        assert not session_stream._schedule_delivery(
+            conversation_id, subscriber, {"type": "event"}
+        )
+        assert queue.empty()
+    finally:
+        loop.close()
+
+
+@pytest.mark.asyncio
 async def test_pre_subscribe_events_are_lost() -> None:
     """
     Events published before any subscriber connected are dropped.
@@ -860,6 +912,54 @@ def test_sse_safe_attributes_whitelists_ids_and_excludes_content() -> None:
         assert leaked.lower() not in flat
 
 
+def test_sse_safe_attributes_captures_level_and_code_for_error_items() -> None:
+    # Level and code on an error item must be captured so dashboards can
+    # exclude info-level notices from error-rate metrics.
+    info_event = {
+        "type": "response.output_item.done",
+        "item": {
+            "id": "item_notice",
+            "type": "error",
+            "source": "execution",
+            "code": "pi_native_effort_ignored",
+            "message": "effort ignored for gateway-routed model: thinking disabled",
+            "level": "info",
+        },
+    }
+    attrs = session_stream._sse_safe_attributes(info_event)
+    assert attrs["item_type"] == "error"
+    assert attrs["item_level"] == "info"
+    assert attrs["item_code"] == "pi_native_effort_ignored"
+    # message text must never reach the debug table
+    assert "message" not in attrs
+    flat = repr(attrs).lower()
+    assert "effort ignored" not in flat
+    assert "thinking disabled" not in flat
+
+
+def test_sse_safe_attributes_omits_level_and_code_for_non_error_items() -> None:
+    # level/code are error-item-specific; they must not appear for other types.
+    event = {
+        "type": "response.output_item.done",
+        "item": {"id": "item_msg", "type": "message", "level": "info", "code": "some_code"},
+    }
+    attrs = session_stream._sse_safe_attributes(event)
+    assert attrs["item_type"] == "message"
+    assert "item_level" not in attrs
+    assert "item_code" not in attrs
+
+
+def test_sse_safe_attributes_omits_oversized_code() -> None:
+    # codes longer than 64 chars are not captured (guard against free-form text).
+    long_code = "x" * 65
+    event = {
+        "type": "response.output_item.done",
+        "item": {"id": "item_e", "type": "error", "code": long_code},
+    }
+    attrs = session_stream._sse_safe_attributes(event)
+    assert "item_code" not in attrs
+
+
 @contextlib.contextmanager
 def _capturing_sse_logger() -> Iterator[list[logging.LogRecord]]:
     """Attach a capturing handler to the SSE logger for the duration of the block."""
@@ -882,7 +982,7 @@ def _capturing_sse_logger() -> Iterator[list[logging.LogRecord]]:
 
 
 def test_log_sse_event_logs_kept_and_skips_noise(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
     with _capturing_sse_logger() as records:
         session_stream._log_sse_event(
             "conv_1", {"type": "response.completed", "response": {"id": "resp_1"}, "delta": "text"}
@@ -906,7 +1006,7 @@ def test_log_sse_event_logs_kept_and_skips_noise(monkeypatch: pytest.MonkeyPatch
 
 
 def test_log_sse_event_noop_when_sink_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: False)
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: False)
     with _capturing_sse_logger() as records:
         session_stream._log_sse_event("conv_1", {"type": "response.completed"})
     assert records == []
@@ -935,6 +1035,7 @@ def _capturing_audit_logger() -> Iterator[list[logging.LogRecord]]:
 def test_log_sse_event_emits_turn_finished_on_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     # A terminal SSE event emits one first-class turn_finished audit row carrying
     # the outcome + safe ids; a non-terminal event emits none.
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
     monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
     with _capturing_audit_logger() as records:
         session_stream._log_sse_event(
@@ -991,6 +1092,7 @@ def test_failed_event_logs_nested_error_code_without_content(
             "message": "private legacy detail",
         }
     expected_code = "legacy_error" if legacy_error else "runner_error"
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
     monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
     with _capturing_sse_logger() as sse_records, _capturing_audit_logger() as audit_records:
         session_stream._log_sse_event("conv_failed", event)
@@ -1020,6 +1122,7 @@ def test_failed_event_logs_omit_unrecognized_sources(
     monkeypatch: pytest.MonkeyPatch, source: object
 ) -> None:
     """Unvalidated source data must not enter diagnostics or suppress the failure log."""
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
     monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
     with _capturing_sse_logger() as sse_records, _capturing_audit_logger() as audit_records:
         session_stream._log_sse_event(

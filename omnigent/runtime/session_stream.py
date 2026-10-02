@@ -39,6 +39,7 @@ from omnigent.debug_logging import (
     debug_event,
     debug_sink_enabled,
     sse_event_logger,
+    sse_logging_enabled,
 )
 from omnigent.errors import ErrorImpact, ErrorPhase
 from omnigent.runtime import inflight_text, pending_elicitations
@@ -87,7 +88,31 @@ def _enqueue_or_overflow(
     queue.put_nowait(_OVERFLOW)
 
 
-# ── SSE-event debug logging (table-only; see omnigent.debug_logging) ──────────
+def _schedule_delivery(
+    conversation_id: str,
+    subscriber: tuple[asyncio.Queue[dict[str, Any] | object], asyncio.AbstractEventLoop],
+    item: dict[str, Any] | object,
+) -> bool:
+    """Schedule one delivery, dropping a slot whose loop has closed."""
+    queue, loop = subscriber
+    # Re-check membership under the same lock subscribe cleanup uses. A slot
+    # removed after the caller's snapshot must not count as a live recipient.
+    with _lock:
+        subs = _subscribers.get(conversation_id)
+        if subs is None or subscriber not in subs:
+            return False
+        try:
+            loop.call_soon_threadsafe(_enqueue_or_overflow, queue, item)
+        except RuntimeError:
+            subs.discard(subscriber)
+            if not subs:
+                _subscribers.pop(conversation_id, None)
+            return False
+        return True
+
+
+# ── SSE-event debug logging (ZeroBus table and/or local file; see
+# omnigent.debug_logging) ─────────────────────────────────────────────────────
 # Frequent, low-signal events not worth a debug-log row.
 _SSE_SKIP_TYPES = frozenset(
     {"session.terminal.activity", "session.heartbeat", "response.heartbeat"}
@@ -128,6 +153,7 @@ _SSE_SAFE_KEYS = (
     "call_id",
     "message_id",
     "phase",
+    "stage",
     "attempt",
     "max_attempts",
     "sequence_number",
@@ -164,6 +190,14 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
             attrs["item_id"] = item["id"]
         if isinstance(item.get("type"), str):
             attrs["item_type"] = item["type"]
+        # For error items, capture level and code so dashboards can exclude
+        # info-level notices from error-rate metrics.
+        if item.get("type") == "error":
+            if isinstance(item.get("level"), str):
+                attrs["item_level"] = item["level"]
+            code = item.get("code")
+            if isinstance(code, str) and len(code) <= 64:
+                attrs["item_code"] = code
     error = event.get("error")
     if not isinstance(error, dict) and isinstance(response, dict):
         error = response.get("error")
@@ -178,14 +212,15 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
 
 
 def _log_sse_event(conversation_id: str, event: dict[str, Any]) -> None:
-    """Mirror one emitted SSE event to the debug-log table (best-effort).
+    """Mirror one emitted SSE event to the debug-log sinks (best-effort).
 
-    No-op unless the debug-log sink is enabled. Logs the event name and safe
-    ids only (never content); heartbeats / terminal-activity are skipped, and
-    failure events go at WARNING. Never raises into :func:`publish`.
+    No-op unless a sink is enabled (the ZeroBus table, the local file, or both).
+    Logs the event name and safe ids only (never content); heartbeats /
+    terminal-activity are skipped, and failure events go at WARNING. Never raises
+    into :func:`publish`.
     """
     with contextlib.suppress(Exception):
-        if not debug_sink_enabled():
+        if not sse_logging_enabled():
             return
         event_type = event.get("type")
         if not isinstance(event_type, str) or event_type in _SSE_SKIP_TYPES:
@@ -194,7 +229,11 @@ def _log_sse_event(conversation_id: str, event: dict[str, Any]) -> None:
         extra = debug_event(event_type, session_id=conversation_id)
         extra["attributes"] = _sse_safe_attributes(event)
         sse_event_logger().log(level, "sse %s", event_type, extra=extra)
-        _log_turn_outcome(conversation_id, event_type, event)
+        # Turn-outcome audit rows are table-only: emit them only when the ZeroBus
+        # sink is on, not merely when the file sink is (the audit logger has no
+        # handler without the table, so an unguarded call would leak to root).
+        if debug_sink_enabled():
+            _log_turn_outcome(conversation_id, event_type, event)
 
 
 def _log_turn_outcome(conversation_id: str, event_type: str, event: dict[str, Any]) -> None:
@@ -253,17 +292,17 @@ def publish(conversation_id: str, event: dict[str, Any]) -> int:
         the Omnigent route layer validates each emitted dict against
         the union before serializing, so an unmodelled event
         fails loud at the SSE boundary.
-    :returns: The number of subscriber slots the event was dispatched
-        toward (``0`` when nothing was listening or the event was
-        suppressed). A slow subscriber's queue may still overflow after
-        dispatch, so a positive count is presence, not delivery. Callers
-        that need a live listener — e.g. the browser action bridge — use
-        this to fail fast instead of awaiting a response that can never
+    :returns: The number of subscriber slots where delivery was
+        successfully scheduled (``0`` when nothing was listening or the
+        event was suppressed). A slow subscriber's queue may still overflow
+        after dispatch, so a positive count is presence, not delivery.
+        Callers that need a live listener — e.g. the browser action bridge —
+        use this to fail fast instead of awaiting a response that can never
         arrive; most callers ignore it.
     """
-    # Mirror the emitted event to the debug-log table (best-effort, table-only,
-    # no-op unless the sink is enabled). Done first so it captures every event
-    # the server produces — including ones with no live subscriber.
+    # Mirror the emitted event to the debug-log sinks (best-effort, no content,
+    # no-op unless a sink is enabled). Done first so it captures every event the
+    # server produces — including ones with no live subscriber.
     _log_sse_event(conversation_id, event)
     # Track reconnect state and centrally suppress or rewrite native deltas
     # before they reach subscribers.
@@ -278,9 +317,11 @@ def publish(conversation_id: str, event: dict[str, Any]) -> int:
         return 0
     with _lock:
         subs = list(_subscribers.get(conversation_id, ()))
-    for queue, loop in subs:
-        loop.call_soon_threadsafe(_enqueue_or_overflow, queue, live_event)
-    return len(subs)
+    scheduled = 0
+    for subscriber in subs:
+        if _schedule_delivery(conversation_id, subscriber, live_event):
+            scheduled += 1
+    return scheduled
 
 
 def has_subscribers(conversation_id: str) -> bool:
@@ -315,8 +356,8 @@ def close(conversation_id: str) -> None:
     """
     with _lock:
         subs = list(_subscribers.get(conversation_id, ()))
-    for queue, loop in subs:
-        loop.call_soon_threadsafe(_enqueue_or_overflow, queue, _DONE)
+    for subscriber in subs:
+        _schedule_delivery(conversation_id, subscriber, _DONE)
 
 
 def shutdown_all() -> None:
