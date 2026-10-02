@@ -7424,73 +7424,6 @@ def _publish_terminal_pending(
     )
 
 
-async def _preset_fork_clone_external_session_id(
-    server_client: httpx.AsyncClient,
-    session_id: str,
-    our_uuid: str,
-    transcript: Path,
-) -> tuple[str, Path]:
-    """
-    Record a forked clone's Claude id, deferring to one another launch recorded first.
-
-    Two launches racing on a fresh fork each write a clone transcript; the server
-    keeps only the first id. Resuming that recorded clone (and dropping ours) keeps
-    the live Claude session and the server's ``external_session_id`` in agreement.
-
-    :param server_client: AP client for the session PATCH / GET.
-    :param session_id: Forked session id, e.g. ``"conv_abc123"``.
-    :param our_uuid: Claude id this launch assigned, e.g. ``"4d656d37-..."``.
-    :param transcript: Clone transcript this launch wrote under *our_uuid*.
-    :returns: The ``(claude_id, transcript)`` to resume.
-    """
-    from omnigent.harnesses.claude_native.main import _CLAUDE_SESSION_ID_RE
-
-    quoted = urllib.parse.quote(session_id, safe="")
-    try:
-        resp = await server_client.patch(
-            f"/v1/sessions/{quoted}",
-            json={"external_session_id": our_uuid},
-            params={"include_usage": "false"},
-            timeout=10.0,
-        )
-        if resp.status_code != 400:
-            return our_uuid, transcript
-        # 400: the id is already set and the server refuses to overwrite it.
-        snap_resp = await server_client.get(
-            f"/v1/sessions/{quoted}", params=_SESSION_METADATA_PARAMS, timeout=10.0
-        )
-    except httpx.HTTPError:
-        _logger.warning(
-            "Could not pre-set external_session_id for forked clone %s; relying on hook capture",
-            session_id,
-            exc_info=True,
-        )
-        return our_uuid, transcript
-    try:
-        snap = snap_resp.json() if snap_resp.status_code == 200 else None
-    except ValueError:
-        snap = None
-    recorded = snap.get("external_session_id") if isinstance(snap, dict) else None
-    if (
-        not isinstance(recorded, str)
-        or recorded == our_uuid
-        or not _CLAUDE_SESSION_ID_RE.fullmatch(recorded)
-    ):
-        return our_uuid, transcript
-    recorded_transcript = transcript.with_name(f"{recorded}.jsonl")
-    if not recorded_transcript.is_file():
-        return our_uuid, transcript
-    transcript.unlink(missing_ok=True)
-    _logger.info(
-        "Forked clone already records Claude id %s; resuming it instead of %s: session=%s",
-        recorded,
-        our_uuid,
-        session_id,
-        extra={"session_id": session_id},
-    )
-    return recorded, recorded_transcript
-
-
 def _measured_prefix_bytes(transcript_path: Path) -> int | None:
     """
     Measure a just-written resume transcript so the forwarder can skip exactly it.
@@ -8390,15 +8323,26 @@ async def _auto_create_claude_terminal(
         if _cloned is not None:
             # Resume our OWN clone (plain --resume, no --fork-session).
             resume_external_session_id = our_uuid
+            resume_prefix_bytes = _measured_prefix_bytes(_cloned)
             # Record the assigned id now so Omnigent reflects the clone's own
             # Claude session immediately, and a later relaunch resumes it
             # via the normal cold-resume path (this branch is gated on
             # external_session_id being unset). Best-effort.
             if server_client is not None:
-                resume_external_session_id, _cloned = await _preset_fork_clone_external_session_id(
-                    server_client, session_id, our_uuid, _cloned
-                )
-            resume_prefix_bytes = _measured_prefix_bytes(_cloned)
+                try:
+                    await server_client.patch(
+                        f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+                        json={"external_session_id": our_uuid},
+                        params={"include_usage": "false"},
+                        timeout=10.0,
+                    )
+                except httpx.HTTPError:
+                    _logger.warning(
+                        "Could not pre-set external_session_id for forked clone %s; "
+                        "relying on hook capture",
+                        session_id,
+                        exc_info=True,
+                    )
     elif (
         server_client is not None
         and fork_carry_history
@@ -8444,13 +8388,25 @@ async def _auto_create_claude_terminal(
             extra={"session_id": session_id},
         )
         if _built is not None:
+            resume_external_session_id = our_uuid
+            resume_prefix_bytes = _measured_prefix_bytes(_built)
             # Record the assigned id so Omnigent reflects the clone's own Claude
             # session and a later relaunch resumes it via the cold-resume
             # path above. Best-effort, mirroring the clone branch.
-            resume_external_session_id, _built = await _preset_fork_clone_external_session_id(
-                server_client, session_id, our_uuid, _built
-            )
-            resume_prefix_bytes = _measured_prefix_bytes(_built)
+            try:
+                await server_client.patch(
+                    f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+                    json={"external_session_id": our_uuid},
+                    params={"include_usage": "false"},
+                    timeout=10.0,
+                )
+            except httpx.HTTPError:
+                _logger.warning(
+                    "Could not pre-set external_session_id for forked clone %s; "
+                    "relying on hook capture",
+                    session_id,
+                    exc_info=True,
+                )
     _logger.info(
         "Claude terminal cold-resume decision: session=%s external_session_id_set=%s "
         "fork_source_set=%s resume_enabled=%s",
