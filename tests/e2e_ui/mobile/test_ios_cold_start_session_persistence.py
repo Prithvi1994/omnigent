@@ -1,12 +1,11 @@
 """iOS shell cold start: the ticket-login session must survive a relaunch.
 
 Linux CI has no iOS runtime, so this re-enacts the shell's ticket login against
-a real OIDC-enabled ``omnigent server`` (local mock IdP, real SPA) and uses a
-persistent Chromium profile at an iPhone device profile as the WKWebView
-stand-in; closing and relaunching the profile plays force-quit + reopen. The
-installed cookie mirrors ``OidcLoginManager.sessionCookie``, including the
-expiry it takes from ``/auth/cli-poll``'s ``expires_in``; the Swift side is
-covered by ``OidcLoginManagerTests.swift``.
+a real OIDC-enabled ``omnigent server`` and drives a persistent Chromium profile
+(iPhone device profile) as a WKWebView stand-in; closing and relaunching it
+plays force-quit + reopen. The cookie mirrors ``OidcLoginManager.sessionCookie``
+with the expiry from ``/auth/cli-poll``. Chromium is not WebKit, so the native
+side stays covered by ``OidcLoginManagerTests.swift``.
 """
 
 from __future__ import annotations
