@@ -15,6 +15,7 @@ readiness map, exactly as the real daemon would after writing the credential.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -28,6 +29,8 @@ from httpx import ASGITransport, AsyncClient
 
 from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
+    CAP_CODEX_SIDE_CHAT,
+    HOST_CAPABILITIES,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
     HostHelloFrame,
@@ -44,6 +47,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
+from tests.server.helpers import websocket_scope as _websocket_scope
 
 pytestmark = [
     pytest.mark.asyncio,
@@ -60,21 +64,6 @@ def _enable_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OMNIGENT_FEATURES", "harness_install")
 
 
-def _websocket_scope(path: str) -> dict[str, object]:
-    return {
-        "type": "websocket",
-        "asgi": {"version": "3.0"},
-        "scheme": "ws",
-        "path": path,
-        "raw_path": path.encode("ascii"),
-        "query_string": b"",
-        "headers": [],
-        "client": ("127.0.0.1", 50000),
-        "server": ("testserver", 80),
-        "subprotocols": [],
-    }
-
-
 def _hello_text(
     name: str = _HOST_NAME,
     version: str = "0.1.0-test",
@@ -85,9 +74,30 @@ def _hello_text(
             version=version,
             frame_protocol_version=1,
             name=name,
-            capabilities=capabilities,
+            capabilities=list(capabilities or []),
         )
     )
+
+
+# The hello fields a 0.6.0 host daemon sends; that release predates ``capabilities``.
+_OLD_HOST_HELLO_FIELDS = (
+    "kind",
+    "version",
+    "frame_protocol_version",
+    "name",
+    "runners",
+    "configured_harnesses",
+    "telemetry_opt_out",
+    "installation_id",
+)
+
+
+def _old_host_hello_text(version: str, name: str = _HOST_NAME) -> str:
+    """Hello as sent by a daemon that predates capability advertisement."""
+    full = json.loads(
+        encode_host_frame(HostHelloFrame(version=version, frame_protocol_version=1, name=name))
+    )
+    return json.dumps({k: full[k] for k in _OLD_HOST_HELLO_FIELDS if k in full})
 
 
 async def _connect_mock_host(
@@ -103,6 +113,11 @@ async def _connect_mock_host(
     while registry.get(_HOST_ID) is None:
         await asyncio.sleep(0.01)
     return comm
+
+
+async def _disconnect_mock_host(comm: ApplicationCommunicator) -> None:
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+    await comm.wait(timeout=5.0)
 
 
 @pytest.fixture()
@@ -530,21 +545,17 @@ async def test_offline_host_returns_409(
 def _auto_reply_store_secret(
     comm: ApplicationCommunicator,
     received: list[HostStoreSecretFrame],
-    stop: asyncio.Event,
 ) -> asyncio.Task[None]:
     """Record + auto-ack every forwarded ``host.store_secret`` frame.
 
     Keeps the old-host gate tests honest AND terminating: a gate regression
     forwards the frame, which lands in ``received`` (failing the assertion)
-    instead of dead-waiting the route's 30s timeout.
+    instead of dead-waiting the route's 30s timeout. Cancel the task to stop.
     """
 
     async def _drain() -> None:
-        while not stop.is_set():
-            try:
-                output = await comm.receive_output(timeout=0.5)
-            except asyncio.TimeoutError:
-                continue
+        while True:
+            output = await comm.receive_output(timeout=None)
             text = output.get("text")
             if output.get("type") != "websocket.send" or not isinstance(text, str):
                 continue
@@ -585,10 +596,9 @@ async def test_rejects_host_predating_store_secret_fast_and_clearly(
     promptly, naming the version and the remedy.
     """
     app, registry, _hs, _cs = cred_app
-    comm = await _connect_mock_host(app, registry, hello=_hello_text(version=version))
+    comm = await _connect_mock_host(app, registry, hello=_old_host_hello_text(version))
     received: list[HostStoreSecretFrame] = []
-    stop = asyncio.Event()
-    drain_task = _auto_reply_store_secret(comm, received, stop)
+    drain_task = _auto_reply_store_secret(comm, received)
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             start = time.monotonic()
@@ -598,11 +608,10 @@ async def test_rejects_host_predating_store_secret_fast_and_clearly(
             )
             elapsed = time.monotonic() - start
     finally:
-        stop.set()
-        try:
-            await asyncio.wait_for(drain_task, timeout=1.0)
-        except asyncio.TimeoutError:
-            drain_task.cancel()
+        drain_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await drain_task
+        await _disconnect_mock_host(comm)
 
     assert resp.status_code == 409, resp.text
     detail = resp.json()["detail"]
@@ -618,31 +627,34 @@ async def test_rejects_host_predating_store_secret_fast_and_clearly(
 
 
 @pytest.mark.parametrize(
-    ("version", "capabilities"),
+    "hello",
     [
-        # Advertised support is authoritative — even on a version the floor
-        # would reject.
-        ("0.6.0", ["host.store_secret"]),
+        pytest.param(
+            _hello_text(version="0.17.0.dev0", capabilities=HOST_CAPABILITIES),
+            id="current-build",
+        ),
+        # Released 0.15.x/0.16.x daemons advertise capability tokens but no
+        # harness-setup entry; they serve the frames and must keep writing.
+        pytest.param(
+            _hello_text(version="0.16.0", capabilities=[CAP_CODEX_SIDE_CHAT]),
+            id="0.16.0-tokens-without-harness-setup",
+        ),
+        # A prerelease of the floor version already ships the frames.
+        pytest.param(_old_host_hello_text("0.7.0rc1"), id="0.7.0rc1"),
         # No advertisement + unparseable version stays permissive: never block
         # a host we can't prove is too old.
-        ("custom-build", None),
-        # A prerelease of the floor version already ships the frames.
-        ("0.7.0rc1", None),
+        pytest.param(_old_host_hello_text("custom-build"), id="unparseable-version"),
     ],
 )
-async def test_capability_advertisement_and_unparseable_version_allow_the_write(
+async def test_hosts_at_or_above_the_floor_still_write(
     cred_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
-    version: str,
-    capabilities: list[str] | None,
+    hello: str,
 ) -> None:
-    """Hosts that advertise store_secret (or can't be proven old) still write."""
+    """Every daemon that ships the frames (or can't be proven old) still writes."""
     app, registry, _hs, _cs = cred_app
-    comm = await _connect_mock_host(
-        app, registry, hello=_hello_text(version=version, capabilities=capabilities)
-    )
+    comm = await _connect_mock_host(app, registry, hello=hello)
     received: list[HostStoreSecretFrame] = []
-    stop = asyncio.Event()
-    drain_task = _auto_reply_store_secret(comm, received, stop)
+    drain_task = _auto_reply_store_secret(comm, received)
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post(
@@ -650,32 +662,13 @@ async def test_capability_advertisement_and_unparseable_version_allow_the_write(
                 json={"kind": "key", "secret": "sk-ant-SECRET"},
             )
     finally:
-        stop.set()
-        try:
-            await asyncio.wait_for(drain_task, timeout=1.0)
-        except asyncio.TimeoutError:
-            drain_task.cancel()
+        drain_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await drain_task
+        await _disconnect_mock_host(comm)
 
     assert resp.status_code == 200, resp.text
     assert len(received) == 1
-
-
-async def test_rejects_daemon_advertising_without_store_secret(
-    cred_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
-) -> None:
-    """An advertised capability list is trusted over any version heuristic."""
-    app, registry, _hs, _cs = cred_app
-    # Keep the communicator referenced so the mock tunnel stays connected.
-    _comm = await _connect_mock_host(
-        app, registry, hello=_hello_text(version="9.9.9", capabilities=["host.stat"])
-    )
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.post(
-            f"/v1/hosts/{_HOST_ID}/harnesses/claude/credential",
-            json={"kind": "key", "secret": "sk-ant-SECRET"},
-        )
-    assert resp.status_code == 409, resp.text
-    assert "update omnigent on the host" in resp.json()["detail"]
 
 
 async def test_old_host_gates_detect_install_and_model_options(
@@ -688,12 +681,14 @@ async def test_old_host_gates_detect_install_and_model_options(
     against a daemon that silently drops the frame.
     """
     app, registry, _hs, _cs = cred_app
-    # Keep the communicator referenced so the mock tunnel stays connected.
-    _comm = await _connect_mock_host(app, registry, hello=_hello_text(version="0.6.0"))
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        detect = await client.get(f"/v1/hosts/{_HOST_ID}/credentials/detected")
-        install = await client.post(f"/v1/hosts/{_HOST_ID}/harnesses/claude/install")
-        models = await client.get(f"/v1/hosts/{_HOST_ID}/harnesses/claude/model-options")
+    comm = await _connect_mock_host(app, registry, hello=_old_host_hello_text("0.6.0"))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            detect = await client.get(f"/v1/hosts/{_HOST_ID}/credentials/detected")
+            install = await client.post(f"/v1/hosts/{_HOST_ID}/harnesses/claude/install")
+            models = await client.get(f"/v1/hosts/{_HOST_ID}/harnesses/claude/model-options")
+    finally:
+        await _disconnect_mock_host(comm)
     for resp in (detect, install, models):
         assert resp.status_code == 409, resp.text
         assert "update omnigent on the host" in resp.json()["detail"]

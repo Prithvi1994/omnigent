@@ -3047,6 +3047,48 @@ def test_inbox_model_change_unknown_model_posts_error(tmp_path: Path) -> None:
     _run_extension_script(node, _extension_path(), script)
 
 
+def test_bound_models_use_literal_ids_and_only_managed_providers() -> None:
+    """A raw gateway selection cannot switch to an ambient vendor provider."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  process.env.OMNIGENT_PI_INFERENCE_BOUND = "1";
+  catalog.unshift({ provider: "anthropic", id: "databricks-claude-opus-4-1", hasKey: true });
+  catalog.push({ provider: "omnigent", id: "foo", hasKey: true });
+  catalog.push({ provider: "omnigent-completions", id: "omnigent/foo", hasKey: true });
+  await handlers.session_start({}, ctx);
+  await deliverModelChange("databricks-claude-opus-4-1");
+  await deliverModelChange("omnigent/foo");
+  assert.deepEqual(setModelCalls.map((model) => [model.provider, model.id]), [
+    ["omnigent", "databricks-claude-opus-4-1"],
+    ["omnigent-completions", "omnigent/foo"],
+  ]);
+  const options = posted.find((event) => event.type === "external_model_options").data.models;
+  assert.deepEqual(options.map((model) => model.id), [
+    "databricks-claude-sonnet-4-6", "databricks-claude-opus-4-1", "foo", "omnigent/foo",
+  ]);
+  await handlers.model_select({ source: "set", model: setModelCalls[1] }, ctx);
+  const changes = posted.filter((event) => event.type === "external_model_change");
+  assert.equal(changes[0].data.model, "databricks-claude-sonnet-4-6");
+  assert.equal(changes[1].data.model, "omnigent/foo");
+  await deliverModelChange("anthropic/databricks-claude-opus-4-1");
+  assert.equal(setModelCalls.length, 2);
+  assert.equal(errorItems().length, 1);
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
 def test_model_select_mirrors_to_external_model_change(tmp_path: Path) -> None:
     """A user ``/model`` pick inside Pi posts ``external_model_change`` (two-way sync).
 
@@ -3379,6 +3421,95 @@ def test_send_delivery_falls_back_to_agent_loop_state() -> None:
   console.error(error && error.stack ? error.stack : error);
   process.exit(1);
 });
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+@pytest.mark.parametrize("outcome", ["complete", "error", "throw", "unavailable", "next-turn"])
+def test_compact_retains_inbox_messages_and_reports_busy(outcome: str) -> None:
+    """Pi owns buffering after delivery; an aborted turn must not release the web queue."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required")
+    script = (
+        _SEND_DELIVERY_HARNESS
+        + "const outcome = "
+        + repr(outcome)
+        + ";\n"
+        + r"""
+const posted = [];
+let releaseIdle;
+const idlePosted = new Promise(resolve => { releaseIdle = resolve; });
+// Enable the real event publisher for this test.
+const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+config.serverUrl = "http://omnigent.test";
+config.sessionId = "compact-session";
+fs.writeFileSync(configPath, JSON.stringify(config));
+global.fetch = async (_url, request) => {
+  if (request.body) {
+    const event = JSON.parse(request.body);
+    posted.push(event);
+    if (outcome === "complete" && event.data?.status === "idle") await idlePosted;
+  }
+  return { ok: true };
+};
+require(extensionPath)(pi);
+let callbacks;
+const ctx = {
+  isIdle: () => true,
+  compact(options) {
+    if (outcome === "throw") throw new Error("cannot compact");
+    callbacks = options;
+  },
+};
+if (outcome === "unavailable") delete ctx.compact;
+const statuses = () => posted.filter(e => e.type === "external_session_status");
+(async () => {
+  await handlers.session_start({}, ctx);
+  await handlers.agent_start({}, ctx);
+  fs.writeFileSync(path.join(inboxDir, "000-compact.json"),
+    JSON.stringify({ id: "compact", type: "compact" }));
+  enqueue("first");
+  enqueue("second");
+  await drain();
+  assert.deepEqual(sends, [], "same-poll messages must stay in the inbox");
+  if (callbacks) {
+    await handlers.agent_end({}, ctx);
+    for (let n = 0; n < 6; n++) await drain();
+    assert.deepEqual(sends, [], "waiting must not consume delivery attempts");
+    assert.equal(statuses().at(-1).data.status, "running");
+    assert.equal(fs.readdirSync(inboxDir).length, 2);
+    if (outcome === "next-turn") {
+      // Pi's terminal can start its own queued turn at compaction completion.
+      await handlers.agent_start({}, ctx);
+      callbacks.onComplete();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(statuses().at(-1).data.status, "running");
+      const nextResponseId = statuses().at(-1).data.response_id;
+      await handlers.agent_end({}, ctx);
+      assert.equal(statuses().at(-1).data.response_id, nextResponseId);
+    } else if (outcome === "complete") callbacks.onComplete();
+    else callbacks.onError(new Error("compaction failed"));
+    await new Promise(resolve => setImmediate(resolve));
+  } else {
+    // Failed before Pi interrupted the original turn: keep that turn busy.
+    assert.equal(statuses().at(-1).data.status, "running");
+    await handlers.agent_end({}, ctx);
+  }
+  assert.equal(statuses().at(-1).data.status, "idle");
+  if (outcome === "complete") {
+    await drain();
+    assert.deepEqual(sends, [], "do not start a turn before idle is published");
+    releaseIdle();
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  await drain();
+  await drain();
+  assert.deepEqual(sends.map(s => s.content), ["first", "second"]);
+  assert.deepEqual(fs.readdirSync(inboxDir), []);
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+})().catch(error => { console.error(error); process.exit(1); });
 """
     )
     _run_extension_script(node, _extension_path(), script)
