@@ -77,3 +77,12 @@ and fall back rather than assuming a fixed structure:
 4. If neither the artifacts nor the logs yield the test's content, **stop with
    `needs_more_info`** naming exactly what the run was missing. Do not reconstruct
    the test from a guess.
+
+**The recovered copy is scratch source, not a deliverable.** Whether you copied
+the test from the session workspace, materialized it from the CI bundle, or CI
+restored it before your session started, the file at `test_path` is untracked
+investigation source in your worktree. On the author path, 2B.4 decides whether
+it becomes permanent coverage or archived evidence. On the existing-PR review
+path, archive it under `.omnigent/repro-evidence/` and delete the worktree copy
+before the final handoff (2A.7); an untracked test left behind fails the
+delivery check and costs a correction turn.
