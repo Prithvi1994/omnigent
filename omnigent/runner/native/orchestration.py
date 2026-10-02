@@ -57,6 +57,7 @@ from omnigent.entities.session_resources import (
 )
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.harness_plugins import native_provider_for_key
+from omnigent.host.frames import workspace_missing_message
 from omnigent.models.model_override import validate_model_override
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
@@ -887,6 +888,28 @@ def _runner_workspace_dir() -> str:
             "OMNIGENT_RUNNER_WORKSPACE is unset and the runner's working "
             "directory no longer exists."
         ) from exc
+
+
+def _claude_session_workspace(session_workspace: str | None) -> str:
+    """
+    Resolve and validate the cwd for a runner-owned Claude terminal.
+
+    The server-stored session ``workspace`` wins, then
+    :func:`_runner_workspace_dir`, so the process cwd is consulted only when
+    neither is set. The path keeps its spelling (no symlink resolution) because
+    Claude keys resume transcripts by cwd. The selected directory must exist:
+    launching somewhere else would silently run the session in the wrong tree.
+
+    :param session_workspace: The session's ``workspace`` from the init
+        snapshot or ``GET /v1/sessions/{id}``; ``None`` when omitted.
+    :returns: Workspace path used as the terminal's cwd.
+    :raises OmnigentError: ``WORKSPACE_MISSING`` when that path is not an
+        existing directory.
+    """
+    workspace = session_workspace or _runner_workspace_dir()
+    if not os.path.isdir(workspace):
+        raise OmnigentError(workspace_missing_message(workspace), code=ErrorCode.WORKSPACE_MISSING)
+    return workspace
 
 
 def _codex_session_workspace(session_workspace: str | None) -> Path:
@@ -4547,7 +4570,7 @@ async def _launch_codex_native_tui(
         resolve_harness_config,
     )
 
-    _codex_harness_cfg = load_effective_config()
+    _codex_harness_cfg = load_effective_config(workspace=workspace)
     # Honor configured wrappers while keeping the host-provisioned binary
     # immune to ambient OMNIGENT_CODEX_PATH overrides.
     _, _codex_overrides = resolve_harness_config(_codex_harness_cfg)
@@ -7522,6 +7545,7 @@ def _native_terminal_start_error_payload(
     """
     error_id = f"err_{uuid.uuid4().hex}"
     missing_agent = isinstance(exc, OmnigentError) and exc.code == ErrorCode.SESSION_AGENT_MISSING
+    missing_workspace = isinstance(exc, OmnigentError) and exc.code == ErrorCode.WORKSPACE_MISSING
     extra = debug_event(
         "native_terminal_start_failed",
         session_id=session_id,
@@ -7529,14 +7553,16 @@ def _native_terminal_start_error_payload(
         runtime=runtime_name,
         code=ErrorCode.SESSION_AGENT_MISSING
         if missing_agent
+        else ErrorCode.WORKSPACE_MISSING
+        if missing_workspace
         else _NATIVE_TERMINAL_START_FAILED_CODE,
         exception_type=type(exc).__name__,
         exception_cause_type=type(exc.__cause__).__name__ if exc.__cause__ is not None else None,
         cause_code=exc.code if isinstance(exc, OmnigentError) else None,
-        # The warning below carries no exc_info for a missing agent, so the
-        # sink cannot derive its category.
+        # The warnings below carry no exc_info for a missing agent or
+        # workspace, so the sink cannot derive their category.
         error_category=exc.category.value
-        if isinstance(exc, OmnigentError) and missing_agent
+        if isinstance(exc, OmnigentError) and (missing_agent or missing_workspace)
         else None,
         error_impact=ErrorImpact.BLOCKING.value,
     )
@@ -7561,6 +7587,26 @@ def _native_terminal_start_error_payload(
                 "This session's agent is no longer available; it was deleted "
                 "or replaced. Recreate the agent or start a new session, then "
                 f"retry. Error ID: {error_id}."
+            ),
+        }
+    if missing_workspace:
+        # Likewise a lifecycle condition, not a startup defect: the directory
+        # the session is bound to was removed, and no other directory may
+        # stand in for it.
+        _logger.warning(
+            "Native %s terminal skipped; session workspace unavailable; error_id=%s: %s",
+            runtime_name,
+            error_id,
+            exc,
+            extra=extra,
+        )
+        return {
+            "code": ErrorCode.WORKSPACE_MISSING,
+            "error_id": error_id,
+            "message": (
+                f"Native {runtime_name} terminal cannot start: {exc}. Restore that "
+                "directory and retry, or start a new session in an existing "
+                f"workspace. Error ID: {error_id}."
             ),
         }
     _logger.warning(
@@ -8097,10 +8143,8 @@ async def _auto_create_claude_terminal(
     from omnigent.harnesses.claude_native.forwarder import reset_transcript_forward_state
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
-    workspace = (
-        session_init.snapshot.workspace
-        if session_init is not None and session_init.snapshot.workspace
-        else _runner_workspace_dir()
+    workspace = _claude_session_workspace(
+        session_init.snapshot.workspace if session_init is not None else None
     )
     started_at = time.monotonic()
     _logger.info(
@@ -8763,7 +8807,7 @@ async def _auto_create_claude_terminal(
         resolve_harness_command,
     )
 
-    _harness_cfg = load_effective_config()
+    _harness_cfg = load_effective_config(workspace=workspace)
     launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
     launch_args = resolve_harness_args("claude-native", tuple(claude_args), cfg=_harness_cfg)
     # Validate the binary this terminal will actually spawn: ``launch_command``

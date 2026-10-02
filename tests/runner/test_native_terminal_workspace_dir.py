@@ -7,7 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.runner.native.orchestration import _runner_workspace_dir
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runner.native.orchestration import (
+    _claude_session_workspace,
+    _runner_workspace_dir,
+)
 
 
 def test_env_wins_without_touching_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -66,3 +70,55 @@ def test_removed_worktree_is_the_real_shape(
     with pytest.raises(FileNotFoundError):
         os.getcwd()
     assert _runner_workspace_dir() == str(tmp_path)
+
+
+def test_claude_workspace_prefers_session_without_reading_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The explicit session workspace is used even when the process cwd is gone."""
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.delenv("OMNIGENT_RUNNER_WORKSPACE", raising=False)
+
+    def _dead_cwd() -> Path:
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(Path, "cwd", staticmethod(_dead_cwd))
+
+    assert _claude_session_workspace(str(workspace)) == str(workspace)
+
+
+def test_claude_workspace_falls_back_to_runner_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no session workspace, the runner's configured workspace is used."""
+    workspace = tmp_path / "runner-workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+
+    assert _claude_session_workspace(None) == str(workspace)
+
+
+def test_claude_workspace_rejects_removed_session_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session workspace that no longer exists is a WORKSPACE_MISSING error,
+    never a silent fall-through to another directory."""
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
+
+    with pytest.raises(OmnigentError) as failure:
+        _claude_session_workspace(str(tmp_path / "gone"))
+    assert failure.value.code == ErrorCode.WORKSPACE_MISSING
+
+
+def test_claude_workspace_rejects_non_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace path that is a file, not a directory, is rejected before launch."""
+    not_a_dir = tmp_path / "file"
+    not_a_dir.write_text("x")
+    monkeypatch.delenv("OMNIGENT_RUNNER_WORKSPACE", raising=False)
+
+    with pytest.raises(OmnigentError) as failure:
+        _claude_session_workspace(str(not_a_dir))
+    assert failure.value.code == ErrorCode.WORKSPACE_MISSING
