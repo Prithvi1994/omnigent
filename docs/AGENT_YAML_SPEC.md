@@ -109,8 +109,9 @@ executor:
 ### Pi context files
 
 With `harness: pi`, Pi automatically appends context files such as `AGENTS.md`
-and `CLAUDE.md` from the workspace, its ancestors, and Pi's global agent
-directory. To disable this discovery for an agent, set `context_files: false`:
+and `CLAUDE.md` from the workspace, its ancestors, Pi's global agent directory,
+and the agent bundle's root. To disable this discovery for an agent, set
+`context_files: false`:
 
 ```yaml
 name: focused-agent

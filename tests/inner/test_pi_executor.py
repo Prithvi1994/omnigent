@@ -1,6 +1,7 @@
 """Tests for PiExecutor."""
 
 import asyncio
+import itertools
 import json
 import logging
 import os
@@ -3520,39 +3521,76 @@ def test_resolve_pi_skill_args_no_bundle() -> None:
     assert _resolve_pi_skill_args(["alpha"], None) == ["--no-skills"]
 
 
-def test_resolve_pi_bundle_resource_args_extension_entries(tmp_path: Path) -> None:
+def test_resolve_pi_skill_args_finds_pi_native_skills_layout(tmp_path: Path) -> None:
+    """``skills_filter='all'`` surfaces a skill shipped in Pi's own
+    ``.pi/skills/<name>/`` layout via ``--skill``.
+
+    Pi only discovers ``.pi/skills`` from its cwd (the session workspace),
+    so without the explicit flag a bundle using Pi's idiomatic layout
+    silently ships no skills.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_skill_args
+
+    bundle = tmp_path / "bundle"
+    pi_skills_root = bundle / ".pi" / "skills"
+    _make_pi_skill_dir(pi_skills_root, "grilling")
+
+    args = _resolve_pi_skill_args("all", bundle)
+
+    paths = [args[i + 1] for i, tok in enumerate(args) if tok == "--skill"]
+    assert str(pi_skills_root / "grilling") in paths, (
+        f"bundle skill under .pi/skills/ was not exposed via --skill; got args={args}"
+    )
+
+
+def test_resolve_pi_skill_args_named_subset_spans_both_skill_roots(tmp_path: Path) -> None:
+    """A named filter resolves skills from ``skills/`` and ``.pi/skills/``
+    alike, and ``skills/`` wins when both roots ship the same name.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_skill_args
+
+    bundle = tmp_path / "bundle"
+    flat_root = bundle / "skills"
+    pi_root = bundle / ".pi" / "skills"
+    _make_pi_skill_dir(flat_root, "shared")
+    _make_pi_skill_dir(pi_root, "shared")
+    _make_pi_skill_dir(pi_root, "grilling")
+
+    args = _resolve_pi_skill_args(["grilling", "shared", "missing"], bundle)
+
+    assert args[0] == "--no-skills"
+    paths = [args[i + 1] for i, tok in enumerate(args) if tok == "--skill"]
+    assert paths == [str(pi_root / "grilling"), str(flat_root / "shared")], f"got {paths}"
+
+
+def test_resolve_pi_bundle_extension_args_extension_entries(tmp_path: Path) -> None:
     """Each bundled extension entry point is passed via ``--extension``
     so bundled extensions load regardless of Pi's cwd.
 
-    Pi only auto-discovers ``.pi/extensions`` from its process cwd (the
-    session workspace), never from the bundle's on-disk location, so
-    without the explicit flags bundled extensions silently never load.
     Entry *files* are passed, not the directory: Pi treats a directory
     ``--extension`` source as a package root, not an extensions dir.
     """
-    from omnigent.inner.pi_executor import _resolve_pi_bundle_resource_args
+    from omnigent.inner.pi_executor import _resolve_pi_bundle_extension_args
 
     bundle = tmp_path / "bundle"
-    ext_root = bundle / ".pi" / "extensions"
-    marker_dir = ext_root / "marker"
+    marker_dir = bundle / ".pi" / "extensions" / "marker"
     marker_dir.mkdir(parents=True)
     (marker_dir / "index.js").write_text("module.exports = function () {};\n")
 
-    args = _resolve_pi_bundle_resource_args(bundle)
-
-    assert args == ["--extension", str(marker_dir / "index.js")], (
-        f"expected the subdir extension's index.js as a --extension source, got {args}"
-    )
+    assert _resolve_pi_bundle_extension_args(bundle) == [
+        "--extension",
+        str(marker_dir / "index.js"),
+    ]
+    assert _resolve_pi_bundle_extension_args(None) == []
+    assert _resolve_pi_bundle_extension_args(tmp_path / "no-extensions") == []
 
 
 def test_resolve_pi_bundle_extension_entries_discovery_shapes(tmp_path: Path) -> None:
     """Entry discovery mirrors Pi's own: top-level ``*.js``/``*.ts``
     files, subdir ``index.ts`` over ``index.js``, ``package.json``
-    ``pi.extensions`` manifests over index files, dotfiles and
-    ``node_modules`` skipped.
+    ``pi.extensions`` manifests over index files (file entries only),
+    dotfiles and ``node_modules`` skipped.
     """
-    import json as jsonlib
-
     from omnigent.inner.pi_executor import _resolve_pi_bundle_extension_entries
 
     ext_root = tmp_path / ".pi" / "extensions"
@@ -3569,7 +3607,10 @@ def test_resolve_pi_bundle_extension_entries_discovery_shapes(tmp_path: Path) ->
     manifest_dir.mkdir()
     (manifest_dir / "main.js").write_text("module.exports = function () {};\n")
     (manifest_dir / "index.js").write_text("manifest entry must win\n")
-    (manifest_dir / "package.json").write_text(jsonlib.dumps({"pi": {"extensions": ["main.js"]}}))
+    (manifest_dir / "lib").mkdir()
+    (manifest_dir / "package.json").write_text(
+        json.dumps({"pi": {"extensions": ["lib", "main.js"]}})
+    )
     (ext_root / "empty-dir").mkdir()
 
     entries = _resolve_pi_bundle_extension_entries(ext_root)
@@ -3581,59 +3622,96 @@ def test_resolve_pi_bundle_extension_entries_discovery_shapes(tmp_path: Path) ->
     ], f"got {entries}"
 
 
-def test_resolve_pi_bundle_resource_args_context_file(tmp_path: Path) -> None:
-    """A bundle-root ``AGENTS.md`` is appended to the system prompt by
-    content, honoring Pi's own candidate precedence order.
-
-    Content, not path: a sandboxed Pi that cannot read the bundle would
-    otherwise append the literal path string to the prompt.
+def test_read_pi_bundle_context_follows_pi_candidate_order(tmp_path: Path) -> None:
+    """The bundle-root context file is read by content in Pi's own
+    precedence order; a missing or blank file yields nothing.
     """
-    from omnigent.inner.pi_executor import _resolve_pi_bundle_resource_args
+    from omnigent.inner.pi_executor import _read_pi_bundle_context
 
+    assert _read_pi_bundle_context(None) is None
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    assert _read_pi_bundle_context(bundle) is None
+    (bundle / "AGENTS.md").write_text("   \n")
+    assert _read_pi_bundle_context(bundle) is None
+
+    (bundle / "AGENTS.md").write_text("Bundle guidance marker.\n")
+    assert _read_pi_bundle_context(bundle) == "Bundle guidance marker."
+
+    (bundle / "AGENTS.override.md").write_text("Override guidance.\n")
+    assert _read_pi_bundle_context(bundle) == "Override guidance."
+
+
+def test_bundle_context_follows_context_files_and_skips_duplicates(tmp_path: Path) -> None:
+    """The bundle-root context file is an automatic context file: it is
+    dropped with ``context_files=False`` and not appended twice when the
+    composed instructions already carry it (``instructions: AGENTS.md``).
+    """
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     (bundle / "AGENTS.md").write_text("Bundle guidance marker.\n")
 
-    args = _resolve_pi_bundle_resource_args(bundle)
-    assert args == ["--append-system-prompt", "Bundle guidance marker.\n"]
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        enabled = PiExecutor(bundle_dir=bundle)
+        disabled = PiExecutor(bundle_dir=bundle, context_files=False)
 
-    # AGENTS.override.md outranks AGENTS.md, matching Pi's loader.
-    (bundle / "AGENTS.override.md").write_text("Override guidance.\n")
-    args = _resolve_pi_bundle_resource_args(bundle)
-    assert args == ["--append-system-prompt", "Override guidance.\n"], (
-        f"AGENTS.override.md must win over AGENTS.md; got {args}"
+    assert enabled._with_bundle_context("Agent prompt.") == (
+        "Agent prompt.\n\nBundle guidance marker."
     )
+    assert enabled._with_bundle_context("") == "Bundle guidance marker."
+    already = "Agent prompt.\n\nBundle guidance marker.\n\nFramework notes."
+    assert enabled._with_bundle_context(already) == already
+    assert disabled._with_bundle_context("Agent prompt.") == "Agent prompt."
+    assert "--no-context-files" in disabled._extra_args
 
 
-def test_resolve_pi_bundle_resource_args_combined_and_empty(tmp_path: Path) -> None:
-    """Extensions and context file combine; bundles without either (or no
-    bundle at all) emit nothing.
+def test_pi_subprocess_receives_bundle_resources_from_session_workspace(tmp_path: Path) -> None:
+    """Pi keeps running in the session workspace while the bundle's
+    ``.pi/extensions``, ``.pi/skills`` and ``AGENTS.md`` reach it through
+    explicit arguments and the composed system prompt.
 
-    A blank context file emits no ``--append-system-prompt`` — appending
-    empty text would only add prompt noise.
+    Pi discovers those resources only from its cwd, so a bundle living
+    elsewhere used to load none of them and the agent silently answered
+    as Pi's stock assistant.
     """
-    from omnigent.inner.pi_executor import _resolve_pi_bundle_resource_args
-
-    assert _resolve_pi_bundle_resource_args(None) == []
-
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     bundle = tmp_path / "bundle"
-    bundle.mkdir()
-    assert _resolve_pi_bundle_resource_args(bundle) == []
+    ext_entry = bundle / ".pi" / "extensions" / "ext" / "index.ts"
+    ext_entry.parent.mkdir(parents=True)
+    ext_entry.write_text("export default function (pi) {}\n")
+    skill_dir = _make_pi_skill_dir(bundle / ".pi" / "skills", "grilling")
+    (bundle / "AGENTS.md").write_text("BUNDLE_CONTEXT_MARKER: answer like a pirate.\n")
 
-    (bundle / "AGENTS.md").write_text("   \n")
-    assert _resolve_pi_bundle_resource_args(bundle) == []
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        executor = PiExecutor(cwd=str(workspace), bundle_dir=bundle)
 
-    (bundle / "AGENTS.md").write_text("Guidance.\n")
-    ext_dir = bundle / ".pi" / "extensions" / "marker"
-    ext_dir.mkdir(parents=True)
-    (ext_dir / "index.js").write_text("module.exports = function () {};\n")
-    args = _resolve_pi_bundle_resource_args(bundle)
-    assert args == [
-        "--extension",
-        str(ext_dir / "index.js"),
-        "--append-system-prompt",
-        "Guidance.\n",
-    ]
+    seen: dict[str, object] = {}
+
+    async def fake_start(self, pi_path, **kwargs):
+        seen.update(kwargs)
+
+    async def _drive() -> None:
+        with (
+            patch.object(_PiRpcSession, "start", fake_start),
+            patch.object(executor, "_load_gateway_model_wire_apis", AsyncMock(return_value={})),
+        ):
+            try:
+                await executor._ensure_rpc("session", "You are the bundle agent.", "gpt-4o", [])
+            finally:
+                await executor.close()
+
+    _run(_drive())
+
+    assert seen["cwd"] == str(workspace), "pi must keep the session workspace as its cwd"
+    extra_args = list(seen["extra_args"])
+    pairs = list(itertools.pairwise(extra_args))
+    assert ("--extension", str(ext_entry)) in pairs, f"got extra_args={extra_args}"
+    assert ("--skill", str(skill_dir)) in pairs, f"got extra_args={extra_args}"
+    system_prompt = seen["system_prompt"]
+    assert isinstance(system_prompt, str)
+    assert system_prompt.startswith("You are the bundle agent.")
+    assert "BUNDLE_CONTEXT_MARKER: answer like a pirate." in system_prompt
 
 
 # ---------------------------------------------------------------------------
@@ -4677,6 +4755,58 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(monkeypatch, tmp
     # The host secret is not in the clean env, so it must not be in the
     # launcher's keep-set either.
     assert "FAKE_HOST_SECRET" not in allowlist
+
+
+def test_pi_sandbox_policy_leaves_bundle_dir_to_temp_grants(monkeypatch, tmp_path) -> None:
+    """The bundle dir is not added as a sandbox read root.
+
+    The runner extracts bundles under the temp dir, which the pi sandbox
+    already binds, and a read root would subject the bundle's top level to
+    the dotfile mask and hide its ``.pi/`` resources from pi.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Pytest tmp dir hosting both the cwd and the bundle.
+    """
+    from omnigent.inner import sandbox as sandbox_mod
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    captured: dict[str, SandboxPolicy] = {}
+
+    def _fake_create_exec_launcher(target_path: str, sandbox: SandboxPolicy) -> str:
+        captured["policy"] = sandbox
+        return "/fake/launcher"
+
+    def _fake_resolve_sandbox(_os_env: OSEnvSpec, cwd: Path) -> SandboxPolicy:
+        return SandboxPolicy(
+            backend_type="linux_bwrap",
+            active=True,
+            read_roots=[cwd.resolve(strict=False)],
+            write_roots=[cwd.resolve(strict=False)],
+            write_files=[],
+            allow_network=False,
+        )
+
+    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _fake_resolve_sandbox)
+    monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _fake_create_exec_launcher)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        executor = PiExecutor(
+            cwd=str(workspace),
+            bundle_dir=bundle,
+            os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+        )
+
+    assert executor._sandboxed is True
+    policy = captured["policy"]
+    assert bundle.resolve() not in (policy.read_roots or [])
+    assert Path(tempfile.gettempdir()).resolve() in [
+        root.resolve(strict=False) for root in policy.write_roots
+    ]
 
 
 def test_run_turn_bridge_extension_carries_live_server_token(monkeypatch) -> None:

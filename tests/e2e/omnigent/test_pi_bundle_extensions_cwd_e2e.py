@@ -1,18 +1,19 @@
-"""E2E: a ``harness: pi`` agent bundle's project-local ``.pi/extensions``
-and bundle-root ``AGENTS.md`` must reach the session's actual pi process.
+"""E2E: a ``harness: pi`` agent bundle's project-local ``.pi/extensions``,
+``.pi/skills`` and bundle-root ``AGENTS.md`` must reach the session's pi process.
 
-Pi auto-discovers project-local extensions (``.pi/extensions/<name>/``) and
-context files (``AGENTS.md``) from its **process cwd**. The runner spawns pi
-with ``cwd`` set to the session workspace, which is unrelated to the agent
-bundle's on-disk location, so without explicit wiring those bundled files are
-never loaded and pi silently falls back to its stock persona with no error
-surfaced.
+Pi auto-discovers project-local extensions (``.pi/extensions/<name>/``), skills
+(``.pi/skills/<name>/``) and context files (``AGENTS.md``) from its **process
+cwd**. The runner spawns pi with ``cwd`` set to the session workspace, which is
+unrelated to the agent bundle's on-disk location, so the executor has to hand
+those bundled resources to pi explicitly; otherwise pi silently falls back to its
+stock persona with no error surfaced.
 
-The reproduction drives the reported journey end to end: register a bundle with
+The test drives the reported journey end to end: register a bundle with
 ``omnigent server --agent <bundle>``, create a session against it, and send a
-message. A marker extension modifies the system prompt via ``before_agent_start``
-and the bundle's ``AGENTS.md`` carries a second marker; both markers must appear
-in the LLM request the mock server captures. Today neither does.
+message. A marker extension modifies the system prompt via ``before_agent_start``,
+the bundle's ``AGENTS.md`` carries a second marker and a bundled skill a third;
+all three must appear in the LLM request the mock server captures, alongside the
+agent's own prompt.
 
 **Serial execution:** uses the session-scoped mock LLM server like the other
 ``tests/e2e/omnigent/`` pi rows — do not run under xdist against a shared mock.
@@ -44,6 +45,8 @@ from tests.e2e.omnigent.conftest import configure_mock_llm, reset_mock_llm
 
 _EXT_MARKER = "OMNI_PI_BUNDLE_EXT_ACTIVE"
 _AGENTSMD_MARKER = "OMNI_PI_BUNDLE_AGENTSMD_MARKER"
+_SKILL_MARKER = "OMNI_PI_BUNDLE_SKILL_MARKER"
+_AGENT_PROMPT = "You are the bundle test agent."
 _BOOT_TIMEOUT = 60.0
 _TURN_TIMEOUT = 180.0
 
@@ -64,12 +67,14 @@ def _find_free_port() -> int:
 
 
 def _build_bundle(bundle: Path, model: str) -> None:
-    """Write a ``harness: pi`` bundle with a project-local extension + AGENTS.md.
+    """Write a ``harness: pi`` bundle with a project-local extension, a
+    ``.pi/skills`` skill and an ``AGENTS.md``.
 
     The extension appends :data:`_EXT_MARKER` to the system prompt from
-    ``before_agent_start``; ``AGENTS.md`` carries :data:`_AGENTSMD_MARKER`. Both
-    rely on pi's cwd-based project loaders, so both are only visible in the LLM
-    request when pi actually runs in the bundle directory.
+    ``before_agent_start``; ``AGENTS.md`` carries :data:`_AGENTSMD_MARKER`; the
+    skill's description carries :data:`_SKILL_MARKER`, which pi lists in its
+    skill index. All three live where only pi's cwd-based project loaders would
+    find them, so they reach the model only when the executor passes them on.
     """
     ext_dir = bundle / ".pi" / "extensions" / "omni-marker"
     ext_dir.mkdir(parents=True)
@@ -85,12 +90,18 @@ def _build_bundle(bundle: Path, model: str) -> None:
         f"# Bundle guidance\n\n{_AGENTSMD_MARKER}: always answer like a pirate.\n",
         encoding="utf-8",
     )
+    skill_dir = bundle / ".pi" / "skills" / "grilling"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: grilling\ndescription: {_SKILL_MARKER} grilling tips\n---\n# Grilling\n",
+        encoding="utf-8",
+    )
     (bundle / "config.yaml").write_text(
         yaml.safe_dump(
             {
                 "spec_version": 1,
                 "name": "pi_ext_bundle_agent",
-                "prompt": "You are the bundle test agent.",
+                "prompt": _AGENT_PROMPT,
                 "executor": {"model": model, "config": {"harness": "pi"}},
                 "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
             },
@@ -206,6 +217,7 @@ def _wait_for_online_runner(
                 if status.status_code == 200 and status.json().get("online") is True:
                     return
         except httpx.HTTPError:
+            # The server is still booting; keep polling until the deadline.
             pass
         time.sleep(0.5)
     pytest.fail(f"server + runner not ready after {timeout}s")
@@ -253,7 +265,9 @@ def _drive_turn_to_terminal(client: httpx.Client, session_id: str, prompt: str) 
         if status == "failed" or (status == "idle" and (seen_running or turn_items)):
             return last
         time.sleep(1.0)
-    pytest.fail(f"session {session_id} did not become terminal in {_TURN_TIMEOUT}s; last={last}")
+    raise AssertionError(
+        f"session {session_id} did not become terminal in {_TURN_TIMEOUT}s; last={last}"
+    )
 
 
 def _captured_system_prompts(mock_url: str) -> list[str]:
@@ -281,14 +295,15 @@ def test_pi_bundle_extensions_reach_session_cwd(
     mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
-    """A pi bundle's ``.pi/extensions`` and ``AGENTS.md`` reach the live session.
+    """A pi bundle's ``.pi/extensions``, ``.pi/skills`` and ``AGENTS.md``
+    reach the live session.
 
     Drives the reported journey (register bundle → create session → send a
     message) against a real server + runner + real pi CLI, with the mock LLM
-    capturing the outgoing request. The marker extension and ``AGENTS.md`` both
-    contribute to the system prompt only when pi loads them from the bundle, so
-    their presence in the captured request proves the bundle-root files reached
-    pi's actual working directory.
+    capturing the outgoing request. The marker extension, ``AGENTS.md`` and the
+    skill index contribute to the system prompt only when pi receives the
+    bundled resources, so their presence in the captured request proves they
+    reached pi; the agent's own prompt must survive alongside them.
     """
     from omnigent.runner.identity import token_bound_runner_id
 
@@ -355,4 +370,11 @@ def test_pi_bundle_extensions_reach_session_cwd(
         "bundle-root AGENTS.md did not reach pi — its marker "
         f"{_AGENTSMD_MARKER!r} is absent from the system prompt (pi's cwd-based "
         "context loader never saw the bundle directory)."
+    )
+    assert _SKILL_MARKER in joined, (
+        "bundle's .pi/skills skill did not reach pi — its description marker "
+        f"{_SKILL_MARKER!r} is absent from the skill index in the system prompt."
+    )
+    assert _AGENT_PROMPT in joined, (
+        "the agent's own prompt was lost while appending the bundle resources"
     )

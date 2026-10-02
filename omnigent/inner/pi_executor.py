@@ -1538,7 +1538,6 @@ def _try_sandbox_pi(
     os_env: OSEnvSpec | None,
     cwd: str | None,
     spawn_env_names: Sequence[str] | None = None,
-    bundle_dir: pathlib.Path | None = None,
 ) -> SandboxedPiCli:
     """Wrap the Pi CLI in a sandbox if ``os_env`` requests it.
 
@@ -1553,10 +1552,6 @@ def _try_sandbox_pi(
         anything else its environment picks up — defense in depth
         against host-env leakage into the sandbox. ``None`` skips the
         prune.
-    :param bundle_dir: The agent bundle's extracted on-disk path. Added
-        as a sandbox read root so bundled resources passed by absolute
-        path (``--skill``, ``--extension``) stay readable from inside
-        the sandbox, which otherwise only sees the session cwd.
     """
     if os_env is None:
         return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
@@ -1581,11 +1576,13 @@ def _try_sandbox_pi(
         # Pi needs to read its own installation + node_modules.
         pi_dir = pathlib.Path(pi_path).resolve().parent.parent
         sandbox = with_additional_read_roots(sandbox, [pi_dir])
-        if bundle_dir is not None:
-            sandbox = with_additional_read_roots(sandbox, [bundle_dir.resolve()])
         # Pi writes to ~/.pi, /tmp, and $TMPDIR (on macOS $TMPDIR is a
         # per-user dir under /var/folders/, not /tmp — grant both so
         # PI_CODING_AGENT_DIR (created via tempfile.mkdtemp) is reachable.
+        # The runner extracts agent bundles under the temp dir too, so the
+        # bundled ``--skill``/``--extension`` paths are visible through these
+        # grants. Do not add the bundle as a read root: the dotfile mask
+        # would hide its ``.pi/`` directory.
         home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
         sys_tmpdir = pathlib.Path(tempfile.gettempdir())
         sandbox = with_additional_write_roots(sandbox, [home_pi, pathlib.Path("/tmp"), sys_tmpdir])
@@ -1622,7 +1619,11 @@ def _resolve_pi_skill_args(
       not an error.
 
     Pi's ``--skill`` flag accepts a directory path, not a name, so
-    the resolver looks up named skills under ``<bundle>/skills/``.
+    the resolver looks up named skills under ``<bundle>/skills/`` and
+    Pi's own project layout ``<bundle>/.pi/skills/`` (``skills/`` wins
+    when both ship the same name). Pi would discover ``.pi/skills``
+    itself, but only relative to its cwd — the session workspace, not
+    the bundle — so bundled skills always need the explicit flag.
     Host-installed Pi skills aren't accessible by name without
     knowing Pi's internal extension layout, so the named-list mode
     only resolves bundle skills.
@@ -1639,11 +1640,12 @@ def _resolve_pi_skill_args(
     """
     bundle_skills: dict[str, pathlib.Path] = {}
     if bundle_dir is not None:
-        skills_root = bundle_dir / "skills"
-        if skills_root.is_dir():
+        for skills_root in (bundle_dir / "skills", bundle_dir / ".pi" / "skills"):
+            if not skills_root.is_dir():
+                continue
             for child in sorted(skills_root.iterdir()):
                 if child.is_dir() and (child / "SKILL.md").is_file():
-                    bundle_skills[child.name] = child
+                    bundle_skills.setdefault(child.name, child)
 
     if skills_filter == "all":
         # Pi auto-discovers host skills; we explicitly add bundled
@@ -1702,7 +1704,7 @@ def _pi_extension_dir_entries(ext_dir: pathlib.Path) -> list[pathlib.Path]:
             entries = [
                 ext_dir / entry
                 for entry in raw_entries
-                if isinstance(entry, str) and (ext_dir / entry).exists()
+                if isinstance(entry, str) and (ext_dir / entry).is_file()
             ]
             if entries:
                 return entries
@@ -1743,29 +1745,19 @@ def _resolve_pi_bundle_extension_entries(extensions_dir: pathlib.Path) -> list[p
     return entries
 
 
-def _resolve_pi_bundle_resource_args(bundle_dir: pathlib.Path | None) -> list[str]:
+def _resolve_pi_bundle_extension_args(bundle_dir: pathlib.Path | None) -> list[str]:
     """
-    Expose a bundle's cwd-discovered Pi resources via explicit CLI flags.
+    Expose a bundle's ``.pi/extensions`` to Pi via explicit ``--extension`` flags.
 
-    Pi auto-discovers project-local extensions (``.pi/extensions/``) and
-    context files (``AGENTS.md``) from its **process cwd**, but the
-    executor runs Pi in the session workspace — a directory unrelated to
-    the bundle's on-disk location — so those bundled files never load
-    through discovery. Mirror the explicit ``--skill`` mechanism with
-    cwd-independent flags:
-
-    - ``--extension <entry file>`` per bundled extension entry point
-      (see :func:`_resolve_pi_bundle_extension_entries`). Entry files —
-      not the directory — because Pi treats a directory ``--extension``
-      source as a *package root* (expecting ``extensions/``/``skills/``
-      subdirs inside it), and a ``<bundle>/.pi`` package source would
-      also load ``.pi/skills`` in defiance of ``skills_filter="none"``.
-    - ``--append-system-prompt <content>``: the first bundle-root
-      context file in Pi's own candidate order, appended the same way
-      the executor already appends the agent prompt. The content is
-      read here rather than passed as a path so a sandboxed Pi that
-      cannot see the bundle appends nothing instead of the literal
-      path string.
+    Pi auto-discovers project-local extensions from its **process cwd**,
+    but the executor runs Pi in the session workspace — a directory
+    unrelated to the bundle's on-disk location — so bundled extensions
+    never load through discovery. This mirrors the explicit ``--skill``
+    mechanism. Entry files (see :func:`_resolve_pi_bundle_extension_entries`)
+    are passed rather than the directory because Pi treats a directory
+    ``--extension`` source as a *package root* (expecting ``extensions/`` /
+    ``skills/`` subdirs inside it), and a ``<bundle>/.pi`` package source
+    would also load ``.pi/skills`` in defiance of ``skills_filter="none"``.
 
     :param bundle_dir: The agent bundle's extracted on-disk path.
         ``None`` when no bundle is available — no flags are emitted.
@@ -1773,26 +1765,45 @@ def _resolve_pi_bundle_resource_args(bundle_dir: pathlib.Path | None) -> list[st
     """
     if bundle_dir is None:
         return []
-    args: list[str] = []
     extensions_dir = bundle_dir / ".pi" / "extensions"
-    if extensions_dir.is_dir():
-        for entry in _resolve_pi_bundle_extension_entries(extensions_dir):
-            args.extend(["--extension", str(entry)])
+    if not extensions_dir.is_dir():
+        return []
+    args: list[str] = []
+    for entry in _resolve_pi_bundle_extension_entries(extensions_dir):
+        args.extend(["--extension", str(entry)])
+    return args
+
+
+def _read_pi_bundle_context(bundle_dir: pathlib.Path | None) -> str | None:
+    """
+    Read the bundle-root context file Pi would have discovered in the bundle.
+
+    Pi loads ``AGENTS.md``/``CLAUDE.md`` relative to its cwd (the session
+    workspace), so a context file at the bundle root is never seen. The
+    first candidate in Pi's own precedence order is read here and appended
+    to the composed system prompt by :meth:`PiExecutor._with_bundle_context`.
+    Content is used rather than a path so a sandboxed Pi that cannot see the
+    bundle appends nothing instead of the literal path string.
+
+    :param bundle_dir: The agent bundle's extracted on-disk path, or ``None``.
+    :returns: The stripped file content, or ``None`` when there is no
+        bundle, no candidate file, an unreadable file, or only whitespace.
+    """
+    if bundle_dir is None:
+        return None
     for candidate in _PI_BUNDLE_CONTEXT_FILE_CANDIDATES:
         context_file = bundle_dir / candidate
         if not context_file.is_file():
             continue
         try:
-            content = context_file.read_text(encoding="utf-8")
+            content = context_file.read_text(encoding="utf-8").strip()
         except OSError as exc:
             logger.warning(
                 "PiExecutor: could not read bundle context file %s: %s", context_file, exc
             )
-        else:
-            if content.strip():
-                args.extend(["--append-system-prompt", content])
-        break
-    return args
+            return None
+        return content or None
+    return None
 
 
 def _extract_pi_turn_usage(
@@ -1951,7 +1962,8 @@ class PiExecutor(Executor):
 
         :param cwd: Working directory for the Pi subprocess.
         :param context_files: Allow Pi to automatically load context files such
-            as AGENTS.md and CLAUDE.md. Explicit agent instructions are unaffected.
+            as AGENTS.md and CLAUDE.md, including the one at the bundle root.
+            Explicit agent instructions are unaffected.
         :param system_prompt_mode: ``append`` retains Pi's base prompt;
             ``replace`` uses Omnigent's composed instructions as the base.
         :param os_env: Optional OS environment / sandbox spec.  When set, the
@@ -1996,13 +2008,13 @@ class PiExecutor(Executor):
             budget. ``None`` resolves to ``RetryPolicy()`` defaults.
             See Phase 1f of ``designs/RETRY_ACROSS_HARNESSES.md``.
         :param bundle_dir: The agent bundle's extracted on-disk path.
-            When set, ``<bundle_dir>/skills/<dir>/SKILL.md`` files
-            are exposed to Pi via ``--skill <path>`` based on
-            *skills_filter*, ``<bundle_dir>/.pi/extensions`` via
-            ``--extension``, and a bundle-root context file
-            (``AGENTS.md`` et al.) via ``--append-system-prompt`` —
-            see :func:`_resolve_pi_bundle_resource_args`. ``None``
-            skips all bundle-resource wiring.
+            When set, ``<bundle_dir>/skills/<dir>/SKILL.md`` and
+            ``<bundle_dir>/.pi/skills/<dir>/SKILL.md`` files are exposed
+            to Pi via ``--skill <path>`` based on *skills_filter*,
+            ``<bundle_dir>/.pi/extensions`` via ``--extension``, and a
+            bundle-root context file (``AGENTS.md`` et al.) is appended
+            to the composed system prompt when *context_files* allows.
+            ``None`` skips all bundle-resource wiring.
         :param agent_name: Optional agent display name. Reserved for
             future use; currently unused by Pi.
         :param skills_filter: Host-skill filter (``"all"`` / ``"none"``
@@ -2076,7 +2088,10 @@ class PiExecutor(Executor):
         # ``_build_env_and_dir`` copies ``self._extra_args`` so this
         # extension is read-only after init.
         self._extra_args.extend(_resolve_pi_skill_args(skills_filter, bundle_dir))
-        self._extra_args.extend(_resolve_pi_bundle_resource_args(bundle_dir))
+        self._extra_args.extend(_resolve_pi_bundle_extension_args(bundle_dir))
+        # The bundle-root context file is an automatic context file like the
+        # workspace ones Pi discovers, so ``context_files=False`` drops it too.
+        self._bundle_context = _read_pi_bundle_context(bundle_dir) if context_files else None
         # Set by Session._wire_sdk_executor().
         self._tool_executor: ToolExecutor | None = None
 
@@ -2137,7 +2152,6 @@ class PiExecutor(Executor):
             os_env,
             cwd,
             spawn_env_names=[*self._env, "PI_CODING_AGENT_DIR"],
-            bundle_dir=bundle_dir,
         )
         self._pi_launch_path = sandboxed.launch_path
         self._sandboxed = sandboxed.sandboxed
@@ -2551,6 +2565,17 @@ class PiExecutor(Executor):
         )
         state.applied_thinking = thinking
 
+    def _with_bundle_context(self, system_prompt: str) -> str:
+        """Append the bundle-root context file to Omnigent's composed prompt.
+
+        Skipped when the prompt already carries that content, as when the
+        spec's ``instructions:`` reference the same file.
+        """
+        context = self._bundle_context
+        if not context or context in system_prompt:
+            return system_prompt
+        return f"{system_prompt}\n\n{context}" if system_prompt else context
+
     async def _ensure_rpc(
         self,
         session_key: str,
@@ -2615,7 +2640,7 @@ class PiExecutor(Executor):
             env=env,
             cwd=self._cwd,
             model=pi_model or None,
-            system_prompt=system_prompt or None,
+            system_prompt=self._with_bundle_context(system_prompt) or None,
             system_prompt_mode=self._system_prompt_mode,
             thinking=thinking,
             extra_args=extra_args or None,
