@@ -152,7 +152,9 @@ the bundle:
   `*.js` files) are passed to Pi with `--extension`; `package.json`
   `pi.extensions` entries must be files inside the extension directory.
   Extensions run as code inside the Pi process, so bundle only extensions you
-  trust.
+  trust. Hook-style extensions (for example `before_agent_start`) take full
+  effect; tools an extension registers are loaded but not offered to the model,
+  because sessions expose only Omnigent's bridged tools to Pi.
 - `skills/<name>/SKILL.md` and `.pi/skills/<name>/SKILL.md` are passed with
   `--skill` and follow the `skills` filter; when both roots define the same
   name, `skills/` wins.

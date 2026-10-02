@@ -21,6 +21,7 @@ agent's own prompt.
 
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import secrets
@@ -133,10 +134,9 @@ def _server_and_runner(
     """
     base_url = f"http://127.0.0.1:{port}"
     log_dir.mkdir(parents=True, exist_ok=True)
-    server_log = (log_dir / "server.log").open("w", encoding="utf-8")
-    runner_log = (log_dir / "runner.log").open("w", encoding="utf-8")
-    procs: list[subprocess.Popen[str]] = []
-    try:
+    with contextlib.ExitStack() as stack:
+        server_log = stack.enter_context((log_dir / "server.log").open("w", encoding="utf-8"))
+        runner_log = stack.enter_context((log_dir / "runner.log").open("w", encoding="utf-8"))
         server = subprocess.Popen(
             [
                 str(python),
@@ -156,7 +156,7 @@ def _server_and_runner(
             stderr=subprocess.STDOUT,
             text=True,
         )
-        procs.append(server)
+        stack.callback(_stop, server)
         runner = subprocess.Popen(
             [str(python), "-m", "omnigent.runner._entry"],
             env={
@@ -171,19 +171,18 @@ def _server_and_runner(
             stderr=subprocess.STDOUT,
             text=True,
         )
-        procs.append(runner)
+        stack.callback(_stop, runner)
         yield server
-    finally:
-        for proc in reversed(procs):
-            if proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=5)
-        server_log.close()
-        runner_log.close()
+
+
+def _stop(proc: subprocess.Popen[str]) -> None:
+    if proc.poll() is None:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
 
 
 def _wait_for_online_runner(
@@ -207,8 +206,8 @@ def _wait_for_online_runner(
                 )
                 if status.status_code == 200 and status.json().get("online") is True:
                     return
-        except httpx.HTTPError:
-            # The server is still booting; keep polling until the deadline.
+        except (httpx.HTTPError, ValueError):
+            # The server is still booting (or answered a partial body); keep polling.
             pass
         time.sleep(0.5)
     pytest.fail(f"server + runner not ready after {timeout}s")

@@ -1527,10 +1527,13 @@ class SandboxedPiCli:
         the original ``pi_path`` (sandbox skipped) or a generated wrapper
         script that applies the sandbox before exec-ing Pi.
     :param sandboxed: ``True`` when the wrapper script is active.
+    :param granted_roots: Read and write roots the active policy exposes;
+        empty when no sandbox is applied.
     """
 
     launch_path: str
     sandboxed: bool
+    granted_roots: tuple[pathlib.Path, ...] = ()
 
 
 def _try_sandbox_pi(
@@ -1586,16 +1589,16 @@ def _try_sandbox_pi(
         # are covered; a bundle read root would let the dotfile mask hide .pi/.
         sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
         launcher = create_exec_launcher(pi_path, sandbox)
-        return SandboxedPiCli(launch_path=launcher, sandboxed=True)
+        granted = (*(sandbox.read_roots or ()), *sandbox.write_roots)
+        return SandboxedPiCli(launch_path=launcher, sandboxed=True, granted_roots=tuple(granted))
     except (OSError, ImportError, NotImplementedError) as exc:
         logger.warning("Could not apply sandbox for Pi: %s", exc)
         return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
 
 
-def _under_pi_sandbox_temp_grants(bundle_dir: pathlib.Path) -> bool:
-    """Whether *bundle_dir* sits under a temp root :func:`_try_sandbox_pi` binds."""
+def _under_sandbox_roots(bundle_dir: pathlib.Path, roots: Sequence[pathlib.Path]) -> bool:
+    """Whether *bundle_dir* sits under one of the sandbox's granted *roots*."""
     resolved = bundle_dir.resolve(strict=False)
-    roots = (pathlib.Path("/tmp"), pathlib.Path(tempfile.gettempdir()))
     return any(resolved.is_relative_to(root.resolve(strict=False)) for root in roots)
 
 
@@ -1712,11 +1715,20 @@ def _pi_extension_dir_entries(ext_dir: pathlib.Path) -> list[pathlib.Path]:
             root = ext_dir.resolve()
             entries: list[pathlib.Path] = []
             for entry in raw_entries:
-                if not isinstance(entry, str):
-                    continue
-                candidate = (ext_dir / entry).resolve()
-                if candidate.is_file() and candidate.is_relative_to(root):
+                candidate = (ext_dir / entry).resolve() if isinstance(entry, str) else None
+                if (
+                    candidate is not None
+                    and candidate.is_file()
+                    and candidate.is_relative_to(root)
+                ):
                     entries.append(ext_dir / entry)
+                else:
+                    logger.warning(
+                        "PiExecutor: skipping manifest extension entry %r in %s "
+                        "(not a file inside the extension dir)",
+                        entry,
+                        manifest_path,
+                    )
             if entries:
                 return entries
     for name in ("index.ts", "index.js"):
@@ -1772,6 +1784,11 @@ def _resolve_pi_bundle_extension_args(bundle_dir: pathlib.Path | None) -> list[s
     ``--extension`` source as a *package root* (expecting ``extensions/`` /
     ``skills/`` subdirs inside it), and a ``<bundle>/.pi`` package source
     would also load ``.pi/skills`` in defiance of ``skills_filter="none"``.
+
+    Hook-style extensions (``before_agent_start`` and friends) take full
+    effect. Tools a bundled extension registers are loaded but not exposed to
+    the model: the executor runs Pi with ``--no-tools`` and allowlists only the
+    bridged Omnigent tools (plus ``read``) via ``--tools``.
 
     :param bundle_dir: The agent bundle's extracted on-disk path.
         ``None`` when no bundle is available — no flags are emitted.
@@ -2178,10 +2195,10 @@ class PiExecutor(Executor):
         if (
             self._sandboxed
             and bundle_dir is not None
-            and not _under_pi_sandbox_temp_grants(bundle_dir)
+            and not _under_sandbox_roots(bundle_dir, sandboxed.granted_roots)
         ):
             logger.warning(
-                "PiExecutor: bundle %s lies outside the temp dir the sandbox grants; "
+                "PiExecutor: bundle %s lies outside the roots the sandbox grants; "
                 "bundled skills and extensions may be unreadable inside the sandbox",
                 bundle_dir,
             )
@@ -2598,8 +2615,10 @@ class PiExecutor(Executor):
     def _with_bundle_context(self, system_prompt: str) -> str:
         """Append the bundle-root context file to Omnigent's composed prompt.
 
-        Skipped when the prompt already carries that content (ignoring
-        whitespace), as when the spec's ``instructions:`` reference the same file.
+        It goes after the composed prompt, where Pi itself places the project
+        context files it discovers. Skipped when the prompt already carries that
+        content (ignoring whitespace), as when the spec's ``instructions:``
+        reference the same file.
         """
         context = self._bundle_context
         if not context or _squash_ws(context) in _squash_ws(system_prompt):

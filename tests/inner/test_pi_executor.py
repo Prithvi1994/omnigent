@@ -3642,6 +3642,25 @@ def test_resolve_pi_bundle_extension_entries_discovery_shapes(
         ext_root / "flat.js",
     ], f"got {entries}"
     assert "could not read extension manifest" in caplog.text
+    assert caplog.text.count("skipping manifest extension entry") == 3
+
+
+def test_resolve_pi_bundle_extension_entries_root_entry_wins(tmp_path: Path) -> None:
+    """An entry point directly under ``.pi/extensions`` makes that directory
+    the single extension, so child directories are not scanned — as in Pi.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_bundle_extension_entries
+
+    ext_root = tmp_path / ".pi" / "extensions"
+    child = ext_root / "child"
+    child.mkdir(parents=True)
+    (child / "index.js").write_text("module.exports = function () {};\n")
+    (ext_root / "index.js").write_text("module.exports = function () {};\n")
+    assert _resolve_pi_bundle_extension_entries(ext_root) == [ext_root / "index.js"]
+
+    (ext_root / "main.js").write_text("module.exports = function () {};\n")
+    (ext_root / "package.json").write_text(json.dumps({"pi": {"extensions": ["main.js"]}}))
+    assert _resolve_pi_bundle_extension_entries(ext_root) == [ext_root / "main.js"]
 
 
 def test_read_pi_bundle_context_follows_pi_candidate_order(
@@ -3672,6 +3691,9 @@ def test_read_pi_bundle_context_follows_pi_candidate_order(
     assert "could not read bundle context file" in caplog.text
     (bundle / "AGENTS.md").unlink()
     assert _read_pi_bundle_context(bundle) is None
+    (bundle / "AGENTS.override.md").unlink()
+    (bundle / "CLAUDE.md").write_text("Claude guidance.\n")
+    assert _read_pi_bundle_context(bundle) == "Claude guidance."
 
 
 def test_bundle_context_follows_context_files_and_skips_duplicates(tmp_path: Path) -> None:
@@ -4867,9 +4889,9 @@ def test_pi_sandbox_policy_leaves_bundle_dir_to_temp_grants(monkeypatch, tmp_pat
     # The temp dir is exempt from the dotfile mask scan, so a recursive scan
     # cannot hide an extracted bundle's .pi/ either.
     assert temp_root in [root.resolve(strict=False) for root in policy.mask_scan_skip_roots or []]
-    assert "lies outside the temp dir" not in caplog.text
+    assert "lies outside the roots" not in caplog.text
 
-    # A bundle outside the temp grants is still spawned, but the gap is logged.
+    # A bundle outside every granted root is still spawned, but the gap is logged.
     with (
         caplog.at_level(logging.WARNING),
         patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
@@ -4879,7 +4901,22 @@ def test_pi_sandbox_policy_leaves_bundle_dir_to_temp_grants(monkeypatch, tmp_pat
             bundle_dir=Path("/opt/omnigent-bundles/outside"),
             os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
         )
-    assert "lies outside the temp dir" in caplog.text
+    assert "lies outside the roots" in caplog.text
+
+    # A bundle under the session cwd is a granted write root: no warning.
+    caplog.clear()
+    inside_cwd = workspace / "vendored-bundle"
+    inside_cwd.mkdir()
+    with (
+        caplog.at_level(logging.WARNING),
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+    ):
+        PiExecutor(
+            cwd=str(workspace),
+            bundle_dir=inside_cwd,
+            os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+        )
+    assert "lies outside the roots" not in caplog.text
 
 
 def test_run_turn_bridge_extension_carries_live_server_token(monkeypatch) -> None:
