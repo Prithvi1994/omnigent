@@ -453,6 +453,10 @@ class ProxyMcpManager:
                 except asyncio.TimeoutError as exc:
                     if monotonic() >= rebind_deadline:
                         raise _no_replacement_server(None) from exc
+                else:
+                    # The rebind completed, so the runner is reachable again; a
+                    # later detach starts a fresh window instead of this streak.
+                    detached_since = None
                 return
             if now - sent_at >= _LONG_REQUEST_MIN_S:
                 detached_since = None
