@@ -1,4 +1,4 @@
-const { describe, it } = require("node:test");
+const { beforeEach, describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const { readFileSync } = require("node:fs");
@@ -66,6 +66,10 @@ function latestWindow() {
 }
 
 describe("OIDC login modal", () => {
+  beforeEach(() => {
+    FakeBrowserWindow.instances.length = 0;
+  });
+
   it("keeps the sandboxed preload self-contained", () => {
     const source = readFileSync(path.join(__dirname, "../src/oidc_login_preload.js"), "utf8");
     assert.doesNotMatch(source, /require\(["']\.\//);

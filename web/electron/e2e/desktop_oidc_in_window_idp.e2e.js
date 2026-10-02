@@ -1,9 +1,6 @@
-// Desktop-shell journey: connecting to a self-hosted server whose auth
-// provider is `oidc`. The shell must hand the IdP sign-in to the system browser
-// (RFC 8252 §8.12) instead of rendering the third-party IdP page in its own
-// window, where a passkey (WebAuthn) ceremony has no authenticator to settle it.
-// On Linux a scripted xdg-open stands in for the browser and completes the
-// sign-in, so the handoff is also proven to land the app signed in.
+// Desktop-shell journey for a self-hosted `oidc` server: the shell must hand the
+// IdP sign-in to the system browser (RFC 8252 §8.12) instead of rendering it
+// in-window. On Linux a scripted xdg-open completes the sign-in as the browser.
 //
 // Run from web/electron after building the SPA (see e2e/README.md):
 //   OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_oidc_in_window_idp.e2e.js
@@ -132,7 +129,7 @@ describe(
         }
         /* oxlint-enable no-await-in-loop */
       } finally {
-        await electronApp.close();
+        await electronApp.close().catch(() => {});
         await stopDisplayCapture();
         observed.recordings = saveRecording(RECORD_DIR, "before-oidc-in-window-idp");
         fs.rmSync(userDataDir, { recursive: true, force: true });
@@ -183,7 +180,7 @@ describe(
         await sleep(2_000);
         signIn.dialogOpenAtEnd = dialogOpen();
       } finally {
-        await electronApp.close();
+        await electronApp.close().catch(() => {});
         await stopDisplayCapture();
         signIn.recordings = saveRecording(RECORD_DIR, "after-oidc-system-browser-sign-in");
         fs.rmSync(userDataDir, { recursive: true, force: true });

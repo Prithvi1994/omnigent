@@ -2132,8 +2132,8 @@ function createWindow(targetUrl, opts = {}) {
       try {
         await loadServerUrl(win, expiredUrl, undefined, { loadUrl: returnUrl, interactive: true });
       } catch (error) {
-        // A cancelled sign-in already returned the window to setup. Error details
-        // are not logged: they can carry the Databricks OAuth client id.
+        // A cancelled sign-in already returned the window to setup. Only the host is
+        // logged: error messages can echo request URLs and credentials.
         if (error?.name !== "AbortError") {
           console.error(
             `[omnigent] oidc session expiry: sign-in handoff failed for ${new URL(expiredUrl).host}`,

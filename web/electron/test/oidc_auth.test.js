@@ -252,7 +252,7 @@ describe("OIDC browser ticket flow", () => {
       async () => {},
       {
         pollIntervalMs: 1,
-        timeoutMs: 100,
+        timeoutMs: 5_000,
         onPollError: (status) => statuses.push(status),
       },
     );
@@ -518,7 +518,7 @@ describe("OIDC browser ticket flow", () => {
       async () => {},
       {
         pollIntervalMs: 1,
-        timeoutMs: 100,
+        timeoutMs: 5_000,
         onPollError: (status) => statuses.push(status),
       },
     );

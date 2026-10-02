@@ -154,7 +154,7 @@ async function waitForHealthy(url, label, logPath) {
  * @param {object} [opts]
  * @param {Record<string, string> | ((ctx: { serverUrl: string, mockUrl: string }) => Record<string, string>)} [opts.env]
  *   Extra server env (e.g. an auth-provider configuration), applied last. A
- *   function form receives the chosen server URL, for env that must name it.
+ *   function form receives the server and mock URLs, for env that must name them.
  * @returns {Promise<{ serverUrl: string, close: () => Promise<void> }>}
  */
 async function spawnServer(tmpDir, opts = {}) {

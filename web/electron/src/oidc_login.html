@@ -142,7 +142,7 @@
         document.body.classList.add("error");
         title.textContent = "Sign-in dialog failed to start";
         message.textContent = "Close this window and try connecting again.";
-        retry.hidden = true;
+        retry.remove();
         cancel.addEventListener("click", () => window.close());
       } else {
         bridge.onState((state) => {
