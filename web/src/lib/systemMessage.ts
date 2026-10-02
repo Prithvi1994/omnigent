@@ -64,7 +64,9 @@ export interface TeammateMarker {
   kind: "teammate_message" | "teammate_finished";
 }
 
-const TEAMMATE_ENVELOPE_RE = /^<teammate-message\s+([^>]*)>([\s\S]*?)<\/teammate-message>/;
+// Attribute values are quoted, so a `>` inside a summary stays in the tag.
+const TEAMMATE_ENVELOPE_RE =
+  /^<teammate-message\s+((?:[^>"]|"[^"]*")*)>([\s\S]*?)<\/teammate-message>/;
 const TEAMMATE_ATTR_RE = /([A-Za-z_][\w-]*)="([^"]*)"/g;
 const TEAMMATE_HEADER_RE = /^teammate (\S+)(?: (finished)|: (.*))?$/;
 

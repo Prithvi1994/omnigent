@@ -339,6 +339,19 @@ describe("teammate deliveries", () => {
     ).toHaveLength(1);
   });
 
+  it("keeps a summary containing '>' inside the tag", () => {
+    const envelope =
+      '<teammate-message teammate_id="buddy" summary="fixed the a->b mapping">\nMapping fixed.\n</teammate-message>';
+    expect(parseTeammateDeliveries(framed(envelope))).toEqual([
+      {
+        teammateId: "buddy",
+        summary: "fixed the a->b mapping",
+        body: "Mapping fixed.",
+        idleResult: null,
+      },
+    ]);
+  });
+
   it.each([
     prose,
     `Another Claude session sent a message:\n${prose}\nWhat does this mean?`,

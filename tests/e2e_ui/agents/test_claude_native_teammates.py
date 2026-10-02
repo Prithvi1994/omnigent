@@ -19,6 +19,7 @@ import pytest
 from playwright.sync_api import Locator, Page, expect
 
 from tests.e2e_ui.conftest import (
+    _CLAUDE_MOCK_MODEL,
     _create_native_claude_session,
     _ensure_runner_online,
     _server_state,
@@ -34,9 +35,6 @@ from tests.e2e_ui.messages.test_native_claude_render_parity import (
     _type_into_tui,
     _wait_terminal_connected,
 )
-
-# Must match the model in the mock anthropic provider config (conftest._CLAUDE_MOCK_MODEL).
-_CLAUDE_MOCK_MODEL = "claude-sonnet-4-20250514"
 
 # Per-session settings layer: the teams gate plus deterministic in-process
 # teammates ("auto" may try tmux panes inside the session terminal's server).
@@ -99,6 +97,7 @@ def native_claude_teams_session(
                     respawned.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     respawned.kill()
+                    respawned.wait(timeout=5)
 
 
 def _evidence_dir(tmp_path: Path, name: str) -> Path:

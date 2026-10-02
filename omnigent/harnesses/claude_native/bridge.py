@@ -2732,7 +2732,7 @@ def _load_settings_layer(value: str, launch_cwd: Path | None) -> _JsonObject | N
             path = launch_cwd / path
         try:
             text = path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             return None
     try:
         payload = json.loads(text)
@@ -2784,6 +2784,11 @@ def _merge_launch_settings(
         arg = args[index]
         if arg == "--settings" and index + 1 < len(args):
             value, index = args[index + 1], index + 2
+        elif arg == "--settings":
+            # Left in place, the bare flag would swallow the --mcp-config appended later.
+            _logger.warning("claude-native: dropping trailing --settings with no value")
+            index += 1
+            continue
         elif arg.startswith("--settings="):
             value, index = arg.partition("=")[2], index + 1
         else:

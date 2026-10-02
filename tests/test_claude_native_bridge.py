@@ -3552,20 +3552,71 @@ def test_augment_claude_args_resolves_a_relative_settings_file_against_the_launc
     assert _load_invocation_settings(args)["teammateMode"] == "in-process"
 
 
-def test_augment_claude_args_drops_an_unreadable_settings_layer(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Claude would ignore the broken flag behind Omnigent's own; say so instead."""
+def test_augment_claude_args_layers_user_settings_in_order(tmp_path: Path) -> None:
+    """Later user layers win per key, same-event hooks concatenate, Omnigent still wins."""
+    first = {
+        "env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1", "TEAM_COLOR": "blue"},
+        "permissions": {"allow": ["Bash(ls:*)"], "defaultMode": "acceptEdits"},
+        "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo first"}]}]},
+    }
+    second = {
+        "env": {"TEAM_COLOR": "green"},
+        "permissions": {"allow": ["Bash(cat:*)"]},
+        "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo second"}]}]},
+    }
     args = augment_claude_args(
-        ("--settings", "not json", "--resume", "abc"),
+        (
+            "--settings",
+            json.dumps(first),
+            "--settings",
+            json.dumps(second),
+            "--permission-mode",
+            "plan",
+        ),
         bridge_dir=tmp_path,
         python_executable="/venv/bin/python",
     )
 
-    assert "not json" not in args
+    assert args.count("--settings") == 1
+    settings = _load_invocation_settings(args)
+    assert settings["env"] == {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1", "TEAM_COLOR": "green"}
+    # The launch flag owns defaultMode; the later layer owns the shared key.
+    assert settings["permissions"] == {"allow": ["Bash(cat:*)"], "defaultMode": "plan"}
+    stop_commands = [
+        hook["command"] for group in settings["hooks"]["Stop"] for hook in group["hooks"]
+    ]
+    assert stop_commands[:2] == ["echo first", "echo second"]
+    assert len(stop_commands) == 3
+
+
+@pytest.mark.parametrize(
+    "layer,expected_warning",
+    [
+        (("--settings", "not json"), "dropping --settings file 'not json'"),
+        (("--settings", "latin1.json"), "dropping --settings file 'latin1.json'"),
+        (("--settings",), "dropping trailing --settings with no value"),
+    ],
+    ids=["unparseable", "invalid-utf8", "dangling"],
+)
+def test_augment_claude_args_drops_an_unreadable_settings_layer(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    layer: tuple[str, ...],
+    expected_warning: str,
+) -> None:
+    """Claude would ignore the broken flag behind Omnigent's own; drop it and say so."""
+    (tmp_path / "latin1.json").write_bytes(b'{"model": "caf\xe9"}')
+    args = augment_claude_args(
+        ("--resume", "abc", *layer),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        launch_cwd=tmp_path,
+    )
+
     assert args[:2] == ["--resume", "abc"]
     assert args.count("--settings") == 1
-    assert "dropping --settings file 'not json'" in caplog.text
+    assert args.index("--mcp-config") < args.index("--settings")
+    assert expected_warning in caplog.text
 
 
 def test_augment_claude_args_observes_worktree_moves(tmp_path: Path) -> None:

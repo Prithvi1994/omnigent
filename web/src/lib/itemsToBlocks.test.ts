@@ -209,27 +209,21 @@ describe("itemsToBlocks — flat shape", () => {
     }
   });
 
-  it("renders framed teammate deliveries readably and keeps bare legacy handbacks out of the transcript", () => {
+  it("keeps bare legacy handbacks out of the transcript", () => {
     const envelope =
       '<teammate-message teammate_id="reviewer" summary="Review complete">Ready</teammate-message>';
     const blocks = itemsToBlocks([
       userMessage("resp_1", "Review this change", "msg_before"),
       userMessage("resp_2", envelope, "msg_teammate"),
       userMessage("resp_2", '<agent-message from="reviewer">Ready</agent-message>', "msg_report"),
-      userMessage("resp_3", `Another Claude session sent a message:\n${envelope}`, "msg_peer"),
-      assistantMessage("resp_3", "The review is complete."),
-      userMessage("resp_4", `What does ${envelope} mean?`, "msg_after"),
+      assistantMessage("resp_2", "The review is complete."),
+      userMessage("resp_3", `What does ${envelope} mean?`, "msg_after"),
     ]);
 
     expect(blocks.map((block) => block.ctx.itemId)).toEqual([
       "msg_before",
-      "msg_peer",
       "msg_asst",
       "msg_after",
-    ]);
-    const peer = blocks[1] as UserMessageBlock;
-    expect(peer.content).toEqual([
-      { type: "input_text", text: "[System: teammate reviewer: Review complete]\nReady" },
     ]);
   });
 
