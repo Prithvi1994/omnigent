@@ -1579,13 +1579,11 @@ def _try_sandbox_pi(
         # Pi writes to ~/.pi, /tmp, and $TMPDIR (on macOS $TMPDIR is a
         # per-user dir under /var/folders/, not /tmp — grant both so
         # PI_CODING_AGENT_DIR (created via tempfile.mkdtemp) is reachable.
-        # The runner extracts agent bundles under the temp dir too, so the
-        # bundled ``--skill``/``--extension`` paths are visible through these
-        # grants. Do not add the bundle as a read root: the dotfile mask
-        # would hide its ``.pi/`` directory.
         home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
         sys_tmpdir = pathlib.Path(tempfile.gettempdir())
         sandbox = with_additional_write_roots(sandbox, [home_pi, pathlib.Path("/tmp"), sys_tmpdir])
+        # Bundles extract under the temp dir, so bundled --skill/--extension paths
+        # are covered; a bundle read root would let the dotfile mask hide .pi/.
         sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
         launcher = create_exec_launcher(pi_path, sandbox)
         return SandboxedPiCli(launch_path=launcher, sandboxed=True)
@@ -1701,11 +1699,14 @@ def _pi_extension_dir_entries(ext_dir: pathlib.Path) -> list[pathlib.Path]:
         pi_field = manifest.get("pi") if isinstance(manifest, dict) else None
         raw_entries = pi_field.get("extensions") if isinstance(pi_field, dict) else None
         if isinstance(raw_entries, list):
-            entries = [
-                ext_dir / entry
-                for entry in raw_entries
-                if isinstance(entry, str) and (ext_dir / entry).is_file()
-            ]
+            root = ext_dir.resolve()
+            entries: list[pathlib.Path] = []
+            for entry in raw_entries:
+                if not isinstance(entry, str):
+                    continue
+                candidate = (ext_dir / entry).resolve()
+                if candidate.is_file() and candidate.is_relative_to(root):
+                    entries.append(ext_dir / entry)
             if entries:
                 return entries
     for name in ("index.ts", "index.js"):
@@ -1774,6 +1775,10 @@ def _resolve_pi_bundle_extension_args(bundle_dir: pathlib.Path | None) -> list[s
     return args
 
 
+def _squash_ws(text: str) -> str:
+    return " ".join(text.split())
+
+
 def _read_pi_bundle_context(bundle_dir: pathlib.Path | None) -> str | None:
     """
     Read the bundle-root context file Pi would have discovered in the bundle.
@@ -1787,7 +1792,8 @@ def _read_pi_bundle_context(bundle_dir: pathlib.Path | None) -> str | None:
 
     :param bundle_dir: The agent bundle's extracted on-disk path, or ``None``.
     :returns: The stripped file content, or ``None`` when there is no
-        bundle, no candidate file, an unreadable file, or only whitespace.
+        bundle, no candidate file, an unreadable or undecodable file, or
+        only whitespace.
     """
     if bundle_dir is None:
         return None
@@ -1797,7 +1803,7 @@ def _read_pi_bundle_context(bundle_dir: pathlib.Path | None) -> str | None:
             continue
         try:
             content = context_file.read_text(encoding="utf-8").strip()
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
             logger.warning(
                 "PiExecutor: could not read bundle context file %s: %s", context_file, exc
             )
@@ -2568,11 +2574,11 @@ class PiExecutor(Executor):
     def _with_bundle_context(self, system_prompt: str) -> str:
         """Append the bundle-root context file to Omnigent's composed prompt.
 
-        Skipped when the prompt already carries that content, as when the
-        spec's ``instructions:`` reference the same file.
+        Skipped when the prompt already carries that content (ignoring
+        whitespace), as when the spec's ``instructions:`` reference the same file.
         """
         context = self._bundle_context
-        if not context or context in system_prompt:
+        if not context or _squash_ws(context) in _squash_ws(system_prompt):
             return system_prompt
         return f"{system_prompt}\n\n{context}" if system_prompt else context
 

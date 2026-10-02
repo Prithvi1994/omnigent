@@ -22,7 +22,6 @@ agent's own prompt.
 from __future__ import annotations
 
 import io
-import json
 import os
 import secrets
 import signal
@@ -40,6 +39,7 @@ import httpx
 import pytest
 import yaml
 
+from tests._helpers.session import bind_session_runner, post_session_bundle
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.omnigent.conftest import configure_mock_llm, reset_mock_llm
 
@@ -147,9 +147,17 @@ def _server_and_runner(
     db_path: Path,
     runner_id: str,
     binding_token: str,
+    log_dir: Path,
 ) -> Iterator[subprocess.Popen[str]]:
-    """Spawn ``omnigent server --agent <bundle>`` and a sibling runner."""
+    """Spawn ``omnigent server --agent <bundle>`` and a sibling runner.
+
+    Output goes to files under *log_dir* so a chatty process cannot fill a
+    pipe buffer and stall mid-test; the server log is read back on failure.
+    """
     base_url = f"http://127.0.0.1:{port}"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    server_log = (log_dir / "server.log").open("w", encoding="utf-8")
+    runner_log = (log_dir / "runner.log").open("w", encoding="utf-8")
     server = subprocess.Popen(
         [
             str(python),
@@ -165,7 +173,7 @@ def _server_and_runner(
         ],
         env={**env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token},
         cwd=str(cwd),
-        stdout=subprocess.PIPE,
+        stdout=server_log,
         stderr=subprocess.STDOUT,
         text=True,
     )
@@ -179,7 +187,7 @@ def _server_and_runner(
             "RUNNER_SERVER_URL": base_url,
         },
         cwd=str(cwd),
-        stdout=subprocess.PIPE,
+        stdout=runner_log,
         stderr=subprocess.STDOUT,
         text=True,
     )
@@ -194,6 +202,8 @@ def _server_and_runner(
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait(timeout=5)
+        server_log.close()
+        runner_log.close()
 
 
 def _wait_for_online_runner(
@@ -202,12 +212,13 @@ def _wait_for_online_runner(
     runner_id: str,
     proc: subprocess.Popen[str],
     timeout: float,
+    server_log: Path,
 ) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            stdout = proc.stdout.read() if proc.stdout else ""
-            pytest.fail(f"server exited with code {proc.returncode}:\n{stdout}")
+            output = server_log.read_text(encoding="utf-8") if server_log.exists() else ""
+            pytest.fail(f"server exited with code {proc.returncode}:\n{output}")
         try:
             if httpx.get(f"http://127.0.0.1:{port}/health", timeout=2.0).status_code == 200:
                 status = httpx.get(
@@ -231,14 +242,10 @@ def _bundle_dir_tarball(bundle: Path) -> bytes:
 
 
 def _create_session(client: httpx.Client, bundle: Path, runner_id: str) -> str:
-    resp = client.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _bundle_dir_tarball(bundle), "application/gzip")},
-    )
+    resp = post_session_bundle(client.post, "/v1/sessions", _bundle_dir_tarball(bundle))
     assert resp.status_code == 201, resp.text
     session_id = resp.json()["session_id"]
-    client.patch(f"/v1/sessions/{session_id}", json={"runner_id": runner_id}).raise_for_status()
+    bind_session_runner(client.patch, "", session_id, runner_id)
     return session_id
 
 
@@ -327,6 +334,7 @@ def test_pi_bundle_extensions_reach_session_cwd(
 
     port = _find_free_port()
     db_path = tmp_path / "server.db"
+    log_dir = tmp_path / "logs"
     binding_token = secrets.token_urlsafe(32)
     runner_id = token_bound_runner_id(binding_token)
 
@@ -339,8 +347,15 @@ def test_pi_bundle_extensions_reach_session_cwd(
         db_path=db_path,
         runner_id=runner_id,
         binding_token=binding_token,
+        log_dir=log_dir,
     ) as server:
-        _wait_for_online_runner(port, runner_id=runner_id, proc=server, timeout=_BOOT_TIMEOUT)
+        _wait_for_online_runner(
+            port,
+            runner_id=runner_id,
+            proc=server,
+            timeout=_BOOT_TIMEOUT,
+            server_log=log_dir / "server.log",
+        )
 
         with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=30.0) as client:
             session_id = _create_session(client, bundle, runner_id)

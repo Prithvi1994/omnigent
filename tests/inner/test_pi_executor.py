@@ -3588,8 +3588,8 @@ def test_resolve_pi_bundle_extension_args_extension_entries(tmp_path: Path) -> N
 def test_resolve_pi_bundle_extension_entries_discovery_shapes(tmp_path: Path) -> None:
     """Entry discovery mirrors Pi's own: top-level ``*.js``/``*.ts``
     files, subdir ``index.ts`` over ``index.js``, ``package.json``
-    ``pi.extensions`` manifests over index files (file entries only),
-    dotfiles and ``node_modules`` skipped.
+    ``pi.extensions`` manifests over index files (file entries inside the
+    extension dir only), dotfiles and ``node_modules`` skipped.
     """
     from omnigent.inner.pi_executor import _resolve_pi_bundle_extension_entries
 
@@ -3608,8 +3608,20 @@ def test_resolve_pi_bundle_extension_entries_discovery_shapes(tmp_path: Path) ->
     (manifest_dir / "main.js").write_text("module.exports = function () {};\n")
     (manifest_dir / "index.js").write_text("manifest entry must win\n")
     (manifest_dir / "lib").mkdir()
+    (tmp_path / "outside.js").write_text("must never be loaded\n")
     (manifest_dir / "package.json").write_text(
-        json.dumps({"pi": {"extensions": ["lib", "main.js"]}})
+        json.dumps(
+            {
+                "pi": {
+                    "extensions": [
+                        "lib",
+                        "../../../outside.js",
+                        str(tmp_path / "outside.js"),
+                        "main.js",
+                    ]
+                }
+            }
+        )
     )
     (ext_root / "empty-dir").mkdir()
 
@@ -3622,9 +3634,12 @@ def test_resolve_pi_bundle_extension_entries_discovery_shapes(tmp_path: Path) ->
     ], f"got {entries}"
 
 
-def test_read_pi_bundle_context_follows_pi_candidate_order(tmp_path: Path) -> None:
+def test_read_pi_bundle_context_follows_pi_candidate_order(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """The bundle-root context file is read by content in Pi's own
-    precedence order; a missing or blank file yields nothing.
+    precedence order; a missing, blank or undecodable file yields nothing,
+    the last with a warning instead of failing executor construction.
     """
     from omnigent.inner.pi_executor import _read_pi_bundle_context
 
@@ -3640,6 +3655,11 @@ def test_read_pi_bundle_context_follows_pi_candidate_order(tmp_path: Path) -> No
 
     (bundle / "AGENTS.override.md").write_text("Override guidance.\n")
     assert _read_pi_bundle_context(bundle) == "Override guidance."
+
+    (bundle / "AGENTS.override.md").write_bytes(b"Caf\xe9 guidance\n")
+    with caplog.at_level(logging.WARNING):
+        assert _read_pi_bundle_context(bundle) is None
+    assert "could not read bundle context file" in caplog.text
 
 
 def test_bundle_context_follows_context_files_and_skips_duplicates(tmp_path: Path) -> None:
@@ -3661,6 +3681,8 @@ def test_bundle_context_follows_context_files_and_skips_duplicates(tmp_path: Pat
     assert enabled._with_bundle_context("") == "Bundle guidance marker."
     already = "Agent prompt.\n\nBundle guidance marker.\n\nFramework notes."
     assert enabled._with_bundle_context(already) == already
+    reflowed = "Agent prompt.\n\nBundle   guidance\nmarker.\n\nFramework notes."
+    assert enabled._with_bundle_context(reflowed) == reflowed
     assert disabled._with_bundle_context("Agent prompt.") == "Agent prompt."
     assert "--no-context-files" in disabled._extra_args
 
@@ -4804,9 +4826,11 @@ def test_pi_sandbox_policy_leaves_bundle_dir_to_temp_grants(monkeypatch, tmp_pat
     assert executor._sandboxed is True
     policy = captured["policy"]
     assert bundle.resolve() not in (policy.read_roots or [])
-    assert Path(tempfile.gettempdir()).resolve() in [
-        root.resolve(strict=False) for root in policy.write_roots
-    ]
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    assert temp_root in [root.resolve(strict=False) for root in policy.write_roots]
+    # The temp dir is exempt from the dotfile mask scan, so a recursive scan
+    # cannot hide an extracted bundle's .pi/ either.
+    assert temp_root in [root.resolve(strict=False) for root in policy.mask_scan_skip_roots or []]
 
 
 def test_run_turn_bridge_extension_carries_live_server_token(monkeypatch) -> None:
