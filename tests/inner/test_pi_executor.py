@@ -4938,20 +4938,23 @@ def test_bundle_visible_in_sandbox_follows_policy(
 
     cwd = tmp_path / "cwd"
     cwd.mkdir()
+    # A dedicated skip root: the real temp dir may contain tmp_path itself.
+    skip_root = tmp_path / "scratch"
+    skip_root.mkdir()
     policy = SandboxPolicy(
         backend_type="linux_bwrap",
         active=True,
         read_roots=[cwd] if read_roots == "cwd" else None,
-        write_roots=[cwd, Path(tempfile.gettempdir())],
+        write_roots=[cwd, skip_root],
         write_files=[],
         allow_network=False,
         cwd_hidden_scan_recursive=recursive,
-        mask_scan_skip_roots=[Path(tempfile.gettempdir())],
+        mask_scan_skip_roots=[skip_root],
     )
     targets = {
         "cwd": cwd,
         "cwd/vendored-bundle": cwd / "vendored-bundle",
-        "tmp": tmp_path / "bundle",
+        "tmp": skip_root / "runner-specs" / "bundle",
     }
     target = targets.get(bundle, Path(bundle))
     assert _bundle_visible_in_sandbox(target, policy, cwd) is visible
