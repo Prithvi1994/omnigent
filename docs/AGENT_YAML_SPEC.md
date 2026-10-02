@@ -142,6 +142,26 @@ Omnigent's runtime instructions are still sent to Pi. This option maps to Pi's
 separate `SYSTEM.md` discovery, and is only supported by `pi`, not `pi-native`
 or other harnesses.
 
+### Pi bundle resources
+
+A `harness: pi` directory bundle can ship Pi's own project-local resources, and
+sessions load them even though Pi runs in the session workspace rather than in
+the bundle:
+
+- `.pi/extensions/<name>/` directories (or top-level `.pi/extensions/*.ts` /
+  `*.js` files) are passed to Pi with `--extension`; `package.json`
+  `pi.extensions` entries must be files inside the extension directory.
+  Extensions run as code inside the Pi process, so bundle only extensions you
+  trust.
+- `skills/<name>/SKILL.md` and `.pi/skills/<name>/SKILL.md` are passed with
+  `--skill` and follow the `skills` filter; when both roots define the same
+  name, `skills/` wins.
+- A bundle-root `AGENTS.override.md`, `AGENTS.md` or `CLAUDE.md` (Pi's order) is
+  appended to the agent's instructions as an automatic context file. It is not
+  appended twice when the spec already adopted that same file as its
+  `instructions:`, and `context_files: false` disables it; an `AGENTS.md` the
+  spec already adopted as the agent's instructions is unaffected by that option.
+
 ### Pi system prompt
 
 With `harness: pi`, `system_prompt_mode` controls how Omnigent sends its composed

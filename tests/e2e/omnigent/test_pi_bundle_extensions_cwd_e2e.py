@@ -41,6 +41,8 @@ import yaml
 
 from tests._helpers.session import bind_session_runner, post_session_bundle
 from tests.e2e._harness_probes import cli_unavailable_reason
+from tests.e2e.conftest import get_mock_requests
+from tests.e2e.omnigent._pi_mock_gateway import write_pi_gateway_config
 from tests.e2e.omnigent.conftest import configure_mock_llm, reset_mock_llm
 
 _EXT_MARKER = "OMNI_PI_BUNDLE_EXT_ACTIVE"
@@ -111,31 +113,6 @@ def _build_bundle(bundle: Path, model: str) -> None:
     )
 
 
-def _write_pi_gateway_config(config_home: Path, *, mock_url: str, model: str) -> None:
-    """Point pi at the mock LLM via an OpenAI-key provider (gateway mode)."""
-    config_home.mkdir(parents=True, exist_ok=True)
-    (config_home / "config.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "auth": {"type": "api_key"},
-                "providers": {
-                    "mock-oai": {
-                        "kind": "key",
-                        "default": True,
-                        "openai": {
-                            "base_url": f"{mock_url}/v1",
-                            "api_key": "mock-key",
-                            "models": {"default": model},
-                        },
-                    },
-                },
-            },
-            sort_keys=False,
-        ),
-        encoding="utf-8",
-    )
-
-
 @contextmanager
 def _server_and_runner(
     *,
@@ -158,43 +135,46 @@ def _server_and_runner(
     log_dir.mkdir(parents=True, exist_ok=True)
     server_log = (log_dir / "server.log").open("w", encoding="utf-8")
     runner_log = (log_dir / "runner.log").open("w", encoding="utf-8")
-    server = subprocess.Popen(
-        [
-            str(python),
-            "-m",
-            "omnigent",
-            "server",
-            "--agent",
-            str(bundle),
-            "-p",
-            str(port),
-            "--database-uri",
-            f"sqlite:///{db_path}",
-        ],
-        env={**env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token},
-        cwd=str(cwd),
-        stdout=server_log,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    runner = subprocess.Popen(
-        [str(python), "-m", "omnigent.runner._entry"],
-        env={
-            **env,
-            "OMNIGENT_RUNNER_ID": runner_id,
-            "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-            "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-            "RUNNER_SERVER_URL": base_url,
-        },
-        cwd=str(cwd),
-        stdout=runner_log,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    procs: list[subprocess.Popen[str]] = []
     try:
+        server = subprocess.Popen(
+            [
+                str(python),
+                "-m",
+                "omnigent",
+                "server",
+                "--agent",
+                str(bundle),
+                "-p",
+                str(port),
+                "--database-uri",
+                f"sqlite:///{db_path}",
+            ],
+            env={**env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token},
+            cwd=str(cwd),
+            stdout=server_log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        procs.append(server)
+        runner = subprocess.Popen(
+            [str(python), "-m", "omnigent.runner._entry"],
+            env={
+                **env,
+                "OMNIGENT_RUNNER_ID": runner_id,
+                "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
+                "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
+                "RUNNER_SERVER_URL": base_url,
+            },
+            cwd=str(cwd),
+            stdout=runner_log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        procs.append(runner)
         yield server
     finally:
-        for proc in (runner, server):
+        for proc in reversed(procs):
             if proc.poll() is None:
                 proc.send_signal(signal.SIGTERM)
                 try:
@@ -277,11 +257,9 @@ def _drive_turn_to_terminal(client: httpx.Client, session_id: str, prompt: str) 
     )
 
 
-def _captured_system_prompts(mock_url: str) -> list[str]:
-    resp = httpx.get(f"{mock_url}/mock/requests", timeout=5.0)
-    resp.raise_for_status()
+def _captured_system_prompts(mock_url: str, model: str) -> list[str]:
     prompts: list[str] = []
-    for req in resp.json().get("requests", []):
+    for req in get_mock_requests(mock_url, key=model):
         if not isinstance(req, dict):
             continue
         for msg in req.get("messages", []):
@@ -327,7 +305,7 @@ def test_pi_bundle_extensions_reach_session_cwd(
     _build_bundle(bundle, model)
 
     config_home = tmp_path / "omnigent-config"
-    _write_pi_gateway_config(config_home, mock_url=mock_llm_server_url, model=model)
+    write_pi_gateway_config(config_home, mock_url=mock_llm_server_url, model=model)
 
     env = dict(mock_credentials_env)
     env["OMNIGENT_CONFIG_HOME"] = str(config_home)
@@ -368,7 +346,7 @@ def test_pi_bundle_extensions_reach_session_cwd(
         f"{snapshot.get('last_task_error') or snapshot.get('error')}"
     )
 
-    system_prompts = _captured_system_prompts(mock_llm_server_url)
+    system_prompts = _captured_system_prompts(mock_llm_server_url, model)
     assert system_prompts, (
         "mock LLM captured no system prompt — the pi turn never reached the "
         "model, so the extension-loading path was not exercised"

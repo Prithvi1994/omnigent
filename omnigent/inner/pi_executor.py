@@ -1592,6 +1592,13 @@ def _try_sandbox_pi(
         return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
 
 
+def _under_pi_sandbox_temp_grants(bundle_dir: pathlib.Path) -> bool:
+    """Whether *bundle_dir* sits under a temp root :func:`_try_sandbox_pi` binds."""
+    resolved = bundle_dir.resolve(strict=False)
+    roots = (pathlib.Path("/tmp"), pathlib.Path(tempfile.gettempdir()))
+    return any(resolved.is_relative_to(root.resolve(strict=False)) for root in roots)
+
+
 def _resolve_pi_skill_args(
     skills_filter: str | list[str],
     bundle_dir: pathlib.Path | None,
@@ -1694,7 +1701,10 @@ def _pi_extension_dir_entries(ext_dir: pathlib.Path) -> list[pathlib.Path]:
     if manifest_path.is_file():
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "PiExecutor: could not read extension manifest %s: %s", manifest_path, exc
+            )
             manifest = None
         pi_field = manifest.get("pi") if isinstance(manifest, dict) else None
         raw_entries = pi_field.get("extensions") if isinstance(pi_field, dict) else None
@@ -1734,7 +1744,10 @@ def _resolve_pi_bundle_extension_entries(extensions_dir: pathlib.Path) -> list[p
     entries: list[pathlib.Path] = []
     try:
         children = sorted(extensions_dir.iterdir())
-    except OSError:
+    except OSError as exc:
+        logger.warning(
+            "PiExecutor: could not list bundle extensions dir %s: %s", extensions_dir, exc
+        )
         return entries
     for child in children:
         if child.name.startswith(".") or child.name == "node_modules":
@@ -1791,9 +1804,10 @@ def _read_pi_bundle_context(bundle_dir: pathlib.Path | None) -> str | None:
     bundle appends nothing instead of the literal path string.
 
     :param bundle_dir: The agent bundle's extracted on-disk path, or ``None``.
-    :returns: The stripped file content, or ``None`` when there is no
-        bundle, no candidate file, an unreadable or undecodable file, or
-        only whitespace.
+    :returns: The stripped file content of the first readable candidate, or
+        ``None`` when there is no bundle, no readable candidate, or only
+        whitespace. An unreadable or undecodable candidate is skipped with a
+        warning.
     """
     if bundle_dir is None:
         return None
@@ -1807,7 +1821,7 @@ def _read_pi_bundle_context(bundle_dir: pathlib.Path | None) -> str | None:
             logger.warning(
                 "PiExecutor: could not read bundle context file %s: %s", context_file, exc
             )
-            return None
+            continue
         return content or None
     return None
 
@@ -2161,6 +2175,16 @@ class PiExecutor(Executor):
         )
         self._pi_launch_path = sandboxed.launch_path
         self._sandboxed = sandboxed.sandboxed
+        if (
+            self._sandboxed
+            and bundle_dir is not None
+            and not _under_pi_sandbox_temp_grants(bundle_dir)
+        ):
+            logger.warning(
+                "PiExecutor: bundle %s lies outside the temp dir the sandbox grants; "
+                "bundled skills and extensions may be unreadable inside the sandbox",
+                bundle_dir,
+            )
 
         self._session_states: dict[str, _PiSessionState] = {}
         self._tool_server: _ToolServer | None = None

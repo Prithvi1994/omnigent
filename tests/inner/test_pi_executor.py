@@ -3585,11 +3585,14 @@ def test_resolve_pi_bundle_extension_args_extension_entries(tmp_path: Path) -> N
     assert _resolve_pi_bundle_extension_args(tmp_path / "no-extensions") == []
 
 
-def test_resolve_pi_bundle_extension_entries_discovery_shapes(tmp_path: Path) -> None:
+def test_resolve_pi_bundle_extension_entries_discovery_shapes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """Entry discovery mirrors Pi's own: top-level ``*.js``/``*.ts``
     files, subdir ``index.ts`` over ``index.js``, ``package.json``
     ``pi.extensions`` manifests over index files (file entries inside the
-    extension dir only), dotfiles and ``node_modules`` skipped.
+    extension dir only), dotfiles and ``node_modules`` skipped. A broken
+    manifest falls back to the index file with a warning.
     """
     from omnigent.inner.pi_executor import _resolve_pi_bundle_extension_entries
 
@@ -3608,6 +3611,10 @@ def test_resolve_pi_bundle_extension_entries_discovery_shapes(tmp_path: Path) ->
     (manifest_dir / "main.js").write_text("module.exports = function () {};\n")
     (manifest_dir / "index.js").write_text("manifest entry must win\n")
     (manifest_dir / "lib").mkdir()
+    broken_dir = ext_root / "c-broken-manifest"
+    broken_dir.mkdir()
+    (broken_dir / "package.json").write_text("{not json")
+    (broken_dir / "index.js").write_text("module.exports = function () {};\n")
     (tmp_path / "outside.js").write_text("must never be loaded\n")
     (manifest_dir / "package.json").write_text(
         json.dumps(
@@ -3625,13 +3632,16 @@ def test_resolve_pi_bundle_extension_entries_discovery_shapes(tmp_path: Path) ->
     )
     (ext_root / "empty-dir").mkdir()
 
-    entries = _resolve_pi_bundle_extension_entries(ext_root)
+    with caplog.at_level(logging.WARNING):
+        entries = _resolve_pi_bundle_extension_entries(ext_root)
 
     assert entries == [
         ts_dir / "index.ts",
         manifest_dir / "main.js",
+        broken_dir / "index.js",
         ext_root / "flat.js",
     ], f"got {entries}"
+    assert "could not read extension manifest" in caplog.text
 
 
 def test_read_pi_bundle_context_follows_pi_candidate_order(
@@ -3658,8 +3668,10 @@ def test_read_pi_bundle_context_follows_pi_candidate_order(
 
     (bundle / "AGENTS.override.md").write_bytes(b"Caf\xe9 guidance\n")
     with caplog.at_level(logging.WARNING):
-        assert _read_pi_bundle_context(bundle) is None
+        assert _read_pi_bundle_context(bundle) == "Bundle guidance marker."
     assert "could not read bundle context file" in caplog.text
+    (bundle / "AGENTS.md").unlink()
+    assert _read_pi_bundle_context(bundle) is None
 
 
 def test_bundle_context_follows_context_files_and_skips_duplicates(tmp_path: Path) -> None:
@@ -3686,16 +3698,27 @@ def test_bundle_context_follows_context_files_and_skips_duplicates(tmp_path: Pat
     assert disabled._with_bundle_context("Agent prompt.") == "Agent prompt."
     assert "--no-context-files" in disabled._extra_args
 
+    # With both files present the parser adopts AGENTS.md as the instructions
+    # while Pi's own precedence picks AGENTS.override.md; both reach the model,
+    # just as Pi layers a project context file over the instructions.
+    (bundle / "AGENTS.override.md").write_text("Override guidance.\n")
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        layered = PiExecutor(bundle_dir=bundle)
+    adopted = "Bundle guidance marker.\n\nFramework notes."
+    assert layered._with_bundle_context(adopted) == f"{adopted}\n\nOverride guidance."
 
-def test_pi_subprocess_receives_bundle_resources_from_session_workspace(tmp_path: Path) -> None:
-    """Pi keeps running in the session workspace while the bundle's
-    ``.pi/extensions``, ``.pi/skills`` and ``AGENTS.md`` reach it through
-    explicit arguments and the composed system prompt.
 
-    Pi discovers those resources only from its cwd, so a bundle living
-    elsewhere used to load none of them and the agent silently answered
-    as Pi's stock assistant.
+@pytest.mark.parametrize("system_prompt_mode", ["append", "replace"])
+def test_pi_subprocess_receives_bundle_resources_from_session_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, system_prompt_mode: str
+) -> None:
+    """Pi discovers ``.pi/extensions``, ``.pi/skills`` and ``AGENTS.md`` relative
+    to its cwd, so the executor must pass bundle resources explicitly while
+    keeping the session workspace as cwd. The bundle context travels in the one
+    content-bearing prompt flag of the active mode.
     """
+    from omnigent.inner import pi_executor as pi_mod
+
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     bundle = tmp_path / "bundle"
@@ -3705,19 +3728,21 @@ def test_pi_subprocess_receives_bundle_resources_from_session_workspace(tmp_path
     skill_dir = _make_pi_skill_dir(bundle / ".pi" / "skills", "grilling")
     (bundle / "AGENTS.md").write_text("BUNDLE_CONTEXT_MARKER: answer like a pirate.\n")
 
+    captured: dict[str, object] = {}
+
+    async def _fake_spawn(*args, **kwargs):
+        captured["argv"] = list(args)
+        captured["cwd"] = kwargs.get("cwd")
+        return _FakeProcess()
+
+    monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
     with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
-        executor = PiExecutor(cwd=str(workspace), bundle_dir=bundle)
-
-    seen: dict[str, object] = {}
-
-    async def fake_start(self, pi_path, **kwargs):
-        seen.update(kwargs)
+        executor = PiExecutor(
+            cwd=str(workspace), bundle_dir=bundle, system_prompt_mode=system_prompt_mode
+        )
 
     async def _drive() -> None:
-        with (
-            patch.object(_PiRpcSession, "start", fake_start),
-            patch.object(executor, "_load_gateway_model_wire_apis", AsyncMock(return_value={})),
-        ):
+        with patch.object(executor, "_load_gateway_model_wire_apis", AsyncMock(return_value={})):
             try:
                 await executor._ensure_rpc("session", "You are the bundle agent.", "gpt-4o", [])
             finally:
@@ -3725,15 +3750,24 @@ def test_pi_subprocess_receives_bundle_resources_from_session_workspace(tmp_path
 
     _run(_drive())
 
-    assert seen["cwd"] == str(workspace), "pi must keep the session workspace as its cwd"
-    extra_args = list(seen["extra_args"])
-    pairs = list(itertools.pairwise(extra_args))
-    assert ("--extension", str(ext_entry)) in pairs, f"got extra_args={extra_args}"
-    assert ("--skill", str(skill_dir)) in pairs, f"got extra_args={extra_args}"
-    system_prompt = seen["system_prompt"]
-    assert isinstance(system_prompt, str)
-    assert system_prompt.startswith("You are the bundle agent.")
-    assert "BUNDLE_CONTEXT_MARKER: answer like a pirate." in system_prompt
+    assert captured["cwd"] == str(workspace), "pi must keep the session workspace as its cwd"
+    argv = list(captured["argv"])
+    pairs = list(itertools.pairwise(argv))
+    assert ("--extension", str(ext_entry)) in pairs, f"got argv={argv}"
+    assert ("--skill", str(skill_dir)) in pairs, f"got argv={argv}"
+    composed = "You are the bundle agent.\n\nBUNDLE_CONTEXT_MARKER: answer like a pirate."
+    prompt_values = [
+        argv[i + 1]
+        for i, tok in enumerate(argv)
+        if tok in ("--system-prompt", "--append-system-prompt")
+    ]
+    if system_prompt_mode == "append":
+        assert "--system-prompt" not in argv
+        assert prompt_values == [composed]
+    else:
+        assert argv[argv.index("--system-prompt") + 1] == composed
+        # Replace mode keeps its empty append, which suppresses APPEND_SYSTEM.md.
+        assert prompt_values == [composed, ""]
 
 
 # ---------------------------------------------------------------------------
@@ -4779,15 +4813,17 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(monkeypatch, tmp
     assert "FAKE_HOST_SECRET" not in allowlist
 
 
-def test_pi_sandbox_policy_leaves_bundle_dir_to_temp_grants(monkeypatch, tmp_path) -> None:
+def test_pi_sandbox_policy_leaves_bundle_dir_to_temp_grants(monkeypatch, tmp_path, caplog) -> None:
     """The bundle dir is not added as a sandbox read root.
 
     The runner extracts bundles under the temp dir, which the pi sandbox
     already binds, and a read root would subject the bundle's top level to
-    the dotfile mask and hide its ``.pi/`` resources from pi.
+    the dotfile mask and hide its ``.pi/`` resources from pi. A bundle
+    outside those grants is reported so the gap is not silent.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Pytest tmp dir hosting both the cwd and the bundle.
+    :param caplog: Pytest log capture fixture.
     """
     from omnigent.inner import sandbox as sandbox_mod
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -4831,6 +4867,19 @@ def test_pi_sandbox_policy_leaves_bundle_dir_to_temp_grants(monkeypatch, tmp_pat
     # The temp dir is exempt from the dotfile mask scan, so a recursive scan
     # cannot hide an extracted bundle's .pi/ either.
     assert temp_root in [root.resolve(strict=False) for root in policy.mask_scan_skip_roots or []]
+    assert "lies outside the temp dir" not in caplog.text
+
+    # A bundle outside the temp grants is still spawned, but the gap is logged.
+    with (
+        caplog.at_level(logging.WARNING),
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+    ):
+        PiExecutor(
+            cwd=str(workspace),
+            bundle_dir=Path("/opt/omnigent-bundles/outside"),
+            os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+        )
+    assert "lies outside the temp dir" in caplog.text
 
 
 def test_run_turn_bridge_extension_carries_live_server_token(monkeypatch) -> None:
