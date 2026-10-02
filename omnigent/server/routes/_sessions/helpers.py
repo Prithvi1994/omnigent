@@ -4818,8 +4818,10 @@ def _publish_status(
     # in-process flow performs a legitimate ``failed`` → ``idle``
     # transition (compaction failure publishes ``running`` → ``idle``, not
     # ``failed``), so this is a safe, harness-agnostic invariant.
-    if status in ("idle", "failed", "waiting"):
-        # These states cannot retain a message in the active turn buffer.
+    if status == "idle":
+        # Only idle proves the turn buffer is empty: the runner publishes
+        # `failed` before draining a buffered continuation, and `waiting`
+        # can be re-announced while a message is still buffered.
         unconsumed_inputs.clear(session_id)
     if status == "idle" and _session_status_cache.get(session_id) == "failed":
         # Session stays ``failed`` (terminal); the turn is over, so drop any

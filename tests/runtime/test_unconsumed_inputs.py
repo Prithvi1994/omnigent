@@ -33,10 +33,6 @@ def test_resolve_returns_recorded_item_exactly_once() -> None:
     assert unconsumed_inputs.snapshot_for("conv_a") == []
 
 
-def test_resolve_unknown_id_is_noop() -> None:
-    assert unconsumed_inputs.resolve("conv_a", "item_missing") is None
-
-
 def test_clear_drops_one_conversation_only() -> None:
     unconsumed_inputs.record("conv_a", "item_1", {"id": "item_1"})
     unconsumed_inputs.record("conv_b", "item_2", {"id": "item_2"})
@@ -84,3 +80,29 @@ def test_clear_drops_pre_drained_marks() -> None:
 
     assert unconsumed_inputs.record("conv_a", "item_1", {"id": "item_1"}) is True
     assert unconsumed_inputs.snapshot_for("conv_a") == ["item_1"]
+
+
+def test_untouched_conversation_entries_expire_on_any_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 1000.0
+    monkeypatch.setattr(unconsumed_inputs, "_now", lambda: now)
+    unconsumed_inputs.record("conv_abandoned", "item_old", {"id": "item_old"})
+
+    now += unconsumed_inputs._TTL_S + 1.0
+    unconsumed_inputs.record("conv_other", "item_new", {"id": "item_new"})
+
+    assert unconsumed_inputs._unconsumed.get("conv_abandoned") is None
+    assert unconsumed_inputs.snapshot_for("conv_other") == ["item_new"]
+
+
+def test_resolve_sweeps_expired_pre_drained_marks(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 1000.0
+    monkeypatch.setattr(unconsumed_inputs, "_now", lambda: now)
+    assert unconsumed_inputs.resolve("conv_abandoned", "item_1") is None
+
+    now += unconsumed_inputs._PRE_DRAINED_TTL_S + 1.0
+    assert unconsumed_inputs.resolve("conv_other", "item_2") is None
+
+    assert unconsumed_inputs._pre_drained.get("conv_abandoned") is None
+    assert unconsumed_inputs.record("conv_abandoned", "item_1", {"id": "item_1"}) is True

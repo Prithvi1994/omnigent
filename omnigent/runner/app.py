@@ -8842,6 +8842,9 @@ def create_runner_app(
                         status_code=202,
                         content={
                             "status": "buffered",
+                            # This runner reports `session.input.drained` when the
+                            # message enters a turn; older runners never do.
+                            "drain_marker": True,
                             "detail": ("Message buffered; active turn will process it."),
                         },
                     )

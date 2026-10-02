@@ -4150,29 +4150,10 @@ async function bindStream(
       ];
       const hasErrorBlock = allBlocks.some((b) => b.type === "error");
       // Move persisted but unconsumed messages out of the committed lane.
-      const unconsumedIds = new Set(session.unconsumedInputIds ?? []);
-      const deliveredPending: PendingUserMessage[] = [];
-      let committedBlocks = allBlocks;
-      if (unconsumedIds.size > 0) {
-        committedBlocks = [];
-        for (const b of allBlocks) {
-          if (
-            b.type === "user_message" &&
-            b.ctx.itemId !== null &&
-            unconsumedIds.has(b.ctx.itemId)
-          ) {
-            deliveredPending.push({
-              tempId: `delivered:${b.ctx.itemId}`,
-              content: b.content,
-              posted: true,
-              deliveredItemId: b.ctx.itemId,
-              ...(b.ctx.createdBy !== undefined ? { author: b.ctx.createdBy } : {}),
-            });
-          } else {
-            committedBlocks.push(b);
-          }
-        }
-      }
+      const { committed: committedBlocks, delivered: deliveredPending } = partitionUnconsumed(
+        allBlocks,
+        new Set(session.unconsumedInputIds ?? []),
+      );
       // Decide the optimistic user bubbles to render after this bind, and
       // (on cold load) keep the per-conversation stash consistent.
       //
@@ -4200,17 +4181,7 @@ async function bindStream(
       let candidatePending: PendingUserMessage[];
       if (!hydratePending) {
         // Restore delivered events missed while disconnected.
-        const knownDelivered = new Set(
-          state.pendingUserMessages
-            .map((p) => p.deliveredItemId)
-            .filter((itemId): itemId is string => itemId !== undefined),
-        );
-        candidatePending = [
-          ...state.pendingUserMessages,
-          ...deliveredPending.filter(
-            (p) => p.deliveredItemId !== undefined && !knownDelivered.has(p.deliveredItemId),
-          ),
-        ];
+        candidatePending = absorbDelivered(state.pendingUserMessages, deliveredPending);
       } else {
         const serverPending = (session.pendingInputs ?? []).map(toPending);
         // One-to-one consumption so two identical queued sends still match
@@ -4224,7 +4195,10 @@ async function bindStream(
           return false;
         });
         // Persisted delivered entries precede queued and in-flight entries.
-        candidatePending = [...deliveredPending, ...serverPending, ...unknownToServer];
+        candidatePending = absorbDelivered(
+          [...serverPending, ...unknownToServer],
+          deliveredPending,
+        );
       }
       // Dedupe on a COLD LOAD only: drop any candidate whose message already
       // committed — a snapshot-replayed ghost the server never drained, or a
@@ -4870,7 +4844,10 @@ async function rehydrateWindowOnReconnect(
   if (isConversationDisposed(id) || get().historyGeneration !== generation) return;
   const snapshotNativeMessageIds = nativeCompletedMessageIds(fresh.items);
   snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
-  const freshBlocks = itemsToBlocks(fresh.items);
+  const { committed: freshBlocks, delivered: freshDelivered } = partitionUnconsumed(
+    itemsToBlocks(fresh.items),
+    new Set(session.unconsumedInputIds ?? []),
+  );
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   set((s) => {
     const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
@@ -4891,6 +4868,7 @@ async function rehydrateWindowOnReconnect(
     );
     return {
       ...reconnectStatusPatch(session, s, launchBeforeFetch),
+      pendingUserMessages: absorbDelivered(s.pendingUserMessages, freshDelivered),
       blocks:
         reconcileElicitationBlocks(
           merged,
@@ -5023,24 +5001,44 @@ async function reconcileOnReconnect(
 
   const snapshotBlocks = itemsToBlocks(items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
+  const unconsumedIds = new Set(session.unconsumedInputIds ?? []);
   set((s) => {
     const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
     const seen = new Set(
       currentBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
-    const unseen = snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
+    // Gap items the runner still buffers re-enter the pending lane.
+    const { committed: unseen, delivered: unseenDelivered } = partitionUnconsumed(
+      snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId)),
+      unconsumedIds,
+    );
     const reconciledBlocks =
       s.isNativeTerminalSession && unseen.some((b) => b.type === "text_done" && b.ctx.itemId)
         ? withoutInterruptedNativePreviews(currentBlocks, ignoredNativeMessageIds)
         : currentBlocks;
     const patch: Partial<ChatState> = reconnectStatusPatch(session, s, launchBeforeFetch);
-    // `session.input.consumed` is not replayed, so recovered user blocks are
-    // the durable equivalent of its FIFO acknowledgement.
-    const recoveredUserInputs = unseen.filter(
-      (b) => b.type === "user_message" && !isSystemUserContent(b.content),
-    ).length;
-    if (recoveredUserInputs > 0) {
-      patch.pendingUserMessages = s.pendingUserMessages.slice(recoveredUserInputs);
+    // Delivered entries settle by exact id. `session.input.consumed` is not
+    // replayed, so other recovered user blocks are its FIFO acknowledgement.
+    const committedIds = new Set(
+      unseen.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+    );
+    let pending = s.pendingUserMessages.filter(
+      (p) => p.deliveredItemId === undefined || !committedIds.has(p.deliveredItemId),
+    );
+    let fifoAcks =
+      unseen.filter((b) => b.type === "user_message" && !isSystemUserContent(b.content)).length -
+      (s.pendingUserMessages.length - pending.length);
+    pending = pending.filter((p) => {
+      if (p.deliveredItemId !== undefined || fifoAcks <= 0) return true;
+      fifoAcks -= 1;
+      return false;
+    });
+    pending = absorbDelivered(pending, unseenDelivered);
+    if (
+      pending.length !== s.pendingUserMessages.length ||
+      pending.some((p, i) => p !== s.pendingUserMessages[i])
+    ) {
+      patch.pendingUserMessages = pending;
     }
     let nextBlocks = reconciledBlocks;
     if (unseen.length > 0) {
@@ -6314,6 +6312,70 @@ function committedContentFor(
  *   across the swap (no remount/flink). Omit for foreign/TUI messages
  *   that had no optimistic predecessor — they mount fresh.
  */
+/** Pending-lane entry for a persisted user message the runner still buffers. */
+function deliveredPendingFromBlock(block: UserMessageBlock): PendingUserMessage {
+  const itemId = block.ctx.itemId ?? "";
+  return {
+    tempId: block.stableKey ?? `delivered:${itemId}`,
+    content: block.content,
+    posted: true,
+    deliveredItemId: itemId,
+    ...(block.ctx.createdBy !== undefined ? { author: block.ctx.createdBy } : {}),
+    ...(block.ctx.clientCreatedAtS !== undefined ? { createdAtS: block.ctx.clientCreatedAtS } : {}),
+  };
+}
+
+/** Split snapshot blocks into committed ones and persisted-but-unconsumed user messages. */
+function partitionUnconsumed(
+  blocks: AnyBlock[],
+  unconsumedIds: ReadonlySet<string>,
+): { committed: AnyBlock[]; delivered: PendingUserMessage[] } {
+  if (unconsumedIds.size === 0) return { committed: blocks, delivered: [] };
+  const committed: AnyBlock[] = [];
+  const delivered: PendingUserMessage[] = [];
+  for (const b of blocks) {
+    if (b.type === "user_message" && b.ctx.itemId !== null && unconsumedIds.has(b.ctx.itemId)) {
+      delivered.push(deliveredPendingFromBlock(b));
+    } else {
+      committed.push(b);
+    }
+  }
+  return { committed, delivered };
+}
+
+/**
+ * Merge persisted-but-unconsumed entries recovered from a snapshot into the
+ * pending lane: ids already tracked are kept, a local optimistic echo with
+ * the same text is stamped, and anything else is prepended (a persisted
+ * entry is older than anything merely queued or in flight).
+ */
+function absorbDelivered(
+  pending: PendingUserMessage[],
+  delivered: PendingUserMessage[],
+): PendingUserMessage[] {
+  if (delivered.length === 0) return pending;
+  let next = pending;
+  const unmatched: PendingUserMessage[] = [];
+  for (const entry of delivered) {
+    const itemId = entry.deliveredItemId;
+    if (itemId === undefined || next.some((p) => p.deliveredItemId === itemId)) continue;
+    const text = messageContentText(entry.content);
+    const at = next.findIndex(
+      (p) => p.deliveredItemId === undefined && messageContentText(p.content) === text,
+    );
+    if (at >= 0) {
+      next = [
+        ...next.slice(0, at),
+        { ...next[at]!, deliveredItemId: itemId, posted: true },
+        ...next.slice(at + 1),
+      ];
+    } else {
+      unmatched.push(entry);
+    }
+  }
+  return unmatched.length > 0 ? [...unmatched, ...next] : next;
+}
+
 function committedUserBlock(
   itemId: string,
   content: MessageContentBlock[],
@@ -6944,25 +7006,32 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // via the POST `denied` response — so the idle-clear is never
           // needed for them and only races the round-trip.
           if (!s.isNativeTerminalSession && s.pendingUserMessages.length > 0) {
-            // Settle persisted entries whose consumed event was lost.
-            const delivered = s.pendingUserMessages.filter(
-              (p) =>
-                p.deliveredItemId !== undefined && !hasCommittedItem(s.blocks, p.deliveredItemId),
-            );
-            patch.pendingUserMessages = [];
-            if (delivered.length > 0) {
-              patch.blocks = [
-                ...s.blocks,
-                ...delivered.map((p) =>
-                  committedUserBlock(
-                    p.deliveredItemId ?? "",
-                    p.content,
-                    p.tempId,
-                    p.author,
-                    p.createdAtS,
+            const delivered = s.pendingUserMessages.filter((p) => p.deliveredItemId !== undefined);
+            if (event.status !== "idle") {
+              // The runner publishes `failed` before draining a buffered
+              // continuation, and `waiting` can be re-announced mid-buffer, so
+              // delivered entries stay pending until their consumed event.
+              patch.pendingUserMessages = delivered;
+            } else {
+              // Settle persisted entries whose consumed event was lost.
+              const lost = delivered.filter(
+                (p) => !hasCommittedItem(s.blocks, p.deliveredItemId ?? ""),
+              );
+              patch.pendingUserMessages = [];
+              if (lost.length > 0) {
+                patch.blocks = [
+                  ...s.blocks,
+                  ...lost.map((p) =>
+                    committedUserBlock(
+                      p.deliveredItemId ?? "",
+                      p.content,
+                      p.tempId,
+                      p.author,
+                      p.createdAtS,
+                    ),
                   ),
-                ),
-              ];
+                ];
+              }
             }
           }
         }
@@ -7261,8 +7330,18 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Keep the persisted message pending until the runner drains it.
       if (event.isMeta === true) return;
       applyToConversation((s) => {
-        if (hasCommittedItem(s.blocks, event.itemId)) return {};
         if (s.pendingUserMessages.some((p) => p.deliveredItemId === event.itemId)) return {};
+        const committedAt = s.blocks.findIndex((b) => b.ctx.itemId === event.itemId);
+        if (committedAt >= 0) {
+          // A snapshot taken before the server tracked delivery committed
+          // this message; move it back to the pending lane.
+          const block = s.blocks[committedAt]!;
+          if (block.type !== "user_message") return {};
+          return {
+            blocks: [...s.blocks.slice(0, committedAt), ...s.blocks.slice(committedAt + 1)],
+            pendingUserMessages: [...s.pendingUserMessages, deliveredPendingFromBlock(block)],
+          };
+        }
         // FIFO is safe within one author; the guard separates concurrent viewers.
         const at = s.pendingUserMessages.findIndex(
           (p) =>

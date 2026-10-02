@@ -547,6 +547,71 @@ async def test_midturn_message_not_double_delivered_to_harness() -> None:
 
 
 @pytest.mark.asyncio
+async def test_live_injection_consumed_reports_drained_marker() -> None:
+    """A mid-turn injection the harness consumes reports the persisted item drained.
+
+    The server upgrades the message from delivered to consumed on that
+    marker; without it the bubble would stay pending until the turn ends.
+    """
+    import asyncio as _aio
+
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.conftest import _drain_session_event_queue
+
+    session_id = "3f1c2a9d6b7e4c0f8a5d1e2b3c4d5e6f"
+    gate = _aio.Event()
+    app, _pm, hc = _build_handshake_app(gate)
+
+    async with _runner_client(app) as client:
+        await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        resp1 = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "first"}],
+                "harness": "openai-agents",
+            },
+        )
+        assert resp1.status_code == 202
+        await _aio.sleep(0.05)
+
+        resp2 = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "second"}],
+                "harness": "openai-agents",
+                "persisted_item_id": "item_second",
+            },
+        )
+        assert resp2.status_code == 202, resp2.text
+        assert resp2.json()["status"] == "buffered"
+        assert resp2.json()["drain_marker"] is True
+
+        events = _drain_session_event_queue(_session_event_queues_ref.get(session_id))
+        assert all(e.get("type") != "session.input.drained" for e in events)
+
+        gate.set()
+        for _ in range(200):
+            events.extend(_drain_session_event_queue(_session_event_queues_ref.get(session_id)))
+            if any(e.get("type") == "session.input.drained" for e in events):
+                break
+            await _aio.sleep(0.01)
+
+    markers = [e for e in events if e.get("type") == "session.input.drained"]
+    assert markers == [{"type": "session.input.drained", "item_id": "item_second"}]
+    # The injection was consumed live, so no continuation turn re-sent it.
+    assert len(hc.posted_bodies) == 1
+
+
+@pytest.mark.asyncio
 async def test_native_buffered_messages_each_delivered_once_in_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

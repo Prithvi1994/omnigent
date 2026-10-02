@@ -11874,6 +11874,8 @@ async def test_continuation_drain_reports_buffered_message_drained() -> None:
             )
             assert resp2.status_code == 202
             assert resp2.json()["status"] == "buffered"
+            # The server defers consumption only for runners that announce this.
+            assert resp2.json()["drain_marker"] is True
 
             drained_events.extend(
                 _drain_session_event_queue(_session_event_queues_ref.get(conv_id))

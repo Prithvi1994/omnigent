@@ -43,11 +43,13 @@ def _capture_stream(
     return published
 
 
-def _fake_runner(status: str) -> httpx.AsyncClient:
+def _fake_runner(status: str, *, drain_marker: bool = True) -> httpx.AsyncClient:
+    """Ack like a current runner; ``drain_marker=False`` acks like one that predates it."""
+    ack: dict[str, Any] = {"status": status, "detail": "test"}
+    if status == "buffered" and drain_marker:
+        ack["drain_marker"] = True
     return httpx.AsyncClient(
-        transport=httpx.MockTransport(
-            lambda _request: httpx.Response(202, json={"status": status, "detail": "test"})
-        ),
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json=ack)),
         base_url="http://runner",
     )
 
@@ -63,12 +65,14 @@ def _bind_runner(monkeypatch: pytest.MonkeyPatch, fake_runner: httpx.AsyncClient
     )
 
 
-async def _post_message(client: httpx.AsyncClient, session_id: str, text: str) -> dict[str, Any]:
+async def _post_message(
+    client: httpx.AsyncClient, session_id: str, text: str, **data: Any
+) -> dict[str, Any]:
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={
             "type": "message",
-            "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+            "data": {"role": "user", "content": [{"type": "input_text", "text": text}], **data},
         },
     )
     assert resp.status_code == 202, resp.text
@@ -121,6 +125,56 @@ async def test_accepted_forward_keeps_consumed_at_post_time(
     assert "session.input.delivered" not in types
     consumed = next(ev for _sid, ev in published if ev["type"] == "session.input.consumed")
     assert consumed["data"]["item_id"] == ack["item_id"]
+
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.json()["unconsumed_input_ids"] == []
+
+
+async def test_buffered_ack_without_drain_marker_keeps_consumed_at_post_time(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner that never reports drains must not leave the message pending."""
+    published = _capture_stream(monkeypatch)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    fake_runner = _fake_runner("buffered", drain_marker=False)
+    _bind_runner(monkeypatch, fake_runner)
+    try:
+        ack = await _post_message(client, session["id"], "steer into an older runner")
+    finally:
+        await fake_runner.aclose()
+
+    types = [ev["type"] for _sid, ev in published]
+    assert "session.input.consumed" in types
+    assert "session.input.delivered" not in types
+    consumed = next(ev for _sid, ev in published if ev["type"] == "session.input.consumed")
+    assert consumed["data"]["item_id"] == ack["item_id"]
+
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.json()["unconsumed_input_ids"] == []
+
+
+async def test_buffered_meta_message_is_consumed_not_tracked(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hidden context is never shown pending, so it is consumed at once."""
+    published = _capture_stream(monkeypatch)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    fake_runner = _fake_runner("buffered")
+    _bind_runner(monkeypatch, fake_runner)
+    try:
+        ack = await _post_message(client, session["id"], "<skill>hidden</skill>", is_meta=True)
+    finally:
+        await fake_runner.aclose()
+
+    types = [ev["type"] for _sid, ev in published]
+    assert "session.input.delivered" not in types
+    consumed = next(ev for _sid, ev in published if ev["type"] == "session.input.consumed")
+    assert consumed["data"]["item_id"] == ack["item_id"]
+    assert consumed["data"]["data"]["is_meta"] is True
 
     snap = await client.get(f"/v1/sessions/{session['id']}")
     assert snap.json()["unconsumed_input_ids"] == []
@@ -231,25 +285,30 @@ async def test_terminal_status_clears_unconsumed_snapshot(
     assert snap.json()["unconsumed_input_ids"] == []
 
 
-async def test_waiting_status_clears_unconsumed_snapshot(
+@pytest.mark.parametrize("status", ["failed", "waiting"])
+async def test_non_idle_status_keeps_unconsumed_snapshot(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    status: str,
 ) -> None:
+    """The runner fails before draining a continuation; waiting can repeat mid-buffer."""
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     fake_runner = _fake_runner("buffered")
     _bind_runner(monkeypatch, fake_runner)
     try:
-        ack = await _post_message(client, session["id"], "steer then waiting edge")
+        ack = await _post_message(client, session["id"], f"steer then {status} edge")
     finally:
         await fake_runner.aclose()
+
+    from omnigent.server.routes._sessions.helpers import _publish_status
+
+    _publish_status(session["id"], status)
 
     snap = await client.get(f"/v1/sessions/{session['id']}")
     assert snap.json()["unconsumed_input_ids"] == [ack["item_id"]]
 
-    from omnigent.server.routes._sessions.helpers import _publish_status
-
-    _publish_status(session["id"], "waiting")
+    _publish_status(session["id"], "idle")
 
     snap = await client.get(f"/v1/sessions/{session['id']}")
     assert snap.json()["unconsumed_input_ids"] == []
@@ -266,7 +325,9 @@ async def test_drain_marker_racing_ahead_of_record_publishes_consumed(
     def _drain_before_ack(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode())
         unconsumed_inputs.resolve(session["id"], body["persisted_item_id"])
-        return httpx.Response(202, json={"status": "buffered", "detail": "test"})
+        return httpx.Response(
+            202, json={"status": "buffered", "drain_marker": True, "detail": "test"}
+        )
 
     fake_runner = httpx.AsyncClient(
         transport=httpx.MockTransport(_drain_before_ack),
@@ -288,15 +349,23 @@ async def test_drain_marker_racing_ahead_of_record_publishes_consumed(
     assert snap.json()["unconsumed_input_ids"] == []
 
 
-async def test_non_object_forward_ack_reads_as_fresh_turn(
+@pytest.mark.parametrize(
+    "ack",
+    [
+        pytest.param(httpx.Response(202, json="ok"), id="non-object-json"),
+        pytest.param(httpx.Response(202, content=b"accepted"), id="not-json"),
+    ],
+)
+async def test_unparseable_forward_ack_reads_as_fresh_turn(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    ack: httpx.Response,
 ) -> None:
     published = _capture_stream(monkeypatch)
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     fake_runner = httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json="ok")),
+        transport=httpx.MockTransport(lambda _request: ack),
         base_url="http://runner",
     )
     _bind_runner(monkeypatch, fake_runner)

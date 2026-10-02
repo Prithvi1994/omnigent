@@ -6400,6 +6400,8 @@ async def _forward_event_to_runner(
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         # A buffered acknowledgment means delivery; accepted means consumption.
+        # Only a runner that reports drain markers may defer consumption:
+        # older runners also answer "buffered" but never send the marker.
         _steer_buffered = False
         if body.type == "message":
             try:
@@ -6408,15 +6410,26 @@ async def _forward_event_to_runner(
                 # Older runners may return a non-JSON accepted response.
                 _forward_ack = None
             _steer_buffered = (
-                isinstance(_forward_ack, dict) and _forward_ack.get("status") == "buffered"
+                isinstance(_forward_ack, dict)
+                and _forward_ack.get("status") == "buffered"
+                and _forward_ack.get("drain_marker") is True
             )
+        _steer_item = persisted_items[0]
+        # Hidden context stays hidden, so it is never shown as pending.
+        _steer_is_meta = (
+            _steer_item.type == "message"
+            and isinstance(_steer_item.data, MessageData)
+            and _steer_item.data.is_meta
+        )
         # A racing drain marker makes record() return false.
-        if _steer_buffered and unconsumed_inputs.record(
-            session_id, persisted_items[0].id, persisted_items[0]
+        if (
+            _steer_buffered
+            and not _steer_is_meta
+            and unconsumed_inputs.record(session_id, _steer_item.id, _steer_item)
         ):
-            _publish_input_delivered(session_id, persisted_items[0])
+            _publish_input_delivered(session_id, _steer_item)
         else:
-            _publish_input_consumed(session_id, persisted_items[0])
+            _publish_input_consumed(session_id, _steer_item)
         _logger.info(
             "turn dispatched to runner for session=%s",
             session_id,
