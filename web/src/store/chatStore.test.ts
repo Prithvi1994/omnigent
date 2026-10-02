@@ -7499,7 +7499,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
           content: [
             {
               type: "input_text",
-              text: "[System: teammate buddy: All good over here]\nAll good here - TMCHAT.",
+              text: "[System: teammate buddy: All good over here]\nAll good here - TMCHAT.\n\n@buddy finished: resting.",
             },
           ],
           teammate: { teammateId: "buddy", kind: "teammate_message" },

@@ -3592,20 +3592,39 @@ def test_augment_claude_args_layers_user_settings_in_order(tmp_path: Path) -> No
 @pytest.mark.parametrize(
     "layer,expected_warning",
     [
-        (("--settings", "not json"), "dropping --settings file 'not json'"),
+        (("--settings", "missing.json"), "dropping --settings file 'missing.json'"),
+        (("--settings", "{not json"), "dropping --settings inline JSON"),
+        (("--settings", "text.json"), "dropping --settings file 'text.json'"),
         (("--settings", "latin1.json"), "dropping --settings file 'latin1.json'"),
+        (("--settings", "huge.json"), "dropping --settings file 'huge.json'"),
+        (("--settings", "pipe.json"), "dropping --settings file 'pipe.json'"),
         (("--settings",), "dropping trailing --settings with no value"),
     ],
-    ids=["unparseable", "invalid-utf8", "dangling"],
+    ids=[
+        "missing",
+        "inline-malformed",
+        "file-malformed",
+        "invalid-utf8",
+        "oversized",
+        "fifo",
+        "dangling",
+    ],
 )
+@pytest.mark.timeout(20)
 def test_augment_claude_args_drops_an_unreadable_settings_layer(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     layer: tuple[str, ...],
     expected_warning: str,
 ) -> None:
-    """Claude would ignore the broken flag behind Omnigent's own; drop it and say so."""
+    """Claude would ignore the broken flag behind Omnigent's own; drop it and say so.
+
+    A FIFO or an oversized file must be rejected without blocking the runner.
+    """
+    (tmp_path / "text.json").write_text("not json", encoding="utf-8")
     (tmp_path / "latin1.json").write_bytes(b'{"model": "caf\xe9"}')
+    (tmp_path / "huge.json").write_text(json.dumps({"pad": "x" * (1 << 20)}), encoding="utf-8")
+    os.mkfifo(tmp_path / "pipe.json")
     args = augment_claude_args(
         ("--resume", "abc", *layer),
         bridge_dir=tmp_path,
@@ -3617,6 +3636,20 @@ def test_augment_claude_args_drops_an_unreadable_settings_layer(
     assert args.count("--settings") == 1
     assert args.index("--mcp-config") < args.index("--settings")
     assert expected_warning in caplog.text
+
+
+def test_augment_claude_args_keeps_omnigent_hooks_enabled(tmp_path: Path) -> None:
+    """``disableAllHooks`` in a user layer would silence the hooks the session relies on."""
+    args = augment_claude_args(
+        ("--settings", json.dumps({"disableAllHooks": True, "teammateMode": "in-process"})),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = _load_invocation_settings(args)
+    assert "disableAllHooks" not in settings
+    assert settings["teammateMode"] == "in-process"
+    assert "SessionStart" in settings["hooks"]
 
 
 def test_augment_claude_args_observes_worktree_moves(tmp_path: Path) -> None:

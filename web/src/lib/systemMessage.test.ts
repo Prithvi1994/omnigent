@@ -420,5 +420,9 @@ describe("teammate deliveries", () => {
     ).toEqual({ teammateId: "buddy", kind: "teammate_finished" });
     expect(teammateMarkerOf(text("[System: background task t1 completed]"))).toBeNull();
     expect(isSystemUserContent(text("[System: teammate buddy]\nhi"))).toBe(true);
+    expect(parseSystemMessage("[System: teammate buddy: finished]\nAll done.")).toMatchObject({
+      kind: "teammate_message",
+      teammate: { id: "buddy", summary: "finished" },
+    });
   });
 });

@@ -68,7 +68,8 @@ export interface TeammateMarker {
 const TEAMMATE_ENVELOPE_RE =
   /^<teammate-message\s+((?:[^>"]|"[^"]*")*)>([\s\S]*?)<\/teammate-message>/;
 const TEAMMATE_ATTR_RE = /([A-Za-z_][\w-]*)="([^"]*)"/g;
-const TEAMMATE_HEADER_RE = /^teammate (\S+)(?: (finished)|: (.*))?$/;
+// The summary branch comes first so a summary that is literally "finished" stays a summary.
+const TEAMMATE_HEADER_RE = /^teammate ([^\s:]+)(?:: (.*)| (finished))?$/;
 
 function idleNotificationResult(body: string): string | null {
   if (!body.startsWith("{")) return null;
@@ -129,7 +130,7 @@ function teammateMarkerHeader(
 }
 
 function teammateMarkerId(teammateId: string): string {
-  return teammateId.replace(/\s+/g, "-");
+  return teammateId.replace(/[\s:]+/g, "-");
 }
 
 /** A framed delivery re-labelled as a marker, with the identity the marker carries. */
@@ -338,7 +339,7 @@ export function parseSystemMessage(text: string): ParsedSystemMessage | null {
   }
   const teammateMatch = TEAMMATE_HEADER_RE.exec(inner);
   if (teammateMatch) {
-    const [, id, finished, summary] = teammateMatch;
+    const [, id, summary, finished] = teammateMatch;
     const teammate = { id: id!, summary: finished ? null : (summary ?? null) };
     return finished
       ? { kind: "teammate_finished", label: `Teammate ${id} finished`, body, teammate }

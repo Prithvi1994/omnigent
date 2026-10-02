@@ -274,6 +274,47 @@ describe("itemsToBlocks — flat shape", () => {
       expect((blocks[0] as UserMessageBlock).content).toEqual([
         { type: "input_text", text: "[System: teammate buddy finished]\nTMREPLY done." },
       ]);
+      // The twin's result is kept on the prose card instead of becoming its own item.
+      expect((blocks[2] as UserMessageBlock).content).toEqual([
+        {
+          type: "input_text",
+          text: "[System: teammate buddy: All good over here]\nAll good here - TMCHAT.\n\n@buddy finished: resting.",
+        },
+      ]);
+    });
+
+    it("folds a twin that only restates the prose without repeating it", () => {
+      const blocks = itemsToBlocks([
+        delivery("resp_1", prose, "msg_prose"),
+        assistantMessage("resp_1", "CHAT-ACK", "msg_ack"),
+        delivery("resp_2", idle("All good here - TMCHAT."), "msg_idle_twin"),
+      ]);
+
+      expect(blocks.map((block) => block.ctx.itemId)).toEqual(["msg_prose", "msg_ack"]);
+      expect((blocks[0] as UserMessageBlock).content).toEqual([
+        {
+          type: "input_text",
+          text: "[System: teammate buddy: All good over here]\nAll good here - TMCHAT.",
+        },
+      ]);
+    });
+
+    it("keeps a final result that differs from a mid-turn status on the card", () => {
+      const status =
+        '<teammate-message teammate_id="buddy" color="blue" summary="Starting">\nStarting on the docs.\n</teammate-message>';
+      const blocks = itemsToBlocks([
+        delivery("resp_1", status, "msg_status"),
+        assistantMessage("resp_1", "Noted.", "msg_ack"),
+        delivery("resp_2", idle("Docs updated in 3 files."), "msg_idle_result"),
+      ]);
+
+      expect(blocks.map((block) => block.ctx.itemId)).toEqual(["msg_status", "msg_ack"]);
+      expect((blocks[0] as UserMessageBlock).content).toEqual([
+        {
+          type: "input_text",
+          text: "[System: teammate buddy: Starting]\nStarting on the docs.\n\n@buddy finished: Docs updated in 3 files.",
+        },
+      ]);
     });
 
     it("keeps an idle result that answers work assigned after the folded twin", () => {

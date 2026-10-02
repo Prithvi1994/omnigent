@@ -310,6 +310,10 @@ def test_in_process_teammate_appears_in_agents_rail(
     expect(rail.get_by_test_id("subagent-teammate-badge").first).to_be_visible(
         timeout=_BUG_ASSERT_TIMEOUT_MS
     )
+    rail.get_by_test_id("view-mode-graph").click()
+    expect(
+        rail.get_by_test_id("subagent-node-badge").filter(has_text="Teammate").first
+    ).to_be_visible(timeout=_BUG_ASSERT_TIMEOUT_MS)
     assert running["list_mentions_teammate"] and running["graph_mentions_teammate"]
 
 

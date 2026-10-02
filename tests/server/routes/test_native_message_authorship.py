@@ -117,7 +117,11 @@ async def test_framed_teammate_delivery_is_internal_without_origin(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Claude's own delivery framing is provenance when the record carries no ``origin``."""
+    """Claude's own delivery framing is provenance when the record carries no ``origin``.
+
+    Kept apart from the grid above: a delivery echoed as a ``queued_command`` is
+    dropped by the bridge, since Claude re-records it as the user record read here.
+    """
     transcript = tmp_path / "session.jsonl"
     entry = {"type": "user", "message": {"role": "user", "content": _FRAMED_DELIVERY}}
     transcript.write_text(json.dumps({"uuid": "native-record", **entry}) + "\n", encoding="utf-8")

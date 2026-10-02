@@ -2719,6 +2719,11 @@ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
     return args
 
 
+# Largest ``--settings`` file folded into the invocation settings. The read runs
+# on the runner before Claude launches, so it must stay small and bounded.
+_SETTINGS_LAYER_MAX_BYTES = 1 << 20
+
+
 def _load_settings_layer(value: str, launch_cwd: Path | None) -> _JsonObject | None:
     """Parse a ``--settings`` value: a JSON object literal or the path of one.
 
@@ -2731,8 +2736,18 @@ def _load_settings_layer(value: str, launch_cwd: Path | None) -> _JsonObject | N
         if launch_cwd is not None and not path.is_absolute():
             path = launch_cwd / path
         try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+            # A FIFO or device would block the runner; only read a regular file.
+            if not path.is_file():
+                return None
+            with path.open("rb") as handle:
+                data = handle.read(_SETTINGS_LAYER_MAX_BYTES + 1)
+        except OSError:
+            return None
+        if len(data) > _SETTINGS_LAYER_MAX_BYTES:
+            return None
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
             return None
     try:
         payload = json.loads(text)
@@ -2807,6 +2822,9 @@ def _merge_launch_settings(
     merged: _JsonObject = {}
     for layer in layers:
         merged = _overlay_settings(merged, layer)
+    # Omnigent's status, approval and activity hooks ride this file; a user layer
+    # cannot switch them off wholesale.
+    merged.pop("disableAllHooks", None)
     return remaining, _overlay_settings(merged, hook_settings)
 
 

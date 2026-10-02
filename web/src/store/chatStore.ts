@@ -56,7 +56,7 @@ import type {
 import { userInputElicitationKey } from "@/lib/askUserQuestion";
 import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
-import { foldsTeammateIdleMarker, itemsToBlocks } from "@/lib/itemsToBlocks";
+import { foldTeammateIdleMarker, itemsToBlocks } from "@/lib/itemsToBlocks";
 import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
 import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
@@ -7158,8 +7158,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           ...committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
           ...(teammate ? { teammate } : {}),
         };
-        if (foldsTeammateIdleMarker(fresh, s.blocks)) return {};
-        return { blocks: [...s.blocks, fresh] };
+        return { blocks: foldTeammateIdleMarker(fresh, s.blocks) ?? [...s.blocks, fresh] };
       });
       return;
     case "slash_command":

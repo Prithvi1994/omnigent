@@ -6218,13 +6218,9 @@ async def test_subagent_watcher_registers_a_task_named_spawn(
 
 
 async def _register_subagents_once(
-    tmp_path: Path, transcript_path: Path, *, reject_start: bool = False
+    tmp_path: Path, transcript_path: Path
 ) -> tuple[dict[str, dict[str, Any]], forwarder.SubagentForwardState]:
-    """Run one watcher tick against a mock server; return the start payloads by id.
-
-    ``reject_start`` makes the server refuse every registration with a permanent
-    400 and gives the tracker a one-attempt budget, so the tick parks the sub-agent.
-    """
+    """Run one watcher tick against a mock server; return the start payloads by id."""
     start_bodies: dict[str, dict[str, Any]] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -6233,8 +6229,6 @@ async def _register_subagents_once(
             return httpx.Response(202, json={})
         subagent_id = body["data"]["subagent_id"]
         start_bodies[subagent_id] = body["data"]
-        if reject_start:
-            return httpx.Response(400, json={"error": {"code": "invalid_input"}})
         return httpx.Response(
             202, json={"queued": False, "child_session_id": f"conv_{subagent_id}"}
         )
@@ -6249,9 +6243,7 @@ async def _register_subagents_once(
             transcript_path=transcript_path,
             state=forwarder.SubagentForwardState(subagents={}),
             agent_name="claude-native-ui",
-            start_retry_tracker=forwarder._PostRetryTracker(
-                base_delay_s=0.0, max_permanent_attempts=1 if reject_start else 3
-            ),
+            start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
             item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
             status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
         )
@@ -6295,39 +6287,6 @@ async def test_subagent_watcher_registers_an_in_process_teammate(tmp_path: Path)
     entry = state.subagents["abuddy-9837bbf1d431dcca"]
     assert entry.child_conversation_id == "conv_abuddy-9837bbf1d431dcca"
     assert entry.parent_subagent_id is None
-
-
-async def test_subagent_watcher_dead_letters_the_payload_it_posted_for_a_teammate(
-    tmp_path: Path,
-) -> None:
-    """A parked teammate registration is replayable: its dead letter matches the POST."""
-    transcript_path = tmp_path / "session.jsonl"
-    transcript_path.write_text("", encoding="utf-8")
-    _seed_subagent_on_disk(
-        transcript_path=transcript_path,
-        subagent_id="abuddy-9837bbf1d431dcca",
-        agent_type="buddy",
-        description="Probe teammate",
-        tool_use_id=None,
-        meta_extras={"name": "buddy", "taskKind": "in_process_teammate"},
-    )
-
-    start_bodies, state = await _register_subagents_once(
-        tmp_path, transcript_path, reject_start=True
-    )
-
-    [record] = [
-        json.loads(line)
-        for line in (tmp_path / "bridge" / "dead_letter.jsonl").read_text("utf-8").splitlines()
-    ]
-    assert record["event_type"] == "external_subagent_start"
-    assert record["reason"] == "permanent HTTP failure after retries"
-    assert record["payload"] == {
-        **start_bodies["abuddy-9837bbf1d431dcca"],
-        "parent_subagent_id": None,
-    }
-    assert record["payload"]["tool_use_id"] == "teammate:abuddy-9837bbf1d431dcca"
-    assert state.subagents["abuddy-9837bbf1d431dcca"].child_conversation_id == ""
 
 
 async def test_subagent_watcher_forwards_the_name_of_a_named_background_agent(
@@ -11397,10 +11356,24 @@ async def test_subagent_item_drop_writes_dead_letter(
     assert "lost" not in json.dumps(row["attributes"])
 
 
+@pytest.mark.parametrize(
+    "tool_use_id,meta_extras,expected_tool_use_id",
+    [
+        ("toolu_dlstart", None, "toolu_dlstart"),
+        (None, {"name": "buddy", "taskKind": "in_process_teammate"}, "teammate:dlstart1"),
+    ],
+    ids=["task", "teammate"],
+)
 @pytest.mark.asyncio
-async def test_subagent_start_drop_writes_dead_letter(tmp_path: Path) -> None:
+async def test_subagent_start_drop_writes_dead_letter(
+    tmp_path: Path,
+    tool_use_id: str | None,
+    meta_extras: dict[str, Any] | None,
+    expected_tool_use_id: str,
+) -> None:
     """
-    A permanently-rejected sub-agent START is dead-lettered (#1120).
+    A permanently-rejected sub-agent START is dead-lettered (#1120) with the
+    payload that was posted, so a teammate's placeholder and kind survive replay.
 
     :param tmp_path: Pytest temp dir for the bridge dir and transcript.
     """
@@ -11414,8 +11387,10 @@ async def test_subagent_start_drop_writes_dead_letter(tmp_path: Path) -> None:
         subagent_id="dlstart1",
         agent_type="Explore",
         description="dead-letter start flow",
-        tool_use_id="toolu_dlstart",
+        tool_use_id=tool_use_id,
+        meta_extras=meta_extras,
     )
+    posted: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         """Permanently reject the sub-agent start POST.
@@ -11423,6 +11398,7 @@ async def test_subagent_start_drop_writes_dead_letter(tmp_path: Path) -> None:
         :param request: Request issued by the forwarder.
         :returns: Canned Omnigent response.
         """
+        posted.append(json.loads(request.content)["data"])
         return httpx.Response(400, json={"error": "nope"})
 
     async with httpx.AsyncClient(
@@ -11452,6 +11428,8 @@ async def test_subagent_start_drop_writes_dead_letter(tmp_path: Path) -> None:
     assert record["event_type"] == "external_subagent_start"
     assert record["payload"]["subagent_id"] == "dlstart1"
     assert record["payload"]["agent_type"] == "Explore"
+    assert record["payload"]["tool_use_id"] == expected_tool_use_id
+    assert record["payload"] == {**posted[-1], "parent_subagent_id": None}
 
 
 @pytest.mark.asyncio
