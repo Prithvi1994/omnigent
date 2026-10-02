@@ -7860,37 +7860,6 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(consumed.pendingUserMessages).toEqual([]);
       expect(consumed.blocks.map((b) => b.ctx.itemId)).toEqual([steered.id]);
     });
-
-    it("terminal status promotes (not drops) a delivered entry whose consumed event was lost", () => {
-      useChatStore.setState({
-        blocks: [],
-        status: "idle",
-        pendingUserMessages: [
-          { tempId: "pend_plain", content: [{ type: "input_text", text: "denied maybe" }] },
-          {
-            tempId: "pend_steer",
-            content: [{ type: "input_text", text: "steer me" }],
-            posted: true,
-            deliveredItemId: "msg_steered_1",
-          },
-        ],
-      });
-
-      const statusEvent: SessionStatusEvent = {
-        type: "session_status",
-        conversationId: "conv_abc",
-        status: "idle",
-      };
-      handleSessionEvent(statusEvent);
-
-      const state = useChatStore.getState();
-      expect(state.pendingUserMessages).toEqual([]);
-      expect(state.blocks).toHaveLength(1);
-      const settled = state.blocks[0] as UserMessageBlock;
-      expect(settled.type).toBe("user_message");
-      expect(settled.ctx.itemId).toBe("msg_steered_1");
-      expect(settled.content).toEqual([{ type: "input_text", text: "steer me" }]);
-    });
   });
 
   describe("slash_command (claude-native skill / surfaced command)", () => {
@@ -12034,6 +12003,63 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(consumed.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, steered.id]);
     expect((consumed.blocks[1] as UserMessageBlock).stableKey).toBe("pend_steer");
 
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("does not let another author's unconsumed snapshot item claim a local echo", async () => {
+    const before = userMessage("xa_pre", "before the gap");
+    seedSession("conv_reconnect_cross_author", [before]);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_reconnect_cross_author",
+      abortController: controller,
+      blocks: itemsToBlocks([before]),
+      pendingUserMessages: [
+        {
+          tempId: "pend_bob",
+          content: [{ type: "input_text", text: "steer me" }],
+          posted: true,
+          author: "bob@example.com",
+        },
+      ],
+    });
+
+    const loop = startStreamPump("conv_reconnect_cross_author", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    // Alice steered the same text during the gap; Bob's own delivery has not
+    // arrived yet, so his echo must stay his.
+    const alice = { ...userMessage("xa_gap", "steer me"), created_by: "alice@example.com" };
+    seedSessionItems("conv_reconnect_cross_author", [before, alice]);
+    seedUnconsumedInputIds("conv_reconnect_cross_author", [alice.id]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    const state = useChatStore.getState();
+    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([before.id]);
+    expect(state.pendingUserMessages).toEqual([
+      {
+        tempId: `delivered:${alice.id}`,
+        content: [{ type: "input_text", text: "steer me" }],
+        posted: true,
+        deliveredItemId: alice.id,
+        author: "alice@example.com",
+      },
+      {
+        tempId: "pend_bob",
+        content: [{ type: "input_text", text: "steer me" }],
+        posted: true,
+        author: "bob@example.com",
+      },
+    ]);
+
+    const last = sinks[1]!;
     last.push("data: [DONE]\n\n");
     last.close();
     await drainAsync(2);

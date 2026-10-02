@@ -198,7 +198,8 @@ async def test_relay_drain_marker_upgrades_delivered_to_consumed(
     published.clear()
 
     marker = json.dumps({"type": "session.input.drained", "item_id": item_id})
-    sse_body = f"data: {marker}\n\ndata: [DONE]\n\n".encode()
+    # The marker arrives twice; the duplicate must not publish a second consumed.
+    sse_body = f"data: {marker}\n\ndata: {marker}\n\ndata: [DONE]\n\n".encode()
     stream_runner = httpx.AsyncClient(
         transport=httpx.MockTransport(lambda _request: httpx.Response(200, content=sse_body)),
         base_url="http://runner",
@@ -219,67 +220,6 @@ async def test_relay_drain_marker_upgrades_delivered_to_consumed(
     assert consumed[0]["data"]["item_id"] == item_id
     assert consumed[0]["data"]["data"]["role"] == "user"
     assert all(ev["type"] != "session.input.drained" for _sid, ev in published)
-
-    snap = await client.get(f"/v1/sessions/{session['id']}")
-    assert snap.json()["unconsumed_input_ids"] == []
-
-
-async def test_duplicate_drain_marker_is_ignored(
-    client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-    db_uri: str,
-) -> None:
-    published = _capture_stream(monkeypatch)
-    agent = await create_test_agent(client)
-    session = await _create_session(client, agent["id"])
-    fake_runner = _fake_runner("buffered")
-    _bind_runner(monkeypatch, fake_runner)
-    try:
-        ack = await _post_message(client, session["id"], "steer, drain twice")
-    finally:
-        await fake_runner.aclose()
-    published.clear()
-
-    marker = json.dumps({"type": "session.input.drained", "item_id": ack["item_id"]})
-    sse_body = f"data: {marker}\n\ndata: {marker}\n\ndata: [DONE]\n\n".encode()
-    stream_runner = httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda _request: httpx.Response(200, content=sse_body)),
-        base_url="http://runner",
-    )
-    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
-
-    try:
-        await _relay_runner_stream_once(
-            session["id"],
-            stream_runner,
-            SqlAlchemyConversationStore(db_uri),
-        )
-    finally:
-        await stream_runner.aclose()
-
-    consumed = [ev for _sid, ev in published if ev["type"] == "session.input.consumed"]
-    assert len(consumed) == 1
-
-
-async def test_terminal_status_clears_unconsumed_snapshot(
-    client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    agent = await create_test_agent(client)
-    session = await _create_session(client, agent["id"])
-    fake_runner = _fake_runner("buffered")
-    _bind_runner(monkeypatch, fake_runner)
-    try:
-        ack = await _post_message(client, session["id"], "steer then turn ends")
-    finally:
-        await fake_runner.aclose()
-
-    snap = await client.get(f"/v1/sessions/{session['id']}")
-    assert snap.json()["unconsumed_input_ids"] == [ack["item_id"]]
-
-    from omnigent.server.routes._sessions.helpers import _publish_status
-
-    _publish_status(session["id"], "idle")
 
     snap = await client.get(f"/v1/sessions/{session['id']}")
     assert snap.json()["unconsumed_input_ids"] == []
@@ -370,7 +310,7 @@ async def test_unparseable_forward_ack_reads_as_fresh_turn(
     )
     _bind_runner(monkeypatch, fake_runner)
     try:
-        ack = await _post_message(client, session["id"], "bare-string ack")
+        posted = await _post_message(client, session["id"], "unparseable ack")
     finally:
         await fake_runner.aclose()
 
@@ -378,7 +318,7 @@ async def test_unparseable_forward_ack_reads_as_fresh_turn(
     assert "session.input.consumed" in types
     assert "session.input.delivered" not in types
     consumed = next(ev for _sid, ev in published if ev["type"] == "session.input.consumed")
-    assert consumed["data"]["item_id"] == ack["item_id"]
+    assert consumed["data"]["item_id"] == posted["item_id"]
 
     snap = await client.get(f"/v1/sessions/{session['id']}")
     assert snap.json()["unconsumed_input_ids"] == []

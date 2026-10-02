@@ -6343,11 +6343,16 @@ function partitionUnconsumed(
   return { committed, delivered };
 }
 
+/** A delivered message may only claim a local echo from the same (or an unknown) author. */
+function authorsCompatible(author: string | undefined, other: string | undefined): boolean {
+  return author === undefined || other === undefined || author === other;
+}
+
 /**
  * Merge persisted-but-unconsumed entries recovered from a snapshot into the
  * pending lane: ids already tracked are kept, a local optimistic echo with
- * the same text is stamped, and anything else is prepended (a persisted
- * entry is older than anything merely queued or in flight).
+ * the same author and content is stamped, and anything else is prepended (a
+ * persisted entry is older than anything merely queued or in flight).
  */
 function absorbDelivered(
   pending: PendingUserMessage[],
@@ -6359,9 +6364,12 @@ function absorbDelivered(
   for (const entry of delivered) {
     const itemId = entry.deliveredItemId;
     if (itemId === undefined || next.some((p) => p.deliveredItemId === itemId)) continue;
-    const text = messageContentText(entry.content);
+    const key = contentKeyOf(entry.content);
     const at = next.findIndex(
-      (p) => p.deliveredItemId === undefined && messageContentText(p.content) === text,
+      (p) =>
+        p.deliveredItemId === undefined &&
+        authorsCompatible(entry.author, p.author) &&
+        contentKeyOf(p.content) === key,
     );
     if (at >= 0) {
       next = [
@@ -7344,11 +7352,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         }
         // FIFO is safe within one author; the guard separates concurrent viewers.
         const at = s.pendingUserMessages.findIndex(
-          (p) =>
-            p.deliveredItemId === undefined &&
-            (event.createdBy === undefined ||
-              p.author === undefined ||
-              p.author === event.createdBy),
+          (p) => p.deliveredItemId === undefined && authorsCompatible(event.createdBy, p.author),
         );
         if (at >= 0) {
           const entry = s.pendingUserMessages[at]!;

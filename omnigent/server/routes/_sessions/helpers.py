@@ -1717,9 +1717,11 @@ def _publish_input_delivered(
     session_id: str,
     item: ConversationItem,
 ) -> None:
-    """Publish a persisted steered item that has not been consumed."""
-    if item.type == "message" and isinstance(item.data, MessageData) and item.data.is_meta:
-        return
+    """Publish a persisted steered item that has not been consumed.
+
+    The caller decides what is tracked; hidden `is_meta` context is consumed
+    at once instead of being announced here.
+    """
     event = SessionInputDeliveredEvent(
         type="session.input.delivered",
         data=SessionInputConsumedPayload(

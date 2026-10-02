@@ -172,6 +172,19 @@ def test_steered_followup_looks_pending_until_the_agent_consumes_it(
             f"first message: {pending_look}"
         )
 
+        # A cold load restores the pending look from the session snapshot.
+        page.reload()
+        expect(page.get_by_label(_COMPOSER_LABEL)).to_be_visible(timeout=30_000)
+        expect(steered).to_be_visible(timeout=15_000)
+        page.wait_for_timeout(1_000)
+        assert _gate_pending(mock_url), "the turn ended before the reload comparison"
+        consumed_look = _presentation(first, _FIRST_MSG)
+        reloaded_look = _presentation(steered, _STEERED_MSG)
+        page.screenshot(path=str(shots / "steered-after-reload.png"))
+        assert any(reloaded_look[k] != consumed_look[k] for k in _VISIBLE_KEYS), (
+            f"steered follow-up lost its pending look after a reload: {reloaded_look}"
+        )
+
         httpx.post(f"{mock_url}/gate/release", timeout=5.0).raise_for_status()
         # The gated turn wraps up and the follow-up is consumed on the way to idle.
         _wait_for(
