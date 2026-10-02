@@ -15,6 +15,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -421,7 +422,8 @@ class WebViewStandIn:
         video = self.page.video if clip_path is not None else None
         self.context.close()
         if video is not None:
-            Path(video.path()).rename(clip_path)
+            # shutil.move, not Path.rename: the record dir may be a different mount.
+            shutil.move(video.path(), str(clip_path))
 
 
 def _record_dir() -> Path | None:
@@ -447,6 +449,7 @@ def _sign_in_like_the_shell(
     ticket, login_url = _request_ticket(origin)
     _complete_login_in_system_browser(browser, login_url)
     poll = _poll_for_token(origin, ticket)
+    assert {"token", "user_id", "expires_in"} <= poll.keys(), poll
     expires_in = poll["expires_in"]
     assert isinstance(expires_in, int) and expires_in > 0, poll
     webview.context.add_cookies(
