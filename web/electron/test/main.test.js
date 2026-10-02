@@ -2395,4 +2395,68 @@ describe("self-hosted OIDC system-browser sign-in wiring (src/main.js)", () => {
     assert.deepEqual(dialogs, [server]);
     assert.deepEqual(h.calls.loadURL, [[`${server}/c/current`]]);
   });
+
+  it("refuses a plain-HTTP remote OIDC server through the dialog instead of loading it", async (t) => {
+    const remote = "http://nas.example:8000";
+    const dialogs = [];
+    const h = loadNavigationHarness({
+      serverUrl: remote,
+      oidcAuth: oidcStub("oidc"),
+      oidcLoginDialog: dialogStub(false, dialogs),
+    });
+    t.after(h.cleanup);
+
+    await assert.rejects(h.api.loadServerUrl(h.win, remote), { name: "AbortError" });
+
+    assert.deepEqual(dialogs, [remote]);
+    assert.deepEqual(h.calls.loadURL, []);
+  });
+
+  it("hands a plain-HTTP remote server's /auth/login to the dialog instead of reloading", async (t) => {
+    const remote = "http://nas.example:8000";
+    const dialogs = [];
+    let signedIn = true;
+    const h = loadNavigationHarness({
+      serverUrl: remote,
+      oidcAuth: oidcStub("oidc"),
+      oidcLoginDialog: {
+        runOidcLoginDialog: async (opts) => {
+          dialogs.push(opts.serverUrl);
+          return signedIn;
+        },
+      },
+    });
+    t.after(h.cleanup);
+    h.api.createWindow(remote);
+    await tick();
+    h.calls.loadURL.length = 0;
+    h.calls.loadFile.length = 0;
+    dialogs.length = 0;
+    signedIn = false;
+    h.setUrl(`${remote}/c/current`);
+
+    const event = {
+      prevented: false,
+      preventDefault() {
+        this.prevented = true;
+      },
+    };
+
+    for (const listener of h.listenersFor("will-navigate")) {
+      listener(event, `${remote}/auth/login?return_to=%2Fc%2Fcurrent`);
+    }
+    // loadSetupPage defers the setup load by a timer; wait past it.
+    await tick();
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    await tick();
+
+    assert.equal(event.prevented, true);
+    assert.deepEqual(dialogs, [remote]);
+    assert.deepEqual(h.calls.loadURL, []);
+    const setup = new URLSearchParams(h.calls.loadFile.at(-1)[1].search);
+    assert.equal(setup.get("error"), "Sign-in did not complete.");
+    assert.equal(setup.get("url"), remote);
+  });
 });

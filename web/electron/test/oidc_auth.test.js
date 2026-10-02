@@ -60,6 +60,17 @@ describe("OIDC provider detection", () => {
     assert.equal(calls[0].init.redirect, "manual");
     assert.equal(calls[0].init.credentials, "include");
   });
+
+  it("probes plain-HTTP remote servers so the dialog can refuse them", async () => {
+    const electronSession = {
+      fetch: async () => response(401, { login_url: "/auth/login" }),
+    };
+
+    const result = await probeServerAuth(electronSession, "http://server.example");
+
+    assert.deepEqual(result, { kind: "oidc", status: 401 });
+    assert.throws(() => serverRoute("not a url", "/v1/me"), /Invalid server URL/);
+  });
 });
 
 describe("OIDC browser ticket flow", () => {

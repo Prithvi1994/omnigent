@@ -764,11 +764,14 @@ const oidcLoginFlows = new WeakMap();
  * Make sure a self-hosted OIDC server has a session before its page loads, so
  * the IdP opens in the system browser instead of inside the window. Servers
  * that aren't OIDC (no auth, accounts mode) or can't be probed load as before.
+ * A plain-HTTP remote OIDC server still gets the dialog, which refuses it with
+ * the HTTPS requirement: loading it instead would bounce the SPA to /auth/login,
+ * which the expiry handoff intercepts, and reload the window forever.
  *
  * @returns {Promise<boolean>} false when the user cancelled or sign-in failed.
  */
 async function ensureWindowOidcSession(win, serverUrl) {
-  if (oidcServerUrlError(serverUrl)) return true;
+  if (oidcServerUrlError(serverUrl) === "invalid_server_url") return true;
   let probe;
   try {
     probe = await probeServerAuth(session.defaultSession, serverUrl);

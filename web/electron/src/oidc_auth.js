@@ -16,9 +16,13 @@ const cookieMutationQueues = new WeakMap();
 // extend — a login window mid-flow.
 const monotonicNowMs = () => performance.now();
 
-// Keep API routes under workspace mounts, matching the CLI.
+// Keep API routes under workspace mounts, matching the CLI. Plain-HTTP remote
+// servers stay routable so the probe can detect OIDC; the login flow and the
+// cookie install refuse them separately with the HTTPS requirement.
 function serverRoute(serverUrl, routePath) {
-  if (oidcServerUrlError(serverUrl)) throw new Error("Invalid server URL.");
+  if (oidcServerUrlError(serverUrl) === "invalid_server_url") {
+    throw new Error("Invalid server URL.");
+  }
   return joinServerUrl(serverUrl, routePath);
 }
 
