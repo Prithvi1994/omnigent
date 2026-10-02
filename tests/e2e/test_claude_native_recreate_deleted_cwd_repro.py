@@ -1,10 +1,9 @@
 """Native Claude terminal creation must use the session workspace when the
 runner's launch directory has been deleted.
 
-With the runner process still alive but its launch directory removed, creating
-the native Claude terminal must still succeed when a valid session workspace is
-configured, instead of failing with HTTP 500 "Native Claude terminal failed to
-start".
+With the runner process alive but its launch cwd removed, auto-creating the
+native Claude terminal must still succeed from the configured session workspace
+instead of failing to start.
 
 Unlike ``test_claude_native_deleted_runner_cwd_e2e`` (which creates the terminal
 BEFORE unlinking the cwd, so Claude keeps the live workspace cwd), here the cwd
@@ -15,6 +14,7 @@ Claude CLI and tmux all run normally.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import secrets
@@ -166,6 +166,7 @@ def test_claude_native_terminal_recreates_after_deleted_runner_cwd(
             stderr=subprocess.STDOUT,
         )
         tmux_socket: str | None = None
+        bridge_dir: Path | None = None
         try:
             _wait(
                 lambda: client.get(f"/v1/runners/{runner_id}/status").json().get("online"),
@@ -242,6 +243,11 @@ os_env:
             except subprocess.TimeoutExpired:
                 runner.kill()
                 runner.wait(timeout=5)
+            if tmux_socket is None and bridge_dir is not None:
+                # The wait for tmux.json may have timed out after the server
+                # was already started; recover its socket so it isn't leaked.
+                with contextlib.suppress(OSError, ValueError, KeyError):
+                    tmux_socket = json.loads((bridge_dir / "tmux.json").read_text())["socket_path"]
             if tmux_socket is not None:
                 subprocess.run(
                     ["tmux", "-S", tmux_socket, "kill-server"],

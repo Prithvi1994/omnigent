@@ -894,14 +894,12 @@ def _claude_session_workspace(session_workspace: str | None) -> str:
     """
     Resolve and validate the cwd for a runner-owned Claude terminal.
 
-    The server-stored session ``workspace`` wins, then
-    :func:`_runner_workspace_dir`, so the process cwd is consulted only when
-    neither is set. A blank value counts as unset (so it never collapses to the
-    process cwd), and padding and a leading ``~`` are normalized (matching
-    :func:`_codex_session_workspace`) so a valid path isn't misread as missing;
-    symlinks are left unresolved because Claude keys resume transcripts by cwd.
-    The selected directory must exist: launching somewhere else would silently
-    run the session in the wrong tree.
+    The session ``workspace`` wins, then :func:`_runner_workspace_dir`; the
+    process cwd is a last resort only when neither is set. A blank value counts
+    as unset, and padding and a leading ``~`` are normalized so a valid path
+    isn't misread as missing; symlinks are left unresolved because Claude keys
+    resume transcripts by cwd. The selected directory must exist, so a stale
+    workspace fails loudly instead of running the session in the wrong tree.
 
     :param session_workspace: The session's ``workspace`` from the init
         snapshot or ``GET /v1/sessions/{id}``; ``None`` when omitted.
