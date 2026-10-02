@@ -383,7 +383,7 @@ def test_failing_cli_refresh_does_not_abort_resolution(
     monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "example")
     _instrument(monkeypatch, stage)
 
-    _resolve_runner_auth(stage, live_server)
+    factory = _resolve_runner_auth(stage, live_server)
 
     resolve_errors = [
         rest
@@ -396,3 +396,10 @@ def test_failing_cli_refresh_does_not_abort_resolution(
         f"{len(during_resolution)} time(s) and its failure aborted resolution "
         f"({resolve_errors}) instead of surfacing when a bearer is requested.\n{stage.render()}"
     )
+    # Resolution completed, the broken CLI ran only for the factory's bearer
+    # probe afterwards, and that probe found no usable credential.
+    assert stage.first("resolve_done") is not None, stage.render()
+    assert stage.cli_spawns_between("resolve_done", "factory_none"), (
+        f"the factory probe never asked the CLI for a bearer\n{stage.render()}"
+    )
+    assert factory is None and stage.first("factory_none") is not None, stage.render()

@@ -618,11 +618,12 @@ class _DatabricksBearerAuth(httpx.Auth):
         try:
             return self._config.authenticate()
         except Exception as exc:
-            if self._failure_message is not None:
+            profile_name = self.profile_name
+            if profile_name is None and self._failure_message is not None:
                 raise DatabricksAuthError(self._failure_message) from exc
-            profile_flag = f" -p {self._profile_name}" if self._profile_name else ""
+            profile_flag = f" -p {profile_name}" if profile_name else ""
             raise DatabricksAuthError(
-                f"Databricks authentication failed for profile {self._profile_name!r}. "
+                f"Databricks authentication failed for profile {profile_name!r}. "
                 f"Run: databricks auth login{profile_flag}"
             ) from exc
 
@@ -803,6 +804,7 @@ def _lazy_sdk_credentials_strategy() -> Any:  # type: ignore[explicit-any]  # SD
                     with self._lock:
                         provider = self._provider
                         if provider is None:
+                            _check_profile_still_names_host(cfg)
                             chain = DefaultCredentials()
                             provider = chain(cfg)
                             cfg.auth_type = chain.auth_type()
@@ -815,14 +817,37 @@ def _lazy_sdk_credentials_strategy() -> Any:  # type: ignore[explicit-any]  # SD
     return _LazyDefaultCredentials()
 
 
+def _check_profile_still_names_host(cfg: Any) -> None:  # type: ignore[explicit-any]  # SDK Config
+    """Refuse to mint when ``cfg.profile`` was repointed since ``cfg.host`` resolved.
+
+    Newer SDKs mint with ``databricks auth token --profile``, and the CLI reads
+    the profile's host again, so a repointed profile would hand this host's
+    client a bearer for another workspace.
+
+    :raises ValueError: When the profile now names a different host.
+    """
+    if not cfg.profile or not cfg.host:
+        return
+    config = _read_databrickscfg_no_inheritance()
+    if config is None or not config.has_section(cfg.profile):
+        return
+    current = (config[cfg.profile].get("host") or "").strip()
+    if current and _normalized_workspace_host(current) != _normalized_workspace_host(cfg.host):
+        raise ValueError(
+            f"profile {cfg.profile!r} now names {current}, not the resolved {cfg.host}; "
+            "resolve credentials again"
+        )
+
+
 def _sdk_config(**kwargs: str | None) -> Any:  # type: ignore[explicit-any]  # SDK Config, imported lazily
     """Construct a databricks-sdk ``Config`` whose credentials initialize on first use.
 
-    Construction resolves settings and raises ``ValueError`` for missing or
-    malformed configuration; providers run on the first ``authenticate()``
-    call, so it never launches a ``databricks auth token`` subprocess. Also
-    the test indirection point: tests patch this helper with a stub instead
-    of touching the SDK module.
+    Construction resolves settings and raises ``ValueError`` for a missing
+    profile or ambiguous auth settings; providers (including unsupported
+    ``auth_type`` values) run on the first ``authenticate()`` call, so it
+    never launches a ``databricks auth token`` subprocess. Also the test
+    indirection point: tests patch this helper with a stub instead of
+    touching the SDK module.
 
     :param kwargs: ``Config`` keyword arguments, e.g.
         ``profile="my-ws"`` or ``host=..., auth_type="databricks-cli"``.
@@ -1011,6 +1036,12 @@ class _ReusedDatabricksTokenSource:
 _NO_DEFAULT_INHERITANCE = "@omnigent-no-default-inheritance@"
 
 
+def _normalized_workspace_host(value: str) -> str:
+    """Compare workspace hosts ignoring scheme, trailing slashes and case."""
+    value = value.strip().rstrip("/")
+    return value.split("://", 1)[-1].lower()
+
+
 def _read_databrickscfg_no_inheritance() -> configparser.ConfigParser | None:
     """Parse ``~/.databrickscfg`` with default-section inheritance disabled.
 
@@ -1089,14 +1120,10 @@ def _databrickscfg_host_matches_and_sp_sections(host: str) -> tuple[list[str], s
         ``([], set())`` when the file is missing or unparseable.
     """
 
-    def _norm(value: str) -> str:
-        value = value.strip().rstrip("/")
-        return value.split("://", 1)[-1].lower()
-
     config = _read_databrickscfg_no_inheritance()
     if config is None:
         return [], set()
-    wanted = _norm(host)
+    wanted = _normalized_workspace_host(host)
     # With the sentinel default_section, the file's [DEFAULT] is a plain
     # section named "DEFAULT"; its host is what named sections inherit.
     default_host = config["DEFAULT"].get("host", "") if config.has_section("DEFAULT") else ""
@@ -1115,9 +1142,9 @@ def _databrickscfg_host_matches_and_sp_sections(host: str) -> tuple[list[str], s
         # overrides inheritance to no host, matching ConfigParser semantics —
         # so an empty host does not fall back and does not match.
         section_host = options.get("host", default_host)
-        if _norm(section_host) == wanted:
+        if _normalized_workspace_host(section_host) == wanted:
             matches.append(section)
-    if default_host and _norm(default_host) == wanted:
+    if default_host and _normalized_workspace_host(default_host) == wanted:
         matches.append("DEFAULT")
     return matches, sp_sections
 
