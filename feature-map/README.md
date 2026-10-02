@@ -115,7 +115,8 @@ map an area, remove it here in the same change.
 - Sharing and session permissions: `tests/e2e_ui/collaboration/`
 - GitHub integration: `tests/e2e_ui/github/`
 - Scheduled tasks: `tests/e2e_ui/scheduled/`
-- In-app browser: `tests/e2e_ui/browser/`
+- In-app browser: `tests/e2e_ui/browser/` (session cookie sharing is covered in
+  Sessions; other browser behavior remains unmapped)
 - Desktop app: `tests/e2e_ui/desktop/`
 - Web sign-in: `tests/e2e_ui/auth/`
 - Branding and base-path deploys: `tests/e2e_ui/branding/`, `tests/e2e_ui/base_path/`
@@ -124,6 +125,7 @@ map an area, remove it here in the same change.
   is mapped)
 - Mobile layout: `tests/e2e_ui/mobile/` (only composer labels and terminal
   touch scroll are mapped)
+- Host import review: `tests/e2e_ui/onboarding/`
 - Visual snapshots: `tests/e2e_ui/visual/`
 - Onboarding: `tests/e2e_ui/onboarding/`
 

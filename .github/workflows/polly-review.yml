@@ -843,6 +843,7 @@ jobs:
           fi
 
       - name: Post review comment
+        id: publish
         if: steps.polly.outputs.review_text != ''
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
@@ -857,6 +858,7 @@ jobs:
           {
             echo "<!-- polly-review-bot -->"
             echo "<!-- polly-reviewed-sha: ${HEAD_SHA} -->"
+            echo "<!-- polly-review-run:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT} -->"
             echo "## <img src=\"https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-logo.svg\" alt=\"\" height=\"20\" valign=\"middle\" /> Polly AI Review"
             echo ""
             cat /tmp/polly_review.txt
@@ -869,7 +871,18 @@ jobs:
           # `/review` comment, or maintainer approval) is visible in the thread
           # and notifies watchers — no in-place upsert of a prior comment.
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
+          printf '%s\n' "$HEAD_SHA" > /tmp/polly-completed-sha.txt
           echo "Created new comment"
+
+      - name: Upload Polly completion receipt
+        if: steps.publish.outcome == 'success' && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: polly-completed-${{ steps.pr.outputs.pr_number }}-${{ steps.ctx.outputs.head_sha }}
+          path: /tmp/polly-completed-sha.txt
+          overwrite: true
+          retention-days: 90
+          if-no-files-found: error
 
       # Successful slow runs need the same evidence as failed reviews.
       - name: Prepare Polly diagnostics

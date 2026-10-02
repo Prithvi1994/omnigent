@@ -134,7 +134,7 @@ import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
-import { isNavigablePath } from "./WorkspacePicker";
+import { isHostAbsolutePath, isNavigablePath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { RecentWorkspaceList } from "./RecentWorkspaceList";
 import {
@@ -534,21 +534,11 @@ export function ConnectHostInstructions({
 }
 
 /**
- * Return true when ``workspace`` is acceptable to send to the backend.
- *
- * Per designs/SESSION_WORKSPACE_SELECTION.md: only fully-absolute
- * paths (starting with ``/``) are accepted. Tilde-prefixed and
- * relative paths are rejected because the server never expands ``~``
- * — that's the host's job, and the workspace request body must be
- * an unambiguous absolute path. Empty / whitespace-only input is
- * also rejected so the submit button is disabled until the user
- * has typed something usable.
- *
- * @param workspace Value the user typed in the workspace input.
- * @returns true when ``workspace.trim()`` starts with ``/``.
+ * Match session-create validation: accept absolute POSIX or drive-letter paths.
+ * The host must expand tilde and relative paths before submission.
  */
 export function isValidWorkspace(workspace: string): boolean {
-  return workspace.trim().startsWith("/");
+  return isHostAbsolutePath(workspace.trim());
 }
 
 /**
@@ -6610,7 +6600,7 @@ export function NewChatLandingScreen() {
                         )}
                         {hasCloudOptions && <DropdownMenuSeparator />}
                         <div className="px-2 py-1 text-xs leading-[18px] text-muted-foreground/75">
-                          Local
+                          My machines
                         </div>
                         {allHosts.length === 0 && !showConnectThisMachine && (
                           <div className="px-2 py-1.5 text-sm text-muted-foreground">

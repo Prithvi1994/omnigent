@@ -137,19 +137,67 @@ whole `tests/e2e_ui/start_session/` suite) drive Playwright *manually* —
 the `page` fixture, and `--video on` records **nothing** for those: the flag never
 sees their browser, so you get a green/red test but an empty `recordings/`.
 Setting `OMNIGENT_E2E_RECORD_DIR` makes the e2e_ui conftest inject
-`record_video_dir` into every page/context the test opens, so the journey is
+`record_video_dir` into pytest-playwright's `page`/`context` fixtures and into
+every page/context the test opens through the async or sync API, so the journey is
 filmed no matter how the test opened the browser. Playwright writes the `.webm` (a
 random hash name) into that dir when the context closes. (If a test already
 hard-codes its own `record_video_dir` — some authored reproductions do — that
 explicit dir wins and the video lands there instead; check both locations.)
+For pytest-playwright fixtures, `--video` takes precedence over the environment
+variable: clips go to its output directory, and `--video retain-on-failure`
+discards passing-test videos.
+
+**The clip ends with the test body, not with fixture teardown.** Playwright
+writes the video when the recorded context closes, and pytest tears fixtures
+down in reverse setup order: the `context` behind `page` is set up before the
+session fixtures a test lists after it, so it closes *last* — after those
+fixtures have deleted the session or stopped the runner. A clip that keeps
+rolling through teardown ends on the SPA's teardown state instead of the state
+the test asserted: an `after` clip on the pane greyed out behind "Bridge closed:
+terminal session ended", a `before` clip on a search palette that drops to "No
+results found" as the fixture deletes the sessions it had just listed. When
+recording is requested (`OMNIGENT_E2E_RECORD_DIR`, `--video`, or a
+`record_video_dir` in `browser_context_args`), the e2e_ui conftest therefore
+closes the pytest-playwright context as soon as the test body finishes, before
+any fixture teardown runs. A test that opens its
+own pages or contexts must close them itself before its body returns, for the
+same reason, and a fixture that touches `page` after `yield` must skip that
+work when `page.is_closed()`. Recording configured with a
+`@pytest.mark.browser_context_args(record_video_dir=...)` marker follows the
+same stop point.
 
 **Move the emitted clip to a stable name.** The video lands under
 `OMNIGENT_E2E_RECORD_DIR` (or the test's own dir) as a random hash name; **move**
 it (do not copy) to a stable `recordings/<slug>/<kind>-<facet>.webm` and delete
 the leftover raw dir, so the same footage isn't collected twice. If that dir has
 **no** `.webm` after the run, the recording genuinely didn't happen (the test
-errored before opening a page, or the fixture never came online) — capture the
-reason per the empty-recordings rule; never report a clip you didn't produce.
+errored before opening a page, or the fixture never came online). For a test
+using the `page` fixture, retry with `--video on` and check pytest's `--output`
+directory before declaring the lane unfilmable. A clip there indicates a recorder
+configuration problem. Then capture the reason per the empty-recordings rule;
+never report a clip you didn't produce.
+
+**Don't poll clipped or element screenshots while filming.** Chromium takes
+`page.screenshot(clip=…)` and `locator.screenshot()` by resizing the view to the
+clip for the capture, and the recorder films that resized view: a pixel probe
+polled during the journey leaves the footage mostly grey with a shrunken or
+magnified strip of the page. The `tests/e2e_ui/` conftest turns a clipped
+`page.screenshot` on a recorded Chromium page into a full-viewport capture
+cropped to the clip, so viewport clip probes there are safe. `full_page=True`
+captures are not covered and can still resize the recorded view. For element
+screenshots, or a Playwright script outside that suite, read pixels via
+`page.evaluate` (e.g. a canvas
+`toDataURL()`) or capture from a second, unrecorded context instead.
+
+Clipped JPEGs on recorded Chromium pages are encoded with Pillow, so they are
+not byte-identical to Chromium's native JPEG output. Unsupported formats and
+malformed screenshot options use Playwright's native validation and errors.
+
+**Maintenance:** Context closure before fixture teardown and screenshot crop
+rounding rely on pytest-playwright and Chromium internals; after Playwright,
+pytest-playwright, or Chromium upgrades, rerun
+`tests/e2e_ui/test_recorded_page_clip_screenshots.py` and
+`tests/e2e_ui/test_recording_stops_before_teardown.py` as canaries.
 
 ## `mobile` facets
 
@@ -190,7 +238,7 @@ Playwright test drives the session page with the terminal view shown, and the
 pane's contents land in the browser video. Save `tmux capture-pane -e` text dumps
 alongside as machine-checkable evidence.
 
-**For a native-harness pane** (claude/codex/cursor/goose/hermes/kiro/… — the bug
+**For a native-harness pane** (claude/codex/cursor/goose/hermes/kiro/pi/… — the bug
 is in a real harness CLI's output), don't hand-roll the launch: the existing
 render-parity tests already drive the *real* CLI against the mock LLM with the
 terminal view shown, so **reuse or adapt the closest one**
@@ -210,11 +258,12 @@ are scripted. It drives a web-composer turn, types a second turn in Terminal,
 waits for the reply on the terminal stream, and checks both replies in Chat and
 the canonical transcript. This covers native delivery/rendering; adapt the
 journey for queueing, steering, or timing bugs instead of claiming this smoke
-journey reproduces those behaviors.
+journey reproduces those behaviors. Script responses with `configure_mock_llm`
+using `match=<prompt marker>` and `required_tools=["bash"]` so title requests
+cannot consume the Pi reply; use empty fallbacks for unrelated requests.
 
-Build the SPA and clear inherited runner variables as above. This test uses the
-**synchronous pytest `page` fixture**, so enable its recorder with `--video on`
-(the current `OMNIGENT_E2E_RECORD_DIR` hook only instruments async browsers):
+Build the SPA and clear inherited runner variables as above. Enable recording
+with `OMNIGENT_E2E_RECORD_DIR` or `--video on`:
 
 ```bash
 pytest tests/e2e_ui/messages/test_native_pi_render_parity.py \
@@ -228,7 +277,7 @@ restoring the original config on exit. No Pi login or live model is required.
 A missing/unrunnable `pi` or missing `tmux` produces an explicit skip; launch,
 delivery, and recorder failures are not successful Pi coverage. Move the emitted
 `video.webm` to a stable name after inspecting it. Declare `capture_mode:
-playwright`, surface `terminal` or `web` as appropriate, and disclose the scripted
+playwright_ui`, surface `terminal` or `web` as appropriate, and disclose the scripted
 model in the caption. Never present this as a live-model capture or a simulated
 Pi implementation.
 
@@ -299,6 +348,13 @@ state, bad output, error) for a `before` recording, or the correct end state for
 `fixed`/`after` one. Convert to `.mp4` with `ffmpeg` when available; `.webm`/`.gif`
 are fine otherwise. Recordings are workspace artifacts exactly like the test —
 leave them uncommitted; in CI the artifact bundle collects them.
+
+Check the clip's last frame before captioning it. Every clip must stop on the
+demonstrated state its caption describes — the failure for a `before` clip, the
+healthy state for a `fixed`/`after` clip; a final frame that shows teardown — the
+pane greyed out behind "Bridge closed: terminal session ended", a deleted
+session, a result list emptied by fixture cleanup — means the recording outlived
+the test body. Fix the stop point and re-record; do not caption around it.
 
 For each recording, write a short **`caption`** in its handoff entry describing
 **the actions that clip performs** — the ordered steps a viewer watches, ending in

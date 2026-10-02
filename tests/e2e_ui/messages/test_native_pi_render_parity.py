@@ -6,7 +6,7 @@ into Pi, then a prompt typed into Pi's TUI back into the web transcript.
 
 from __future__ import annotations
 
-import shutil
+import re
 import time
 import uuid
 from pathlib import Path
@@ -14,8 +14,7 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e._harness_probes import cli_unavailable_reason
-from tests.e2e_ui.conftest import reset_mock_llm, set_fallback_mock_llm
+from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm, set_fallback_mock_llm
 from tests.helpers.ui_configuration import _CLAUDE_MOCK_MODEL
 
 from .test_message_render_parity import (
@@ -28,11 +27,6 @@ from .test_message_render_parity import (
     _select_view_mode,
     _send,
 )
-
-_reason = cli_unavailable_reason("pi") or (
-    "Pi recording needs tmux on PATH" if shutil.which("tmux") is None else None
-)
-pytestmark = pytest.mark.skipif(_reason is not None, reason=_reason or "")
 
 
 def _terminal(page: Page):
@@ -58,6 +52,16 @@ def test_native_pi_message_render_parity(
     markers = [f"pi-web-{nonce}", f"pi-tui-{nonce}"]
     replies = [f"PI-WEB-REPLY-{nonce}", f"PI-TUI-REPLY-{nonce}"]
     reset_mock_llm(mock_llm_server_url)
+    for marker, reply in zip(markers, replies, strict=True):
+        configure_mock_llm(
+            mock_llm_server_url,
+            [{"text": reply}],
+            key=marker,
+            match=marker,
+            required_tools=["bash"],
+        )
+    set_fallback_mock_llm(mock_llm_server_url, "default", "")
+    set_fallback_mock_llm(mock_llm_server_url, _CLAUDE_MOCK_MODEL, "")
     terminal_frames: list[str] = []
 
     def observe_socket(socket):
@@ -69,14 +73,17 @@ def test_native_pi_message_render_parity(
                 ),
             )
 
+    def terminal_text() -> str:
+        # Pi can insert ANSI styling or line wraps inside a streamed reply.
+        text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", "".join(terminal_frames))
+        return text.replace("\r", "").replace("\n", "")
+
     page.on("websocket", observe_socket)
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_test_id("view-mode-toggle")).to_be_visible(timeout=120_000)
     _terminal(page)
 
     for index, (marker, reply) in enumerate(zip(markers, replies, strict=True)):
-        set_fallback_mock_llm(mock_llm_server_url, "default", reply)
-        set_fallback_mock_llm(mock_llm_server_url, _CLAUDE_MOCK_MODEL, reply)
         if index == 0:
             _ensure_chat_view(page)
             _send(page, marker)
@@ -86,9 +93,9 @@ def test_native_pi_message_render_parity(
             page.keyboard.type(marker, delay=30)
             page.keyboard.press("Enter")
             deadline = time.monotonic() + 60
-            while reply not in "".join(terminal_frames) and time.monotonic() < deadline:
+            while reply not in terminal_text() and time.monotonic() < deadline:
                 page.wait_for_timeout(100)
-            assert reply in "".join(terminal_frames), "Pi reply never reached the terminal stream"
+            assert reply in terminal_text(), "Pi reply never reached the terminal stream"
             # Hold the observed outcome long enough to inspect in the recording.
             page.wait_for_timeout(1000)
             page.screenshot(path=str(tmp_path / "pi-terminal-reply.png"))
@@ -99,4 +106,5 @@ def test_native_pi_message_render_parity(
 
     _assert_no_duplicate_render(page, markers, replies)
     _assert_transcript_parity(base_url, session_id, markers, replies)
+    # Keep the verified Chat outcome visible at the end of the clip.
     page.wait_for_timeout(1000)

@@ -32,11 +32,13 @@ const {
 const { autoUpdater } = require("electron-updater");
 const { createDesktopUpdater } = require("./desktop_updater");
 const { createUpdateOverlay } = require("./update_overlay");
+const { createConnectionLoading } = require("./connection_loading");
 const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window");
 const { registerFileReveal } = require("./fileReveal");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
+const { omnigentBuild } = require("../package.json");
 const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
 const {
@@ -64,6 +66,7 @@ const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
 const { isDeveloperModeEnabled } = require("./developer_mode");
+const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
 const {
   excludingManagedServers,
   getDatabricksInternalFeaturesEnabled,
@@ -247,41 +250,29 @@ const POPUP_PRELOAD = path.join(__dirname, "popup_preload.js");
 /** Absolute path to the app icon (PNG works for the macOS dock at runtime). */
 const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
 
-/**
- * Development builds always expose debugging. Packaged macOS builds require
- * `defaults write ai.omnigent.desktop DeveloperMode -bool true` before launch.
- */
+const isDevBuild = !app.isPackaged || omnigentBuild === "dev";
+const getUserDefault =
+  !app.isPackaged && process.platform === "darwin"
+    ? getDevUserDefault
+    : systemPreferences.getUserDefault?.bind(systemPreferences);
+
+/** Packaged builds require an explicit user default to enable debugging. */
 function developerModeEnabled() {
   return isDeveloperModeEnabled({
     isPackaged: app.isPackaged,
     platform: process.platform,
-    getUserDefault:
-      typeof systemPreferences.getUserDefault === "function"
-        ? systemPreferences.getUserDefault.bind(systemPreferences)
-        : undefined,
+    getUserDefault,
   });
 }
 
 /** Read the current macOS MDM-provided server list without persisting it. */
 function managedServerUrls() {
-  return getManagedServerUrls({
-    platform: process.platform,
-    getUserDefault:
-      typeof systemPreferences.getUserDefault === "function"
-        ? systemPreferences.getUserDefault.bind(systemPreferences)
-        : undefined,
-  });
+  return getManagedServerUrls({ platform: process.platform, getUserDefault });
 }
 
 /** Display names for the MDM-provided servers, keyed by server URL. */
 function managedServerNames() {
-  return getManagedServerNames({
-    platform: process.platform,
-    getUserDefault:
-      typeof systemPreferences.getUserDefault === "function"
-        ? systemPreferences.getUserDefault.bind(systemPreferences)
-        : undefined,
-  });
+  return getManagedServerNames({ platform: process.platform, getUserDefault });
 }
 
 /**
@@ -289,13 +280,7 @@ function managedServerNames() {
  * macOS on every call (never persisted), so profile changes apply live.
  */
 function databricksInternalFeaturesEnabled() {
-  return getDatabricksInternalFeaturesEnabled({
-    platform: process.platform,
-    getUserDefault:
-      typeof systemPreferences.getUserDefault === "function"
-        ? systemPreferences.getUserDefault.bind(systemPreferences)
-        : undefined,
-  });
+  return getDatabricksInternalFeaturesEnabled({ platform: process.platform, getUserDefault });
 }
 
 /**
@@ -393,6 +378,76 @@ const arcaAutoConnect = createArcaAutoConnect({
   },
   log: (message) => console.log(`[omnigent] ${message}`),
 });
+
+/**
+ * The auto-connect opt-in shared by overlapping onboarding connects: how many
+ * are running, the preference from before the first of them, and whether any
+ * succeeded.
+ */
+const onboardingArcaOptIn = { pending: 0, baseline: undefined, succeeded: false };
+
+/**
+ * Onboarding's Arca connect, run through the auto-connect state machine so
+ * the window's own launch-time connect joins it instead of racing a second
+ * `arca ssh`. Picking Arca opts into auto-connect; overlapping attempts share
+ * the opt-in, and the last to finish keeps it only if any of them succeeded.
+ * Like any auto-connect, a started run finishes in the background even if
+ * setup closes; nothing starts once it has.
+ *
+ * @param {string} serverUrl
+ * @param {(line: string) => void} log
+ * @param {() => boolean} isClosed Whether the setup window has closed.
+ * @returns {Promise<{ ok: boolean, canceled?: boolean, alreadyRunning?: boolean, error?: string }>}
+ */
+async function connectOnboardingArca(serverUrl, log, isClosed) {
+  const optIn = onboardingArcaOptIn;
+  const settings = loadSettings();
+  if (optIn.pending === 0) {
+    optIn.baseline = settings.arca_auto_connect;
+    optIn.succeeded = false;
+  }
+  optIn.pending += 1;
+  settings.arca_auto_connect = true;
+  saveSettings(settings);
+  let result;
+  try {
+    await refreshArcaBinary();
+    if (isClosed()) {
+      result = { ok: false, canceled: true };
+    } else {
+      const current = arcaAutoConnect.getStatus(serverUrl);
+      // Joining a run already in flight streams nothing, so only a new run shows its command.
+      if (current.command && (current.state === "idle" || current.state === "failed")) {
+        log(`$ ${current.command}`);
+      }
+      const status =
+        current.state === "failed"
+          ? await arcaAutoConnect.retry(serverUrl, log)
+          : await arcaAutoConnect.ensure(serverUrl, log);
+      result =
+        status.state === "online"
+          ? { ok: true, alreadyRunning: status.alreadyRunning === true }
+          : {
+              ok: false,
+              error:
+                status.state === "unavailable"
+                  ? "The arca CLI was not found on this machine."
+                  : (status.error ?? "Couldn't connect Arca."),
+            };
+    }
+  } catch (error) {
+    result = { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  optIn.pending -= 1;
+  if (result.ok) optIn.succeeded = true;
+  if (optIn.pending === 0 && !optIn.succeeded) {
+    const latest = loadSettings();
+    if (optIn.baseline === undefined) delete latest.arca_auto_connect;
+    else latest.arca_auto_connect = optIn.baseline;
+    saveSettings(latest);
+  }
+  return result;
+}
 
 /**
  * Quit-safety timeouts (see the before-quit handler near the end of this
@@ -694,6 +749,7 @@ function abortConnectionAttempt(win, message = "Connection superseded") {
   const attempt = connectionAttempts.get(win);
   if (!attempt) return;
   connectionAttempts.delete(win);
+  connectionLoading.hide(win, attempt);
   attempt.pending = false;
   attempt.controller.abort(Object.assign(new Error(message), { name: "AbortError" }));
 }
@@ -972,6 +1028,18 @@ function setWindowServerUrl(win, serverUrl) {
 }
 
 /**
+ * The URL a window's Arca host connects to: the one the user picked, even after
+ * sign-in moved to another host, so one server keeps one Arca host.
+ *
+ * @param {Electron.BrowserWindow | null} win
+ * @returns {string | null}
+ */
+function windowArcaServerUrl(win) {
+  const state = win ? windows.get(win) : undefined;
+  return state?.arcaServerUrl ?? state?.serverUrl ?? null;
+}
+
+/**
  * Record the version manifest of the server a window connected to (see
  * `fetchServerManifest` in src/url.js). Stored per-window because different
  * windows can be pinned to different servers — and therefore to servers of
@@ -1095,6 +1163,7 @@ const updater = createDesktopUpdater({
   // this to !app.isPackaged — not an env var — ensures a packaged app can
   // never be redirected to a repository-local update configuration.
   forceDevUpdateConfig: !app.isPackaged,
+  updatesEnabled: !app.isPackaged || !isDevBuild,
 });
 
 // Shell-owned About window: available from the native application menu even
@@ -1117,6 +1186,8 @@ const aboutWindow = createAboutWindow({
   aboutPage: ABOUT_PAGE,
   preloadPath: path.join(__dirname, "about_preload.js"),
 });
+
+const connectionLoading = createConnectionLoading({ BrowserWindow });
 
 // Shell-owned update toast: renders the reused web UpdateBanner in a transparent
 // corner window so it shows even against servers running old omnigent web.
@@ -1566,11 +1637,23 @@ async function loadServerUrl(
     databricksAuth?.reset(win);
     pinWindow(win, originOf(serverUrl), attempt);
     setWindowServerUrl(win, serverUrl);
+    const windowState = windows.get(win);
+    if (windowState) {
+      // An explicit connect targets what was typed; a restore or switch lands on
+      // the workspace host and maps back to the URL picked for it.
+      windowState.arcaServerUrl =
+        (!interactive &&
+          serverLabel(parseServerLabels(loadSettings().server_labels), requestedServerUrl)) ||
+        requestedServerUrl;
+    }
     let target = loadUrl ?? (routePath ? resolveServerPath(serverUrl, routePath) : serverUrl);
     if (usesBrowserAuth(serverUrl)) {
       reportConnectionProgress(win, attempt, "authenticating");
       const auth = getDatabricksAuth();
       win.webContents.stop();
+      if (!isSetupPageUrl(win.webContents.getURL())) {
+        connectionLoading.show(win, attempt, "Signing in…");
+      }
       try {
         const entered = new URL(serverUrl);
         const resolvedOrigin = await ensureDatabricksSession(
@@ -1613,11 +1696,14 @@ async function loadServerUrl(
     void fetchServerManifest(serverUrl).then((manifest) => {
       if (current()) setWindowServerManifest(win, manifest);
     });
+    connectionLoading.show(win, attempt, "Opening Omnigent…");
     await win.loadURL(target);
     assertCurrent();
-    void refreshArcaBinary().then(() => arcaAutoConnect.ensure(serverUrl));
+    const arcaServerUrl = windowArcaServerUrl(win);
+    void refreshArcaBinary().then(() => arcaAutoConnect.ensure(arcaServerUrl));
     return serverUrl;
   } finally {
+    connectionLoading.hide(win, attempt);
     attempt.pending = false;
   }
 }
@@ -3244,13 +3330,7 @@ function registerIpc() {
       if (!databricksInternalFeaturesEnabled() || !isDatabricksManagedServerUrl(target)) {
         return { ok: false, error: "A remote environment isn't available for this server." };
       }
-      const run = arca.startArcaConnect(target, { onOutput: log });
-      if (run.command) log(`$ ${run.command}`);
-      // Closing the setup window cancels the connect, like the connect console.
-      const cancel = () => run.cancel();
-      event.sender.once("destroyed", cancel);
-      const result = await run.promise;
-      event.sender.removeListener("destroyed", cancel);
+      const result = await connectOnboardingArca(target, log, () => event.sender.isDestroyed());
       if (result.ok) rememberOnboardingRunner(target, runner);
       return result;
     }
@@ -3258,8 +3338,12 @@ function registerIpc() {
     if (!cliCommand) return { ok: false, error: missingHostCliError(target) };
     log(`$ ${omnigentCli.cliCommandParts(cliCommand).displayName} host --server ${target}`);
     log("Signing in to the server if needed…");
-    const auth = await serverManager.ensureServerAuth(cliCommand, target);
+    const auth = await serverManager.ensureServerAuth(cliCommand, target, {
+      onLogin: () => log("If a browser window opens, finish signing in there."),
+    });
     if (!auth.ok) return { ok: false, error: auth.error };
+    // Close out the sign-in lines so the log never ends on a stale prompt.
+    log("Signed in. Connecting this laptop to the server…");
     const result = await serverManager.ensureHostConnected(cliCommand, target);
     broadcastHostStatus();
     if (result.ok) {
@@ -3510,14 +3594,19 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("get-cli-status is only available to the setup page");
     }
+    // Concurrent: the setup page holds its first paint on this.
+    const [status, localUrl] = await Promise.all([
+      omnigentCli.getCliStatus(loadSettings().omnigent_path),
+      omnigentCli.localServerHealthy(),
+    ]);
     return {
-      ...(await omnigentCli.getCliStatus(loadSettings().omnigent_path)),
+      ...status,
       customizationDisabled: databricksInternalFeaturesEnabled(),
       // In-app install is macOS-only; the renderer must not route connect/local
       // through an install step on platforms where it can't run.
       installSupported: process.platform === "darwin",
       // start-local's own reuse test, so "Open" vs "Start Omnigent" matches it.
-      localServerRunning: (await omnigentCli.localServerHealthy()) !== null,
+      localServerRunning: localUrl !== null,
     };
   });
 
@@ -3812,9 +3901,15 @@ function registerIpc() {
     if (!isDatabricksManagedServerUrl(serverUrl)) {
       return { ok: false, error: "Arca hosts can only connect to Databricks-managed servers." };
     }
+    const win = BrowserWindow.fromWebContents(event.sender);
+    const arcaServerUrl = windowArcaServerUrl(win);
+    // It can come from a settings label, so it passes the same gate.
+    if (!isDatabricksManagedServerUrl(arcaServerUrl)) {
+      return { ok: false, error: "Arca hosts can only connect to Databricks-managed servers." };
+    }
     // An auto-connect already running shares its outcome instead of racing a
     // second `arca ssh`.
-    const autoRun = arcaAutoConnect.inFlight(serverUrl);
+    const autoRun = arcaAutoConnect.inFlight(arcaServerUrl);
     if (autoRun) {
       const status = await autoRun;
       return status.state === "online"
@@ -3826,8 +3921,7 @@ function registerIpc() {
             authError: status.errorKind === "omni-auth",
           };
     }
-    const win = BrowserWindow.fromWebContents(event.sender);
-    return arcaConnectFlow.run(win, serverUrl);
+    return arcaConnectFlow.run(win, arcaServerUrl);
   });
 
   // Push a status ping when a host child connects or exits on its own (no
@@ -4147,7 +4241,12 @@ async function handleDeepLink(raw) {
 // ---------------------------------------------------------------------------
 
 // Name drives the macOS app menu title and the notification source name.
-app.setName("Omnigent");
+app.setName(isDevBuild ? "Omnigent Dev" : "Omnigent");
+if (isDevBuild) {
+  const devData = path.join(app.getPath("appData"), "Omnigent Dev");
+  fs.mkdirSync(devData, { recursive: true });
+  app.setPath("userData", devData);
+}
 
 // Single-instance: focus the existing window instead of opening a second.
 const gotLock = app.requestSingleInstanceLock();
@@ -4201,7 +4300,8 @@ if (!gotLock) {
 
   app.whenReady().then(() => {
     // App User Model ID so Windows attributes notifications/taskbar correctly.
-    if (process.platform === "win32") app.setAppUserModelId("ai.omnigent.desktop");
+    if (process.platform === "win32")
+      app.setAppUserModelId(isDevBuild ? DEV_DOMAIN : "ai.omnigent.desktop");
     applyDockIcon();
     registerPermissions();
     registerLocalhostAccess();
