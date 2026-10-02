@@ -561,7 +561,11 @@ def _auto_reply_store_secret(
             text = output.get("text")
             if output.get("type") != "websocket.send" or not isinstance(text, str):
                 continue
-            frame = decode_host_frame(text)
+            try:
+                frame = decode_host_frame(text)
+            except ValueError:
+                # Non-host frames (e.g. keepalive pings) are not the drain's concern.
+                continue
             if not isinstance(frame, HostStoreSecretFrame):
                 continue
             received.append(frame)
