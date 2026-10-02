@@ -46,10 +46,11 @@ APP_THEME_KEY = "web-theme"
 _RECORDING = bool(os.environ.get("OMNIGENT_E2E_RECORD_DIR"))
 
 # What a TUI that assumes a light background emits (ANSI black text), followed
-# by the background hint the shell actually received.
+# by the background hint the shell actually received. The marker is split in
+# the typed command so the shell's echo of the command line never contains it.
 _PANE_BACKGROUND_PROBE = (
     "printf '\\e[30m  LIGHT-TUI DEMO: a light-background TUI paints this near-black  \\e[0m\\n'; "
-    "printf 'PTYBG=%s\\n' \"${COLORFGBG-UNSET}\""
+    "printf 'PTY''BG=%s\\n' \"${COLORFGBG-UNSET}\""
 )
 _PANE_HINT_RE = re.compile(r"PTYBG=([0-9A-Za-z;]+)")
 _ANSI_RE = re.compile(
@@ -235,14 +236,19 @@ def test_light_terminal_under_dark_app(
     )
 
 
-def test_dark_terminal_under_light_app(page: Page, terminal_session: tuple[str, str]) -> None:
-    """A "Dark" terminal stays dark while the app runs Light.
+def test_dark_terminal_under_light_app(
+    request: pytest.FixtureRequest, terminal_session: tuple[str, str]
+) -> None:
+    """A "Dark" terminal stays dark while the app runs Light, and its shell is told so.
 
     The mirror of the light-on-dark case: pin the app to Light and the terminal to
     Dark, launch a shell, and confirm the terminal resolves to dark
-    (``data-terminal-theme=dark``) with no ``dark`` class on ``<html>``.
+    (``data-terminal-theme=dark``) with no ``dark`` class on ``<html>``, and that
+    the shell carries a dark-background ``COLORFGBG`` hint.
     """
     base_url, session_id = terminal_session
+    page = _journey_page(request)
+    frames = _capture_pane_output(page)
 
     _open_appearance(page, base_url)
     _pick_app_theme(page, "light")
@@ -256,6 +262,12 @@ def test_dark_terminal_under_light_app(page: Page, terminal_session: tuple[str, 
 
     expect(terminal_view).to_have_attribute("data-terminal-theme", "dark")
     assert not _html_has_dark(page), "app theme must stay light while the terminal is dark"
+
+    hint = _pane_background_hint(page, terminal_view, frames)
+    assert hint.rsplit(";", 1)[-1] == "0", (
+        f"pane was pinned dark but its shell was told COLORFGBG={hint}; "
+        "the setting restyled only the canvas"
+    )
 
 
 def test_terminal_theme_control_defaults_and_persists(page: Page, live_server: str) -> None:
