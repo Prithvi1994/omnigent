@@ -491,4 +491,3 @@ async def test_chunk_delay_paces_messages_sse_event_by_event(clean_mock_state: N
     assert len(chunks) > 1
     for chunk in chunks:
         assert _count_events(chunk) == 1
-
