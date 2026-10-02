@@ -1821,12 +1821,9 @@ def resolve_pi_native_provider(
                 "surface; Pi will use its own login."
             )
             return None
-        # A picker override can arrive qualified by the omnigent provider
-        # name ("rpw-fable/databricks-claude-fable-5-1"); registering it
-        # verbatim renders a slash id no endpoint serves. Split only when
-        # the prefix names a configured provider — any other slash id is
-        # the endpoint's own model naming (e.g. "openai/gpt-4o" on
-        # OpenRouter, "zai-org/GLM-4.7") and must stay verbatim.
+        # Split only when the prefix names a configured provider; any other
+        # slash id is the endpoint's own model naming (e.g. "openai/gpt-4o"
+        # on OpenRouter) and must stay verbatim.
         if names_configured_provider:
             if prefix != entry.name:
                 unmanaged_prefix_warning = (

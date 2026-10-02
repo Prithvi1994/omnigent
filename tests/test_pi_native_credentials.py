@@ -2224,13 +2224,20 @@ def test_provider_qualified_override_split_to_configured_provider() -> None:
     assert not [mid for mid in ids if "/" in mid]
 
 
-def test_override_qualified_by_other_configured_provider_warns() -> None:
+@pytest.mark.parametrize("pi_login_serves_reference", [False, True])
+def test_override_qualified_by_other_configured_provider_warns(
+    pi_login_serves_reference: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Naming a configured provider other than the serving one warns.
 
     The session is served by the pi-default provider, so a model picked from
     another configured provider is requested from the default instead — say
-    so rather than silently reinterpreting the value.
+    so rather than silently reinterpreting the value. The configured prefix
+    keeps precedence even when Pi's own login serves the same reference.
     """
+    if pi_login_serves_reference:
+        _seed_pi_login_catalog(tmp_path, "other-gw", ["databricks-claude-fable-5-1"])
+        monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
     config = _rpw_fable_anthropic_gateway()
     config["providers"]["other-gw"] = {
         "kind": "gateway",

@@ -701,6 +701,7 @@ async def test_auto_create_pi_terminal_passes_pi_own_login_reference_through(
 
     assert "omnigent/openai-codex/gpt-5.6-sol" not in args
     assert "--provider" not in args
+    assert "--model" in args
     assert args[args.index("--model") + 1] == "openai-codex/gpt-5.6-sol"
 
 
@@ -724,6 +725,7 @@ async def test_auto_create_pi_terminal_spec_pinned_own_login_reference_passes_th
 
     assert "omnigent/openai-codex/gpt-5.6-sol" not in args
     assert "--provider" not in args
+    assert "--model" in args
     assert args[args.index("--model") + 1] == "openai-codex/gpt-5.6-sol"
 
 
@@ -736,6 +738,8 @@ async def test_auto_create_pi_terminal_keeps_gateway_routing_for_slash_model(
         tmp_path, monkeypatch, model_override="openai/gpt-4o-mini"
     )
 
+    assert "--provider" in args
+    assert "--model" in args
     assert args[args.index("--provider") + 1] == "omnigent"
     assert args[args.index("--model") + 1] == "omnigent/openai/gpt-4o-mini"
 
