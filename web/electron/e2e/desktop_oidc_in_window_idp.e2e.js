@@ -113,11 +113,17 @@ describe(
             if (state !== "pending") break;
             await sleep(1_000);
           }
-          observed.webauthn = await window.evaluate(() => ({
-            ...window.passkeyCeremony,
-            observedMs: Date.now() - window.passkeyCeremony.startedAt,
-            statusText: document.getElementById("webauthn-status")?.textContent ?? "",
-          }));
+          observed.webauthn = await window
+            .evaluate(() => {
+              const ceremony = window.passkeyCeremony;
+              if (!ceremony) return null;
+              return {
+                ...ceremony,
+                observedMs: Date.now() - ceremony.startedAt,
+                statusText: document.getElementById("webauthn-status")?.textContent ?? "",
+              };
+            })
+            .catch(() => null);
           await window.screenshot({ path: path.join(RECORD_DIR, "in-window-idp-passkey.png") });
         }
         /* oxlint-enable no-await-in-loop */
@@ -131,15 +137,11 @@ describe(
 
     async function driveSignInJourney() {
       const signIn = observed.signIn;
-      const originalPath = process.env.PATH;
-      process.env.PATH = `${FAKE_BROWSER_DIR}${path.delimiter}${originalPath}`;
-      let launched;
-      try {
-        launched = await launchDesktop({ recordDir: RECORD_DIR });
-      } finally {
-        process.env.PATH = originalPath;
-      }
-      const { electronApp, window, userDataDir, stopDisplayCapture } = launched;
+      fs.accessSync(path.join(FAKE_BROWSER_DIR, "xdg-open"), fs.constants.X_OK);
+      const { electronApp, window, userDataDir, stopDisplayCapture } = await launchDesktop({
+        recordDir: RECORD_DIR,
+        env: { PATH: `${FAKE_BROWSER_DIR}${path.delimiter}${process.env.PATH}` },
+      });
       const dialogOpen = () =>
         electronApp.windows().some((page) => page.url().endsWith("/oidc_login.html"));
       try {

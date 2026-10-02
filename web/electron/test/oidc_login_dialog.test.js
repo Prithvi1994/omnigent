@@ -69,8 +69,11 @@ describe("OIDC login modal", () => {
   it("keeps the sandboxed preload self-contained", () => {
     const source = readFileSync(path.join(__dirname, "../src/oidc_login_preload.js"), "utf8");
     assert.doesNotMatch(source, /require\(["']\.\//);
-    assert.ok(source.includes(OIDC_LOGIN_ACTION_CHANNEL));
-    assert.ok(source.includes(OIDC_LOGIN_STATE_CHANNEL));
+    const defines = (name, value) => source.includes(`const ${name} = ${JSON.stringify(value)}`);
+    assert.ok(defines("OIDC_LOGIN_ACTION_CHANNEL", OIDC_LOGIN_ACTION_CHANNEL));
+    assert.ok(defines("OIDC_LOGIN_STATE_CHANNEL", OIDC_LOGIN_STATE_CHANNEL));
+    assert.match(source, /ipcRenderer\.send\(OIDC_LOGIN_ACTION_CHANNEL, /);
+    assert.match(source, /ipcRenderer\.on\(OIDC_LOGIN_STATE_CHANNEL, /);
   });
 
   it("uses a sandboxed isolated preload and cancels an in-flight login", async () => {
@@ -342,6 +345,24 @@ describe("OIDC login modal", () => {
       setImmediate(resolve);
     });
     controller.abort();
+
+    assert.equal(await flow, false);
+    assert.equal(latestWindow().destroyed, true);
+  });
+
+  it("resolves false immediately when opened with an already superseded attempt", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const flow = runOidcLoginDialog({
+      BrowserWindow: FakeBrowserWindow,
+      ipcMain: new EventEmitter(),
+      parent: {},
+      serverUrl: "https://server.example",
+      pagePath: "/app/oidc_login.html",
+      preloadPath: "/app/oidc_login_preload.js",
+      signal: controller.signal,
+      runAttempt: async () => assert.fail("attempted a superseded sign-in"),
+    });
 
     assert.equal(await flow, false);
     assert.equal(latestWindow().destroyed, true);

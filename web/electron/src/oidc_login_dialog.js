@@ -84,6 +84,7 @@ function runOidcLoginDialog({
 
     const cleanup = () => {
       ipcMain.removeListener(OIDC_LOGIN_ACTION_CHANNEL, onAction);
+      signal?.removeEventListener("abort", onAbort);
       controller?.abort();
     };
 
@@ -137,6 +138,10 @@ function runOidcLoginDialog({
       sendState();
     };
 
+    function onAbort() {
+      finish(false);
+    }
+
     function onAction(event, action) {
       if (event.sender !== loginWindow.webContents) return;
       if (action === "cancel") {
@@ -147,7 +152,11 @@ function runOidcLoginDialog({
     }
 
     ipcMain.on(OIDC_LOGIN_ACTION_CHANNEL, onAction);
-    signal?.addEventListener("abort", () => finish(false), { once: true });
+    if (signal?.aborted) {
+      finish(false);
+      return;
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
     loginWindow.webContents.on("will-navigate", (event, url) => {
       if (url !== allowedPageUrl) event.preventDefault();
     });

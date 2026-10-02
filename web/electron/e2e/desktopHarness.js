@@ -361,6 +361,7 @@ function startDisplayCapture(recordDir, display) {
  *
  * @param {object} opts
  * @param {string} opts.recordDir Directory the .webm video is written into.
+ * @param {Record<string, string>} [opts.env] Extra environment for the shell process.
  * @param {string} [opts.serverUrl] Pre-seed settings.json's server_url with
  *   this, so the shell auto-connects on launch.
  * @param {string} [opts.userDataDir] Override the isolated userData dir
@@ -423,7 +424,7 @@ async function launchDesktop(opts) {
       recordVideo: { dir: opts.recordDir },
       // Dev builds read dev-app-update.yml and would try to reach the update
       // endpoint; a version override keeps the app off the update path.
-      env: { ...process.env, OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0" },
+      env: { ...process.env, OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0", ...(opts.env ?? {}) },
     });
   } catch (err) {
     await stopDisplayCapture();

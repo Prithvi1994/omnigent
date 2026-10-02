@@ -757,8 +757,6 @@ const EXPIRY_RELOAD_MIN_INTERVAL_MS = 15_000;
 let databricksAuthMode;
 let databricksAuth;
 const connectionAttempts = new WeakMap();
-/** @type {WeakMap<Electron.BrowserWindow, { serverUrl: string, promise: Promise<boolean> }>} */
-const oidcLoginFlows = new WeakMap();
 
 /**
  * Make sure a self-hosted OIDC server has a session before its page loads, so
@@ -787,11 +785,9 @@ async function ensureWindowOidcSession(win, serverUrl, attempt) {
 }
 
 /** Sign in through the system browser behind a cancellable status dialog. */
-async function runWindowOidcBrowserHandoff(win, serverUrl, attemptSignal) {
-  const existingFlow = oidcLoginFlows.get(win);
-  if (existingFlow?.serverUrl === serverUrl) return existingFlow.promise;
-
-  const promise = runOidcLoginDialog({
+function runWindowOidcBrowserHandoff(win, serverUrl, attemptSignal) {
+  const host = new URL(serverUrl).host;
+  return runOidcLoginDialog({
     BrowserWindow,
     ipcMain,
     parent: win,
@@ -807,9 +803,12 @@ async function runWindowOidcBrowserHandoff(win, serverUrl, attemptSignal) {
         {
           timeoutMs: OIDC_LOGIN_TIMEOUT_MS,
           signal,
-          onPollError: () => {
-            const host = new URL(serverUrl).host;
-            updateMessage(`Still waiting — the last attempt failed to reach ${host}. Retrying…`);
+          onPollError: (status) => {
+            updateMessage(
+              status
+                ? `Still waiting — ${host} answered ${status}. Retrying…`
+                : `Still waiting — the last attempt failed to reach ${host}. Retrying…`,
+            );
           },
         },
       );
@@ -833,11 +832,7 @@ async function runWindowOidcBrowserHandoff(win, serverUrl, attemptSignal) {
       }
       return { ok: true };
     },
-  }).finally(() => {
-    if (oidcLoginFlows.get(win)?.promise === promise) oidcLoginFlows.delete(win);
   });
-  oidcLoginFlows.set(win, { serverUrl, promise });
-  return promise;
 }
 
 function oidcLoginErrorMessage(reason) {

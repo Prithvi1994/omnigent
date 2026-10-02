@@ -601,7 +601,7 @@ describe("OIDC browser ticket flow", () => {
   it("rejects a token whose body arrives past the login deadline", async () => {
     // The poll request is issued in time, but the response body trickles in
     // after the 5-minute window — expired-flow output must not become a
-    // session (parity with the Android shell's late-token check).
+    // session.
     const electronSession = {
       fetch: async (url) => {
         if (url.endsWith("/auth/cli-login")) {
@@ -1136,5 +1136,13 @@ describe("OIDC session lifetime", () => {
       "expirationDate" in sessionCookieDetails("https://server.example", "token", 0),
       false,
     );
+  });
+});
+
+describe("OIDC server URL validation", () => {
+  it("accepts a root workspace URL with a selector and no trailing slash", () => {
+    assert.equal(oidcServerUrlError("https://dbc-a.cloud.databricks.com?o=123456789"), null);
+    assert.equal(oidcServerUrlError("https://server.example"), null);
+    assert.equal(oidcServerUrlError("https://server.example/"), null);
   });
 });

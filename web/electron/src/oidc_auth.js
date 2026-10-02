@@ -107,7 +107,7 @@ function oidcServerUrlError(serverUrl) {
     return "invalid_server_url";
   }
   const serialized = parsed.toString();
-  const rootWithoutSlash = parsed.pathname === "/" ? serialized.slice(0, -1) : null;
+  const rootWithoutSlash = parsed.pathname === "/" ? `${parsed.origin}${parsed.search}` : null;
   if (serverUrl !== serialized && serverUrl !== rootWithoutSlash) {
     return "invalid_server_url";
   }
