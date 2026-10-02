@@ -54,6 +54,7 @@ describe(
     const observed = {
       windowUrls: [],
       inWindowIdpUrl: null,
+      dialogSeen: false,
       idpAuthorizeAgents: [],
       windowCount: 0,
       webauthn: null,
@@ -88,6 +89,9 @@ describe(
         while (Date.now() < navigationDeadline) {
           const url = window.url();
           if (observed.windowUrls.at(-1) !== url) observed.windowUrls.push(url);
+          if (electronApp.windows().some((page) => page.url().endsWith("/oidc_login.html"))) {
+            observed.dialogSeen = true;
+          }
           if (url.startsWith(idpOrigin)) {
             observed.inWindowIdpUrl = url;
             break;
@@ -225,6 +229,7 @@ describe(
           `IdP /authorize fetched by: ${observed.idpAuthorizeAgents.join(" | ") || "(nobody)"}` +
           passkey,
       );
+      assert.equal(observed.dialogSeen, true, "the shell's sign-in dialog never appeared");
     });
 
     it(

@@ -2511,6 +2511,60 @@ describe("self-hosted OIDC system-browser sign-in wiring (src/main.js)", () => {
     assert.deepEqual(dialogs, []);
   });
 
+  it("hands off an OIDC login navigation that arrives before the initial load settles", async (t) => {
+    const dialogs = [];
+    // The probe sees a valid session that the page load then finds expired.
+    let posture = "authenticated";
+    const h = loadNavigationHarness({
+      serverUrl: server,
+      oidcAuth: {
+        ...require("../src/oidc_auth"),
+        probeServerAuth: async () =>
+          posture === "oidc"
+            ? { kind: "oidc", status: 401 }
+            : { kind: "authenticated", status: 200 },
+      },
+      oidcLoginDialog: dialogStub(true, dialogs),
+    });
+    t.after(h.cleanup);
+    h.api.createWindow(server);
+    // oxlint-disable-next-line no-await-in-loop -- wait for the cold load to be recorded
+    while (h.calls.loadURL.length === 0) await tick();
+    h.calls.loadURL.length = 0;
+    const originalLoadURL = h.win.loadURL;
+    let releaseLoad;
+    h.win.loadURL = (...args) => {
+      h.calls.loadURL.push(args);
+      return new Promise((resolve) => {
+        releaseLoad = resolve;
+      });
+    };
+    const initial = h.api.loadServerUrl(h.win, server);
+    await tick();
+    assert.deepEqual(h.calls.loadURL, [[server]]);
+    h.win.loadURL = originalLoadURL;
+    posture = "oidc";
+    h.setUrl(`${server}/`);
+    const event = {
+      prevented: false,
+      preventDefault() {
+        this.prevented = true;
+      },
+    };
+
+    for (const listener of h.listenersFor("will-navigate")) {
+      listener(event, `${server}/auth/login?return_to=%2F`);
+    }
+    await tick();
+    await tick();
+    releaseLoad();
+
+    assert.equal(event.prevented, true);
+    assert.deepEqual(dialogs, [server]);
+    assert.deepEqual(h.calls.loadURL.at(-1), [`${server}/`]);
+    await assert.rejects(initial, { name: "AbortError" });
+  });
+
   it("closes a pending sign-in dialog when a newer connection supersedes it", async (t) => {
     const other = "https://other.example";
     const h = loadNavigationHarness({

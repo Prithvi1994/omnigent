@@ -762,9 +762,8 @@ const connectionAttempts = new WeakMap();
  * Make sure a self-hosted OIDC server has a session before its page loads, so
  * the IdP opens in the system browser instead of inside the window. Servers
  * that aren't OIDC (no auth, accounts mode) or can't be probed load as before.
- * A plain-HTTP remote OIDC server still gets the dialog, which refuses it with
- * the HTTPS requirement: loading it instead would bounce the SPA to /auth/login,
- * which the expiry handoff intercepts, and reload the window forever.
+ * Plain-HTTP remote OIDC servers are probed too, so the dialog can refuse them
+ * with the HTTPS requirement instead of the window reloading forever.
  *
  * @returns {Promise<boolean>} false when the user cancelled or sign-in failed.
  */
@@ -2128,7 +2127,8 @@ function createWindow(targetUrl, opts = {}) {
       return handsOff ? connectedUrl : null;
     },
     async ({ serverUrl: expiredUrl, returnUrl }) => {
-      if (connectionAttempts.get(win)?.pending) return;
+      // The redirect can arrive while the initial load is still pending (the
+      // probe fell back to loading the page); the handoff supersedes that load.
       try {
         await loadServerUrl(win, expiredUrl, undefined, { loadUrl: returnUrl, interactive: true });
       } catch (error) {
