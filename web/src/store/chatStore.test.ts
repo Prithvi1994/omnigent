@@ -4395,7 +4395,8 @@ describe("chatStore — send while streaming (queueing)", () => {
   }
 
   it("ignores a bare idle while the trailing tool call is still unresolved", () => {
-    // A bare PTY idle must not end an unresolved tool call.
+    // A bare PTY idle must not end an unresolved tool call, flip the sidebar
+    // row, or fire the turn-end refetches.
     useChatStore.setState({
       conversationId: "conv_abc",
       status: "streaming",
@@ -4403,6 +4404,8 @@ describe("chatStore — send while streaming (queueing)", () => {
       activeResponse: { responseId: "resp_a", state: "streaming", error: null },
       blocks: [inFlightToolGroup("c1")],
     });
+    seedConversationsCache([conv("conv_abc", "running")]);
+    const invalidateSpy = vi.spyOn(client, "invalidateQueries");
     handleSessionEvent({
       type: "session_status",
       conversationId: "conv_abc",
@@ -4416,6 +4419,8 @@ describe("chatStore — send while streaming (queueing)", () => {
       state: "streaming",
       error: null,
     });
+    expect(readConversationRows()[0]?.status).toBe("running");
+    expect(invalidateSpy).not.toHaveBeenCalled();
   });
 
   it("adopts the bare idle once the trailing tool call has its result", () => {

@@ -4158,4 +4158,9 @@ describe("hasUnresolvedTrailingToolCall", () => {
   it("one resolved and one in-flight call in the trailing phase → true", () => {
     expect(hasUnresolvedTrailingToolCall([group(["c1", "c2"]), result("c1")])).toBe(true);
   });
+
+  it("another turn's result does not settle a reused call id → true", () => {
+    const staleResult = { ...result("c1"), ctx: ctx({ itemId: "fco_0", responseId: "resp_0" }) };
+    expect(hasUnresolvedTrailingToolCall([group(["c1"]), staleResult])).toBe(true);
+  });
 });

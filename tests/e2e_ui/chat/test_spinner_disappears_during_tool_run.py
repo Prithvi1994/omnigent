@@ -8,9 +8,11 @@ import httpx
 from playwright.sync_api import Page, expect
 
 _WORKING = '[data-testid="working-indicator"]'
+_TRACKER = '[data-testid="plan-tracker"]'
 _COMPOSER = "Message the agent"
 _NARRATION = "let me look for universe repos around the file system"
 _SEARCH_COMMAND = "find / -type d -name '*universe*'"
+_MARKER_TODO = {"content": "Report the repos found", "status": "pending", "activeForm": ""}
 
 
 def _post_event(client: httpx.Client, session_id: str, event_type: str, data: dict) -> None:
@@ -30,12 +32,9 @@ def test_working_indicator_survives_false_idle_during_tool_call(
     base_url, session_id = seeded_session
     response_id = f"resp_universe_{uuid.uuid4().hex[:8]}"
     call_id = f"call_{uuid.uuid4().hex[:8]}"
-    marker_title = f"universe-search-{uuid.uuid4().hex[:8]}"
 
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_role("textbox", name=_COMPOSER)).to_be_visible(timeout=20_000)
-    sidebar_row = page.locator(f'a[href="/c/{session_id}"]')
-    expect(sidebar_row).to_be_visible(timeout=20_000)
 
     working = page.locator(_WORKING)
 
@@ -90,11 +89,11 @@ def test_working_indicator_survives_false_idle_during_tool_call(
 
         # The idle watcher emits this bare status while the tool is still running.
         _post_event(client, session_id, "external_session_status", {"status": "idle"})
-        # Published behind the idle on the same ordered session stream: once the
-        # sidebar shows this title, the browser has already processed the idle.
-        _post_event(client, session_id, "external_session_title", {"title": marker_title})
+        # Published behind the idle on the same session stream and rendered only
+        # from that stream: once the plan tracker shows, the idle was processed.
+        _post_event(client, session_id, "external_session_todos", {"todos": [_MARKER_TODO]})
 
-    expect(sidebar_row).to_contain_text(marker_title, timeout=20_000)
+    expect(page.locator(_TRACKER)).to_be_visible(timeout=20_000)
     expect(working).to_be_visible()
     # The in-flight tool card keeps spinning instead of folding into a settled summary.
     expect(page.locator('[data-testid="turn-worked-fold"]')).to_have_count(0)
