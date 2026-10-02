@@ -2905,17 +2905,18 @@ def create_runner_app(
                         and _terminal_registry.get(session_id, "claude", "main")
                         is not claude_terminal_before_init
                     )
-                    wants_rebuild = (
-                        has_terminal
-                        and not built_during_init
-                        and await _claude_native_session_wants_rebuild(
-                            server_client, session_id, init_context.envelope
-                        )
+                    # The init snapshot predates a terminal registered during init, so
+                    # judge that one against fresh server state: a recorded fork clone
+                    # is current, while a launch begun before an agent switch is not.
+                    wants_rebuild = has_terminal and await _claude_native_session_wants_rebuild(
+                        server_client,
+                        session_id,
+                        None if built_during_init else init_context.envelope,
                     )
-                    if built_during_init:
+                    if built_during_init and not wants_rebuild:
                         _logger.info(
-                            "Claude terminal created while session init ran; keeping it: "
-                            "session=%s",
+                            "Claude terminal created while session init ran is current; "
+                            "keeping it: session=%s",
                             session_id,
                             extra={"session_id": session_id},
                         )

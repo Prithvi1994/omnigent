@@ -2793,12 +2793,14 @@ class _LabelsAndEmptyHistoryServerClient:
     loudly instead of silently returning a mock.
     """
 
-    def __init__(self, bridge_id_label: str) -> None:
+    def __init__(self, bridge_id_label: str, extra_labels: dict[str, str] | None = None) -> None:
         """
         :param bridge_id_label: Bridge id to report on the session's
             ``labels``, e.g. ``"bridge_shared"``.
+        :param extra_labels: Further snapshot labels, e.g. the carry-history label.
         """
         self._bridge_id_label = bridge_id_label
+        self._extra_labels = extra_labels or {}
 
     async def get(self, url: str, **kwargs: Any) -> Any:
         """
@@ -2825,7 +2827,9 @@ class _LabelsAndEmptyHistoryServerClient:
 
         if url.endswith("/items"):
             return _Response({"data": [], "has_more": False})
-        return _Response({"labels": {BRIDGE_ID_LABEL_KEY: self._bridge_id_label}})
+        return _Response(
+            {"labels": {BRIDGE_ID_LABEL_KEY: self._bridge_id_label, **self._extra_labels}}
+        )
 
 
 _AUTO_CREATE_SCENARIOS = [
@@ -3020,24 +3024,37 @@ async def test_create_session_auto_create_guard_skips_rotation_targets(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("terminal_built_during_init", [False, True], ids=["before", "during"])
-async def test_create_session_rebuilds_only_claude_terminals_that_predate_init(
+@pytest.mark.parametrize(
+    ("terminal_built_during_init", "fresh_state_wants_rebuild", "expect_rebuild"),
+    [
+        pytest.param(False, False, True, id="before"),
+        pytest.param(True, False, False, id="during-current"),
+        pytest.param(True, True, True, id="during-stale"),
+    ],
+)
+async def test_create_session_rebuilds_claude_terminal_only_when_stale(
     terminal_built_during_init: bool,
+    fresh_state_wants_rebuild: bool,
+    expect_rebuild: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Session init tears down a pending-rebuild Claude terminal only if it predates init.
+    Session init rebuilds a Claude terminal only when it is stale.
 
     A fork or agent switch into claude-native leaves the init snapshot with no
     ``external_session_id`` plus the carry-history label. A terminal registered
-    before init started is the stale pre-switch one and must be rebuilt. A
-    terminal that a racing terminal-ensure (e.g. a side chat's first message)
-    creates while init runs was built from the current server state; tearing it
-    down throws away a live clone whose id the server already recorded.
+    before init started is the stale pre-switch one and must be rebuilt. For a
+    terminal registered while init runs, that snapshot is out of date, so init
+    re-reads the session: a racing ensure that recorded a fork clone's id is
+    kept, while a launch begun before an agent switch (fresh state still pending
+    a rebuild) is rebuilt.
 
     :param terminal_built_during_init: Register the terminal mid-init (inside
         spec resolution) instead of before the init request.
+    :param fresh_state_wants_rebuild: Whether the fresh session GET still shows
+        the carry-history label with no ``external_session_id``.
+    :param expect_rebuild: Whether init should tear down and recreate the terminal.
     :param tmp_path: Temporary directory for bridge and terminal paths.
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
@@ -3107,7 +3124,10 @@ async def test_create_session_rebuilds_only_claude_terminals_that_predate_init(
     app = create_runner_app(
         process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
         spec_resolver=_resolver,
-        server_client=_LabelsAndEmptyHistoryServerClient(session_id),  # type: ignore[arg-type]
+        server_client=_LabelsAndEmptyHistoryServerClient(  # type: ignore[arg-type]
+            session_id,
+            {FORK_CARRY_HISTORY_LABEL_KEY: "1"} if fresh_state_wants_rebuild else None,
+        ),
         terminal_registry=terminal_registry,
     )
     payload: dict[str, Any] = {
@@ -3132,10 +3152,10 @@ async def test_create_session_rebuilds_only_claude_terminals_that_predate_init(
     assert resp.status_code == 201, resp.text
 
     kept = terminal_registry.get(session_id, "claude", "main") is instance
-    if terminal_built_during_init:
-        assert kept and created == [], "a terminal built during init must not be torn down"
+    if expect_rebuild:
+        assert not kept and created == [session_id], "a stale terminal must be rebuilt"
     else:
-        assert not kept and created == [session_id], "a pre-init terminal must be rebuilt"
+        assert kept and created == [], "a current terminal must not be torn down"
 
 
 @dataclass
