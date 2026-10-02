@@ -7968,6 +7968,16 @@ _TEAMMATE_DELIVERY_GUIDANCE = (
     "This came from another Claude session — not typed by your user,",
     'That "other Claude session" is an agent working inside this same session —',
 )
+# Claude Code returns a delegated subagent's final report to the parent
+# transcript as a ``role=user`` record whose whole text is a framed
+# ``<agent-message from="…">`` envelope carrying a ``[Subagent
+# hand-back]`` header. It is framework plumbing, not operator input —
+# matching the full frame shape (opening tag with sender, header,
+# closing tag) so a message that merely mentions the words survives.
+_SUBAGENT_HANDBACK_FRAME_RE = re.compile(
+    r'<agent-message\s+[^>]*\bfrom="[^"]+"[^>]*>.*?\[Subagent hand-back\].*?</agent-message>',
+    re.DOTALL,
+)
 
 # Substrings Claude Code writes to a ``/compact`` command's
 # ``<local-command-stdout>`` when it declines to compact (context too small
@@ -8295,6 +8305,27 @@ def _subagent_handback_id(origin: object) -> str | None:
     return task_id if isinstance(task_id, str) and task_id else None
 
 
+def _is_subagent_handback_frame(text: str) -> bool:
+    """
+    Recognize Claude's framed subagent hand-back in user-record text.
+
+    Without peer ``origin`` provenance the hand-back lands as a plain
+    ``role=user`` record. The record's whole text must be the structured
+    frame — optionally behind Claude's delivery prefix — which an operator
+    never types; a message that only mentions the tags or the header is
+    left alone.
+
+    :param text: User-record text from a Claude transcript record.
+    :returns: True when the text is exactly a hand-back frame.
+    """
+    stripped = text.lstrip()
+    for prefix in _TEAMMATE_MESSAGE_PREFIXES:
+        if stripped.startswith(prefix):
+            stripped = stripped[len(prefix) :].lstrip()
+            break
+    return _SUBAGENT_HANDBACK_FRAME_RE.fullmatch(stripped) is not None
+
+
 def _is_task_completion_text(text: str) -> bool:
     return (
         text.lstrip().startswith("<task-notification>")
@@ -8589,6 +8620,11 @@ def _user_transcript_items_from_entry(
         # of leaking as user bubbles.
         if any(stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS):
             return current_response_id, []
+        # A subagent hand-back frame without peer provenance is also
+        # framework plumbing; drop it instead of rendering it as a user
+        # bubble.
+        if _is_subagent_handback_frame(content):
+            return current_response_id, []
         items.append(
             ClaudeTranscriptItem(
                 source_id=_source_id(source_key, 0, "message"),
@@ -8646,6 +8682,9 @@ def _user_transcript_items_from_entry(
             if "<command-name>" in stripped or any(
                 stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS
             ):
+                continue
+            # Same for a subagent hand-back frame delivered as a text block.
+            if _is_subagent_handback_frame(text):
                 continue
             user_blocks.append(
                 {"type": "input_text", "text": _unwrap_pasted_content_markers(text)}

@@ -1355,6 +1355,63 @@ def test_internal_scaffolding_does_not_split_parent_response(
     assert response_id == "active"
 
 
+_HANDBACK_FRAME = (
+    '<agent-message from="researcher" to="lead">\n'
+    "[Subagent hand-back]\n"
+    "Fixed the parser; see bridge.py for the diff.\n"
+    "</agent-message>"
+)
+
+
+@pytest.mark.parametrize("as_blocks", [False, True])
+@pytest.mark.parametrize(
+    "text",
+    [
+        _HANDBACK_FRAME,
+        "Another Claude session sent a message:\n" + _HANDBACK_FRAME,
+    ],
+)
+def test_read_transcript_items_since_drops_subagent_handback_frame(
+    tmp_path: Path, text: str, as_blocks: bool
+) -> None:
+    """
+    Claude Code writes a delegated subagent's final report back into the
+    parent transcript as a ``role=user`` record whose whole text is the
+    framed hand-back. It is framework plumbing, not operator input — both
+    the string form and the text-block form must drop instead of
+    rendering as a user bubble.
+    """
+    content = [{"type": "text", "text": text}] if as_blocks else text
+    _, response_id, items = _read_native_user(tmp_path, content)
+
+    assert items == [], (
+        f"Subagent hand-back frame must drop; bridge emitted {[item.item_type for item in items]}"
+    )
+    assert response_id == "active"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "What does [Subagent hand-back] mean?",
+        'Explain this frame: <agent-message from="x">hi</agent-message>',
+        "Check this: " + _HANDBACK_FRAME,
+    ],
+)
+def test_read_transcript_items_since_keeps_user_text_mentioning_handback(
+    tmp_path: Path, text: str
+) -> None:
+    """
+    The hand-back drop requires the full structured frame; a genuine user
+    message that merely mentions the header or the tags still renders.
+    """
+    _, _, items = _read_native_user(tmp_path, text)
+
+    [item] = items
+    assert item.item_type == "message"
+    assert item.data == {"role": "user", "content": [{"type": "input_text", "text": text}]}
+
+
 @pytest.mark.parametrize("queued", [None, "prompt", "task-notification"])
 @pytest.mark.parametrize("handback", [False, True])
 def test_completion_preserves_hidden_provenance(
