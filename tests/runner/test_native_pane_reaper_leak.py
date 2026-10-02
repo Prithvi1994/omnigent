@@ -15,7 +15,6 @@ then ask the reaper whether the quiet, unattended pane is still busy.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from pathlib import Path
 
 import httpx
@@ -69,13 +68,19 @@ def _build_reaper_app(harness: str, gate: asyncio.Event):
 
 async def _drive_finished_turn(
     client: httpx.AsyncClient, harness: str, gate: asyncio.Event
-) -> None:
-    """Create a session and run one message turn to completion via HTTP."""
+) -> int:
+    """Create a session and run one message turn to completion via HTTP.
+
+    Returns the turn event POST's status code so the caller can confirm the
+    turn ran instead of silently erroring behind the gate.
+    """
     r = await client.post("/v1/sessions", json={"session_id": _CONV, "agent_id": _AGENT})
     assert r.status_code == 201, r.text
 
+    turn: dict[str, httpx.Response] = {}
+
     async def _turn() -> None:
-        await client.post(
+        turn["response"] = await client.post(
             f"/v1/sessions/{_CONV}/events",
             json={
                 "type": "message",
@@ -89,21 +94,25 @@ async def _drive_finished_turn(
     task = asyncio.create_task(_turn())
     await asyncio.sleep(0.3)
     gate.set()
-    with contextlib.suppress(Exception):
-        await asyncio.wait_for(task, timeout=10)
+    await asyncio.wait_for(task, timeout=10)
     await asyncio.sleep(0.3)
+    assert "response" in turn, "native turn task raised before responding"
+    return turn["response"].status_code
 
 
 @pytest.mark.parametrize(
     ("harness", "pane_name"),
     [("codex-native", "codex"), ("antigravity-native", "antigravity")],
 )
-async def test_finished_native_pane_reads_idle(harness: str, pane_name: str) -> None:
-    # Bound by name when the app is built, so stub before building: no tmux here.
-    # With the pane quiet and unattended, the only thing that could read "busy"
-    # is a stale status record.
-    native_cost_popup._list_tmux_clients = lambda *_a, **_k: []  # type: ignore[assignment]
-    native_cost_popup._tmux_window_activity_at = lambda *_a, **_k: None  # type: ignore[assignment]
+async def test_finished_native_pane_reads_idle(
+    harness: str, pane_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Bound by name when the app is built, so stub before building: no tmux
+    # here. monkeypatch restores the module globals so a stray stub can't make
+    # a later test read a quiet pane as busy. With the pane quiet and
+    # unattended, the only thing that could read "busy" is a stale status.
+    monkeypatch.setattr(native_cost_popup, "_list_tmux_clients", lambda *_a, **_k: [])
+    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_a, **_k: None)
 
     gate = asyncio.Event()
     app = _build_reaper_app(harness, gate)
@@ -118,7 +127,12 @@ async def test_finished_native_pane_reads_idle(harness: str, pane_name: str) -> 
     )
 
     async with _runner_client(app) as client:
-        await _drive_finished_turn(client, harness, gate)
+        assert await _drive_finished_turn(client, harness, gate) == 202
+
+        # Before any idle is relayed the finished pane must still read busy:
+        # codex/antigravity emit no local turn-end edge, so a passing final
+        # assertion only means something if the pane was busy to begin with.
+        assert await reaper._is_busy(pane)
 
         # The turn is over; the harness reports idle only through the relayed
         # external_session_status event the server posts back to the runner.
