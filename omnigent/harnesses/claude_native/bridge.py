@@ -2736,11 +2736,18 @@ def _load_settings_layer(value: str, launch_cwd: Path | None) -> _JsonObject | N
         if launch_cwd is not None and not path.is_absolute():
             path = launch_cwd / path
         try:
-            # A FIFO or device would block the runner; only read a regular file.
-            if not path.is_file():
-                return None
-            with path.open("rb") as handle:
-                data = handle.read(_SETTINGS_LAYER_MAX_BYTES + 1)
+            # A FIFO or device would block the runner; open without blocking and
+            # read only a regular file, checked on the descriptor itself.
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    return None
+                with os.fdopen(fd, "rb") as handle:
+                    fd = -1
+                    data = handle.read(_SETTINGS_LAYER_MAX_BYTES + 1)
+            finally:
+                if fd >= 0:
+                    os.close(fd)
         except OSError:
             return None
         if len(data) > _SETTINGS_LAYER_MAX_BYTES:

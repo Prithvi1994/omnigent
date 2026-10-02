@@ -84,13 +84,15 @@ def native_claude_teams_session(
     with _temp_omnigent_mock_config(
         mock_llm_server_url, "claude", workflow_owned=bool(_server_state.get("workflow_owned"))
     ):
-        session_id = _create_native_claude_session(
-            live_server, runner_id, terminal_launch_args=["--settings", _TEAMS_SETTINGS]
-        )
+        session_id: str | None = None
         try:
+            session_id = _create_native_claude_session(
+                live_server, runner_id, terminal_launch_args=["--settings", _TEAMS_SETTINGS]
+            )
             yield (live_server, session_id)
         finally:
-            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+            if session_id is not None:
+                httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
             if respawned is not None:
                 respawned.terminate()
                 try:
