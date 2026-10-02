@@ -154,3 +154,49 @@ def test_claude_workspace_normalizes_padding_and_tilde(
 
     monkeypatch.setenv("HOME", str(tmp_path))
     assert _claude_session_workspace("~/project") == str(project)
+
+
+def test_claude_workspace_blank_session_falls_back_to_runner_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A whitespace-only session workspace counts as unset: it must fall back to
+    the runner workspace, never collapse to ``.`` and launch in the process cwd."""
+    runner_workspace = tmp_path / "runner-workspace"
+    runner_workspace.mkdir()
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(runner_workspace))
+
+    assert _claude_session_workspace("   ") == str(runner_workspace)
+
+
+def test_claude_workspace_blank_everything_is_workspace_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a blank session workspace, no runner workspace, and a dead cwd, the
+    terminal must not silently launch in ``.``; it reports WORKSPACE_MISSING."""
+    monkeypatch.delenv("OMNIGENT_RUNNER_WORKSPACE", raising=False)
+
+    def _dead_cwd() -> Path:
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(Path, "cwd", staticmethod(_dead_cwd))
+
+    with pytest.raises(OmnigentError) as failure:
+        _claude_session_workspace("   ")
+    assert failure.value.code == ErrorCode.WORKSPACE_MISSING
+
+
+def test_claude_workspace_expanduser_failure_is_workspace_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``Path.expanduser`` can raise RuntimeError when a home dir can't be
+    resolved for a ``~`` path; that stays a WORKSPACE_MISSING condition."""
+    monkeypatch.delenv("OMNIGENT_RUNNER_WORKSPACE", raising=False)
+
+    def _no_home(self: Path) -> Path:
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(Path, "expanduser", _no_home)
+
+    with pytest.raises(OmnigentError) as failure:
+        _claude_session_workspace("~/project")
+    assert failure.value.code == ErrorCode.WORKSPACE_MISSING

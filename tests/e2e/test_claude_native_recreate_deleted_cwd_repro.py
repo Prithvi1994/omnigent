@@ -1,11 +1,10 @@
-"""Native Claude terminal (re)creation must survive a removed runner cwd.
+"""Native Claude terminal creation must use the session workspace when the
+runner's launch directory has been deleted.
 
-Reproduces OMNI-8679 / #7609: when the runner process is still alive but its
-launch directory was removed, creating the native Claude terminal fails even
-though a valid session workspace is configured. The terminal-launch path calls
-``load_effective_config()`` with no workspace, which eagerly reads ``Path.cwd()``
-and raises ``FileNotFoundError``; the server surfaces that as HTTP 500
-``native_terminal_start_failed`` ("Native Claude terminal failed to start").
+With the runner process still alive but its launch directory removed, creating
+the native Claude terminal must still succeed when a valid session workspace is
+configured, instead of failing with HTTP 500 "Native Claude terminal failed to
+start".
 
 Unlike ``test_claude_native_deleted_runner_cwd_e2e`` (which creates the terminal
 BEFORE unlinking the cwd, so Claude keeps the live workspace cwd), here the cwd

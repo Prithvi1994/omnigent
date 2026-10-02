@@ -896,11 +896,12 @@ def _claude_session_workspace(session_workspace: str | None) -> str:
 
     The server-stored session ``workspace`` wins, then
     :func:`_runner_workspace_dir`, so the process cwd is consulted only when
-    neither is set. Padding and a leading ``~`` are normalized (matching
-    :func:`_codex_session_workspace`) so a valid path isn't misread as missing,
-    but symlinks are left unresolved because Claude keys resume transcripts by
-    cwd. The selected directory must exist: launching somewhere else would
-    silently run the session in the wrong tree.
+    neither is set. A blank value counts as unset (so it never collapses to the
+    process cwd), and padding and a leading ``~`` are normalized (matching
+    :func:`_codex_session_workspace`) so a valid path isn't misread as missing;
+    symlinks are left unresolved because Claude keys resume transcripts by cwd.
+    The selected directory must exist: launching somewhere else would silently
+    run the session in the wrong tree.
 
     :param session_workspace: The session's ``workspace`` from the init
         snapshot or ``GET /v1/sessions/{id}``; ``None`` when omitted.
@@ -909,11 +910,11 @@ def _claude_session_workspace(session_workspace: str | None) -> str:
         the resolved path is not an existing directory.
     """
     try:
-        raw = session_workspace or _runner_workspace_dir()
+        raw = (session_workspace or "").strip() or _runner_workspace_dir()
+        workspace = str(Path(raw.strip()).expanduser())
     except RuntimeError as exc:
         raise OmnigentError(str(exc), code=ErrorCode.WORKSPACE_MISSING) from exc
-    workspace = str(Path(raw.strip()).expanduser())
-    if not os.path.isdir(workspace):
+    if not raw.strip() or not os.path.isdir(workspace):
         raise OmnigentError(workspace_missing_message(workspace), code=ErrorCode.WORKSPACE_MISSING)
     return workspace
 
