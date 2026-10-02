@@ -265,6 +265,11 @@ Terminal view shown, and keep filming past that window until the pane is gone
 (`fixed`/`after`) or still listed (`before`). A production window measured in
 hours, or a symptom that takes days to pile up, does not make the per-pane
 behavior unfilmable. Name the shortened window in the clip's caption.
+The variable only reaches a runner the recorder starts: the default fixtures
+and `--ui-base-url` both spawn one, but the workflow-prepared environment
+(`OMNIGENT_REPRO_SERVER_URL`, `dev.repro_env exec`) attaches to a runner that is
+already running, so there the runner itself must be restarted with the variable
+set, or record against fixture-spawned processes instead.
 
 The shortened window is not the whole wait. Recent pane output or viewer input
 counts as busy for two minutes, the reaper scans once a minute, and a newly idle
