@@ -6774,26 +6774,23 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // further down are deliberately NOT (they are keyed by explicit id, so a
       // sub-agent's status still refreshes its parent's rail).
       applyToNamedConversation(event.conversationId, (s) => {
-        // A quiet, unresolved tool can trigger a bare PTY idle mid-turn.
-        // Keep Working lit; id-bearing and blocked-on edges remain authoritative.
+        // A quiet, unresolved tool can trigger a bare PTY idle mid-turn. Keep
+        // Working lit; id-bearing, blocked-on and post-interrupt (`cancelled`)
+        // edges remain authoritative.
         if (
           event.status === "idle" &&
           event.responseId === undefined &&
           event.blockedOn == null &&
+          s.activeResponse?.state !== "cancelled" &&
           (s.sessionStatus === "running" || s.activeResponse?.state === "streaming") &&
           hasUnresolvedTrailingToolCall(s.blocks)
         ) {
           ignoredFalseIdle = true;
           return {};
         }
-        // `sessionStatus` tracks the server's session-level status 1:1 — a
-        // server `idle` means the session is idle, full stop, and the
-        // "Working…" indicator (which reads only `sessionStatus`) turns off.
-        // There is exactly one idle heuristic and it lives server-side (the
-        // runner's PTY-activity watcher); the client second-guesses it only
-        // for the single false-idle shape dropped above (a bare idle mid-tool).
-        // The bubble lifecycle below (`status`/`activeResponse`) still defers
-        // to response_end, but that is separate from the session-level status.
+        // `sessionStatus` mirrors the server's status 1:1; the bare-idle-mid-tool
+        // shape dropped above is the only client exception. The bubble lifecycle
+        // below (`status`/`activeResponse`) still defers to response_end.
         const patch: Partial<ChatState> = {
           sessionStatus: event.status,
           // Not sticky, unlike the background tally: every edge carries the

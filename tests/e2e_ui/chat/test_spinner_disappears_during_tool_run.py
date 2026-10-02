@@ -30,9 +30,12 @@ def test_working_indicator_survives_false_idle_during_tool_call(
     base_url, session_id = seeded_session
     response_id = f"resp_universe_{uuid.uuid4().hex[:8]}"
     call_id = f"call_{uuid.uuid4().hex[:8]}"
+    marker_title = f"universe-search-{uuid.uuid4().hex[:8]}"
 
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_role("textbox", name=_COMPOSER)).to_be_visible(timeout=20_000)
+    sidebar_row = page.locator(f'a[href="/c/{session_id}"]')
+    expect(sidebar_row).to_be_visible(timeout=20_000)
 
     working = page.locator(_WORKING)
 
@@ -87,11 +90,11 @@ def test_working_indicator_survives_false_idle_during_tool_call(
 
         # The idle watcher emits this bare status while the tool is still running.
         _post_event(client, session_id, "external_session_status", {"status": "idle"})
+        # Published behind the idle on the same ordered session stream: once the
+        # sidebar shows this title, the browser has already processed the idle.
+        _post_event(client, session_id, "external_session_title", {"title": marker_title})
 
-    # Let the bare-idle edge settle in the client store so the positive
-    # assertion below cannot pass on a pre-event frame.
-    page.wait_for_timeout(2_500)
-
+    expect(sidebar_row).to_contain_text(marker_title, timeout=20_000)
     expect(working).to_be_visible()
     # The in-flight tool card keeps spinning instead of folding into a settled summary.
     expect(page.locator('[data-testid="turn-worked-fold"]')).to_have_count(0)

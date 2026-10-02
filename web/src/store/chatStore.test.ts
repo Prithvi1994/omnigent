@@ -4478,6 +4478,35 @@ describe("chatStore — send while streaming (queueing)", () => {
     expect(state.blockedOn).toBe("user_input");
   });
 
+  it("adopts a bare idle after a user interrupt even with a dangling tool call", () => {
+    // Stop clicked in another tab: `session.interrupted` cancels the response
+    // here while `sessionStatus` is still running, and the interrupt handler's
+    // bare idle must then end the session although the tool never resolved.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      status: "streaming",
+      sessionStatus: "running",
+      activeResponse: { responseId: "resp_a", state: "streaming", error: null },
+      blocks: [inFlightToolGroup("c1")],
+    });
+    handleSessionEvent({ type: "session_interrupted", requestedAt: 0, responseId: "resp_a" });
+    expect(useChatStore.getState().sessionStatus).toBe("running");
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "idle",
+    });
+    const state = useChatStore.getState();
+    expect(state.sessionStatus).toBe("idle");
+    expect(state.status).toBe("idle");
+    expect(state.activeResponse).toEqual({
+      responseId: "resp_a",
+      state: "cancelled",
+      error: null,
+      completedAt: expect.any(Number),
+    });
+  });
+
   it("finalizes a streaming turn to failed on a bare failed edge", () => {
     useChatStore.setState({
       conversationId: "conv_abc",
