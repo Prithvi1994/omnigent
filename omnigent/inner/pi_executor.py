@@ -46,7 +46,7 @@ import tempfile
 from asyncio import Queue, Task
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
+from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
 from omnigent.harnesses.pi_native.credentials import (
@@ -97,6 +97,9 @@ from .executor import (
     ToolSpec,
     TurnComplete,
 )
+
+if TYPE_CHECKING:
+    from .sandbox import SandboxPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -1527,13 +1530,12 @@ class SandboxedPiCli:
         the original ``pi_path`` (sandbox skipped) or a generated wrapper
         script that applies the sandbox before exec-ing Pi.
     :param sandboxed: ``True`` when the wrapper script is active.
-    :param granted_roots: Read and write roots the active policy exposes;
-        empty when no sandbox is applied.
+    :param policy: The applied sandbox policy, or ``None`` without a sandbox.
     """
 
     launch_path: str
     sandboxed: bool
-    granted_roots: tuple[pathlib.Path, ...] = ()
+    policy: SandboxPolicy | None = None
 
 
 def _try_sandbox_pi(
@@ -1589,17 +1591,35 @@ def _try_sandbox_pi(
         # are covered; a bundle read root would let the dotfile mask hide .pi/.
         sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
         launcher = create_exec_launcher(pi_path, sandbox)
-        granted = (*(sandbox.read_roots or ()), *sandbox.write_roots)
-        return SandboxedPiCli(launch_path=launcher, sandboxed=True, granted_roots=tuple(granted))
+        return SandboxedPiCli(launch_path=launcher, sandboxed=True, policy=sandbox)
     except (OSError, ImportError, NotImplementedError) as exc:
         logger.warning("Could not apply sandbox for Pi: %s", exc)
         return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
 
 
-def _under_sandbox_roots(bundle_dir: pathlib.Path, roots: Sequence[pathlib.Path]) -> bool:
-    """Whether *bundle_dir* sits under one of the sandbox's granted *roots*."""
+def _bundle_visible_in_sandbox(
+    bundle_dir: pathlib.Path, policy: SandboxPolicy, cwd: pathlib.Path
+) -> bool:
+    """Whether a sandboxed Pi can read *bundle_dir* with its ``.pi/`` intact.
+
+    Roots exempt from the dotfile mask scan are always safe. Otherwise the
+    bundle must be readable (reads unrestricted, or under a granted root) and
+    must not itself be a scanned root, whose top-level ``.pi/`` would be masked;
+    a nested bundle survives unless the scan recurses.
+    """
     resolved = bundle_dir.resolve(strict=False)
-    return any(resolved.is_relative_to(root.resolve(strict=False)) for root in roots)
+
+    def under(root: pathlib.Path) -> bool:
+        return resolved.is_relative_to(root.resolve(strict=False))
+
+    if any(under(root) for root in policy.mask_scan_skip_roots or ()):
+        return True
+    granted = [*(policy.read_roots or ()), *policy.write_roots]
+    if policy.read_roots is not None and not any(under(root) for root in granted):
+        return False
+    if any(resolved == root.resolve(strict=False) for root in (*granted, cwd)):
+        return False
+    return not policy.cwd_hidden_scan_recursive
 
 
 def _resolve_pi_skill_args(
@@ -2193,13 +2213,16 @@ class PiExecutor(Executor):
         self._pi_launch_path = sandboxed.launch_path
         self._sandboxed = sandboxed.sandboxed
         if (
-            self._sandboxed
+            sandboxed.policy is not None
             and bundle_dir is not None
-            and not _under_sandbox_roots(bundle_dir, sandboxed.granted_roots)
+            and not _bundle_visible_in_sandbox(
+                bundle_dir, sandboxed.policy, pathlib.Path(cwd or os.getcwd())
+            )
         ):
             logger.warning(
-                "PiExecutor: bundle %s lies outside the roots the sandbox grants; "
-                "bundled skills and extensions may be unreadable inside the sandbox",
+                "PiExecutor: bundle %s may be hidden from the sandboxed pi (outside the "
+                "granted roots or subject to the dotfile mask); bundled skills and "
+                "extensions may not load",
                 bundle_dir,
             )
 
@@ -2616,12 +2639,12 @@ class PiExecutor(Executor):
         """Append the bundle-root context file to Omnigent's composed prompt.
 
         It goes after the composed prompt, where Pi itself places the project
-        context files it discovers. Skipped when the prompt already carries that
-        content (ignoring whitespace), as when the spec's ``instructions:``
-        reference the same file.
+        context files it discovers. Skipped when the prompt starts with that
+        content (ignoring whitespace): the parser-adopted instructions open the
+        composed prompt, so that is where an already-adopted file appears.
         """
         context = self._bundle_context
-        if not context or _squash_ws(context) in _squash_ws(system_prompt):
+        if not context or _squash_ws(system_prompt).startswith(_squash_ws(context)):
             return system_prompt
         return f"{system_prompt}\n\n{context}" if system_prompt else context
 

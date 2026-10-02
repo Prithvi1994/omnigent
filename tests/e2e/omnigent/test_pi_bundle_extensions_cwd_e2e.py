@@ -25,8 +25,6 @@ import contextlib
 import io
 import os
 import secrets
-import signal
-import socket
 import subprocess
 import tarfile
 import time
@@ -40,6 +38,7 @@ import httpx
 import pytest
 import yaml
 
+from tests._helpers.live_server import find_free_port, terminate_process
 from tests._helpers.session import bind_session_runner, post_session_bundle
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.conftest import get_mock_requests
@@ -61,12 +60,6 @@ pytestmark = pytest.mark.skipif(
         f"{_pytest_pi_unavailable}. Install/fix Pi to run this test."
     ),
 )
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def _build_bundle(bundle: Path, model: str) -> None:
@@ -126,7 +119,7 @@ def _server_and_runner(
     runner_id: str,
     binding_token: str,
     log_dir: Path,
-) -> Iterator[subprocess.Popen[str]]:
+) -> Iterator[tuple[subprocess.Popen[str], subprocess.Popen[str]]]:
     """Spawn ``omnigent server --agent <bundle>`` and a sibling runner.
 
     Output goes to files under *log_dir* so a chatty process cannot fill a
@@ -156,7 +149,7 @@ def _server_and_runner(
             stderr=subprocess.STDOUT,
             text=True,
         )
-        stack.callback(_stop, server)
+        stack.callback(terminate_process, server)
         runner = subprocess.Popen(
             [str(python), "-m", "omnigent.runner._entry"],
             env={
@@ -171,33 +164,30 @@ def _server_and_runner(
             stderr=subprocess.STDOUT,
             text=True,
         )
-        stack.callback(_stop, runner)
-        yield server
-
-
-def _stop(proc: subprocess.Popen[str]) -> None:
-    if proc.poll() is None:
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
+        stack.callback(terminate_process, runner)
+        yield server, runner
 
 
 def _wait_for_online_runner(
     port: int,
     *,
     runner_id: str,
-    proc: subprocess.Popen[str],
+    procs: dict[str, subprocess.Popen[str]],
     timeout: float,
-    server_log: Path,
+    log_dir: Path,
 ) -> None:
+    def _logs() -> str:
+        return "\n".join(
+            f"--- {name}.log ---\n{(log_dir / f'{name}.log').read_text(encoding='utf-8')}"
+            for name in procs
+            if (log_dir / f"{name}.log").exists()
+        )
+
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            output = server_log.read_text(encoding="utf-8") if server_log.exists() else ""
-            pytest.fail(f"server exited with code {proc.returncode}:\n{output}")
+        for name, proc in procs.items():
+            if proc.poll() is not None:
+                pytest.fail(f"{name} exited with code {proc.returncode}:\n{_logs()}")
         try:
             if httpx.get(f"http://127.0.0.1:{port}/health", timeout=2.0).status_code == 200:
                 status = httpx.get(
@@ -210,7 +200,7 @@ def _wait_for_online_runner(
             # The server is still booting (or answered a partial body); keep polling.
             pass
         time.sleep(0.5)
-    pytest.fail(f"server + runner not ready after {timeout}s")
+    pytest.fail(f"server + runner not ready after {timeout}s:\n{_logs()}")
 
 
 def _bundle_dir_tarball(bundle: Path) -> bytes:
@@ -309,7 +299,7 @@ def test_pi_bundle_extensions_reach_session_cwd(
     env = dict(mock_credentials_env)
     env["OMNIGENT_CONFIG_HOME"] = str(config_home)
 
-    port = _find_free_port()
+    port = find_free_port()
     db_path = tmp_path / "server.db"
     log_dir = tmp_path / "logs"
     binding_token = secrets.token_urlsafe(32)
@@ -325,13 +315,13 @@ def test_pi_bundle_extensions_reach_session_cwd(
         runner_id=runner_id,
         binding_token=binding_token,
         log_dir=log_dir,
-    ) as server:
+    ) as (server, runner):
         _wait_for_online_runner(
             port,
             runner_id=runner_id,
-            proc=server,
+            procs={"server": server, "runner": runner},
             timeout=_BOOT_TIMEOUT,
-            server_log=log_dir / "server.log",
+            log_dir=log_dir,
         )
 
         with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=30.0) as client:

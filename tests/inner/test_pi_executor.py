@@ -3713,10 +3713,13 @@ def test_bundle_context_follows_context_files_and_skips_duplicates(tmp_path: Pat
         "Agent prompt.\n\nBundle guidance marker."
     )
     assert enabled._with_bundle_context("") == "Bundle guidance marker."
-    already = "Agent prompt.\n\nBundle guidance marker.\n\nFramework notes."
-    assert enabled._with_bundle_context(already) == already
-    reflowed = "Agent prompt.\n\nBundle   guidance\nmarker.\n\nFramework notes."
+    adopted = "Bundle guidance marker.\n\nFramework notes."
+    assert enabled._with_bundle_context(adopted) == adopted
+    reflowed = "Bundle   guidance\nmarker.\n\nFramework notes."
     assert enabled._with_bundle_context(reflowed) == reflowed
+    # Quoting the text inside other instructions is not adoption.
+    quoted = 'Agent prompt. Sample wording, not policy: "Bundle guidance marker."'
+    assert enabled._with_bundle_context(quoted) == f"{quoted}\n\nBundle guidance marker."
     assert disabled._with_bundle_context("Agent prompt.") == "Agent prompt."
     assert "--no-context-files" in disabled._extra_args
 
@@ -3726,7 +3729,6 @@ def test_bundle_context_follows_context_files_and_skips_duplicates(tmp_path: Pat
     (bundle / "AGENTS.override.md").write_text("Override guidance.\n")
     with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
         layered = PiExecutor(bundle_dir=bundle)
-    adopted = "Bundle guidance marker.\n\nFramework notes."
     assert layered._with_bundle_context(adopted) == f"{adopted}\n\nOverride guidance."
 
 
@@ -4889,7 +4891,7 @@ def test_pi_sandbox_policy_leaves_bundle_dir_to_temp_grants(monkeypatch, tmp_pat
     # The temp dir is exempt from the dotfile mask scan, so a recursive scan
     # cannot hide an extracted bundle's .pi/ either.
     assert temp_root in [root.resolve(strict=False) for root in policy.mask_scan_skip_roots or []]
-    assert "lies outside the roots" not in caplog.text
+    assert "may be hidden" not in caplog.text
 
     # A bundle outside every granted root is still spawned, but the gap is logged.
     with (
@@ -4901,22 +4903,58 @@ def test_pi_sandbox_policy_leaves_bundle_dir_to_temp_grants(monkeypatch, tmp_pat
             bundle_dir=Path("/opt/omnigent-bundles/outside"),
             os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
         )
-    assert "lies outside the roots" in caplog.text
+    assert "may be hidden" in caplog.text
 
-    # A bundle under the session cwd is a granted write root: no warning.
-    caplog.clear()
-    inside_cwd = workspace / "vendored-bundle"
-    inside_cwd.mkdir()
-    with (
-        caplog.at_level(logging.WARNING),
-        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
-    ):
-        PiExecutor(
-            cwd=str(workspace),
-            bundle_dir=inside_cwd,
-            os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
-        )
-    assert "lies outside the roots" not in caplog.text
+
+@pytest.mark.parametrize(
+    ("read_roots", "recursive", "bundle", "visible"),
+    [
+        ("cwd", False, "cwd/vendored-bundle", True),
+        ("cwd", True, "cwd/vendored-bundle", False),
+        ("cwd", False, "cwd", False),
+        (None, False, "/opt/omnigent-bundles/outside", True),
+        ("cwd", False, "/opt/omnigent-bundles/outside", False),
+        ("cwd", True, "tmp", True),
+    ],
+    ids=[
+        "nested",
+        "nested-recursive-scan",
+        "bundle-is-cwd",
+        "unrestricted-reads",
+        "outside",
+        "temp-skip-root",
+    ],
+)
+def test_bundle_visible_in_sandbox_follows_policy(
+    tmp_path: Path, read_roots: str | None, recursive: bool, bundle: str, visible: bool
+) -> None:
+    """The visibility check behind the warning mirrors the mask scan: skip roots
+    are safe, unrestricted reads see everything, a bundle that is itself a
+    scanned root loses its ``.pi/``, and nested bundles survive unless the scan
+    recurses.
+    """
+    from omnigent.inner.pi_executor import _bundle_visible_in_sandbox
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    policy = SandboxPolicy(
+        backend_type="linux_bwrap",
+        active=True,
+        read_roots=[cwd] if read_roots == "cwd" else None,
+        write_roots=[cwd, Path(tempfile.gettempdir())],
+        write_files=[],
+        allow_network=False,
+        cwd_hidden_scan_recursive=recursive,
+        mask_scan_skip_roots=[Path(tempfile.gettempdir())],
+    )
+    targets = {
+        "cwd": cwd,
+        "cwd/vendored-bundle": cwd / "vendored-bundle",
+        "tmp": tmp_path / "bundle",
+    }
+    target = targets.get(bundle, Path(bundle))
+    assert _bundle_visible_in_sandbox(target, policy, cwd) is visible
 
 
 def test_run_turn_bridge_extension_carries_live_server_token(monkeypatch) -> None:
