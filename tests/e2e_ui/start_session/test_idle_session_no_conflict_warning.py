@@ -34,8 +34,9 @@ from tests.e2e_ui.start_session.helpers import (
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-# Long enough for the SPA's runner-health poll to feed the banner at least once.
-_CONFLICT_OBSERVATION_MS = 12_000
+# Two SPA runner-health poll cycles (POLL_INTERVAL_MS in
+# web/src/hooks/useRunnerHealth.ts), so one delayed poll can't pass this vacuously.
+_CONFLICT_OBSERVATION_MS = 20_000
 
 
 @contextlib.asynccontextmanager
@@ -68,7 +69,8 @@ async def _host_daemon(base_url: str, mock_llm_url: str, home: Path) -> AsyncIte
             PROCESS_LOG_FILE_ENV_VAR: str(log_path),
         }
     )
-    with open(log_path, "w") as log_fh:
+    # Append mode: the daemon's own process log writes to this file too.
+    with open(log_path, "a") as log_fh:
         proc = subprocess.Popen(
             [sys.executable, "-m", "omnigent.host._daemon_entry", "--server", base_url],
             env=env,
@@ -217,6 +219,7 @@ async def _drive(base_url: str, mock_llm_url: str, tmp_path: Path, output_dir: P
             await page.screenshot(path=output_dir / "directory-picker.png")
             if appeared:
                 text = " ".join((await conflict.inner_text()).split())
+                # Hold the banner on screen so a recording of the failure stays readable.
                 await page.wait_for_timeout(2_000)
                 pytest.fail(
                     f"Phantom conflict warning {text!r}: the only session in {project} is the "
