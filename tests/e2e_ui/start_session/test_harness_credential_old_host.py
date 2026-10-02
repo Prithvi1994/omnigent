@@ -1,36 +1,12 @@
-"""E2E: writing a harness credential to a host running omnigent v0.6.0.
+"""E2E: saving a harness credential to a host running omnigent v0.6.0.
 
-The setup dialog's credential form POSTs
-``/v1/hosts/{id}/harnesses/{harness}/credential``, which forwards a
-``host.store_secret`` frame over the host tunnel. A host daemon on omnigent
-v0.6.0 predates that frame kind: its frame loop can't decode it and silently
-drops it (v0.6.0 ``omnigent/host/connect.py:_serve_frames``). The reported bug:
-the server never checks the host can handle the frame before forwarding, so the
-user's save spins for the full 30s store-secret timeout and then fails with a
-misleading ``504 "host ... did not respond to store_secret within 30s"`` — as if
-the host were flaky, when it is online and healthy but will *never* answer.
-Expected: a fast, actionable rejection (the host is too old — update it), not a
-30-second dead wait blamed on host responsiveness.
-
-Unlike ``test_harness_credential.py`` (which stubs the credential POST with
-``page.route``), these tests must exercise the real server route and the real
-tunnel — the bug lives between them. So a **fake v0.6.0 host** connects over the
-real host WebSocket tunnel (``/v1/hosts/{id}/tunnel``), sends the hello a 0.6.0
-daemon sends, answers only the frame kinds v0.6.0 knew (pings, stat, list_dir),
-and silently drops everything else — exactly the production behavior of an
-out-of-date machine. The shared ``live_server`` doesn't enable the
-``harness_install`` flag, so a dedicated server is spawned with it on.
-
-Covered facets:
-
-- ``test_credential_route_rejects_old_host_fast_and_clearly`` — the credential
-  route itself: POSTing a key for a host that can't handle ``store_secret``
-  must fail fast with a non-504, non-"did not respond" error (bug: 30s hang,
-  then 504 "did not respond to store_secret within 30s").
-- ``test_setup_dialog_save_against_old_host_gives_prompt_feedback`` — the user
-  journey: in the setup dialog, saving an API key against the old host must
-  surface feedback promptly instead of leaving the save spinning ~30s and then
-  toasting the misleading timeout message.
+A 0.6.0 host daemon predates ``host.store_secret``: it cannot decode the frame
+and drops it without replying. The bug lived between the credential route and
+the tunnel, so ``test_harness_credential.py``'s ``page.route`` stub cannot reach
+it. Here a fake v0.6.0 host connects over the real host WebSocket tunnel, sends
+the 0.6.0 hello, answers only frame kinds that release knew and drops the rest,
+while the real SPA drives the real server. The shared ``live_server`` does not
+enable ``harness_install``, so a dedicated server is spawned with it on.
 
 Browser journeys run on a fresh thread and loop (``tests._helpers.async_thread``)
 because pytest-asyncio can't start a loop on the main thread once a sync
@@ -56,10 +32,10 @@ import pytest
 from playwright.async_api import async_playwright, expect
 
 from omnigent.host.frames import (
+    HostCreateDirResultFrame,
     HostHelloFrame,
-    HostListDirFrame,
     HostListDirResultFrame,
-    HostStatFrame,
+    HostListWorktreesResultFrame,
     HostStatResultFrame,
     encode_host_frame,
 )
@@ -88,37 +64,14 @@ _PROMPT_FEEDBACK_S = 20.0
 # ── Fake v0.6.0 host ─────────────────────────────────────────────────────────
 
 
-def _stat_reply(frame: HostStatFrame) -> HostStatResultFrame:
-    """Answer ``host.stat`` the way the old host would for any path: exists.
+async def _serve_old_host(ws: Any) -> None:
+    """Serve frames like a v0.6.0 host daemon.
 
-    The journey never browses the filesystem; a permissive stat just keeps any
-    incidental recent-workspace validation from wedging the landing screen.
+    Answers the filesystem probes the landing page may send and the tunnel
+    keepalive pings; every frame kind 0.6.0 did not know (``store_secret``,
+    ``detect_credentials``, ``model_options``, ...) is dropped without a reply,
+    exactly like the real old daemon.
     """
-    return HostStatResultFrame(
-        request_id=frame.request_id,
-        status="ok",
-        exists=True,
-        type="directory",
-        canonical_path=frame.path,
-    )
-
-
-async def _serve_old_host(ws: Any, dropped: list[str]) -> None:
-    """Serve frames exactly like a v0.6.0 host daemon.
-
-    v0.6.0 knew hello/readiness/runner/stat/list_dir/worktree/create_dir
-    frames. ``host.store_secret``, ``host.detect_credentials`` and
-    ``host.model_options`` did not exist yet: ``decode_host_frame`` raises on
-    them, the runner-frame fallback also fails, and the frame is silently
-    dropped (v0.6.0 ``connect.py:_serve_frames``). Tunnel keepalive pings are
-    answered so the host stays "online" throughout.
-
-    :param ws: The connected ``websockets`` client connection.
-    :param dropped: Mutated with the ``kind`` of every silently-dropped frame,
-        so tests can report whether the server really forwarded a frame the
-        host can't handle.
-    """
-    known_kinds = {"host.stat", "host.list_dir"}
     async for raw in ws:
         if not isinstance(raw, str):
             continue
@@ -126,26 +79,31 @@ async def _serve_old_host(ws: Any, dropped: list[str]) -> None:
             payload = json.loads(raw)
         except ValueError:
             continue
-        kind = payload.get("kind") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            continue
+        kind = payload.get("kind")
+        request_id = str(payload.get("request_id", ""))
+        reply: Any = None
         if kind == "host.stat":
-            frame = HostStatFrame(request_id=payload["request_id"], path=payload.get("path", "~"))
-            await ws.send(encode_host_frame(_stat_reply(frame)))
-            continue
-        if kind == "host.list_dir":
-            frame = HostListDirFrame(
-                request_id=payload["request_id"], path=payload.get("path", "~")
+            reply = HostStatResultFrame(
+                request_id=request_id,
+                status="ok",
+                exists=True,
+                type="directory",
+                canonical_path=payload.get("path", "~"),
             )
-            await ws.send(
-                encode_host_frame(
-                    HostListDirResultFrame(request_id=frame.request_id, status="ok", entries=[])
-                )
+        elif kind == "host.list_dir":
+            reply = HostListDirResultFrame(request_id=request_id, status="ok", entries=[])
+        elif kind == "host.create_dir":
+            reply = HostCreateDirResultFrame(request_id=request_id, status="ok")
+        elif kind == "host.list_worktrees":
+            reply = HostListWorktreesResultFrame(
+                request_id=request_id, status="failed", error="not a git repository"
             )
+        if reply is not None:
+            await ws.send(encode_host_frame(reply))
             continue
-        if isinstance(kind, str) and kind.startswith("host.") and kind not in known_kinds:
-            # Unknown to 0.6.0 (store_secret / detect_credentials /
-            # model_options / ...): dropped without a reply, like the real
-            # old daemon.
-            dropped.append(kind)
+        if isinstance(kind, str) and kind.startswith("host."):
             continue
         try:
             runner_frame = decode_frame(raw)
@@ -156,7 +114,7 @@ async def _serve_old_host(ws: Any, dropped: list[str]) -> None:
 
 
 @contextlib.asynccontextmanager
-async def _old_host(base_url: str, dropped: list[str]) -> AsyncIterator[str]:
+async def _old_host(base_url: str) -> AsyncIterator[str]:
     """Connect a fake v0.6.0 host to the live server's host tunnel.
 
     Sends the hello a 0.6.0 daemon sends: ``version="0.6.0"``, wire protocol 1,
@@ -164,7 +122,6 @@ async def _old_host(base_url: str, dropped: list[str]) -> AsyncIterator[str]:
     the state whose fix is exactly the credential write under test.
 
     :param base_url: The dedicated server's base URL.
-    :param dropped: Passed through to :func:`_serve_old_host`.
     :returns: Async context manager yielding the REST-reported host id.
     """
     import websockets
@@ -183,7 +140,7 @@ async def _old_host(base_url: str, dropped: list[str]) -> AsyncIterator[str]:
                 )
             )
         )
-        serve_task = asyncio.create_task(_serve_old_host(ws, dropped))
+        serve_task = asyncio.create_task(_serve_old_host(ws))
         try:
             rest_host_id: str | None = None
             async with httpx.AsyncClient(trust_env=False) as client:
@@ -314,54 +271,6 @@ def _video_kwargs() -> dict[str, Any]:
 # ── Tests ────────────────────────────────────────────────────────────────────
 
 
-def test_credential_route_rejects_old_host_fast_and_clearly(old_host_server: str) -> None:
-    """POSTing a credential for a pre-store_secret host fails fast and clearly.
-
-    The buggy build forwards ``host.store_secret`` to a host that can't decode
-    it, waits the full 30s ``_STORE_SECRET_TIMEOUT_S``, and returns
-    ``504 "host ... did not respond to store_secret within 30s"`` — misleading,
-    because the host is online and will never answer. The route must instead
-    reject the write promptly with an error that doesn't blame responsiveness.
-    """
-    _run_in_fresh_loop(_drive_credential_post(old_host_server))
-
-
-async def _drive_credential_post(base_url: str) -> None:
-    dropped: list[str] = []
-    async with (
-        _old_host(base_url, dropped) as host_id,
-        httpx.AsyncClient(trust_env=False, timeout=60.0) as client,
-    ):
-        start = time.monotonic()
-        resp = await client.post(
-            f"{base_url}/v1/hosts/{host_id}/harnesses/{_HARNESS}/credential",
-            json={"kind": "key", "secret": "fake-key-old-host"},
-        )
-        elapsed = time.monotonic() - start
-
-        problems: list[str] = []
-        if elapsed >= _PROMPT_FEEDBACK_S:
-            problems.append(
-                f"took {elapsed:.1f}s — the user sits through the full 30s store-secret timeout"
-            )
-        if resp.status_code == 504:
-            problems.append("returned 504 (gateway timeout) for a host that is online")
-        if 200 <= resp.status_code < 300:
-            problems.append(
-                f"returned HTTP {resp.status_code} — a v0.6.0 host cannot write a "
-                "credential, so the route must not claim success"
-            )
-        if "did not respond" in resp.text.lower():
-            problems.append(
-                f"error blames host responsiveness ({resp.text[:200]!r}) — the host "
-                "is healthy; it is too old to know the store_secret frame"
-            )
-        assert not problems, (
-            f"credential write against a v0.6.0 host (dropped frames: {dropped}) "
-            f"-> HTTP {resp.status_code} after {elapsed:.1f}s: " + "; ".join(problems)
-        )
-
-
 def test_setup_dialog_save_against_old_host_gives_prompt_feedback(old_host_server: str) -> None:
     """Saving a key in the setup dialog against the old host answers promptly.
 
@@ -376,8 +285,7 @@ def test_setup_dialog_save_against_old_host_gives_prompt_feedback(old_host_serve
 
 
 async def _drive_setup_dialog_save(base_url: str) -> None:
-    dropped: list[str] = []
-    async with _old_host(base_url, dropped) as host_id, async_playwright() as pw:
+    async with _old_host(base_url) as host_id, async_playwright() as pw:
         browser = await pw.chromium.launch()
         # Explicit context so a recorded video is finalized on context.close()
         # even when the drive fails mid-way.
@@ -396,13 +304,9 @@ async def _drive_setup_dialog_save(base_url: str) -> None:
             # (same Radix timing artifact test_windows_workspace_picker.py notes).
             await expect(page.locator('[data-slot="dropdown-menu-content"]')).to_have_count(0)
 
-            # The built-in Claude Code agent is the default landing selection and
-            # reads needs-auth on this host, so its "Set up →" affordance is present
-            # immediately. Don't route through the agent picker: on a v0.6.0 host
-            # its model list never resolves (host.model_options is another frame
-            # the old daemon drops), so the picker trigger stays in its loading
-            # placeholder — the same missing-capability-negotiation root cause,
-            # surfacing before the user can even reach Save.
+            # Use the default Claude agent's "Set up" affordance directly: the agent
+            # picker's model list never resolves on a v0.6.0 host (host.model_options
+            # is another frame the old daemon drops).
             setup = page.get_by_test_id("new-chat-landing-harness-setup")
             await expect(setup).to_be_visible(timeout=60_000)
             await setup.click()

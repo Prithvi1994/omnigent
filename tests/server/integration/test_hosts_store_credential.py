@@ -579,6 +579,19 @@ def _auto_reply_store_secret(
     return asyncio.create_task(_drain())
 
 
+def _record_forwarded_kinds(comm: ApplicationCommunicator, kinds: list[str]) -> asyncio.Task[None]:
+    """Record the ``kind`` of every frame the server forwards to the mock host."""
+
+    async def _drain() -> None:
+        while True:
+            output = await comm.receive_output(timeout=None)
+            text = output.get("text")
+            if output.get("type") == "websocket.send" and isinstance(text, str):
+                kinds.append(json.loads(text)["kind"])
+
+    return asyncio.create_task(_drain())
+
+
 # The rc shape matters: omnigent ships prerelease daemons (v0.6.0rc1, …), and a
 # naive major.minor.patch split fails on "0rc1" and would fall through to the
 # permissive unparseable path — re-opening the 30s-timeout bug for rc hosts.
@@ -673,6 +686,7 @@ async def test_hosts_at_or_above_the_floor_still_write(
 
 async def test_old_host_gates_detect_install_and_model_options(
     cred_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The sibling harness-setup proxies share the same fast old-host gate.
 
@@ -681,14 +695,28 @@ async def test_old_host_gates_detect_install_and_model_options(
     against a daemon that silently drops the frame.
     """
     app, registry, _hs, _cs = cred_app
+    # A gate regression forwards frames this host never answers; fail fast on
+    # the shortened timeouts instead of waiting out the routes' real ones.
+    for name in (
+        "_STORE_SECRET_TIMEOUT_S",
+        "_INSTALL_HARNESS_TIMEOUT_S",
+        "_MODEL_OPTIONS_TIMEOUT_S",
+    ):
+        monkeypatch.setattr(f"omnigent.server.routes.hosts.{name}", 2.0)
     comm = await _connect_mock_host(app, registry, hello=_old_host_hello_text("0.6.0"))
+    forwarded: list[str] = []
+    drain_task = _record_forwarded_kinds(comm, forwarded)
     try:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             detect = await client.get(f"/v1/hosts/{_HOST_ID}/credentials/detected")
             install = await client.post(f"/v1/hosts/{_HOST_ID}/harnesses/claude/install")
             models = await client.get(f"/v1/hosts/{_HOST_ID}/harnesses/claude/model-options")
     finally:
+        drain_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await drain_task
         await _disconnect_mock_host(comm)
+    assert forwarded == []
     for resp in (detect, install, models):
         assert resp.status_code == 409, resp.text
         assert "update omnigent on the host" in resp.json()["detail"]

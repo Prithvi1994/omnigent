@@ -154,17 +154,14 @@ def _release_tuple(version: str) -> tuple[int, int, int] | None:
 
 
 def _require_harness_setup_support(host_conn: HostConnection, action: str) -> None:
-    """Reject fast when the connected daemon provably predates the harness-setup frames.
+    """Reject fast when the daemon predates the harness-setup frames.
 
-    A 0.6.x daemon has no ``host.store_secret`` handler: it decodes the frame
-    to an unknown-kind error and never replies, so forwarding it can only end
-    in a timeout misread as an unresponsive host. The hello-reported version is
-    judged against ``_HARNESS_SETUP_MIN_HOST_VERSION`` rather than a capability
-    token because these frames predate ``HostHelloFrame.capabilities``: released
-    0.15.x/0.16.x daemons advertise tokens without any harness-setup entry while
-    serving the frames, so a token gate would wrongly reject them. An
-    unparseable version stays permissive: never block a host we can't prove is
-    too old.
+    Pre-0.7.0 daemons have no handler for these frames and drop them without
+    replying, so forwarding one can only end in a timeout misread as an
+    unresponsive host. The floor is a version check, not a capability token:
+    the frames predate ``HostHelloFrame.capabilities``, and released
+    0.15.x/0.16.x daemons advertise tokens without a harness-setup entry while
+    serving them. Unparseable versions stay permissive.
 
     :param host_conn: Live host connection (carries the hello).
     :param action: Human phrase for the rejected action, e.g.
@@ -781,6 +778,10 @@ def create_hosts_router(
         A preview of the host's ambient default catalog, not a binding
         snapshot: launch re-resolves with the session's agent spec, and the
         in-session picker reflects that launch snapshot once the runner is up.
+
+        :raises HTTPException: 404 when the host is unknown, 403 when not the
+            owner, 409 when offline or the host daemon is too old to list model
+            options, 502 on host-side failure, 504 on timeout.
         """
         user_id = require_user(request, auth_provider)
         host = await asyncio.to_thread(host_store.get_host, host_id)
@@ -1613,9 +1614,7 @@ def create_hosts_router(
         conn = host_registry.get(host.host_id)
         if conn is None:
             raise _host_absent_error(host)
-        # Reject BEFORE forwarding: a daemon that predates host.store_secret
-        # silently drops the frame, and the only outcome left would be the 30s
-        # timeout blamed on responsiveness — the misleading 504 this guards.
+        # Reject before forwarding: a pre-0.7.0 daemon drops this frame without replying.
         _require_harness_setup_support(conn, "storing harness credentials")
 
         frame = HostStoreSecretFrame(
