@@ -277,6 +277,20 @@ def test_written_evidence_is_limited_to_results_without_visible_interaction() ->
         "For internal/API-only results with no visible user interaction, "
         "written evidence is enough" in normalized
     )
+    assert "Judge visibility by what one user sees in one session after the fix" in normalized
+    assert (
+        "shows in the session's Terminal view and is filmable with a shortened "
+        "idle window" in normalized
+    )
+    assert (
+        "Footage of the ticket's surface in the recovered repro bundle proves the "
+        "surface is filmable" in normalized
+    )
+    assert (
+        "a lifecycle change visible in the Terminal view, or a surface the repro "
+        "bundle already filmed, is not internal" in normalized
+    )
+    assert "such a facet, or inherited footage of it, voids this reason" in normalized
     assert "just a static line, value, or the absence of an error" not in normalized
     assert "For purely textual evidence" not in normalized
 
