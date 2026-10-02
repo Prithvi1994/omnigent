@@ -906,15 +906,20 @@ def _claude_session_workspace(session_workspace: str | None) -> str:
     :param session_workspace: The session's ``workspace`` from the init
         snapshot or ``GET /v1/sessions/{id}``; ``None`` when omitted.
     :returns: Workspace path used as the terminal's cwd.
-    :raises OmnigentError: ``WORKSPACE_MISSING`` when no workspace resolves or
-        the resolved path is not an existing directory.
+    :raises OmnigentError: ``WORKSPACE_MISSING`` when nothing configures a
+        workspace or the resolved path is not an existing directory.
     """
     try:
-        raw = (session_workspace or "").strip() or _runner_workspace_dir()
-        workspace = str(Path(raw.strip()).expanduser())
+        raw = (session_workspace or "").strip() or _runner_workspace_dir().strip()
+        workspace = str(Path(raw).expanduser())
     except RuntimeError as exc:
         raise OmnigentError(str(exc), code=ErrorCode.WORKSPACE_MISSING) from exc
-    if not raw.strip() or not os.path.isdir(workspace):
+    if not raw:
+        raise OmnigentError(
+            "No workspace is configured for this session or runner.",
+            code=ErrorCode.WORKSPACE_MISSING,
+        )
+    if not os.path.isdir(workspace):
         raise OmnigentError(workspace_missing_message(workspace), code=ErrorCode.WORKSPACE_MISSING)
     return workspace
 

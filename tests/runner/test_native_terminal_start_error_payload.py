@@ -134,6 +134,10 @@ def test_unrelated_missing_file_is_not_a_workspace_condition() -> None:
             OmnigentError("agent gone", code=ErrorCode.SESSION_AGENT_MISSING),
             "user",
         ),
+        (
+            OmnigentError("workspace gone", code=ErrorCode.WORKSPACE_MISSING),
+            "user",
+        ),
     ],
 )
 def test_start_failure_log_row_is_blocking_with_derived_category(

@@ -185,6 +185,19 @@ def test_claude_workspace_blank_everything_is_workspace_missing(
     assert failure.value.code == ErrorCode.WORKSPACE_MISSING
 
 
+def test_claude_workspace_blank_runner_env_is_workspace_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A whitespace-only runner workspace resolves to nothing, so the error
+    says no workspace is configured instead of naming a bare ``.`` path."""
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", "   ")
+
+    with pytest.raises(OmnigentError) as failure:
+        _claude_session_workspace(None)
+    assert failure.value.code == ErrorCode.WORKSPACE_MISSING
+    assert "No workspace is configured" in str(failure.value)
+
+
 def test_claude_workspace_expanduser_failure_is_workspace_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
