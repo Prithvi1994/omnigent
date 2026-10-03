@@ -158,7 +158,13 @@ def _send_case(
         timeout_s=30,
     )
     _log.info("%s: input box while delivered: %r", label, _input_line(draft or ""))
-    page.wait_for_timeout(600)
+    # The submit has landed once the input box is back to the bare prompt.
+    _wait_pane(
+        base_url,
+        session_id,
+        lambda pane: _input_line(pane) in ("", _PROMPT_GLYPH),
+        timeout_s=10,
+    )
 
     _ensure_chat_view(page)
     expect(page.locator(_ASSISTANT, has_text=token).first).to_be_visible(timeout=_TURN_TIMEOUT_MS)
