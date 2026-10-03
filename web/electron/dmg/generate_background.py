@@ -1,11 +1,11 @@
 """Generate the DMG installer background picture (``background.tiff``).
 
 Finder composes the mounted-DMG window from ``build.dmg`` in
-``web/electron/package.json`` and this picture: the picture is drawn at its
-1x point size (so ``dmg.window`` must match that size or Finder tiles it),
-each ``contents`` entry is an icon centered at its ``x``/``y`` with
-``iconSize`` points per side, and Finder draws the icon's filename label in
-a text band directly below the icon.
+``web/electron/package.json`` and this picture: electron-builder sizes the
+window from the picture's 1x point size (``dmg.window`` is kept equal to it
+so the config describes the real window), each ``contents`` entry is an icon
+centered at its ``x``/``y`` with ``iconSize`` points per side, and Finder
+draws the icon's filename label in a text band directly below the icon.
 
 The layout keeps every icon slot and its label band on a plain white
 backdrop so the labels stay legible and the drag source / drop target read

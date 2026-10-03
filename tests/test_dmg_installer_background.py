@@ -179,9 +179,10 @@ def test_drop_target_slots_are_clear_of_artwork() -> None:
 def test_window_matches_background_size() -> None:
     """The configured DMG window must match the background's 1x point size.
 
-    Finder tiles a background picture smaller than the window, so a mismatch
-    shows a repeated strip below the artwork and breaks the designed layout
-    the icons and labels sit in.
+    electron-builder sizes the Finder window from the background picture
+    (``dmg.window`` is ignored once ``dmg.background`` is set), so keeping
+    the two equal stops the config from describing a window Finder never
+    opens; a window larger than the picture would tile it.
     """
     dmg = _dmg_config()
     bg = _background_1x(dmg)
