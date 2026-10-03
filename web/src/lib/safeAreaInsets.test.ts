@@ -1,6 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
+import { setEmbedRoot } from "@/lib/host";
 import { getSafeAreaCollisionBoundary, withSafeAreaCollisionBoundary } from "./safeAreaInsets";
+
+afterEach(() => {
+  setEmbedRoot(null);
+});
 
 describe("getSafeAreaCollisionBoundary", () => {
   it("attaches one shared element inset by the safe-area variables", () => {
@@ -25,6 +30,18 @@ describe("getSafeAreaCollisionBoundary", () => {
     const el = getSafeAreaCollisionBoundary();
     el.remove();
     expect(getSafeAreaCollisionBoundary().isConnected).toBe(true);
+  });
+
+  it("lives in the embed root while one is registered", () => {
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    setEmbedRoot(root);
+    getSafeAreaCollisionBoundary().remove();
+    expect(getSafeAreaCollisionBoundary().parentElement).toBe(root);
+
+    root.remove();
+    setEmbedRoot(null);
+    expect(getSafeAreaCollisionBoundary().parentElement).toBe(document.body);
   });
 });
 

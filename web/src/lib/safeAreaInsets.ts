@@ -4,7 +4,10 @@
 // it clamp — and size their `--radix-*-available-height` cap — at the
 // safe-area line instead of the raw screen edge, and the CSS variables resolve
 // live at every position update (getComputedStyle cannot absolutize the custom
-// properties, so a rect-carrying element stands in for a numeric read).
+// properties, so a rect-carrying element stands in for a numeric read). It
+// lives in the Radix portal container, so the embed's scoped variables apply.
+
+import { getEmbedRoot } from "@/lib/host";
 
 type CollisionBoundary = Element | null | (Element | null)[];
 
@@ -22,7 +25,7 @@ export function getSafeAreaCollisionBoundary(): HTMLElement {
   el.style.visibility = "hidden";
   el.style.pointerEvents = "none";
   el.setAttribute("aria-hidden", "true");
-  document.body.appendChild(el);
+  (getEmbedRoot() ?? document.body).appendChild(el);
   safeAreaBoundary = el;
   return el;
 }

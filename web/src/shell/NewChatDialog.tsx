@@ -5,6 +5,7 @@ import {
   HarnessPicker,
   HarnessPickerEntry,
   HarnessPickerConfigPage,
+  HarnessPickerPage,
   HarnessPickerSubContent,
 } from "@/components/composer/HarnessPicker";
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -1871,7 +1872,7 @@ export function AgentHarnessPicker({
         </HarnessPickerConfigPage>
       ) : showMore ? (
         // Mobile drill-in page for the remaining harnesses.
-        <div className="animate-in fade-in-0 slide-in-from-right-2 duration-150">
+        <HarnessPickerPage>
           <DropdownMenuItem
             data-testid="new-chat-landing-page-back"
             onSelect={(e) => {
@@ -1885,10 +1886,10 @@ export function AgentHarnessPicker({
           </DropdownMenuItem>
           <DropdownMenuSeparator />
           {moreHarnessEntries.map(renderEntry)}
-        </div>
+        </HarnessPickerPage>
       ) : showCustom ? (
         // Mobile drill-in page for custom agents.
-        <div className="animate-in fade-in-0 slide-in-from-right-2 duration-150">
+        <HarnessPickerPage>
           <DropdownMenuItem
             data-testid="new-chat-landing-page-back"
             onSelect={(e) => {
@@ -1902,7 +1903,7 @@ export function AgentHarnessPicker({
           </DropdownMenuItem>
           <DropdownMenuSeparator />
           {customAgentsBody}
-        </div>
+        </HarnessPickerPage>
       ) : (
         <>
           {/* Smart Routing sits in its own unlabeled group above the

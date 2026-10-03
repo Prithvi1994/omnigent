@@ -203,6 +203,17 @@ describe("HarnessPicker", () => {
     }
   });
 
+  it("opens the mobile configuration page at the top of a scrolled menu", () => {
+    render(<PickerFixture mobile />);
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Harness" }), { button: 0 });
+    const menu = screen.getByTestId("menu");
+    // jsdom has no layout, so stand in for a harness list the user scrolled.
+    Object.defineProperty(menu, "scrollTop", { value: 36, writable: true, configurable: true });
+    fireEvent.click(screen.getByTestId("edit"));
+    expect(screen.getByTestId("back")).toBeInTheDocument();
+    expect(menu.scrollTop).toBe(0);
+  });
+
   it("keeps a non-modal picker open while focusing its active row inside a dialog", async () => {
     const user = userEvent.setup();
     render(
