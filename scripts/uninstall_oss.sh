@@ -638,13 +638,14 @@ collect_keychain_secret_names() {
     # instead of being truncated into a different name.
     bad_quoted="\"keychain:[^\"]*[][:space:]',{}[][^\"]*\"|'keychain:[^']*[][:space:]\",{}[][^']*'"
     grep -vE "$bad_quoted" "$HELPER_OUT" >"$HELPER_ERR" || true
-    # Only "%" needs encoding for the helper, which percent-decodes column one.
-    grep -oE "keychain:[^][:space:]\"',{}[]+" "$HELPER_ERR" | sed 's/^keychain://' | sort -u |
-      sed 's/[[:cntrl:]]//g' |
+    # A reference starts a value; "keychain:" inside another token is not one.
+    ref="(^|[][:space:]\"',:{}[])keychain:"
+    # Names reach the helper untouched apart from "%", which it percent-decodes.
+    grep -oE "${ref}[^][:space:]\"',{}[]+" "$HELPER_ERR" | sed 's/^.*keychain://' | sort -u |
       awk '{ raw = $0; enc = $0; gsub(/%/, "%25", enc); print enc "\t" raw }' >>"$SECRETS_FILE" || true
     # Any reference the scan did not extract must not vanish silently.
-    mentioned="$(grep -o 'keychain:' "$HELPER_ERR" | wc -l | tr -d ' ')"
-    extracted="$(grep -oE "keychain:[^][:space:]\"',{}[]+" "$HELPER_ERR" | wc -l | tr -d ' ')"
+    mentioned="$(grep -oE "$ref" "$HELPER_ERR" | wc -l | tr -d ' ')"
+    extracted="$(grep -oE "${ref}[^][:space:]\"',{}[]+" "$HELPER_ERR" | wc -l | tr -d ' ')"
     if [ "$mentioned" != "$extracted" ] || grep -qE "$bad_quoted" "$HELPER_OUT"; then
       KEYCHAIN_UNRESOLVED=$((KEYCHAIN_UNRESOLVED + 1))
       record_action keychain_secret config.yaml discover failed "" "$config references keychain secrets the standalone scan could not parse; run the purge through the omnigent CLI"
@@ -656,7 +657,9 @@ purge_keychain_secrets() {
   while IFS="$TAB" read -r name display; do
     [ -n "$name" ] || continue
     display="${display:-$name}"
-    if [ "$DRY_RUN" = true ]; then
+    if [ "$DRY_RUN" = true ] && [ -z "${OMNIGENT_UNINSTALL_PYTHON:-}" ]; then
+      record_action keychain_secret "$display" remove reported "" "would be left in the OS keychain (service omnigent): no omnigent CLI to delete it; remove it manually"
+    elif [ "$DRY_RUN" = true ]; then
       record_action keychain_secret "$display" remove reported "" "would remove from the OS keychain (service omnigent)"
     elif [ -z "${OMNIGENT_UNINSTALL_PYTHON:-}" ]; then
       KEYCHAIN_UNRESOLVED=$((KEYCHAIN_UNRESOLVED + 1))

@@ -222,42 +222,28 @@ def test_uninstall_cli_manifest_survives_recursive_yaml_aliases(
     assert _keychain_rows(rows) == [["keychain_secret", "anthropic", "anthropic"]]
 
 
-def test_uninstall_cli_manifest_scans_malformed_config_without_comments(
-    monkeypatch, tmp_path: Path
-) -> None:
-    rows, _ = _uninstall_manifest_rows(
-        monkeypatch,
-        tmp_path,
+@pytest.mark.parametrize(
+    "config",
+    [
+        None,
+        b"\xff\xfe not utf-8",
+        "[" * 2000 + "]" * 2000,
         "providers:\n"
         "  anthropic: {\n"
         "    api_key_ref: keychain:anthropic\n"
-        '    other: "keychain:with#hash"\n'
-        "# api_key_ref: keychain:old\n",
-    )
-
-    assert _keychain_rows(rows) == [
-        ["keychain_secret", "anthropic", "anthropic"],
-        ["keychain_secret", "with%23hash", "with#hash"],
-    ]
-
-
-@pytest.mark.parametrize("config", [None, b"\xff\xfe not utf-8"], ids=["unreadable", "non-utf8"])
+        '    other: "keychain:has space"\n',
+    ],
+    ids=["unreadable", "non-utf8", "too-deep", "malformed-yaml"],
+)
 def test_uninstall_cli_manifest_reports_undiscoverable_config_for_purge(
-    monkeypatch, tmp_path: Path, config: bytes | None
+    monkeypatch, tmp_path: Path, config: str | bytes | None
 ) -> None:
     rows, _ = _uninstall_manifest_rows(monkeypatch, tmp_path, config)
 
+    # Never guess names from a config that cannot be read exactly.
     keychain_rows = _keychain_rows(rows)
     assert [row[0] for row in keychain_rows] == ["keychain_discovery_error"]
     assert len(keychain_rows[0]) == 2 and keychain_rows[0][1]
-
-
-def test_uninstall_cli_manifest_reports_unparseable_nesting_for_purge(
-    monkeypatch, tmp_path: Path
-) -> None:
-    rows, _ = _uninstall_manifest_rows(monkeypatch, tmp_path, "[" * 2000 + "]" * 2000)
-
-    assert [row[0] for row in _keychain_rows(rows)] == ["keychain_discovery_error"]
 
 
 def test_uninstall_cli_manifest_discovers_from_config_home_not_data_dir(

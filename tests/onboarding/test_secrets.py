@@ -313,3 +313,18 @@ def test_delete_secret_reports_corrupt_file_store_without_keyring_entry(
     assert secrets.delete_secret("anthropic") == secrets.SecretDeletion(
         removed=False, file_error="JSONDecodeError"
     )
+
+
+def test_delete_secret_clears_both_stores_when_keyring_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secrets.store_secret("anthropic", "sk-file-value")
+    monkeypatch.delenv("OMNIGENT_DISABLE_KEYRING")
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        keyring, "delete_password", lambda service, username: deleted.append(username)
+    )
+
+    assert secrets.delete_secret("anthropic") == secrets.SecretDeletion(removed=True)
+    assert deleted == ["anthropic"]
+    assert secrets._read_secrets_file() == {}

@@ -5045,22 +5045,19 @@ def _uninstall_script_path() -> Path:
     raise click.ClickException("uninstall script is missing from this installation")
 
 
-_KEYCHAIN_REF_RE = re.compile(r"keychain:([^\s\"',\[\]{}]+)")
-
-
 def _keychain_secret_names() -> list[str]:
     """Collect the secret names the global config references as ``keychain:<name>``.
 
     Those secrets live in the OS keychain, outside the state dir and its backup,
     so purge must delete or report them explicitly. The effective config
     (``OMNIGENT_CONFIG_HOME`` or ``~/.omnigent``) is the source of truth even
-    when ``OMNIGENT_DATA_DIR`` places the state elsewhere. A config the YAML
-    parser rejects is scanned as text with comments removed; that scan stops
-    names at whitespace.
+    when ``OMNIGENT_DATA_DIR`` places the state elsewhere. A config that cannot
+    be parsed exactly is reported rather than guessed at.
 
     :returns: Sorted unique secret names, e.g. ``["anthropic", "cursor"]``.
     :raises OSError: If the config exists but cannot be read.
     :raises UnicodeDecodeError: If the config is not valid UTF-8.
+    :raises yaml.YAMLError: If the config is not valid YAML.
     """
     from omnigent.onboarding.provider_config import config_path
 
@@ -5085,10 +5082,7 @@ def _keychain_secret_names() -> list[str]:
             for value in node.values() if isinstance(node, dict) else node:
                 _walk(value)
 
-    try:
-        _walk(yaml.safe_load(text))
-    except yaml.YAMLError:
-        names.update(_KEYCHAIN_REF_RE.findall(re.sub(r"(^|\s)#[^\n]*", "", text)))
+    _walk(yaml.safe_load(text))
     return sorted(names)
 
 
@@ -5096,8 +5090,8 @@ def _write_uninstall_manifest(ledger: InstallLedger, *, purge: bool = False) -> 
     """Write the ledger fields the POSIX uninstaller needs as tab records.
 
     With *purge*, the ``keychain:<name>`` secrets the config references follow;
-    a config that cannot be read becomes a ``keychain_discovery_error`` row so
-    the script fails the purge instead of treating it as "no secrets".
+    a config that cannot be read or parsed becomes a ``keychain_discovery_error``
+    row so the script fails the purge instead of treating it as "no secrets".
     """
     fd, manifest_name = tempfile.mkstemp(prefix="omnigent-uninstall-ledger-", suffix=".tsv")
     manifest = Path(manifest_name)
@@ -5147,7 +5141,7 @@ def _write_uninstall_manifest(ledger: InstallLedger, *, purge: bool = False) -> 
         if purge:
             try:
                 names = _keychain_secret_names()
-            except (OSError, UnicodeDecodeError, RecursionError) as exc:
+            except (OSError, UnicodeDecodeError, RecursionError, yaml.YAMLError) as exc:
                 reason = re.sub(r"\s+", " ", str(exc))
                 handle.write("\t".join(["keychain_discovery_error", reason]) + "\n")
                 names = []

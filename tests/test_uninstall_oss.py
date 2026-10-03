@@ -770,31 +770,26 @@ def test_uninstall_script_purge_deletes_keychain_secrets_from_manifest(tmp_path:
     assert kinds.index("backup") < kinds.index("keychain_secret") < kinds.index("state")
 
 
-def test_uninstall_script_purge_passes_encoded_name_and_reports_display_name(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("row", "display", "helper_arg"),
+    [
+        ("keychain_secret\ttab%09here\ttab here\n", "tab here", "tab%09here"),
+        ("keychain_secret\tanthropic\tan\x01thropic\n", "anthropic", "anthropic"),
+    ],
+    ids=["encoded-name", "control-character"],
+)
+def test_uninstall_script_purge_transports_names_and_keeps_json_valid(
+    tmp_path: Path, row: str, display: str, helper_arg: str
 ) -> None:
     helper, log = _fake_secret_helper(tmp_path)
-    result, _ = _purge_with_manifest(
-        tmp_path, "keychain_secret\ttab%09here\ttab here\n", helper, "--yes"
-    )
+    result, _ = _purge_with_manifest(tmp_path, row, helper, "--yes")
 
     assert result.returncode == 0, result.stderr
     actions = _keychain_actions(json.loads(result.stdout))
-    assert [(name, status) for name, status, _ in actions] == [("tab here", "done")]
+    assert [(name, status) for name, status, _ in actions] == [(display, "done")]
     assert log.read_text().splitlines() == [
-        "-m omnigent _internal delete-keychain-secret -- tab%09here"
+        f"-m omnigent _internal delete-keychain-secret -- {helper_arg}"
     ]
-
-
-def test_uninstall_script_purge_keeps_json_valid_for_control_characters(tmp_path: Path) -> None:
-    helper, _ = _fake_secret_helper(tmp_path)
-    result, _ = _purge_with_manifest(
-        tmp_path, "keychain_secret\tanthropic\tan\x01thropic\n", helper, "--yes"
-    )
-
-    assert result.returncode == 0, result.stderr
-    actions = _keychain_actions(json.loads(result.stdout))
-    assert [(name, status) for name, status, _ in actions] == [("anthropic", "done")]
 
 
 def test_uninstall_script_purge_reports_keychain_secrets_without_helper(tmp_path: Path) -> None:
@@ -919,16 +914,23 @@ def test_uninstall_script_purge_keeps_state_for_unresolved_helper_outcomes(
     assert state.exists()
 
 
-def test_uninstall_script_purge_dry_run_previews_keychain_secrets(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("with_helper", "fragment"),
+    [(True, "would remove from the OS keychain"), (False, "would be left in the OS keychain")],
+    ids=["helper", "no-helper"],
+)
+def test_uninstall_script_purge_dry_run_previews_keychain_secrets(
+    tmp_path: Path, with_helper: bool, fragment: str
+) -> None:
     helper, log = _fake_secret_helper(tmp_path)
     result, state = _purge_with_manifest(
-        tmp_path, "keychain_secret\tanthropic\n", helper, "--dry-run"
+        tmp_path, "keychain_secret\tanthropic\n", helper if with_helper else None, "--dry-run"
     )
 
     assert result.returncode == 0, result.stderr
     actions = _keychain_actions(json.loads(result.stdout))
     assert [(name, status) for name, status, _ in actions] == [("anthropic", "reported")]
-    assert "would remove" in actions[0][2]
+    assert fragment in actions[0][2]
     assert not log.exists()
     assert state.exists()
 
@@ -967,6 +969,7 @@ def test_uninstall_script_standalone_purge_reports_config_keychain_refs(tmp_path
         '      api_key_ref: "keychain:with#hash"\n'
         "cursor:\n"
         "  api_key_ref: keychain:cursor\n"
+        "note: disabled-keychain:prod\n"
         "# api_key_ref: keychain:old\n"
     )
 
@@ -995,10 +998,12 @@ def test_uninstall_script_standalone_purge_reports_config_keychain_refs(tmp_path
     assert state.exists()
 
 
-def test_uninstall_script_standalone_purge_encodes_percent_for_helper(tmp_path: Path) -> None:
+def test_uninstall_script_standalone_purge_passes_raw_names_to_helper(tmp_path: Path) -> None:
     home = tmp_path / "home"
     state = _state_with_install_signal(home)
-    (state / "config.yaml").write_text("odd:\n  api_key_ref: keychain:pct%name\n")
+    (state / "config.yaml").write_text(
+        "odd:\n  api_key_ref: keychain:pct%name\nctl:\n  api_key_ref: keychain:ctl\x01name\n"
+    )
     helper, log = _fake_secret_helper(tmp_path)
 
     result = _run_uninstall(
@@ -1015,9 +1020,14 @@ def test_uninstall_script_standalone_purge_encodes_percent_for_helper(tmp_path: 
 
     assert result.returncode == 0, result.stderr
     actions = _keychain_actions(json.loads(result.stdout))
-    assert [(name, status) for name, status, _ in actions] == [("pct%name", "done")]
+    # The ledger drops the control character; the helper receives the exact name.
+    assert [(name, status) for name, status, _ in actions] == [
+        ("ctlname", "done"),
+        ("pct%name", "done"),
+    ]
     assert log.read_text().splitlines() == [
-        "-m omnigent _internal delete-keychain-secret -- pct%25name"
+        "-m omnigent _internal delete-keychain-secret -- ctl\x01name",
+        "-m omnigent _internal delete-keychain-secret -- pct%25name",
     ]
     assert not state.exists()
 
@@ -1087,4 +1097,27 @@ def test_uninstall_script_standalone_purge_flags_names_it_cannot_parse(tmp_path:
         ("anthropic", "reported"),
     ]
     assert "could not parse" in actions[0][2]
+    assert state.exists()
+
+
+def test_uninstall_script_purge_reports_each_secret_separately(tmp_path: Path) -> None:
+    log = tmp_path / "helper.log"
+    helper = tmp_path / "fake-python"
+    helper.write_text(
+        "#!/bin/sh\ncat >/dev/null\n"
+        f"printf '%s\\n' \"$*\" >>'{log}'\n"
+        'case "$*" in *anthropic) echo removed ;; *) echo "file-only KeyringLocked" ;; esac\n'
+    )
+    helper.chmod(0o755)
+    result, state = _purge_with_manifest(
+        tmp_path, "keychain_secret\tanthropic\nkeychain_secret\topenrouter\n", helper, "--yes"
+    )
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert [(name, status) for name, status, _ in _keychain_actions(payload)] == [
+        ("anthropic", "done"),
+        ("openrouter", "reported"),
+    ]
+    assert _state_actions(payload) == [("skipped", "--force")]
     assert state.exists()
