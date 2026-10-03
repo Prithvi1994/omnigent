@@ -262,13 +262,7 @@ def test_user_provider_in_opencode_json_reaches_spawned_server(
     tmp_path: Path,
     live_server: str,
 ) -> None:
-    """A provider in ``opencode.json`` must survive an ``opencode.jsonc`` model pin.
-
-    The user keeps their custom provider in ``~/.config/opencode/opencode.json``
-    and a small ``opencode.jsonc`` holding only the default-model pin, a layout
-    the opencode CLI resolves fine. The session's spawned server must expose that
-    provider; otherwise the session is pinned to a model that does not exist.
-    """
+    """A split-file provider and model pin both reach the spawned OpenCode server."""
     home = tmp_path / "home"
     cfg_dir = home / ".config" / "opencode"
     cfg_dir.mkdir(parents=True)

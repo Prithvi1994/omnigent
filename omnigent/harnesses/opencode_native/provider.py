@@ -561,10 +561,21 @@ def _load_user_config_file(path: Path) -> dict[str, object] | None:
             cleaned = _strip_trailing_commas(cleaned)
             parsed = json.loads(cleaned)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as err:
-        _logger.warning("Skipping user OpenCode config at %s: %s", path, err)
+        _logger.warning(
+            "Skipping user OpenCode config at %s: %s; any provider defined only here is "
+            "dropped, so a model pin in another config file that points at it may no "
+            "longer resolve",
+            path,
+            err,
+        )
         return None
     if not isinstance(parsed, dict):
-        _logger.warning("Skipping user OpenCode config at %s: top level is not an object", path)
+        _logger.warning(
+            "Skipping user OpenCode config at %s: top level is not an object; any provider "
+            "defined only here is dropped, so a model pin in another config file that points "
+            "at it may no longer resolve",
+            path,
+        )
         return None
     return parsed
 
