@@ -60,14 +60,14 @@ def _background_1x(dmg: dict) -> Image.Image:
     The TIFF carries 1x and 2x frames; Finder lays the window out in points,
     i.e. against the smallest frame.
     """
-    tif = Image.open(ELECTRON_DIR / dmg["background"])
-    sizes = []
-    for i in range(getattr(tif, "n_frames", 1)):
-        tif.seek(i)
-        sizes.append((tif.size, i))
-    _, idx = min(sizes)
-    tif.seek(idx)
-    return tif.convert("RGB")
+    with Image.open(ELECTRON_DIR / dmg["background"]) as tif:
+        sizes = []
+        for i in range(getattr(tif, "n_frames", 1)):
+            tif.seek(i)
+            sizes.append((tif.size, i))
+        _, idx = min(sizes)
+        tif.seek(idx)
+        return tif.convert("RGB")
 
 
 def _relative_luminance(rgb: tuple[int, int, int]) -> float:
@@ -148,9 +148,14 @@ def test_drop_target_slots_are_clear_of_artwork() -> None:
     A background that is itself a large illustration reaching into an icon
     slot leaves the user unable to tell the draggable app icon from the
     decoration. Each icon slot's backdrop must be visually quiet so the real
-    drag source and drop target read as the interactive elements.
+    drag source and drop target read as the interactive elements, and the
+    destination must be the single link to /Applications.
     """
     dmg = _dmg_config()
+    links = [entry.get("path") for entry in dmg["contents"] if entry.get("type") == "link"]
+    assert len(dmg["contents"]) == 2 and links == ["/Applications"], (
+        "the installer must show exactly one app icon and one link to /Applications"
+    )
     bg = _background_1x(dmg)
     margin = dmg["iconSize"] // 2 + SLOT_MARGIN
 
@@ -202,14 +207,14 @@ def test_background_carries_matching_retina_frame() -> None:
     Retina displays or breaks the point-size layout.
     """
     dmg = _dmg_config()
-    tif = Image.open(ELECTRON_DIR / dmg["background"])
-    assert getattr(tif, "n_frames", 1) == 2, (
-        "background picture must carry exactly a 1x and a 2x frame"
-    )
-    frames = []
-    for i in range(2):
-        tif.seek(i)
-        frames.append((tif.size, tif.info.get("dpi")))
+    with Image.open(ELECTRON_DIR / dmg["background"]) as tif:
+        assert getattr(tif, "n_frames", 1) == 2, (
+            "background picture must carry exactly a 1x and a 2x frame"
+        )
+        frames = []
+        for i in range(2):
+            tif.seek(i)
+            frames.append((tif.size, tif.info.get("dpi")))
     frames.sort()
     (one_x_size, one_x_dpi), (two_x_size, two_x_dpi) = frames
     assert two_x_size == (one_x_size[0] * 2, one_x_size[1] * 2), (
