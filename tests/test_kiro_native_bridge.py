@@ -349,9 +349,8 @@ def test_send_kiro_permission_verdict_stops_once_verdict_is_recorded(
 ) -> None:
     """A recorded response ends delivery even when an identical prompt follows.
 
-    Kiro may queue a second request with the same title; after it consumes the
-    Enter the pane shows that prompt with the default focus, indistinguishable
-    from a dropped keypress. The recorder, not the pane, must stop the retry.
+    A queued request with the same title renders an identical prompt the moment
+    Kiro consumes the Enter, so the recorder, not the pane, must stop the retry.
     """
     monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)

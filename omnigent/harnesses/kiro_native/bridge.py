@@ -575,9 +575,9 @@ def _wait_for_kiro_permission_verdict_applied(
 ) -> None:
     """Verify Kiro consumed a verdict, retrying only on the same safe prompt.
 
-    A recorded ACP response for this request also counts as consumed: the pane
-    alone cannot tell a dropped Enter from one that was consumed and followed
-    by an identically titled prompt, which a retry must never answer.
+    ``verdict_recorded`` (Kiro's ACP response for this request) also means
+    consumed: the pane alone cannot tell a dropped Enter from an identical
+    follow-up prompt, which a retry must never answer.
     """
     deadline = time.monotonic() + min(timeout_s, _PERMISSION_VERDICT_VERIFY_TIMEOUT_S)
     last_enter = time.monotonic()
@@ -804,9 +804,8 @@ def send_kiro_permission_verdict(
 ) -> None:
     """Deliver a one-time Kiro permission verdict to the active TUI prompt.
 
-    ``verdict_recorded`` reports whether Kiro's ACP recorder already holds the
-    response for this request, so delivery stops before retrying into a later
-    prompt that happens to render the same title.
+    ``verdict_recorded`` reports whether Kiro's ACP recorder already holds this
+    request's response; see :func:`_wait_for_kiro_permission_verdict_applied`.
     """
     if action not in {"accept", "decline", "cancel"}:
         raise RuntimeError(f"unsupported Kiro permission action: {action!r}")
