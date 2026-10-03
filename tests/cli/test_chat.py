@@ -1416,7 +1416,8 @@ def _patch_daemon_launch(monkeypatch: pytest.MonkeyPatch, captured: dict[str, ob
     )
 
     async def _no_host_wait(client: object, host_id: str, *, timeout_s: float) -> None:
-        return None
+        captured["host_wait_timeout_s"] = timeout_s
+        return
 
     async def _fake_launch(
         client: object, *, host_id: str, session_id: str, workspace: str, fresh: bool = False
@@ -4696,17 +4697,46 @@ def test_daemon_chat_host_online_timeout_honors_env_override(
     assert chat_module._daemon_chat_host_online_timeout_s() == 120.0
 
 
-@pytest.mark.parametrize("bad", ["", "soon", "0", "-5", "nan"])
+@pytest.mark.parametrize("bad", ["", "soon", "0", "-5", "nan", "inf", "Infinity", "1e309"])
 def test_daemon_chat_host_online_timeout_ignores_unusable_env(
     monkeypatch: pytest.MonkeyPatch, bad: str
 ) -> None:
-    """A non-numeric or non-positive override falls back to the default.
+    """A non-numeric, non-finite, or non-positive override falls back to the default.
 
-    A 0 or negative wait would fail the launch instantly, and a non-number is
-    a typo — neither should silently break ``omnigent run``.
+    A 0 or negative wait would fail the launch instantly, a non-number is a typo,
+    and a non-finite value (``inf``/``1e309``) would wait forever — none should
+    silently break ``omnigent run``.
     """
     monkeypatch.setenv("OMNIGENT_HOST_ONLINE_TIMEOUT_S", bad)
     assert (
         chat_module._daemon_chat_host_online_timeout_s()
         == chat_module._DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S
     )
+
+
+def test_prepare_chat_session_via_daemon_forwards_host_online_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The resolved override reaches ``wait_for_host_online`` at launch.
+
+    The resolver tests alone would still pass if the launch flow stopped
+    forwarding the value, so assert the host-online wait actually receives it.
+    """
+    monkeypatch.setenv("OMNIGENT_HOST_ONLINE_TIMEOUT_S", "120")
+    captured: dict[str, object] = {}
+    _patch_daemon_launch(monkeypatch, captured)
+
+    asyncio.run(
+        _prepare_chat_session_via_daemon(
+            base_url="https://example.databricksapps.com",
+            headers={},
+            auth=None,
+            host_id="host_x",
+            bundle=b"bundle-bytes",
+            resume_conversation_id=None,
+            fork_session_id=None,
+            workspace="/tmp/proj",
+        )
+    )
+
+    assert captured["host_wait_timeout_s"] == 120.0

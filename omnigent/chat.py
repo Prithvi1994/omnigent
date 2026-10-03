@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import secrets
 import shutil
@@ -1485,8 +1486,8 @@ def _daemon_chat_host_online_timeout_s() -> float:
     against one shared server at once, that server can take longer than the
     default to register a newly connected host; the wait then expires before a
     session exists. The dev launchers raise this ceiling for shared-``--server``
-    runs (see ``dev/repro.py`` / ``dev/resolve.py``). A missing, non-numeric, or
-    non-positive value keeps the default.
+    runs (see ``dev/repro.py`` / ``dev/resolve.py``). A missing, non-numeric,
+    non-finite, or non-positive value keeps the default.
     """
     raw = os.environ.get("OMNIGENT_HOST_ONLINE_TIMEOUT_S")
     if raw is None:
@@ -1495,7 +1496,7 @@ def _daemon_chat_host_online_timeout_s() -> float:
         value = float(raw)
     except ValueError:
         return _DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S
-    return value if value > 0 else _DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S
+    return value if math.isfinite(value) and value > 0 else _DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S
 
 
 _ACCOUNTS_SETUP_POLL_INTERVAL_S = 1.0
