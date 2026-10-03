@@ -32,7 +32,6 @@ if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
     from omnigent.runner.mcp_manager import RunnerMcpManager
-    from omnigent.runner.policy import PolicyVerdict
     from omnigent.terminals.registry import TerminalRegistry
 
 import httpx
@@ -2403,9 +2402,9 @@ def create_runner_app(
             )
             harness_name = canonicalize_harness(raw_harness) or raw_harness
 
-            _start_verdict = await _evaluate_agent_start_gate(spec, harness_name)
-            if _start_verdict is not None and _start_verdict.data is not None:
-                _apply_sandbox_override_from_verdict(spec, _start_verdict.data)
+            _start_data = await _evaluate_agent_start_gate(spec, harness_name)
+            if _start_data is not None:
+                _apply_sandbox_override_from_verdict(spec, _start_data)
 
             await _ensure_session_subagent_router(
                 session_id,
@@ -7906,11 +7905,12 @@ def _build_spawn_env_from_spec(
 async def _evaluate_agent_start_gate(
     spec: AgentSpec,
     harness: str,
-) -> PolicyVerdict | None:
-    """Evaluate the synthetic start probe for sandbox transforms.
+) -> object | None:
+    """Collect the policies' launch transforms for the synthetic start probe.
 
-    Deny and ask verdicts from generic tool policies are logged and ignored so
-    they cannot leave a session partially initialized.
+    Returns the composed replacement payload (``enforce_sandbox`` forcing a
+    sandbox) or ``None``. DENY/ASK verdicts never gate agent start; see
+    :meth:`RunnerToolPolicyGate.evaluate_agent_start`.
     """
     from omnigent.runner.policy import RunnerToolPolicyGate
 
@@ -7922,23 +7922,13 @@ async def _evaluate_agent_start_gate(
     if spec.os_env is not None and spec.os_env.sandbox is not None:
         sandbox_dict = cast(_JsonObject, dataclasses.asdict(spec.os_env.sandbox))
 
-    verdict = await gate.evaluate_tool_call(
-        "sys_agent_start",
+    return await gate.evaluate_agent_start(
         {
             "agent_name": getattr(spec, "name", None) or "",
             "harness": harness,
             "sandbox": sandbox_dict,
         },
     )
-    if verdict.action in ("deny", "ask"):
-        _logger.warning(
-            "Policy %r returned %s for the synthetic sys_agent_start probe; "
-            "ignoring it — tool_call policies do not gate agent start",
-            verdict.policy_name,
-            verdict.action,
-        )
-        return None
-    return verdict
 
 
 def _apply_sandbox_override_from_verdict(

@@ -1,8 +1,16 @@
-"""Verify deny-capable tool policies do not block session initialization."""
+"""Verify deny-capable tool policies neither block nor weaken session initialization.
+
+Before spawning the harness, the runner probes the spec's tool policies with a
+synthetic ``sys_agent_start`` call. A policy that allowlists tool names and
+DENYs everything else rejects that probe name. Session init must still
+succeed, register the session inbox, and apply the sandbox transform of an
+``enforce_sandbox`` policy declared in the same bundle, in either order.
+"""
 
 from __future__ import annotations
 
 import contextlib
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -10,8 +18,10 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.runner import app as runner_app_module
 from omnigent.runner import create_runner_app
+from omnigent.runner.policy import RunnerToolPolicyGate
 from omnigent.spec.types import (
     AgentSpec,
     ExecutorSpec,
@@ -32,6 +42,44 @@ _DENY_CAPABLE_EXPRESSION = (
     '    ? {"result": "ALLOW"}\n'
     '    : {"result": "DENY"}\n'
 )
+
+_START_PROBE_ARGS: dict[str, object] = {
+    "agent_name": "deny-capable-policy-agent",
+    "harness": "claude-sdk",
+    "sandbox": {"type": "none"},
+}
+
+
+def _allowlist_then_deny() -> FunctionPolicySpec:
+    """Tool-call allowlist whose terminal branch DENYs every other tool name."""
+    return FunctionPolicySpec(
+        name="allowlist_then_deny",
+        on=[PhaseSelector(phase=Phase.TOOL_CALL)],
+        function=FunctionRef(
+            path="omnigent.policies.builtins.cel.cel_policy",
+            arguments={"expression": _DENY_CAPABLE_EXPRESSION},
+        ),
+    )
+
+
+def _force_bwrap() -> FunctionPolicySpec:
+    """``enforce_sandbox`` forcing bwrap without network on agent start."""
+    return FunctionPolicySpec(
+        name="force_bwrap",
+        on=None,
+        function=FunctionRef(
+            path="omnigent.policies.builtins.safety.enforce_sandbox",
+            arguments={"sandbox_type": "linux_bwrap", "allow_network": False},
+        ),
+    )
+
+
+# A leading DENY skips enforce_sandbox entirely; a trailing one discards the
+# transform enforce_sandbox already produced. Both must keep the sandbox.
+_POLICY_ORDERS = {
+    "sandbox_then_allowlist": lambda: [_force_bwrap(), _allowlist_then_deny()],
+    "allowlist_then_sandbox": lambda: [_allowlist_then_deny(), _force_bwrap()],
+}
 
 
 class _ScriptedHarnessClient:
@@ -89,8 +137,8 @@ async def _runner_client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
         yield client
 
 
-def _spec_with_deny_capable_policy() -> AgentSpec:
-    """Build a spec whose policy denies unlisted tool calls."""
+def _spec(*policies: FunctionPolicySpec) -> AgentSpec:
+    """Build a claude-sdk spec declaring ``sandbox.type: none`` plus *policies*."""
     return AgentSpec(
         spec_version=1,
         name="deny-capable-policy-agent",
@@ -98,25 +146,15 @@ def _spec_with_deny_capable_policy() -> AgentSpec:
             config={"harness": "claude-sdk"},
             model="databricks-claude-sonnet-4-6",
         ),
-        guardrails=GuardrailsSpec(
-            policies=[
-                FunctionPolicySpec(
-                    name="allowlist_then_deny",
-                    on=[PhaseSelector(phase=Phase.TOOL_CALL)],
-                    function=FunctionRef(
-                        path="omnigent.policies.builtins.cel.cel_policy",
-                        arguments={"expression": _DENY_CAPABLE_EXPRESSION},
-                    ),
-                ),
-            ],
-        ),
+        os_env=OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="none")),
+        guardrails=GuardrailsSpec(policies=list(policies)),
     )
 
 
-@pytest.mark.asyncio
-async def test_deny_capable_policy_does_not_block_session_init() -> None:
-    """A fail-closed tool policy still permits session initialization."""
-    spec = _spec_with_deny_capable_policy()
+async def _create_session(
+    spec: AgentSpec, session_id: str
+) -> tuple[httpx.Response, _FakeProcessManager]:
+    """POST the runner's session init for *spec* and return the response and spawns."""
     pm = _FakeProcessManager()
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
@@ -128,14 +166,30 @@ async def test_deny_capable_policy_does_not_block_session_init() -> None:
         spec_resolver=_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "ag_test"},
+        )
+    return resp, pm
 
+
+def _spawned_sandbox(pm: _FakeProcessManager) -> dict[str, Any]:
+    """Return the sandbox block the runner serialized into the harness spawn env."""
+    assert pm.get_client_calls, "harness was not spawned"
+    _conv_id, _harness, env = pm.get_client_calls[-1]
+    assert env is not None, "spawn env was None"
+    os_env_json = env.get("HARNESS_CLAUDE_SDK_OS_ENV")
+    assert os_env_json is not None, "HARNESS_CLAUDE_SDK_OS_ENV missing from spawn env"
+    return json.loads(os_env_json).get("sandbox", {})
+
+
+@pytest.mark.asyncio
+async def test_deny_capable_policy_does_not_block_session_init() -> None:
+    """A fail-closed tool policy still permits session initialization."""
     session_id = "conv_deny_capable_init"
     try:
-        async with _runner_client(app) as client:
-            resp = await client.post(
-                "/v1/sessions",
-                json={"session_id": session_id, "agent_id": "ag_test"},
-            )
+        resp, pm = await _create_session(_spec(_allowlist_then_deny()), session_id)
 
         assert resp.status_code == 201, (
             f"Session init must succeed despite the deny-capable policy; "
@@ -148,3 +202,51 @@ async def test_deny_capable_policy_does_not_block_session_init() -> None:
         )
     finally:
         runner_app_module._session_inboxes_ref.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order", sorted(_POLICY_ORDERS))
+async def test_deny_capable_policy_does_not_suppress_enforce_sandbox(order: str) -> None:
+    """``enforce_sandbox`` still forces bwrap when an allowlist DENYs the start probe."""
+    session_id = f"conv_deny_capable_sandbox_{order}"
+    try:
+        resp, pm = await _create_session(_spec(*_POLICY_ORDERS[order]()), session_id)
+
+        assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+        sandbox = _spawned_sandbox(pm)
+        assert sandbox.get("type") == "linux_bwrap", (
+            f"[{order}] enforce_sandbox should force linux_bwrap but the spawn env "
+            f"carries {sandbox!r}: the allowlist's DENY on the sys_agent_start probe "
+            "suppressed the sandbox transform"
+        )
+        assert sandbox.get("allow_network") is False
+        assert session_id in runner_app_module._session_inboxes_ref
+    finally:
+        runner_app_module._session_inboxes_ref.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order", sorted(_POLICY_ORDERS))
+async def test_start_probe_keeps_sandbox_transform_past_a_deny(order: str) -> None:
+    """The gate composes start transforms even when another policy DENYs the probe."""
+    gate = RunnerToolPolicyGate.from_spec(_spec(*_POLICY_ORDERS[order]()))
+
+    data = await gate.evaluate_agent_start(dict(_START_PROBE_ARGS))
+
+    assert isinstance(data, dict), f"[{order}] expected a composed payload, got {data!r}"
+    assert data["arguments"]["sandbox"]["type"] == "linux_bwrap"
+    assert data["arguments"]["sandbox"]["allow_network"] is False
+
+
+@pytest.mark.asyncio
+async def test_start_probe_without_transforms_keeps_real_tool_enforcement() -> None:
+    """An allowlist alone yields no start transform and still gates real tool calls."""
+    gate = RunnerToolPolicyGate.from_spec(_spec(_allowlist_then_deny()))
+
+    assert await gate.evaluate_agent_start(dict(_START_PROBE_ARGS)) is None
+
+    allowed = await gate.evaluate_tool_call("sys_session_send", {"agent": "child"})
+    assert allowed.action == "allow"
+    denied = await gate.evaluate_tool_call("shell", {"command": "ls"})
+    assert denied.action == "deny"
+    assert denied.policy_name == "allowlist_then_deny"
