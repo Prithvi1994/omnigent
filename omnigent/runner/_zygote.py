@@ -48,6 +48,7 @@ import importlib.util
 import json
 import os
 import selectors
+import signal
 import socket
 import sys
 import threading
@@ -57,6 +58,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from omnigent.process_logging import LOG_TTY_FD_ENV_VAR, env_truthy
+from omnigent.runner.identity import RUNNER_WORKSPACE_ENV_VAR
 
 # Env var the daemon sets to the inherited control-socket fd number.
 ZYGOTE_CONTROL_FD_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_CONTROL_FD"
@@ -82,6 +84,9 @@ _ZYGOTE_TEST_CHILD_RAISE_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_RAISE"
 # genuinely alive) instead of exiting, so a test can kill the zygote out from
 # under a live child and assert the crash-recovery path. Never set in prod.
 _ZYGOTE_TEST_CHILD_SLEEP_ENV_VAR = "OMNIGENT_RUNNER_ZYGOTE_TEST_CHILD_SLEEP"
+
+# Upper bound on draining a forked child's debug-log sink before os._exit.
+_CHILD_TELEMETRY_FLUSH_TIMEOUT_S = 2.0
 
 
 @dataclass(frozen=True)
@@ -288,6 +293,23 @@ def _run_child(request: dict[str, Any], harness_fd: int) -> None:
     main()
 
 
+def _flush_child_telemetry() -> None:
+    """Drain the child's debug-log sink and stdio before ``os._exit``.
+
+    ``os._exit`` skips ``atexit``, where the sink would otherwise send its last
+    batch. Bounded so a slow upload cannot keep a dying child alive.
+    """
+    # BaseException too: this runs in a dying child, where nothing may stop the
+    # caller's os._exit (e.g. a KeyboardInterrupt during the drain join).
+    with contextlib.suppress(BaseException):
+        from omnigent.debug_logging import close_debug_log_sink
+
+        close_debug_log_sink(timeout=_CHILD_TELEMETRY_FLUSH_TIMEOUT_S)
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(BaseException):
+            stream.flush()
+
+
 def _maybe_run_test_seam() -> None:
     """Honor the fork-payload test seams (exit / raise / sleep). Never in prod.
 
@@ -334,6 +356,23 @@ def _run_harness_child(request: dict[str, Any]) -> None:
 
     _wire_child_stdio(os.environ.get(PROCESS_LOG_FILE_ENV_VAR))
 
+    # Match direct exec by running the harness in its session workspace.
+    workspace = os.environ.get(RUNNER_WORKSPACE_ENV_VAR)
+    if workspace:
+        try:
+            os.chdir(workspace)
+        except OSError as exc:
+            # The workspace may disappear after launch; keep the stable zygote cwd.
+            sys.stderr.write(
+                f"zygote harness fork: cannot chdir to workspace {workspace!r}: {exc}\n"
+            )
+            sys.stderr.flush()
+    else:
+        sys.stderr.write(
+            "zygote harness fork: no workspace in payload env; staying in zygote cwd\n"
+        )
+        sys.stderr.flush()
+
     # Test seam: a sleep seam keeps the harness genuinely alive (crash-recovery
     # tests); the exit seam echoes argv so a test can assert the payload
     # round-tripped. Never set in production.
@@ -346,6 +385,7 @@ def _run_harness_child(request: dict[str, Any]) -> None:
     test_exit = os.environ.get(_ZYGOTE_TEST_CHILD_EXIT_ENV_VAR)
     if test_exit is not None:
         sys.stdout.write(f"harness_argv={' '.join(request.get('argv') or [])}\n")
+        sys.stdout.write(f"harness_cwd={os.getcwd()}\n")
         sys.stdout.flush()
         os._exit(int(test_exit))
 
@@ -655,29 +695,43 @@ class _ZygoteServer:
 
         :param body: Zero-arg callable running the child's real work.
         """
+        exit_code = 0
         try:
             body()
         except SystemExit as exc:
             # Preserve the exec'd entrypoint's exit code (main() raises
             # SystemExit) rather than flattening it to a traceback + code 1.
             code = exc.code
-            os._exit(code if isinstance(code, int) else (0 if code is None else 1))
-        except BaseException:  # noqa: BLE001 — last-resort child guard
-            import traceback
-
-            traceback.print_exc()
-            os._exit(1)
-        os._exit(0)
+            exit_code = code if isinstance(code, int) else (0 if code is None else 1)
+        except BaseException as exc:  # noqa: BLE001 — last-resort child guard
+            # Route through sys.excepthook so the runner's crash hook (installed
+            # by its main()) records the cause; it chains to the default print.
+            with contextlib.suppress(BaseException):
+                sys.excepthook(type(exc), exc, exc.__traceback__)
+            exit_code = 1
+        # The child must never fall back into the zygote's serve loop, even if
+        # the flush is interrupted.
+        try:
+            _flush_child_telemetry()
+        finally:
+            os._exit(exit_code)
 
     def _drop_runner(self, conn: socket.socket) -> None:
         """Forget a runner whose control socket closed (the runner exited).
 
-        Its harness children self-terminate via their own watchdog (which
-        probes the runner pid). With the runner gone, nothing will ever poll
-        their exit codes, so mark them orphaned: _reap still waitpid's them (no
-        zombies) but discards the code instead of leaking it in _exit_codes —
-        which would otherwise grow unbounded and risk pid-reuse misattribution.
-        Any already-reaped codes for this runner's harnesses are dropped too.
+        Its harness children are SIGTERM'd here. They also self-terminate via
+        their own watchdog (a 1 Hz probe of the runner pid), but that probe is
+        their ONLY death signal on macOS — PR_SET_PDEATHSIG is Linux-only and is
+        skipped for zygote-forked harnesses regardless — so a wedged harness or
+        a starved watchdog thread would otherwise survive for the zygote's whole
+        life. We are these children's real OS parent and already track their
+        pids, so an explicit signal is both cheap and correct.
+
+        With the runner gone, nothing will ever poll their exit codes, so mark
+        them orphaned: _reap still waitpid's them (no zombies) but discards the
+        code instead of leaking it in _exit_codes — which would otherwise grow
+        unbounded and risk pid-reuse misattribution. Any already-reaped codes
+        for this runner's harnesses are dropped too.
 
         :param conn: The closed runner socket.
         """
@@ -690,6 +744,10 @@ class _ZygoteServer:
             self._exit_codes.pop(harness_pid, None)
             if harness_pid in self._live:
                 self._orphaned.add(harness_pid)
+                # Signal the pid, never the group: everything the zygote forks
+                # shares the daemon's group, so a killpg would take it down too.
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    os.kill(harness_pid, signal.SIGTERM)
         with contextlib.suppress(OSError):
             conn.close()
 
