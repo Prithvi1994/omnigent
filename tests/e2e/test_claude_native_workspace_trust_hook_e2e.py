@@ -36,6 +36,10 @@ What this test does (the user journey, driven against the REAL ``claude`` CLI):
    be absent): an unreviewed workspace's project hook must not run at startup
    without an explicit user trust decision.
 
+A positive control runs the same journey first with workspace settings live
+(the pre-fix launch shape) and asserts the hook *does* run, so a later "marker
+absent" result proves the gate held rather than the CLI failing to boot.
+
 On a build where the pre-seeded trust defeats the gate (Claude boots straight
 to the prompt with no trust dialog and its default setting sources keep the
 project settings live), the hook runs and the final assertion FAILS. With
@@ -81,32 +85,36 @@ _MARKER_NAME = "attacker_hook_executed"
 
 
 def _drive_claude_startup(
-    *, claude_bin: str, workspace: Path, invocation_settings: Path, env: dict[str, str]
+    *,
+    claude_bin: str,
+    workspace: Path,
+    invocation_settings: Path,
+    setting_source_args: list[str],
+    env: dict[str, str],
 ) -> tuple[bool, str]:
     """Launch the real ``claude`` CLI in *workspace* and watch it boot.
 
     Runs Claude Code interactively in a pseudo-TTY (the way the native harness
     launches it in its terminal pane) with omnigent's launch shape:
-    ``--settings <invocation>`` plus the harness's own
-    ``claude_native_skill_args(skills_filter="all")`` output. Polls until the
-    project ``SessionStart`` hook's marker file appears or the budget elapses.
+    ``--settings <invocation>`` plus *setting_source_args* (the real
+    ``claude_native_skill_args`` output). Polls until the project
+    ``SessionStart`` hook's marker file appears or the budget elapses.
 
     :param claude_bin: Path to the ``claude`` executable.
     :param workspace: The unreviewed workspace to launch in (holds the project
         ``.claude/settings.json`` hook).
     :param invocation_settings: omnigent-style invocation ``--settings`` file.
+    :param setting_source_args: The ``claude_native_skill_args`` output that
+        decides whether the workspace's project settings (the hook) stay live.
     :param env: Environment for the child (with an isolated ``HOME``).
     :returns: ``(marker_seen, decoded_tui_output)``.
     """
     marker = workspace / _MARKER_NAME
-    # Mirror the harness launch: invocation --settings + the real skill/setting
-    # -source args for the default filter. These args decide whether the
-    # workspace's project settings (the hook) stay live.
     launch_args = [
         claude_bin,
         "--settings",
         str(invocation_settings),
-        *claude_native_skill_args(None, skills_filter="all"),
+        *setting_source_args,
     ]
 
     master_out, slave_out = pty.openpty()
@@ -154,27 +162,29 @@ def _drive_claude_startup(
     return marker.exists(), text.decode("utf-8", "replace")
 
 
-def test_claude_native_pre_seeded_trust_runs_unreviewed_project_hook(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """omnigent's trust pre-seed must not let an unreviewed project hook run.
+def _seed_unreviewed_workspace(
+    base: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path, dict[str, str]]:
+    """Set up one launch: an unreviewed workspace plus omnigent's trust seed.
 
-    Drives the real omnigent seed + the real ``claude`` binary and asserts the
-    project ``SessionStart`` hook does NOT execute at startup.
+    Builds a workspace whose project ``.claude/settings.json`` defines a
+    ``SessionStart`` hook, pre-seeds trust via the real
+    ``ensure_claude_workspace_trusted`` into an isolated ``HOME``, and returns
+    the inputs for :func:`_drive_claude_startup`.
+
+    :param base: A unique directory for this launch (its own ``HOME`` and
+        workspace, so two launches in one test do not share trust state).
+    :returns: ``(workspace, invocation_settings, env)``.
     """
-    claude_bin = shutil.which("claude")
-    assert claude_bin is not None  # guarded by pytestmark
-
     # Isolated home so the real ensure_claude_workspace_trusted() (which writes
     # Path.home()/.claude.json) never touches the developer's real config.
-    fake_home = tmp_path / "home"
-    fake_home.mkdir()
+    fake_home = base / "home"
+    fake_home.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(fake_home))
 
     # An unreviewed / attacker-authored workspace: its project settings define a
     # SessionStart hook that runs an arbitrary command at startup.
-    workspace = tmp_path / "unreviewed-workspace"
+    workspace = base / "unreviewed-workspace"
     (workspace / ".claude").mkdir(parents=True)
     marker = workspace / _MARKER_NAME
     project_hook_cmd = f"echo attacker-code-executed > {json.dumps(str(marker))}"
@@ -202,31 +212,64 @@ def test_claude_native_pre_seeded_trust_runs_unreviewed_project_hook(
 
     # An omnigent-style invocation --settings file: hooks/statusline only; it
     # does not itself restrict settingSources (the CLI args must do that).
-    invocation_settings = tmp_path / "claude-settings.json"
+    invocation_settings = base / "claude-settings.json"
     invocation_settings.write_text(
         json.dumps({"statusLine": {"type": "command", "command": "true"}}),
         encoding="utf-8",
     )
+    return workspace, invocation_settings, dict(os.environ)
 
-    marker_seen, tui_output = _drive_claude_startup(
+
+def test_claude_native_pre_seeded_trust_runs_unreviewed_project_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """omnigent's trust pre-seed must not let an unreviewed project hook run.
+
+    Positive control first: with workspace-scoped settings live (the pre-fix
+    launch shape), the pre-seeded trust defeats Claude's dialog and the project
+    SessionStart hook DOES run --- proving the hook fires at startup and the
+    seed really bypasses the gate in this environment, so a later "marker
+    absent" result reflects the gate holding, not a boot failure. Then the
+    harness's actual launch shape (user-scope setting sources) must NOT run it.
+    """
+    claude_bin = shutil.which("claude")
+    assert claude_bin is not None  # guarded by pytestmark
+
+    control_ws, control_settings, control_env = _seed_unreviewed_workspace(
+        tmp_path / "control", monkeypatch
+    )
+    control_seen, control_out = _drive_claude_startup(
         claude_bin=claude_bin,
-        workspace=workspace,
-        invocation_settings=invocation_settings,
-        env=dict(os.environ),
+        workspace=control_ws,
+        invocation_settings=control_settings,
+        setting_source_args=claude_native_skill_args(
+            None, skills_filter="all", include_workspace_settings=True
+        ),
+        env=control_env,
+    )
+    assert control_seen, (
+        "positive control failed: with workspace settings live and trust "
+        "pre-seeded, the project SessionStart hook did not run, so claude never "
+        f"reached SessionStart in this environment. TUI output:\n{control_out}"
     )
 
-    # Sanity: the CLI actually launched and produced terminal output, so a
-    # "marker absent" result reflects the trust gate holding --- not the binary
-    # failing to boot at all.
-    assert tui_output.strip(), (
-        "claude CLI produced no terminal output; cannot conclude the trust gate held"
+    fixed_ws, fixed_settings, fixed_env = _seed_unreviewed_workspace(
+        tmp_path / "fixed", monkeypatch
+    )
+    fixed_seen, _fixed_out = _drive_claude_startup(
+        claude_bin=claude_bin,
+        workspace=fixed_ws,
+        invocation_settings=fixed_settings,
+        setting_source_args=claude_native_skill_args(None, skills_filter="all"),
+        env=fixed_env,
     )
 
-    assert not marker_seen, (
+    assert not fixed_seen, (
         "SECURITY: the project .claude/settings.json SessionStart hook executed at "
         "claude-native startup with no trust prompt. omnigent's global trust pre-seed "
         "(ensure_claude_workspace_trusted) defeated Claude's workspace-trust gate, and "
         "project settings were not disabled (claude_native_skill_args emitted no "
         "--setting-sources), so an unreviewed workspace ran arbitrary hook code at "
-        f"startup. Marker created by the hook: {marker}"
+        f"startup. Marker created by the hook: {fixed_ws / _MARKER_NAME}"
     )
