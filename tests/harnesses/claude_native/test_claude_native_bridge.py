@@ -4161,9 +4161,8 @@ def test_inject_user_message_pastes_content_then_submits(
     clear_home, clear_kill, load, paste, submit = captured
     assert clear_home[-4:] == ["-l", "-t", "claude:0.0", "\x1b[97;5u"]
     assert clear_kill[-4:] == ["-l", "-t", "claude:0.0", "\x1b[107;5u"]
-    # The buffer file carried the normalized content, plus a CR only after a
-    # trailing "\". An extra CR collapses a two-break message into a placeholder;
-    # a newline left as \n (not CR) is the anthropics/claude-code#52126 collapse.
+    # An extra CR collapses a two-break message into a placeholder; a newline
+    # left as \n (not CR) is the anthropics/claude-code#52126 collapse.
     assert loaded_payloads == [expected_payload]
     assert load[:6] == [
         "tmux",

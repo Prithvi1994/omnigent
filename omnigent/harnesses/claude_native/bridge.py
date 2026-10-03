@@ -4004,8 +4004,7 @@ def inject_user_message(
     ``Enter`` reads as a line-continuation and the message sits unsent.
     No other message gets one: Claude Code collapses a paste holding
     three or more line breaks into a ``[Pasted text #N +X lines]``
-    placeholder, so an unconditional newline hid three-line messages.
-    ``Enter`` is a separate tmux call. The file-based buffer
+    placeholder. ``Enter`` is a separate tmux call. The file-based buffer
     path (not ``send-keys`` argv) matters: tmux caps a single
     client→server command at ~16KB, so a large message — e.g. a PR diff
     in a sub-agent dispatch — failed with "command too long".
