@@ -9,17 +9,23 @@ import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import quote
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
-from omnigent.entities.environment_filesystem import FilesystemPathNotFound, InvalidPath
+from omnigent.entities.environment_filesystem import FilesystemPathNotFound, PathUnreachable
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
+from omnigent.inner.sandbox import ReachableRoot
 from omnigent.runner import create_runner_app
-from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
+from omnigent.runner.environment_filesystem import (
+    CallerProcessFilesystem,
+    resolve_browse_target,
+    search_indexed_paths,
+)
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
 from tests.runner.helpers import NullServerClient
@@ -2075,9 +2081,9 @@ async def test_edit_and_delete_outside_workspace_round_trip(
     assert not target.exists()
 
 
-def _absolute_delete_url(path: Path, *, recursive: bool = False) -> str:
+def _absolute_delete_url(path: Path | str, *, recursive: bool = False) -> str:
     base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
-    url = f"{base}/%2F{str(path).lstrip('/')}"
+    url = f"{base}/{quote(str(path), safe='')}"
     return f"{url}?recursive=true" if recursive else url
 
 
@@ -2246,8 +2252,8 @@ async def test_delete_absolute_refuses_filesystem_and_environment_roots(
     client: httpx.AsyncClient,
     workspace: Path,
 ) -> None:
-    for root in (Path("/"), workspace):
-        resp = await client.request("DELETE", _absolute_delete_url(root))
+    for root in ("/", "//", str(workspace), f"/{workspace}"):
+        resp = await client.request("DELETE", _absolute_delete_url(root, recursive=True))
         assert resp.status_code == 400, (root, resp.text)
         assert resp.json()["error"]["code"] == "invalid_path"
     assert (workspace / "hello.txt").exists()
@@ -2255,47 +2261,90 @@ async def test_delete_absolute_refuses_filesystem_and_environment_roots(
 
 @pytest.mark.asyncio
 async def test_delete_absolute_refuses_dot_dot_segments(
-    registry: SessionResourceRegistry,
+    client: httpx.AsyncClient,
     tmp_path: Path,
 ) -> None:
     keep = tmp_path / "keep.txt"
     keep.write_text("keep me\n")
-    fs = CallerProcessFilesystem(registry._primary_envs["conv_test"])
 
-    with pytest.raises(InvalidPath, match="traversal"):
-        await fs.delete(f"{tmp_path}/missing/../keep.txt")
+    resp = await client.request("DELETE", _absolute_delete_url(f"{tmp_path}/missing/../keep.txt"))
 
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_path"
     assert keep.exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_absolute_handles_non_bmp_names(
+    client: httpx.AsyncClient,
+    absolute_delete_dir: Path,
+) -> None:
+    victim = absolute_delete_dir / "\U0001f600 report.txt"
+    victim.write_text("bye\n")
+
+    resp = await client.request("DELETE", _absolute_delete_url(victim))
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["type"] == "file"
+    assert not victim.exists()
+
+
+def test_resolve_browse_target_can_judge_a_symlink_by_where_it_sits(tmp_path: Path) -> None:
+    grant = tmp_path / "grant"
+    grant.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    escape = grant / "escape"
+    escape.symlink_to(elsewhere)
+    intruder = tmp_path / "intruder"
+    intruder.symlink_to(grant)
+    roots = [ReachableRoot(path=grant, access="write", origin="write_paths", kind="tree")]
+
+    with pytest.raises(PathUnreachable):
+        resolve_browse_target(str(escape), roots, unconfined=False, need_write=True)
+    assert (
+        resolve_browse_target(
+            str(escape), roots, unconfined=False, need_write=True, follow_leaf=False
+        )
+        == escape
+    )
+    assert resolve_browse_target(str(intruder), roots, unconfined=False, need_write=True) == grant
+    with pytest.raises(PathUnreachable):
+        resolve_browse_target(
+            str(intruder), roots, unconfined=False, need_write=True, follow_leaf=False
+        )
 
 
 @pytest.mark.asyncio
 async def test_delete_absolute_routes_grant_covered_paths_through_the_helper(
     client: httpx.AsyncClient,
-    registry: SessionResourceRegistry,
     workspace: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A path a grant covers is deleted by the helper's own interpreter; a path
-    admitted only because the environment is unconfined is deleted in-process."""
-    os_env = registry._primary_envs["conv_test"]
-    commands: list[str] = []
-    real_shell = os_env.shell
+    """A path a grant covers is deleted by the sandboxed helper; a path admitted
+    only because the environment is unconfined is deleted in-process."""
+    helper_targets: list[str] = []
+    real_helper_delete = CallerProcessFilesystem._helper_delete_nofollow
 
-    async def recording_shell(command: str, **kwargs: object) -> dict[str, object]:
-        commands.append(command)
-        return await real_shell(command, **kwargs)
+    async def recording_helper_delete(
+        self: CallerProcessFilesystem, target: str, *, recursive: bool
+    ) -> dict[str, object]:
+        helper_targets.append(target)
+        return await real_helper_delete(self, target, recursive=recursive)
 
-    monkeypatch.setattr(os_env, "shell", recording_shell)
+    monkeypatch.setattr(
+        CallerProcessFilesystem, "_helper_delete_nofollow", recording_helper_delete
+    )
     inside = workspace / "inside.txt"
     inside.write_text("in\n")
     outside = tmp_path / "outside.txt"
     outside.write_text("out\n")
 
     assert (await client.request("DELETE", _absolute_delete_url(inside))).status_code == 200
-    assert len(commands) == 1 and "_delete_nofollow" in commands[0]
+    assert helper_targets == [str(inside)]
     assert (await client.request("DELETE", _absolute_delete_url(outside))).status_code == 200
-    assert len(commands) == 1
+    assert helper_targets == [str(inside)]
     assert not inside.exists() and not outside.exists()
 
 
@@ -2315,11 +2364,14 @@ def test_delete_nofollow_without_dir_fd_support_still_refuses_symlinked_parent(
 
     refused = _delete_nofollow(str(tmp_path / "link" / "keep.txt"), False)
     removed = _delete_nofollow(str(plain), False)
+    unsupported = _delete_nofollow(str(target), True)
 
     assert refused["code"] == "invalid_path"
     assert (target / "keep.txt").exists()
     assert removed == {"deleted": True, "type": "file", "bytes_deleted": 4}
     assert not plain.exists()
+    assert unsupported["code"] == "unsupported"
+    assert (target / "keep.txt").exists()
 
 
 @pytest.mark.asyncio
@@ -2340,6 +2392,12 @@ async def test_delete_absolute_under_real_sandbox_runs_in_the_helper(
     target.mkdir()
     (target / "keep.txt").write_text("keep me\n")
     (grant / "link").symlink_to(target)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "keep.txt").write_text("keep me\n")
+    (grant / "escape").symlink_to(elsewhere)
+    intruder = tmp_path / "intruder"
+    intruder.symlink_to(grant)
     beyond = tmp_path / "beyond.txt"
     beyond.write_text("out of reach\n")
     # The helper imports omnigent from this checkout, which the sandbox
@@ -2383,10 +2441,17 @@ async def test_delete_absolute_under_real_sandbox_runs_in_the_helper(
             assert not (grant / "link").is_symlink()
             assert (target / "keep.txt").exists()
 
-            unreachable = await client.request("DELETE", _absolute_delete_url(beyond))
-            assert unreachable.status_code == 403, unreachable.text
-            assert unreachable.json()["error"]["code"] == "path_unreachable"
+            escaped = await client.request("DELETE", _absolute_delete_url(grant / "escape"))
+            assert escaped.status_code == 200, escaped.text
+            assert escaped.json()["type"] == "symlink"
+            assert (elsewhere / "keep.txt").exists()
+
+            for outside in (beyond, intruder):
+                unreachable = await client.request("DELETE", _absolute_delete_url(outside))
+                assert unreachable.status_code == 403, unreachable.text
+                assert unreachable.json()["error"]["code"] == "path_unreachable"
             assert beyond.exists()
+            assert intruder.is_symlink() and grant.is_dir()
     finally:
         os_env.close()
 
