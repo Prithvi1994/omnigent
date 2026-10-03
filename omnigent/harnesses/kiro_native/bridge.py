@@ -65,6 +65,8 @@ _PERMISSION_KEY_INTERVAL_S = 0.3
 _PERMISSION_ENTER_SETTLE_S = 0.5
 _PERMISSION_VERDICT_VERIFY_TIMEOUT_S = 5.0
 _PERMISSION_VERDICT_RETRY_INTERVAL_S = 0.5
+# Pane rows above "requires approval" searched for the rendered tool block.
+_PERMISSION_TOOL_BLOCK_SCAN_LINES = 24
 _KIRO_SEPARATOR = "────"
 _KIRO_INPUT_READY_MARKERS = (
     "ask a question or describe a task",
@@ -483,21 +485,18 @@ def _kiro_active_permission_tool_line(pane: str) -> str:
     if approval_index < 0:
         return ""
     tool_index = -1
-    # Kiro separates the tool block from the approval picker with a horizontal
-    # rule, and may render metadata (for example ``working_dir``) after the
-    # command. Search only the nearby block instead of treating the line
-    # immediately above ``requires approval`` as the command.
-    for index in range(approval_index - 1, max(-1, approval_index - 24), -1):
+    scan_floor = max(-1, approval_index - _PERMISSION_TOOL_BLOCK_SCAN_LINES)
+    # Kiro may render metadata (e.g. working_dir) and a rule between the command
+    # and the picker, so scan the nearby block for a tool-status glyph.
+    for index in range(approval_index - 1, scan_floor, -1):
         stripped = lines[index].strip()
         if stripped.startswith(("↓ ", "● ", "○ ", "✓ ", "✗ ")):
             tool_index = index
             break
     if tool_index < 0:
-        # The supported Kiro E2E shim renders the ACP request title directly,
-        # without a leading tool-status glyph. Keep that explicit title shape
-        # as a narrow fallback; do not fall back to arbitrary command fragments
-        # or metadata, which caused false correlations in the native TUI.
-        for index in range(approval_index - 1, max(-1, approval_index - 24), -1):
+        # The Kiro E2E shim renders the ACP title without a tool-status glyph; keep
+        # that explicit shape as a narrow fallback, never arbitrary fragments.
+        for index in range(approval_index - 1, scan_floor, -1):
             if lines[index].strip().startswith("Running:"):
                 tool_index = index
                 break
@@ -519,6 +518,39 @@ def _squash_whitespace(text: str) -> str:
     return "".join(text.split())
 
 
+def _contains_at_token_boundaries(tool_line: str, needle: str, *, suffix_only: bool) -> bool:
+    """Whitespace-insensitive containment that still honors token boundaries.
+
+    Rejoined wrapped lines carry a space at each break, and a break can fall
+    mid-token, so compare without whitespace; but the match must start and end
+    where the pane had whitespace, so ``ls`` never matches ``installs``.
+    """
+    haystack: list[str] = []
+    origins: list[int] = []
+    for index, char in enumerate(tool_line):
+        if not char.isspace():
+            haystack.append(char)
+            origins.append(index)
+    squashed_line = "".join(haystack)
+    needle = _squash_whitespace(needle)
+    if not needle or len(needle) > len(squashed_line):
+        return False
+    starts = (
+        [len(squashed_line) - len(needle)]
+        if suffix_only
+        else range(len(squashed_line) - len(needle) + 1)
+    )
+    for start in starts:
+        if not squashed_line.startswith(needle, start):
+            continue
+        end = start + len(needle)
+        starts_token = start == 0 or origins[start] - origins[start - 1] > 1
+        ends_token = end == len(squashed_line) or origins[end] - origins[end - 1] > 1
+        if starts_token and ends_token:
+            return True
+    return False
+
+
 def _kiro_permission_prompt_matches_title(pane: str, expected_title: str | None) -> bool:
     """Return whether the visible prompt appears to match the parsed request title."""
     if not expected_title:
@@ -529,16 +561,13 @@ def _kiro_permission_prompt_matches_title(pane: str, expected_title: str | None)
     tool_line = _kiro_active_permission_tool_line(pane)
     if not tool_line:
         return False
-    # Rejoined wrapped lines carry a space at each break, and a break can fall
-    # mid-token, so compare the shapes without whitespace.
-    squashed_title = _squash_whitespace(title)
-    squashed_tool_line = _squash_whitespace(tool_line)
-    if squashed_title == squashed_tool_line:
+    if _squash_whitespace(title) == _squash_whitespace(tool_line):
         return True
     if title.startswith("Running:"):
-        command = _squash_whitespace(title.removeprefix("Running:"))
-        return bool(command and squashed_tool_line.endswith(command))
-    return squashed_title in squashed_tool_line
+        return _contains_at_token_boundaries(
+            tool_line, title.removeprefix("Running:"), suffix_only=True
+        )
+    return _contains_at_token_boundaries(tool_line, title, suffix_only=False)
 
 
 def _wait_for_kiro_permission_prompt(
@@ -575,9 +604,10 @@ def _wait_for_kiro_permission_verdict_applied(
 ) -> None:
     """Verify Kiro consumed a verdict, retrying only on the same safe prompt.
 
-    ``verdict_recorded`` (Kiro's ACP response for this request) also means
-    consumed: the pane alone cannot tell a dropped Enter from an identical
-    follow-up prompt, which a retry must never answer.
+    Bounded by ``_PERMISSION_VERDICT_VERIFY_TIMEOUT_S``. Retries need
+    ``verdict_recorded`` (Kiro's ACP response for this request): the pane alone
+    cannot tell a dropped Enter from an identical follow-up prompt, which a retry
+    must never answer, so without the callback the verdict is only verified.
     """
     deadline = time.monotonic() + min(timeout_s, _PERMISSION_VERDICT_VERIFY_TIMEOUT_S)
     last_enter = time.monotonic()
@@ -601,7 +631,12 @@ def _wait_for_kiro_permission_verdict_applied(
                 "kiro-native permission focus changed before verdict delivery completed"
             )
         now = time.monotonic()
-        if now - last_enter >= _PERMISSION_VERDICT_RETRY_INTERVAL_S:
+        if (
+            verdict_recorded is not None
+            and now - last_enter >= _PERMISSION_VERDICT_RETRY_INTERVAL_S
+        ):
+            if verdict_recorded():
+                return
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             last_enter = now
         time.sleep(_POLL_INTERVAL_S)
@@ -805,7 +840,8 @@ def send_kiro_permission_verdict(
     """Deliver a one-time Kiro permission verdict to the active TUI prompt.
 
     ``verdict_recorded`` reports whether Kiro's ACP recorder already holds this
-    request's response; see :func:`_wait_for_kiro_permission_verdict_applied`.
+    request's response; without it a lingering prompt is verified but never
+    retried. See :func:`_wait_for_kiro_permission_verdict_applied`.
     """
     if action not in {"accept", "decline", "cancel"}:
         raise RuntimeError(f"unsupported Kiro permission action: {action!r}")

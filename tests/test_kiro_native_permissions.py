@@ -233,7 +233,7 @@ async def test_run_one_permission_reports_recorded_verdict_for_this_request_only
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The delivery callback flips only on this request's recorder response."""
+    """The delivery probe flips only on this request's recorder response, then stays set."""
     record_file = acp_record_path(tmp_path)
     record_file.write_bytes(_record_bytes(_permission_msg("req-1")))
     seen: list[bool] = []
@@ -253,6 +253,7 @@ async def test_run_one_permission_reports_recorded_verdict_for_this_request_only
         with record_file.open("ab") as handle:
             handle.write(_record_bytes(_permission_result_msg("req-1")))
         seen.append(verdict_recorded())
+        seen.append(verdict_recorded())
 
     monkeypatch.setattr(knp, "send_kiro_permission_verdict", _fake_send)
     req = parse_permission_request(_permission_msg("req-1"))
@@ -267,7 +268,7 @@ async def test_run_one_permission_reports_recorded_verdict_for_this_request_only
         elicitation_id="elic_1",
     )
 
-    assert seen == [False, False, True]
+    assert seen == [False, False, True, True]
 
 
 @pytest.mark.asyncio

@@ -81,12 +81,9 @@ _DELIVERY_CONFIRM_TIMEOUT_S = 45.0
 # The single permission request the fake TUI raises for the first task.
 _REQUEST_ID = "perm-req-1"
 
-# A minimal fake ``kiro-cli`` TUI (see module docstring). ``__FAKE_MODE__`` is
-# substituted per test: ``drop-first-enter`` ignores the first Enter while the
-# approval picker is active (the reported under-load keystroke drop);
-# ``wrapped-title`` renders the approval block the way the reporter captured it
-# live — the command title wrapped at 80 columns, a ``╰ working_dir=…`` row,
-# and a horizontal separator before ``shell requires approval``.
+# Minimal fake ``kiro-cli`` TUI (see module docstring). ``__FAKE_MODE__`` selects the
+# injected fault: ``drop-first-enter`` swallows the first Enter on the picker;
+# ``wrapped-title`` renders the 80-column wrapped tool block with a working_dir row.
 _FAKE_KIRO_TEMPLATE = r'''#!/usr/bin/env python3
 """Fake kiro-cli TUI for the verdict-delivery regression tests."""
 import json

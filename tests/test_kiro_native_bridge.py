@@ -336,11 +336,64 @@ def test_send_kiro_permission_verdict_retries_ignored_enter(
     )
 
     send_kiro_permission_verdict(
-        bridge_dir, action="accept", expected_title="Running: pwd", timeout_s=0.1
+        bridge_dir,
+        action="accept",
+        expected_title="Running: pwd",
+        timeout_s=0.1,
+        verdict_recorded=lambda: False,
     )
 
     sent_keys = [call[-1] for call in calls if "send-keys" in call]
     assert sent_keys == ["Enter", "Enter"]
+
+
+def test_send_kiro_permission_verdict_never_retries_without_a_recorder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a consumption signal a lingering prompt is verified, not retried."""
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RETRY_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE])
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    with pytest.raises(RuntimeError, match="did not resolve after verdict delivery"):
+        send_kiro_permission_verdict(
+            bridge_dir, action="accept", expected_title="Running: pwd", timeout_s=0.02
+        )
+
+    assert [call[-1] for call in calls if "send-keys" in call] == ["Enter"]
+
+
+def test_send_kiro_permission_verdict_refuses_suffix_inside_a_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whitespace-insensitive matching must not let ``ls`` match ``installs``."""
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch, pane_outputs=[_PERMISSION_PANE.replace("↓ Shell pwd", "↓ Shell installs")]
+    )
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    with pytest.raises(RuntimeError, match="permission prompt was not safely focused"):
+        send_kiro_permission_verdict(
+            bridge_dir, action="accept", expected_title="Running: ls", timeout_s=0.01
+        )
+
+    assert [call[-1] for call in calls if "send-keys" in call] == []
 
 
 def test_send_kiro_permission_verdict_stops_once_verdict_is_recorded(
