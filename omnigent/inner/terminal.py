@@ -15,6 +15,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -806,9 +807,57 @@ def _terminals_tmp_root() -> Path:
     return Path(tempfile.gettempdir())
 
 
+def _list_pane_pids(socket_path: Path) -> list[int]:
+    """
+    Return the pids of every pane on a terminal's tmux server.
+
+    Captured before ``kill-server`` so the sweep can still reach harness
+    children that outlive the SIGHUP tmux sends their panes on teardown.
+
+    :param socket_path: The terminal's control socket, e.g.
+        ``Path("/tmp/omnigent-terminal-ab12/tmux.sock")``.
+    :returns: The live pane pids, or ``[]`` when tmux cannot report them.
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "-S", str(socket_path), "list-panes", "-a", "-F", "#{pane_pid}"],
+            check=False,
+            capture_output=True,
+            timeout=_REAP_KILL_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    pids: list[int] = []
+    for token in result.stdout.decode(errors="replace").split():
+        with contextlib.suppress(ValueError):
+            pids.append(int(token))
+    return pids
+
+
+def _kill_pane_process_group(pid: int) -> None:
+    """
+    SIGKILL a terminal pane's process group.
+
+    ``tmux kill-server`` only SIGHUPs its panes, so a harness CLI that traps
+    SIGHUP to survive terminal disconnects (e.g. ``claude``) outlives the
+    server. The sweep force-kills the pane's whole group so its descendants
+    die with it. A pid that is already gone, reused, or owned by another user
+    reads as ``ProcessLookupError``/``PermissionError`` and is left alone, so
+    this can only no-op, never kill a live owner's process.
+
+    :param pid: A pane pid captured before ``kill-server``, e.g. ``48213``.
+    """
+    if pid <= 0 or IS_WINDOWS:
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+
+
 def reap_orphaned_terminals() -> int:
     """
-    Kill terminal tmux servers whose owning process is gone.
+    Kill orphaned terminal tmux servers and their harness children.
 
     Terminal tmux servers are deliberately detached so they survive
     transient client disconnects; graceful shutdown closes them
@@ -832,7 +881,10 @@ def reap_orphaned_terminals() -> int:
             continue
         socket_path = entry / "tmux.sock"
         had_socket = socket_path.exists()
+        pane_pids: list[int] = []
         if had_socket:
+            # Snapshot the panes before kill-server, which only SIGHUPs them.
+            pane_pids = _list_pane_pids(socket_path)
             try:
                 result = subprocess.run(
                     ["tmux", "-S", str(socket_path), "kill-server"],
@@ -856,6 +908,10 @@ def reap_orphaned_terminals() -> int:
                         entry,
                     )
                     continue
+        # The server is down; SIGHUP-ignoring harness children (e.g. claude)
+        # outlive it, so force-kill the pane groups they lead.
+        for pane_pid in pane_pids:
+            _kill_pane_process_group(pane_pid)
         shutil.rmtree(entry, ignore_errors=True)
         # Record what the sweep destroyed. The socket path is the join key
         # against the owning session's "no server running on <socket>" exit,

@@ -4,9 +4,6 @@
 from __future__ import annotations
 
 import json
-import shutil
-import subprocess
-import tempfile
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -16,7 +13,6 @@ from click.testing import CliRunner
 
 from omnigent.cli import _HostDaemonRecord, _SessionPagesResult, cli
 from omnigent.host.local_server import LocalServerInfo, LocalServerStartup
-from omnigent.native import owner_claim
 
 
 def _record(
@@ -452,56 +448,38 @@ def test_stop_reports_untracked_orphan_server(monkeypatch: pytest.MonkeyPatch) -
     assert "Nothing to stop." not in result.output
 
 
-@pytest.mark.skipif(shutil.which("tmux") is None, reason="needs tmux on PATH")
-def test_stop_kills_orphaned_managed_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``stop`` tears down a session terminal whose owning runner died uncleanly.
+def test_stop_reaps_orphaned_managed_terminals_and_reports_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``stop`` runs the orphan terminal reaper after the server and reports it.
 
     A SIGKILL'd runner leaves its detached private-socket tmux server (session
-    ``main``) with no owner; the off-switch must not leave that server and its
-    harness child running.
+    ``main``) and harness child with no owner. ``stop`` must drive the orphan
+    reaper and surface what it cleaned up, and only after the server itself is
+    down so it never races a live owner. The reaper's own behaviour -- owner
+    checks and killing the server plus its harness child -- is covered by
+    ``tests/inner/test_terminal_orphan_ownership.py``.
     """
+    order: list[str] = []
     monkeypatch.setattr("omnigent.cli._list_daemon_records", list)
     monkeypatch.setattr("omnigent.cli.local_server_url_if_healthy", lambda: None)
-    monkeypatch.setattr("omnigent.cli.stop_local_omnigent_server", Mock())
     monkeypatch.setattr("omnigent.cli.stop_untracked_local_server", lambda: None)
-    # Short scratch root: pytest's tmp_path can overrun the unix socket path limit.
-    tmp_root = Path(tempfile.mkdtemp(prefix="omnigent-stop-"))
-    monkeypatch.setattr("omnigent.inner.terminal._terminals_tmp_root", lambda: tmp_root)
-    monkeypatch.setenv("TMPDIR", str(tmp_root))
-    instance_dir = tmp_root / "omnigent-terminal-orphan"
-    instance_dir.mkdir()
-    # 2147483647 exceeds pid_max, so the recorded owner counts as dead.
-    (instance_dir / owner_claim.OWNER_PID_FILENAME).write_text(
-        f"2147483647\npid_ns={owner_claim.current_pid_namespace()}\n"
-        f"boot={owner_claim.current_boot_id()}\n"
-    )
-    socket_path = instance_dir / "tmux.sock"
-    subprocess.run(
-        ["tmux", "-S", str(socket_path), "new-session", "-d", "-s", "main", "sleep 300"],
-        check=True,
-        capture_output=True,
+    monkeypatch.setattr(
+        "omnigent.cli.stop_local_omnigent_server",
+        Mock(side_effect=lambda *a, **k: order.append("stop_server")),
     )
 
-    def _server_alive() -> bool:
-        return (
-            subprocess.run(
-                ["tmux", "-S", str(socket_path), "list-sessions"], capture_output=True
-            ).returncode
-            == 0
-        )
+    def _reap() -> int:
+        order.append("reap")
+        return 2
 
-    try:
-        assert _server_alive()
+    monkeypatch.setattr("omnigent.inner.terminal.reap_orphaned_terminals", _reap)
 
-        result = CliRunner().invoke(cli, ["stop"])
+    result = CliRunner().invoke(cli, ["stop"])
 
-        assert result.exit_code == 0, result.output
-        assert "1 orphaned terminal(s)" in result.output
-        assert not _server_alive(), "orphaned managed tmux server survived `omnigent stop`"
-        assert not instance_dir.exists()
-    finally:
-        subprocess.run(["tmux", "-S", str(socket_path), "kill-server"], capture_output=True)
-        shutil.rmtree(tmp_root, ignore_errors=True)
+    assert result.exit_code == 0, result.output
+    assert "2 orphaned terminal(s)" in result.output
+    assert order == ["stop_server", "reap"]
 
 
 def test_server_stop_finds_untracked_orphan_when_pidfile_lost(

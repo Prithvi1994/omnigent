@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import shutil
+import signal
 import subprocess
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -39,7 +42,9 @@ def test_failed_reap_preserves_control_socket_for_retry(
     assert terminal_mod.reap_orphaned_terminals() == 0
     assert socket.exists()
     monkeypatch.setattr(
-        terminal_mod.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0)
+        terminal_mod.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=b""),
     )
     assert terminal_mod.reap_orphaned_terminals() == 1
     assert not directory.exists()
@@ -128,4 +133,59 @@ def test_sweep_only_kills_real_tmux_with_proven_dead_owner(
         )
         assert (result.returncode == 0) is (ownership != "dead_local")
     finally:
+        subprocess.run([*base, "kill-server"], check=False, capture_output=True, timeout=10)
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed")
+def test_sweep_kills_sighup_ignoring_pane_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sweep SIGKILLs a pane child that ignores the SIGHUP kill-server sends.
+
+    A native harness CLI (e.g. claude) traps SIGHUP to survive disconnects, so
+    ``tmux kill-server`` alone leaves it running; the reaper must force-kill the
+    pane's process group.
+    """
+    directory = tmp_path / "omnigent-terminal-harness"
+    directory.mkdir()
+    owner_claim.write_owner_claim(directory)
+    base = ["tmux", "-S", str(directory / "tmux.sock"), "-f", os.devnull]
+    subprocess.run(
+        [*base, "new-session", "-d", "-s", "main", "trap '' HUP; sleep 300"],
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
+    pane_pid = int(
+        subprocess.run(
+            [*base, "list-panes", "-a", "-F", "#{pane_pid}"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout.split()[0]
+    )
+    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
+    monkeypatch.setattr(terminal_mod, "_process_alive", lambda pid: False)
+    try:
+        assert _alive(pane_pid)
+        assert terminal_mod.reap_orphaned_terminals() == 1
+        assert not directory.exists()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and _alive(pane_pid):
+            time.sleep(0.1)
+        assert not _alive(pane_pid), "SIGHUP-ignoring pane child survived the sweep"
+    finally:
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.killpg(os.getpgid(pane_pid), signal.SIGKILL)
         subprocess.run([*base, "kill-server"], check=False, capture_output=True, timeout=10)
