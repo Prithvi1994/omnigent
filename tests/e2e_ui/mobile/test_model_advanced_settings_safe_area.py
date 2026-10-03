@@ -17,6 +17,7 @@ the ``start_session`` suite's route stubs; the server and SPA are real.
 
 from __future__ import annotations
 
+import os
 import re
 
 import pytest
@@ -449,7 +450,8 @@ def test_advanced_settings_sheet_stays_below_ios_safe_area(
         sheet_box = _settled_box(page, sheet)
         back_box = _settled_box(page, back)
         # Hold the open sheet so the outcome is readable in a recording.
-        page.wait_for_timeout(1_500)
+        if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
+            page.wait_for_timeout(1_500)
 
         assert sheet_box["y"] >= safe_top, (
             f"the {label} advanced-settings sheet starts at y={sheet_box['y']:.0f}px, inside "

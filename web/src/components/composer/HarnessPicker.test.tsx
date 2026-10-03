@@ -14,6 +14,7 @@ import {
   DropdownMenuSubTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
+import { getSafeAreaCollisionBoundary } from "@/lib/safeAreaInsets";
 
 afterEach(() => {
   cleanup();
@@ -203,15 +204,19 @@ describe("HarnessPicker", () => {
     }
   });
 
-  it("opens the mobile configuration page at the top of a scrolled menu", () => {
+  it("opens the mobile configuration page at the top of a scrolled menu and restores the list", () => {
     render(<PickerFixture mobile />);
     fireEvent.pointerDown(screen.getByRole("button", { name: "Harness" }), { button: 0 });
     const menu = screen.getByTestId("menu");
+    expect(getSafeAreaCollisionBoundary().isConnected).toBe(true);
     // jsdom has no layout, so stand in for a harness list the user scrolled.
     Object.defineProperty(menu, "scrollTop", { value: 36, writable: true, configurable: true });
     fireEvent.click(screen.getByTestId("edit"));
     expect(screen.getByTestId("back")).toBeInTheDocument();
     expect(menu.scrollTop).toBe(0);
+    fireEvent.click(screen.getByTestId("back"));
+    expect(screen.getByTestId("entry")).toBeInTheDocument();
+    expect(menu.scrollTop).toBe(36);
   });
 
   it("keeps a non-modal picker open while focusing its active row inside a dialog", async () => {

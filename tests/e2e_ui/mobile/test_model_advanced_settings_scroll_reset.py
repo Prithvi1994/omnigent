@@ -57,6 +57,8 @@ def _scroll_list_to_end(page: Page, menu: Locator) -> int:
         if state["max"] > 0 and state["top"] >= state["max"]:
             return state["top"]
         page.wait_for_timeout(50)
+    if state["max"] <= 0:
+        raise AssertionError(f"the harness list never overflowed the capped menu: {state}")
     raise AssertionError(f"the harness list did not scroll to its end: {state}")
 
 
@@ -98,9 +100,18 @@ def test_drill_in_page_opens_at_top_of_scrolled_list(
         assert scrolled > 0
 
         expect(trigger).to_be_visible()
+        # Capture the list's offset at the moment of the tap: the page must open
+        # from the scrolled list, not from one the click driver scrolled back.
+        menu.evaluate(
+            "el => el.addEventListener('pointerdown', "
+            "() => { window.__scrollAtTap = el.scrollTop; }, {capture: true, once: true})"
+        )
         trigger.click()
         back = page.get_by_test_id("new-chat-landing-page-back")
         expect(back).to_be_visible()
+        assert page.evaluate("() => window.__scrollAtTap") == scrolled, (
+            "the harness list was no longer at its end when the control was tapped"
+        )
         menu_box = _settled_box(page, menu)
         back_box = _settled_box(page, back)
         # Hold the open page so the outcome is readable in a recording.

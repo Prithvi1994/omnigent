@@ -1,16 +1,19 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import { setEmbedRoot } from "@/lib/host";
-import { getSafeAreaCollisionBoundary, withSafeAreaCollisionBoundary } from "./safeAreaInsets";
+import {
+  getSafeAreaCollisionBoundary,
+  mountSafeAreaCollisionBoundary,
+  withSafeAreaCollisionBoundary,
+} from "./safeAreaInsets";
 
 afterEach(() => {
   setEmbedRoot(null);
 });
 
 describe("getSafeAreaCollisionBoundary", () => {
-  it("attaches one shared element inset by the safe-area variables", () => {
+  it("creates one shared element inset by the safe-area variables", () => {
     const el = getSafeAreaCollisionBoundary();
-    expect(el.isConnected).toBe(true);
     expect(getSafeAreaCollisionBoundary()).toBe(el);
     expect(el.style.position).toBe("fixed");
     expect(el.style.top).toBe("var(--omnigent-safe-top, 0px)");
@@ -25,25 +28,32 @@ describe("getSafeAreaCollisionBoundary", () => {
     expect(el.style.pointerEvents).toBe("none");
     expect(el.getAttribute("aria-hidden")).toBe("true");
   });
+});
 
-  it("re-attaches after the element is detached", () => {
+describe("mountSafeAreaCollisionBoundary", () => {
+  it("attaches the element to the document body and re-attaches after removal", () => {
+    mountSafeAreaCollisionBoundary();
     const el = getSafeAreaCollisionBoundary();
+    expect(el.parentElement).toBe(document.body);
     el.remove();
-    expect(getSafeAreaCollisionBoundary().isConnected).toBe(true);
+    mountSafeAreaCollisionBoundary();
+    expect(el.parentElement).toBe(document.body);
   });
 
-  it("follows the embed root registered after the first menu rendered", () => {
+  it("follows an embed root registered after the first mount", () => {
+    mountSafeAreaCollisionBoundary();
     const el = getSafeAreaCollisionBoundary();
     expect(el.parentElement).toBe(document.body);
 
     const root = document.createElement("div");
     document.body.appendChild(root);
     setEmbedRoot(root);
+    mountSafeAreaCollisionBoundary();
     expect(getSafeAreaCollisionBoundary()).toBe(el);
     expect(el.parentElement).toBe(root);
 
     setEmbedRoot(null);
-    expect(getSafeAreaCollisionBoundary()).toBe(el);
+    mountSafeAreaCollisionBoundary();
     expect(el.parentElement).toBe(document.body);
     root.remove();
   });

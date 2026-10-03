@@ -8,15 +8,10 @@ type CollisionBoundary = Element | null | (Element | null)[];
 
 let safeAreaBoundary: HTMLElement | null = null;
 
-/** The shared safe-area boundary element, kept inside the Radix portal container. */
+/** The shared boundary element; `mountSafeAreaCollisionBoundary` attaches it. */
 export function getSafeAreaCollisionBoundary(): HTMLElement {
-  // The embed registers its root after the first closed menus render, and its
-  // scoped variables only resolve inside it, so follow the current container.
-  const container = getEmbedRoot() ?? document.body;
-  if (safeAreaBoundary?.isConnected && safeAreaBoundary.parentElement === container) {
-    return safeAreaBoundary;
-  }
-  const el = safeAreaBoundary ?? document.createElement("div");
+  if (safeAreaBoundary) return safeAreaBoundary;
+  const el = document.createElement("div");
   el.style.position = "fixed";
   el.style.top = "var(--omnigent-safe-top, 0px)";
   el.style.right = "var(--omnigent-safe-right, 0px)";
@@ -25,9 +20,19 @@ export function getSafeAreaCollisionBoundary(): HTMLElement {
   el.style.visibility = "hidden";
   el.style.pointerEvents = "none";
   el.setAttribute("aria-hidden", "true");
-  container.appendChild(el);
   safeAreaBoundary = el;
   return el;
+}
+
+/**
+ * Attach the boundary to the Radix portal container (the embed root once one
+ * is registered, else `document.body`), moving it when that container changes.
+ * Call from a layout effect that runs before the popover positions itself.
+ */
+export function mountSafeAreaCollisionBoundary(): void {
+  const container = getEmbedRoot() ?? document.body;
+  const el = getSafeAreaCollisionBoundary();
+  if (el.parentElement !== container) container.appendChild(el);
 }
 
 /**

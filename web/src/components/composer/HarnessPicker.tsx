@@ -581,11 +581,17 @@ export function HarnessPickerConfigRow({
 /** A drill-in page rendered in place of the picker's list on mobile. */
 export function HarnessPickerPage({ children }: { children: ReactNode }) {
   const pageRef = useRef<HTMLDivElement>(null);
-  // The list and its pages share one scroll container, so a scrolled list
-  // would otherwise open the page with its Back row above the visible edge.
+  // The list and its pages share one scroll container: start the page at the
+  // top (a scrolled list would hide its Back row), and put the list back where
+  // it was once the page closes.
   useLayoutEffect(() => {
     const menu = pageRef.current?.closest<HTMLElement>('[role="menu"]');
-    if (menu) menu.scrollTop = 0;
+    if (!menu) return;
+    const listScrollTop = menu.scrollTop;
+    menu.scrollTop = 0;
+    return () => {
+      menu.scrollTop = listScrollTop;
+    };
   }, []);
   return (
     <div ref={pageRef} className="animate-in fade-in-0 slide-in-from-right-2 duration-150">
