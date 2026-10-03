@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from typing import cast
 
 import pytest
@@ -291,11 +290,7 @@ async def test_runner_router_resources_reuses_preloaded_conversation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resource_routing_carries_only_the_pinned_runners_delete_capability(
-    tmp_path: Path,
-) -> None:
-    victim = tmp_path / "victim"
-    victim.write_bytes(b"unchanged")
+async def test_resource_routing_carries_only_the_pinned_runners_delete_capability() -> None:
     registry = TunnelRegistry()
     hello = _hello(harnesses=["codex"])
     hello.capabilities.append("workspace_delete_nofollow_v1")
@@ -314,7 +309,6 @@ async def test_resource_routing_carries_only_the_pinned_runners_delete_capabilit
         assert router.client_for_session_resources("conv_test").capabilities == (
             "workspace_delete_nofollow_v1",
         )
-        assert victim.read_bytes() == b"unchanged"
     finally:
         await router.aclose()
 

@@ -3938,14 +3938,22 @@ async def test_workspace_delete_gate_checks_the_executing_runner(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "message", "status"),
+    [
+        (ErrorCode.RUNNER_UNAVAILABLE, "runner is offline", 503),
+        (ErrorCode.CONFLICT, "conversation is not bound to a runner", 409),
+        (ErrorCode.NOT_FOUND, "conversation not found", 404),
+    ],
+)
 async def test_workspace_delete_unresolved_runner_is_refused(
     client: httpx.AsyncClient,
-    tmp_path: Path,
+    code: str,
+    message: str,
+    status: int,
 ) -> None:
     from omnigent.runner.routing import RunnerRouter
 
-    victim = tmp_path / "victim"
-    victim.write_bytes(b"keep")
     runner = _FakeRunnerClient(payload=_fs_delete_payload())
 
     class MissingRunner(_FakeRunnerRouter):
@@ -3955,14 +3963,24 @@ async def test_workspace_delete_unresolved_runner_is_refused(
             *,
             conversation: Conversation | None = None,
         ) -> _RoutedRunner:
-            raise LookupError("unknown runner")
+            raise OmnigentError(message, code=code)
 
     set_runner_router(cast(RunnerRouter, MissingRunner(runner)))
     response = await client.delete(f"{_FS_BASE}/filesystem/victim")
-    assert victim.read_bytes() == b"keep"
-    assert response.status_code == 409
-    assert response.json()["error"]["code"] == "runner_upgrade_required"
+    assert response.status_code == status
+    assert response.json()["error"] == {"code": code, "message": message}
     assert not runner.calls
+
+
+@pytest.mark.asyncio
+async def test_workspace_delete_without_router_preserves_unavailable_error(
+    client: httpx.AsyncClient,
+) -> None:
+    set_runner_router(None)
+    set_runner_client(None)
+    response = await client.delete(f"{_FS_BASE}/filesystem/victim")
+    assert response.status_code == 502
+    assert response.json()["detail"] == "no runner available for resource access"
 
 
 @pytest.mark.asyncio
@@ -8634,6 +8652,8 @@ async def test_filesystem_mutations_are_not_gzipped(
         # Padded past minimum_size so only the method decides the outcome.
         "detail": "x" * 4096,
     }
+    if method == "DELETE":
+        payload = {**_fs_delete_payload(), "detail": "x" * 4096}
     set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
 
     resp = await client.request(
@@ -8643,7 +8663,7 @@ async def test_filesystem_mutations_are_not_gzipped(
         json={"content": "hi", "old_text": "a", "new_text": "b"},
     )
 
-    assert resp.status_code == (502 if method == "DELETE" else 200)
+    assert resp.status_code == 200
     assert "content-encoding" not in resp.headers
 
 

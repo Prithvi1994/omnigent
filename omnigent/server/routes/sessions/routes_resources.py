@@ -969,13 +969,12 @@ def register_resources_routes(
             client = await _get_runner_client_for_resource_access(
                 conversation.id, conversation=conversation
             )
-            return client, workspace_delete_metadata() if client is not None else unavailable
-        try:
-            routed = router.client_for_session_resources(
-                conversation.id, conversation=conversation
-            )
-        except (LookupError, httpx.HTTPError, OmnigentError):
-            return None, unavailable
+            if client is None:
+                raise HTTPException(
+                    status_code=502, detail="no runner available for resource access"
+                )
+            return client, workspace_delete_metadata()
+        routed = router.client_for_session_resources(conversation.id, conversation=conversation)
         if CAP_WORKSPACE_DELETE not in (getattr(routed, "capabilities", ()) or ()):
             return None, unavailable
         return routed.client, {"available": True}

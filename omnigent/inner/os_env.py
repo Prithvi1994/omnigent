@@ -101,7 +101,11 @@ def workspace_delete_metadata() -> dict[str, object]:
 
 @contextlib.contextmanager
 def _open_parent_beneath(
-    root: Path, relative_path: str, *, nofollow_root: bool = False
+    root: Path,
+    relative_path: str,
+    *,
+    nofollow_root: bool = False,
+    root_identity: tuple[int, int] | None = None,
 ) -> Iterator[tuple[int, str]]:
     """Keep a no-follow parent descriptor open through a leaf operation."""
     parts = relative_path.split("/")
@@ -110,6 +114,10 @@ def _open_parent_beneath(
         root_flags |= os.O_NOFOLLOW
     descriptor = os.open(root, root_flags)
     try:
+        if root_identity is not None:
+            root_stat = os.fstat(descriptor)
+            if (root_stat.st_dev, root_stat.st_ino) != root_identity:
+                raise OSError(errno.ELOOP, "Workspace root changed since helper startup")
         for name in parts[:-1]:
             next_descriptor = os.open(
                 name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=descriptor
@@ -1107,6 +1115,7 @@ def _handle_helper_request(
     cwd: Path,
     shell_path: str,
     sandbox: SandboxPolicy,
+    root_identity: tuple[int, int] | None = None,
 ) -> OpResult:
     op = request.get("op")
     if op == "delete":
@@ -1114,7 +1123,9 @@ def _handle_helper_request(
         recursive = request.get("recursive", False)
         if not isinstance(raw_path, str) or not isinstance(recursive, bool):
             return {"error": "Invalid delete request", "code": "invalid_path"}
-        return _delete_impl(cwd, raw_path, sandbox, recursive=recursive)
+        return _delete_impl(
+            cwd, raw_path, sandbox, recursive=recursive, root_identity=root_identity
+        )
 
     if op == "read":
         raw_path = request.get("path")
@@ -1204,7 +1215,14 @@ def _handle_helper_request(
     return {"error": f"Unsupported os_env helper operation: {op!r}"}
 
 
-def _delete_impl(cwd: Path, raw_path: str, sandbox: SandboxPolicy, *, recursive: bool) -> OpResult:
+def _delete_impl(
+    cwd: Path,
+    raw_path: str,
+    sandbox: SandboxPolicy,
+    *,
+    recursive: bool,
+    root_identity: tuple[int, int] | None = None,
+) -> OpResult:
     """Delete a leaf inside the helper using its anchored parent descriptor."""
     if "\x00" in raw_path:
         return {"error": "Path contains NUL bytes", "code": "invalid_path"}
@@ -1225,7 +1243,10 @@ def _delete_impl(cwd: Path, raw_path: str, sandbox: SandboxPolicy, *, recursive:
             _assert_write_allowed(sandbox, target)
             return _delete_leaf(path, recursive=recursive)
         _assert_write_allowed(sandbox, cwd / path)
-        with _open_parent_beneath(cwd, path, nofollow_root=True) as (parent_descriptor, name):
+        with _open_parent_beneath(cwd, path, nofollow_root=True, root_identity=root_identity) as (
+            parent_descriptor,
+            name,
+        ):
             return _delete_leaf(name, recursive=recursive, parent_descriptor=parent_descriptor)
     except OSError as exc:
         code = "delete_failed"
@@ -1254,12 +1275,17 @@ def _delete_leaf(path: str, *, recursive: bool, parent_descriptor: int | None = 
         entry_type = "directory"
     else:
         os.unlink(path, dir_fd=parent_descriptor)
-        entry_type = "symlink" if stat.S_ISLNK(leaf_stat.st_mode) else "file"
+        if stat.S_ISLNK(leaf_stat.st_mode):
+            entry_type = "symlink"
+        elif stat.S_ISREG(leaf_stat.st_mode):
+            entry_type = "file"
+        else:
+            entry_type = "other"
     return {
         "deleted": True,
         "exit_code": 0,
         "type": entry_type,
-        "bytes_deleted": None if entry_type == "directory" else leaf_stat.st_size,
+        "bytes_deleted": leaf_stat.st_size if entry_type in ("file", "symlink") else None,
     }
 
 
@@ -1885,6 +1911,8 @@ def _run_helper(config: JsonValue) -> int:
 
     sandbox = SandboxPolicy.from_jsonable(sandbox_value)
     activate_sandbox(sandbox)
+    root_stat = os.stat(".")
+    root_identity = (root_stat.st_dev, root_stat.st_ino)
 
     for line in sys.stdin:
         line = line.strip()
@@ -1899,6 +1927,7 @@ def _run_helper(config: JsonValue) -> int:
                 cwd=cwd,
                 shell_path=shell_path_value,
                 sandbox=sandbox,
+                root_identity=root_identity,
             )
         except Exception as exc:  # noqa: BLE001 — helper loop surfaces any error through the JSON response envelope
             response = {"error": f"os_env helper exception: {exc}"}

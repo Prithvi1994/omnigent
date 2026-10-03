@@ -6,8 +6,10 @@ import io
 import json
 import os
 import shutil
+import socket
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
@@ -17,6 +19,7 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import CallerProcessOSEnvironment, create_os_environment
 from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.runner import create_runner_app
+from omnigent.runner.environment_filesystem import CallerProcessFilesystem, InvalidPath
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runner.transports.ws_tunnel.serve import _send_hello
 from tests.runner.helpers import NullServerClient
@@ -89,6 +92,77 @@ async def test_delete_uses_runner_helper_not_workspace_package(
     assert response.status_code == 200, response.text
     assert response.json()["deleted"] is True
     assert not (workspace / "victim").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("symlinked_ancestor", [False, True])
+async def test_delete_refuses_changed_workspace_ancestor(
+    tmp_path: Path, symlinked_ancestor: bool
+) -> None:
+    ancestor = tmp_path / "ancestor"
+    root = ancestor / "workspace"
+    root.mkdir(parents=True)
+    configured_root = root
+    if symlinked_ancestor:
+        alias = tmp_path / "alias"
+        alias.symlink_to(ancestor, target_is_directory=True)
+        configured_root = alias / "workspace"
+    outside = tmp_path / "outside"
+    (outside / "workspace").mkdir(parents=True)
+    outside_victim = outside / "workspace" / "victim"
+    outside_victim.write_bytes(b"outside bytes")
+    (root / "victim").write_bytes(b"workspace bytes")
+    (root / "initial").write_bytes(b"initial alias works")
+    env = create_os_environment(
+        OSEnvSpec(cwd=str(configured_root), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    try:
+        fs = CallerProcessFilesystem(env)
+        assert (await fs.delete("initial")).deleted is True
+        moved = tmp_path / "moved"
+        ancestor.rename(moved)
+        ancestor.symlink_to(outside, target_is_directory=True)
+        with pytest.raises(InvalidPath, match="Workspace root changed"):
+            await fs.delete("victim")
+        assert outside_victim.read_bytes() == b"outside bytes"
+        assert (moved / "workspace" / "victim").read_bytes() == b"workspace bytes"
+    finally:
+        env.close()
+
+
+@pytest.mark.asyncio
+async def test_delete_records_symlinks_but_not_directories(
+    client: httpx.AsyncClient, workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transport = cast(httpx.ASGITransport, client._transport)
+    registry = transport.app.state.filesystem_registry
+    changes: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(registry, "record_change", lambda *change: changes.append(change))
+    (workspace / "link").symlink_to(workspace / "victim")
+    (workspace / "directory").mkdir()
+    assert (await client.delete(f"{FS_URL}/link")).status_code == 200
+    assert (await client.delete(f"{FS_URL}/directory")).status_code == 200
+    assert changes == [("link", "deleted", "conv_test")]
+    assert (workspace / "victim").read_bytes() == b"workspace bytes"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["fifo", "socket"])
+async def test_delete_classifies_special_entries_as_other(
+    client: httpx.AsyncClient, workspace: Path, kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = workspace / "special"
+    with socket.socket(socket.AF_UNIX) as unix_socket:
+        if kind == "fifo":
+            os.mkfifo(target)
+        else:
+            monkeypatch.chdir(workspace)
+            unix_socket.bind(target.name)
+        response = await client.delete(f"{FS_URL}/special")
+    assert response.status_code == 200, response.text
+    assert response.json()["type"] == "other"
+    assert response.json()["bytes_deleted"] is None
+    assert not target.exists()
 
 
 @pytest.mark.asyncio
