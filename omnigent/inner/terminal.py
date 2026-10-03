@@ -807,7 +807,7 @@ def _terminals_tmp_root() -> Path:
     return Path(tempfile.gettempdir())
 
 
-def _list_pane_pids(socket_path: Path) -> list[int]:
+def _list_pane_pids(socket_path: Path) -> list[int] | None:
     """
     Return the pids of every pane on a terminal's tmux server.
 
@@ -816,7 +816,9 @@ def _list_pane_pids(socket_path: Path) -> list[int]:
 
     :param socket_path: The terminal's control socket, e.g.
         ``Path("/tmp/omnigent-terminal-ab12/tmux.sock")``.
-    :returns: The live pane pids, or ``[]`` when tmux cannot report them.
+    :returns: The live pane pids; ``[]`` when tmux reports none; ``None``
+        when the snapshot could not run, so the caller preserves the
+        instance dir for a later sweep instead of reaping it blind.
     """
     try:
         result = subprocess.run(
@@ -826,7 +828,7 @@ def _list_pane_pids(socket_path: Path) -> list[int]:
             timeout=_REAP_KILL_TIMEOUT_S,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return []
+        return None
     if result.returncode != 0:
         return []
     pids: list[int] = []
@@ -836,20 +838,50 @@ def _list_pane_pids(socket_path: Path) -> list[int]:
     return pids
 
 
-def _kill_pane_process_group(pid: int) -> None:
+def _pid_start_time(pid: int) -> int | None:
+    """
+    Return *pid*'s start time in clock ticks since boot, or ``None``.
+
+    Field 22 of ``/proc/<pid>/stat`` identifies a process instance within a
+    boot, so the sweep can tell a surviving pane from an unrelated process
+    that reused its pid. Linux only; ``None`` elsewhere or when the pid is gone.
+
+    :param pid: A pane pid, e.g. ``48213``.
+    """
+    if pid <= 0 or IS_WINDOWS:
+        return None
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    # comm (field 2) is parenthesised and may contain spaces or ')'; split
+    # after the final ')' so starttime sits at a fixed offset.
+    fields = stat.rpartition(")")[2].split()
+    try:
+        return int(fields[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def _kill_pane_process_group(pid: int, start_time: int | None) -> None:
     """
     SIGKILL a terminal pane's process group.
 
     ``tmux kill-server`` only SIGHUPs its panes, so a harness CLI that traps
     SIGHUP to survive terminal disconnects (e.g. ``claude``) outlives the
     server. The sweep force-kills the pane's whole group so its descendants
-    die with it. A pid that is already gone, reused, or owned by another user
-    reads as ``ProcessLookupError``/``PermissionError`` and is left alone, so
-    this can only no-op, never kill a live owner's process.
+    die with it. *start_time* is the pid's start time captured before
+    ``kill-server``: if it no longer matches, the pane process already died
+    and its pid was reused, so the group is left alone. A gone, reused, or
+    foreign (``PermissionError``) pid is a no-op, so where ``/proc`` can
+    confirm identity this never kills a live unrelated process group.
 
     :param pid: A pane pid captured before ``kill-server``, e.g. ``48213``.
+    :param start_time: ``_pid_start_time(pid)`` from that same snapshot.
     """
     if pid <= 0 or IS_WINDOWS:
+        return
+    if start_time is not None and _pid_start_time(pid) != start_time:
         return
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
         os.killpg(os.getpgid(pid), signal.SIGKILL)
@@ -882,9 +914,20 @@ def reap_orphaned_terminals() -> int:
         socket_path = entry / "tmux.sock"
         had_socket = socket_path.exists()
         pane_pids: list[int] = []
+        pane_start_times: dict[int, int | None] = {}
         if had_socket:
             # Snapshot the panes before kill-server, which only SIGHUPs them.
-            pane_pids = _list_pane_pids(socket_path)
+            snapshot = _list_pane_pids(socket_path)
+            if snapshot is None:
+                # The snapshot could not run; a blind kill-server + rmtree would
+                # strand SIGHUP-ignoring children, so preserve the dir for retry.
+                logger.warning(
+                    "Could not read terminal %s panes; preserving its socket for retry",
+                    entry,
+                )
+                continue
+            pane_pids = snapshot
+            pane_start_times = {pid: _pid_start_time(pid) for pid in pane_pids}
             try:
                 result = subprocess.run(
                     ["tmux", "-S", str(socket_path), "kill-server"],
@@ -911,7 +954,7 @@ def reap_orphaned_terminals() -> int:
         # The server is down; SIGHUP-ignoring harness children (e.g. claude)
         # outlive it, so force-kill the pane groups they lead.
         for pane_pid in pane_pids:
-            _kill_pane_process_group(pane_pid)
+            _kill_pane_process_group(pane_pid, pane_start_times.get(pane_pid))
         shutil.rmtree(entry, ignore_errors=True)
         # Record what the sweep destroyed. The socket path is the join key
         # against the owning session's "no server running on <socket>" exit,

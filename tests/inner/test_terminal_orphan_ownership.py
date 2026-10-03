@@ -189,3 +189,62 @@ def test_sweep_kills_sighup_ignoring_pane_child(
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
             os.killpg(os.getpgid(pane_pid), signal.SIGKILL)
         subprocess.run([*base, "kill-server"], check=False, capture_output=True, timeout=10)
+
+
+def test_reap_preserves_dir_when_pane_snapshot_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable pane snapshot preserves the dir instead of reaping blind.
+
+    If the pane list cannot be read, killing the server and removing the dir
+    would strand SIGHUP-ignoring children, so the sweep must not even run
+    kill-server; it leaves the socket for a later retry.
+    """
+    directory = tmp_path / "omnigent-terminal-blind"
+    directory.mkdir()
+    socket = directory / "tmux.sock"
+    socket.touch()
+    owner_claim.write_owner_claim(directory)
+    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
+    monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    monkeypatch.setattr(terminal_mod, "_process_alive", lambda pid: False)
+    monkeypatch.setattr(terminal_mod, "_list_pane_pids", lambda socket_path: None)
+
+    def _fail_run(*args: object, **kwargs: object) -> SimpleNamespace:
+        raise AssertionError("kill-server must not run when the pane snapshot fails")
+
+    monkeypatch.setattr(terminal_mod.subprocess, "run", _fail_run)
+    assert terminal_mod.reap_orphaned_terminals() == 0
+    assert socket.exists()
+
+
+def test_reap_skips_pane_group_when_pid_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pane pid reused after kill-server is not force-killed.
+
+    The pane process's start time is captured before kill-server; if a later
+    read returns a different start time the pid was recycled, so the sweep
+    must leave that unrelated process group alone.
+    """
+    directory = tmp_path / "omnigent-terminal-reused"
+    directory.mkdir()
+    socket = directory / "tmux.sock"
+    socket.touch()
+    owner_claim.write_owner_claim(directory)
+    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
+    monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    monkeypatch.setattr(terminal_mod, "_process_alive", lambda pid: False)
+    monkeypatch.setattr(terminal_mod, "_list_pane_pids", lambda socket_path: [4242])
+    monkeypatch.setattr(
+        terminal_mod.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+    )
+    start_times = iter([100, 200])
+    monkeypatch.setattr(terminal_mod, "_pid_start_time", lambda pid: next(start_times))
+    killed: list[int] = []
+    monkeypatch.setattr(terminal_mod.os, "killpg", lambda pgid, sig: killed.append(pgid))
+    assert terminal_mod.reap_orphaned_terminals() == 1
+    assert not directory.exists()
+    assert killed == []

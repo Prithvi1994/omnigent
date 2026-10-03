@@ -95,8 +95,11 @@ tmux_reports_target_gone() {
 # tmux kill-server only SIGHUPs panes, so a harness CLI that traps SIGHUP (e.g.
 # claude) survives it; SIGKILL the pane's process group to take its descendants.
 kill_pane_group() {
+  # Reject empty, non-numeric, and zero/leading-zero pids: kill -KILL -0 would
+  # signal the script's own process group. $1 is then a positive integer, so
+  # -$1 names its process group unambiguously (dash's kill rejects a -- guard).
   case "$1" in
-    '' | *[!0-9]*) return 0 ;;
+    '' | *[!0-9]* | 0*) return 0 ;;
   esac
   kill -KILL "-$1" 2>/dev/null || kill -KILL "$1" 2>/dev/null || true
 }
@@ -262,7 +265,7 @@ stop_processes() {
         # Snapshot panes before kill-server so SIGHUP-ignoring harness children
         # can be force-killed once the server is down.
         terminal_panes=$(tmux -S "$terminal_socket" list-panes -a -F '#{pane_pid}' 2>/dev/null || true)
-        kill_err=$(tmux -S "$terminal_socket" kill-server 2>&1)
+        kill_err=$(tmux -S "$terminal_socket" kill-server 2>&1 >/dev/null)
         kill_rc=$?
         if [ "$kill_rc" -ne 0 ] && [ -S "$terminal_socket" ] && ! tmux_reports_target_gone "$kill_err"; then
           # kill-server failed without proving the target gone (client/protocol
