@@ -4017,10 +4017,11 @@ def test_write_tmux_target_persists_socket_and_target(tmp_path: Path) -> None:
     assert before <= payload["updated_at"] <= after
 
 
+@pytest.mark.parametrize("content", ["\x07\x1b", "\n\n"], ids=["control-only", "newlines-only"])
 def test_inject_user_message_rejects_a_message_with_nothing_to_paste(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    content: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Control-only content encodes to an empty paste, refused before any tmux write."""
+    """Content that encodes to an empty paste is refused before any tmux write."""
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
@@ -4039,8 +4040,8 @@ def test_inject_user_message_rejects_a_message_with_nothing_to_paste(
 
     monkeypatch.setattr("subprocess.run", _fake_run)
 
-    with pytest.raises(RuntimeError, match="nothing to paste"):
-        inject_user_message(bridge_dir, content="\x07\x1b")
+    with pytest.raises(RuntimeError, match="no text to paste"):
+        inject_user_message(bridge_dir, content=content)
 
     assert captured == [], f"Expected no tmux writes for an unpasteable message, got {captured}"
 
@@ -4056,6 +4057,9 @@ def test_inject_user_message_rejects_a_message_with_nothing_to_paste(
         # Exactly two line breaks stay two: a third CR tips Claude Code into
         # collapsing the paste to a "[Pasted text #N +3 lines]" placeholder.
         ("first line\n\nthird line", b"first line\r\rthird line"),
+        # A trailing newline is dropped: it adds nothing before the submit Enter
+        # and would be the third break that collapses the paste.
+        ("first line\n\nthird line\n", b"first line\r\rthird line"),
         # Trailing "\" escapes an appended paste CR, not the submit Enter.
         ("deploy to prod\\", b"deploy to prod\\\r"),
         # A "\" the user already followed with a newline needs no extra CR.
@@ -4077,6 +4081,7 @@ def test_inject_user_message_rejects_a_message_with_nothing_to_paste(
         "plain",
         "multiline",
         "two-line-breaks",
+        "trailing-newline",
         "trailing-backslash",
         "backslash-then-newline",
         "backslash-then-dropped-control",

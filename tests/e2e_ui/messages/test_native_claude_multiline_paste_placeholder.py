@@ -116,9 +116,9 @@ def _send_multiline(page: Page, lines: tuple[str, ...]) -> None:
         if line:
             page.keyboard.type(line, delay=5)
     text = "\n".join(lines)
-    if composer.input_value() != text:
-        _log.info("Shift+Enter typing did not produce the message; filling it instead")
-        composer.fill(text)
+    assert composer.input_value() == text, (
+        f"Shift+Enter typing produced {composer.input_value()!r} instead of {text!r}"
+    )
     page.get_by_role("button", name="Send", exact=True).click()
 
 

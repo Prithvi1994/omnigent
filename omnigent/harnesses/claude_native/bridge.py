@@ -4143,11 +4143,14 @@ def _paste_and_submit(
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before sending a message."
         )
-    payload = _paste_payload_bytes(text)
+    delivery_diagnostics.set_stage("encoding")
+    # Trailing line breaks add nothing before the submit Enter, and a third CR
+    # collapses the paste into a placeholder.
+    payload = _paste_payload_bytes(text).rstrip(b"\r")
     if not payload:
         raise RuntimeError(
-            "The message contains only control characters, so there is nothing to "
-            "paste into Claude Code. The message was not delivered."
+            "The message has no text to paste into Claude Code (only line breaks or "
+            "control characters). The message was not delivered."
         )
     if payload.endswith(b"\\"):
         # Append a CR only when a trailing backslash would consume the submit Enter.
