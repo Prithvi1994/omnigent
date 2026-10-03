@@ -2112,22 +2112,42 @@ def _record_helper_deletes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 
 @pytest.mark.asyncio
-async def test_delete_absolute_path_through_symlinked_parent_is_refused(
+async def test_delete_absolute_path_through_symlinked_parent_deletes_the_named_file(
     client: httpx.AsyncClient,
     absolute_delete_dir: Path,
 ) -> None:
+    """Parents resolve once, as listing and reading resolve them; the file the
+    path names is removed and the link itself is left alone."""
     target = absolute_delete_dir / "target"
     target.mkdir()
-    (target / "keep.txt").write_text("keep me\n")
+    (target / "bye.txt").write_text("bye\n")
     link = absolute_delete_dir / "link"
     link.symlink_to(target)
 
-    resp = await client.request("DELETE", _absolute_delete_url(link / "keep.txt"))
+    resp = await client.request("DELETE", _absolute_delete_url(link / "bye.txt"))
 
-    assert resp.status_code == 400, resp.text
-    assert resp.json()["error"]["code"] == "invalid_path"
-    assert (target / "keep.txt").exists()
-    assert link.is_symlink()
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["type"] == "file"
+    assert not (target / "bye.txt").exists()
+    assert link.is_symlink() and target.is_dir()
+
+
+def test_delete_nofollow_refuses_a_component_that_is_a_symlink(tmp_path: Path) -> None:
+    """The walk itself never follows a parent: a component swapped for a link
+    after the caller resolved the path is refused, naming the component."""
+    from omnigent.runner.environment_filesystem import _delete_nofollow
+
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "keep.txt").write_text("keep me\n")
+    link = tmp_path / "link"
+    link.symlink_to(target)
+
+    result = _delete_nofollow(str(link / "keep.txt"), False)
+
+    assert result["code"] == "invalid_path"
+    assert f"{link!s}' is a symbolic link" in str(result["error"])
+    assert (target / "keep.txt").exists() and link.is_symlink()
 
 
 @pytest.mark.asyncio
@@ -2394,8 +2414,8 @@ async def test_delete_absolute_under_real_sandbox_runs_in_the_helper(
     monkeypatch: pytest.MonkeyPatch,
     sandbox_type: str,
 ) -> None:
-    """A grant-covered absolute delete runs inside the confined helper with the
-    same no-follow rules, and a path no grant covers never reaches it."""
+    """A grant-covered absolute delete runs inside the confined helper on the
+    resolved entry, and a path no grant covers never reaches it."""
     ws = tmp_path / "workspace"
     ws.mkdir()
     grant = tmp_path / "grant"
@@ -2443,17 +2463,18 @@ async def test_delete_absolute_under_real_sandbox_runs_in_the_helper(
             assert removed.json()["type"] == "file"
             assert not (grant / "victim.txt").exists()
 
-            refused = await client.request(
+            through = await client.request(
                 "DELETE", _absolute_delete_url(grant / "link" / "keep.txt")
             )
-            assert refused.status_code == 400, refused.text
-            assert (target / "keep.txt").exists()
+            assert through.status_code == 200, through.text
+            assert not (target / "keep.txt").exists()
+            assert (grant / "link").is_symlink()
 
             unlinked = await client.request("DELETE", _absolute_delete_url(grant / "link"))
             assert unlinked.status_code == 200, unlinked.text
             assert unlinked.json()["type"] == "symlink"
             assert not (grant / "link").is_symlink()
-            assert (target / "keep.txt").exists()
+            assert target.is_dir()
 
             escaped = await client.request("DELETE", _absolute_delete_url(grant / "escape"))
             assert escaped.status_code == 200, escaped.text
@@ -2468,7 +2489,7 @@ async def test_delete_absolute_under_real_sandbox_runs_in_the_helper(
             assert intruder.is_symlink() and grant.is_dir()
             assert helper_targets == [
                 str(grant / "victim.txt"),
-                str(grant / "link" / "keep.txt"),
+                str(target / "keep.txt"),
                 str(grant / "link"),
                 str(grant / "escape"),
             ]
