@@ -740,6 +740,29 @@ def test_merge_user_provider_config_skips_unparseable_file_keeps_others(
     assert result["provider"]["my-gw"]["options"]["baseURL"] == "https://my-gw/v1"
 
 
+def test_merge_user_provider_config_later_plugin_list_replaces_earlier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Lists are not concatenated across files: the later file's ``plugin`` wins.
+
+    OpenCode's own merge (``opencode debug config``, 1.18.30) only merges nested
+    objects; lists and scalars are replaced by the later file.
+    """
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.json").write_text(
+        '{"plugin": ["/opt/plugins/from-json", "/opt/plugins/shared"]}', encoding="utf-8"
+    )
+    (cfg_dir / "opencode.jsonc").write_text(
+        '{"plugin": ["/opt/plugins/from-jsonc"]}', encoding="utf-8"
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    result = maybe_merge_user_provider_config({"plugin": ["/tmp/omnigent-policy.js"]})
+
+    assert result["plugin"] == ["/tmp/omnigent-policy.js", "/opt/plugins/from-jsonc"]
+
+
 def test_build_mcp_block_preserves_custom_timeout() -> None:
     from types import SimpleNamespace as N
 

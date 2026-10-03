@@ -571,7 +571,8 @@ def _deep_merge_configs(
     base: dict[str, object], override: Mapping[str, object]
 ) -> dict[str, object]:
     """Merge *override* into *base* the way OpenCode merges its global config:
-    nested dicts merge recursively, any other value from *override* wins."""
+    nested dicts merge recursively; any other value, lists included, is
+    replaced by *override*."""
     merged = dict(base)
     for key, value in override.items():
         existing = merged.get(key)
