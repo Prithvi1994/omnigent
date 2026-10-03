@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from urllib.parse import urlparse
 
+import httpx
 from playwright.sync_api import Page, Route, expect
 
 from tests.e2e_ui.chat.test_model_flows_contract import _install_stream_controller
@@ -14,6 +15,20 @@ _SKILLS = [
     for i in range(40)
 ]
 _HELP_NEEDLE = "/repro-skill-00"
+_BG_TASKS = [
+    {
+        "id": f"bg-task-{i}",
+        "type": "shell",
+        "status": "running",
+        "description": f"Background job {i}: watch the deploy pipeline and tail its logs",
+        "command": (
+            f"while true; do gh run watch 100{i} --exit-status && "
+            f"kubectl logs -f deploy/service-{i} --all-containers --since=1h | "
+            "tee -a /var/log/service.log; sleep 30; done"
+        ),
+    }
+    for i in range(12)
+]
 
 
 def _patch_session_host(page: Page, session_id: str, *, native: bool = False) -> None:
@@ -250,3 +265,65 @@ def test_bare_model_command_clears_the_draft(
 
     expect(page.get_by_text(re.compile(r"Usage: /model"))).to_be_visible(timeout=15_000)
     expect(composer).to_have_value("")
+
+
+def _header_and_popover(page: Page, label: str) -> dict:
+    """Header rect and the Radix popover panel (portaled out of the card) rect."""
+    return page.evaluate(
+        """
+        (label) => {
+          const rect = (el) => {
+            const b = el.getBoundingClientRect();
+            return { top: b.top, bottom: b.bottom, left: b.left, right: b.right };
+          };
+          const header = document.querySelector('.chat-header');
+          const panel = document.querySelector(`[aria-label="${label}"]`);
+          return {
+            header: header ? rect(header) : null,
+            headerZ: header ? getComputedStyle(header).zIndex : null,
+            panel: panel ? rect(panel) : null,
+          };
+        }
+        """,
+        label,
+    )
+
+
+def test_background_task_card_stays_below_header_on_short_window(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The collision-aware background-task popover must open below the header band."""
+    base_url, session_id = seeded_session
+    httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_session_status",
+            "data": {
+                "status": "idle",
+                "background_task_count": len(_BG_TASKS),
+                "background_tasks": _BG_TASKS,
+            },
+        },
+        timeout=10.0,
+    ).raise_for_status()
+
+    # A short window pushes the top-side popover up toward the header.
+    page.set_viewport_size({"width": 1280, "height": 430})
+    page.goto(f"{base_url}/c/{session_id}")
+
+    expect(page.get_by_label("Message the agent")).to_be_visible(timeout=30_000)
+    pill = page.get_by_test_id("background-task-pill")
+    expect(pill).to_be_visible(timeout=15_000)
+    pill.click()
+
+    label = f"{len(_BG_TASKS)} background tasks"
+    expect(page.locator(f'[aria-label="{label}"]')).to_be_visible(timeout=15_000)
+
+    geom = _header_and_popover(page, label)
+    assert geom["header"] is not None, "ChatHeader overlay not found"
+    assert geom["panel"] is not None, "background-task popover not found"
+    assert geom["panel"]["top"] >= geom["header"]["bottom"] - 1, (
+        f"background-task card top {geom['panel']['top']} crosses under header bottom "
+        f"{geom['header']['bottom']} (z-index {geom['headerZ']})"
+    )
