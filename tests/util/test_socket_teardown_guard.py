@@ -104,18 +104,22 @@ async def _close_during_pending_read(tmp: Path, iterations: int) -> list[_Delive
     return delivered
 
 
-def _drive_aclose(stream: Any) -> None:
-    """Run ``aclose()`` synchronously inside a loop callback.
+def _drive_aclose(stream: Any, outcomes: list[bool]) -> None:
+    """Run ``aclose()`` synchronously inside a loop callback, recording the shape.
 
     Driving the coroutine here completes the readiness future on the same loop
     iteration the queued readiness callback fires, which is the teardown race.
+    Records whether aclose finished on the first ``send`` so the caller fails
+    loudly if a future anyio makes it suspend and silently voids this coverage.
     """
     coro = stream.aclose()
     try:
         coro.send(None)
     except StopIteration:
+        outcomes.append(True)
         return
     coro.close()
+    outcomes.append(False)
 
 
 async def _close_during_pending_write(tmp: Path, iterations: int) -> list[_Delivery]:
@@ -128,8 +132,10 @@ async def _close_during_pending_write(tmp: Path, iterations: int) -> list[_Deliv
             # its readiness callback for this tick; aclose() then completes the
             # same _send_future the queued callback is about to complete.
             stream._wait_until_writable(loop)
-            loop.call_soon(_drive_aclose, stream)
+            outcomes: list[bool] = []
+            loop.call_soon(_drive_aclose, stream, outcomes)
             await asyncio.sleep(0)
+            assert outcomes == [True], f"aclose() must finish synchronously; got {outcomes}"
             peer.close()
             server.close()
     return delivered
@@ -312,13 +318,58 @@ def test_fully_guarded_backend_is_left_alone() -> None:
 
 def test_unrecognized_waiter_shape_is_reported_not_patched(caplog) -> None:
     backend = type("Backend", (_RenamedWaiters,), {})
-    with caplog.at_level(logging.INFO, logger=socket_teardown_guard.__name__):
+    with caplog.at_level(logging.WARNING, logger=socket_teardown_guard.__name__):
         assert socket_teardown_guard._patch_unguarded_methods(backend) == ()
     assert backend._wait_until_readable is _RenamedWaiters._wait_until_readable
     assert any(
         "_wait_until_readable, _wait_until_writable" in record.getMessage()
         for record in caplog.records
     )
+
+
+def test_install_gives_up_when_backend_source_unreadable(monkeypatch, caplog) -> None:
+    monkeypatch.setattr(socket_teardown_guard, "_installed", False)
+    monkeypatch.setattr(socket_teardown_guard, "_gave_up", False)
+    probes: list[int] = []
+
+    def _unreadable(_mixin: type) -> tuple[str, ...]:
+        # OSError is what inspect.getsource raises for a frozen/zipapp backend.
+        probes.append(1)
+        raise OSError("could not get source code")
+
+    monkeypatch.setattr(socket_teardown_guard, "_patch_unguarded_methods", _unreadable)
+    with caplog.at_level(logging.WARNING, logger=socket_teardown_guard.__name__):
+        install_socket_teardown_guard()
+    assert socket_teardown_guard._gave_up is True
+    assert socket_teardown_guard._installed is False
+    assert any("backend source unavailable" in r.getMessage() for r in caplog.records)
+
+    # The give-up is permanent: a later transport must not re-probe the backend.
+    install_socket_teardown_guard()
+    assert probes == [1]
+
+
+def test_install_retries_after_transient_error(monkeypatch, caplog) -> None:
+    monkeypatch.setattr(socket_teardown_guard, "_installed", False)
+    monkeypatch.setattr(socket_teardown_guard, "_gave_up", False)
+    attempts: list[int] = []
+
+    def _transient(_mixin: type) -> tuple[str, ...]:
+        attempts.append(1)
+        raise RuntimeError("interpreter not fully initialized")
+
+    monkeypatch.setattr(socket_teardown_guard, "_patch_unguarded_methods", _transient)
+    with caplog.at_level(logging.DEBUG, logger=socket_teardown_guard.__name__):
+        install_socket_teardown_guard()
+        install_socket_teardown_guard()
+    # A transient failure re-probes each call and never latches the give-up flag.
+    assert attempts == [1, 1]
+    assert socket_teardown_guard._installed is False
+    assert socket_teardown_guard._gave_up is False
+
+    monkeypatch.setattr(socket_teardown_guard, "_patch_unguarded_methods", lambda _mixin: ())
+    install_socket_teardown_guard()
+    assert socket_teardown_guard._installed is True
 
 
 async def test_create_uds_client_installs_guard(monkeypatch) -> None:

@@ -25,6 +25,7 @@ from omnigent.runner.transports.uds import (
     _is_socket_listening,
     create_uds_client,
 )
+from omnigent.util.socket_teardown_guard import install_socket_teardown_guard
 
 _REQUIRES_UDS = pytest.mark.skipif(
     sys.platform == "win32", reason="Unix domain sockets are POSIX-only"
@@ -195,21 +196,35 @@ async def _drive_teardown_once(path: str, loop: asyncio.AbstractEventLoop) -> No
             raise AssertionError("listener never accepted the client connection")
         server_stream = server_box["stream"]
 
+        # The race depends on these anyio internals; assert they exist up front
+        # so a rename fails loudly here instead of silently losing the coverage.
+        assert hasattr(client_stream, "_wait_until_readable")
+        assert hasattr(client_stream, "_raw_socket")
+
         # Park a read, then make the fd readable with no intervening await so
         # the reader callback stays queued for the same tick the stream closes.
         client_stream._wait_until_readable(loop)
         server_stream._raw_socket.send(b"x")
 
+        closed_synchronously = False
+
         def _close_now() -> None:
+            nonlocal closed_synchronously
             coro = client_stream.aclose()
             try:
                 coro.send(None)  # aclose sets the result before its first await
             except StopIteration:
+                closed_synchronously = True
                 return
             coro.close()
 
         loop.call_soon(_close_now)
         await asyncio.sleep(0)
+
+        assert closed_synchronously, (
+            "aclose() must complete on the first send to fire the race; anyio "
+            "made it suspend, which voids this regression"
+        )
 
         with contextlib.suppress(Exception):
             await server_stream.aclose()
@@ -222,10 +237,9 @@ def test_uds_teardown_does_not_double_complete_receive_future() -> None:
     ``set_result`` twice on its receive future."""
 
     async def _run() -> int:
-        # Building the runner's UDS client is the product path that installs
-        # the process-wide teardown guard.
-        with tempfile.TemporaryDirectory(prefix="uds-teardown-") as tdir:
-            await create_uds_client(os.path.join(tdir, "runner.sock")).aclose()
+        # Install the guard directly so the precondition is explicit and
+        # order-independent; the factory wiring is covered by its own test.
+        install_socket_teardown_guard()
         return await _count_invalid_state_on_uds_teardown(20)
 
     invalid_state = asyncio.run(_run())

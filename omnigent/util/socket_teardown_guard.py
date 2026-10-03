@@ -26,11 +26,12 @@ from typing import Any
 _logger = logging.getLogger(__name__)
 
 # One-shot process flag: the patch is class-level, so a single install covers
-# every stream for the process lifetime. It stays unset after a failed attempt
-# so a later transport can retry a transient import error.
+# every stream for the process lifetime.
 _installed = False
-# Surface a persistent install failure once; retries after it stay at debug.
-_install_failure_logged = False
+# Set when the backend source is unreadable (a frozen/zipapp build): the shape
+# can never be inspected, so give up permanently instead of re-probing on every
+# transport. A transient import error does not set this, so a retry stays open.
+_gave_up = False
 
 
 def install_socket_teardown_guard() -> None:
@@ -42,22 +43,27 @@ def install_socket_teardown_guard() -> None:
 
     :returns: ``None``.
     """
-    global _installed, _install_failure_logged
-    if _installed:
+    global _installed, _gave_up
+    if _installed or _gave_up:
         return
     try:
         from anyio._backends import _asyncio as anyio_asyncio
 
         _patch_unguarded_methods(anyio_asyncio._RawSocketMixin)
+    except (OSError, TypeError):
+        # inspect.getsource cannot read the backend (a frozen/zipapp build), so
+        # the shape can never be inspected here: give up for the process rather
+        # than re-probe on every transport. The cost is the original log noise.
+        _logger.warning(
+            "anyio raw-socket teardown guard not installed: backend source unavailable",
+            exc_info=True,
+        )
+        _gave_up = True
+        return
     except Exception:  # noqa: BLE001 — best-effort: an unpatched teardown only logs noise
-        # Leave the flag unset so a later transport can retry a transient import
-        # error. Report a persistent failure once at warning, then stay quiet so
-        # a frozen build without readable source does not spam every teardown.
-        if _install_failure_logged:
-            _logger.debug("anyio raw-socket teardown guard not installed", exc_info=True)
-        else:
-            _logger.warning("anyio raw-socket teardown guard not installed", exc_info=True)
-            _install_failure_logged = True
+        # A transient import error (e.g. partial interpreter init): leave both
+        # flags unset so a later transport can retry.
+        _logger.debug("anyio raw-socket teardown guard not installed", exc_info=True)
         return
     _installed = True
 
@@ -87,8 +93,9 @@ def _patch_unguarded_methods(mixin: type) -> tuple[str, ...]:
             unrecognized.append(name)
     if unrecognized:
         # Neither the known racy shape nor a done()-guarded one: upstream changed
-        # and the shim can no longer tell whether the race is still live.
-        _logger.info(
+        # and the shim can no longer tell whether the race is still live, so the
+        # noise it exists to prevent may return. Warn rather than whisper at info.
+        _logger.warning(
             "anyio raw-socket teardown guard left %s unpatched: unrecognized shape",
             ", ".join(unrecognized),
         )
