@@ -93,6 +93,14 @@ _PERMISSION_PANE_WITH_WRAPPED_WORKDIR = _PERMISSION_PANE_WITH_WORKDIR.replace(
 )
 
 
+# A command that hard-wraps mid-token ("installs" -> "instal" / "ls") leaves a
+# join space before "ls"; "Running: ls" must not be authorized by that seam.
+_PERMISSION_PANE_WITH_MID_WORD_WRAP_DECOY = _PERMISSION_PANE.replace(
+    "↓ Shell pwd",
+    "↓ Shell instal\n  ls",
+)
+
+
 @pytest.fixture
 def secure_bridge_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Mirror the Kiro directory layout, with tmp_path as the trusted parent."""
@@ -405,6 +413,35 @@ def test_send_kiro_permission_verdict_refuses_suffix_inside_a_token(
     assert [call[-1] for call in calls if "send-keys" in call] == []
 
 
+def test_send_kiro_permission_verdict_refuses_a_wrap_seam_token_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-token hard wrap must not fabricate a boundary that authorizes ``ls``.
+
+    ``installs`` wrapped to ``instal`` / ``ls`` leaves a join space before ``ls``;
+    full-equality matching must reject the shorter approved command rather than
+    treat the wrap seam as a real token boundary.
+    """
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch, pane_outputs=[_PERMISSION_PANE_WITH_MID_WORD_WRAP_DECOY]
+    )
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    with pytest.raises(RuntimeError, match="permission prompt was not safely focused"):
+        send_kiro_permission_verdict(
+            bridge_dir, action="accept", expected_title="Running: ls", timeout_s=0.01
+        )
+
+    assert [call[-1] for call in calls if "send-keys" in call] == []
+
+
 def test_send_kiro_permission_verdict_ignores_wrapped_working_dir_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -626,6 +663,48 @@ def test_send_kiro_permission_verdict_does_not_retry_a_changed_prompt(
 
     sent_keys = [call[-1] for call in calls if "send-keys" in call]
     assert sent_keys == ["Enter"]
+
+
+def test_send_kiro_permission_verdict_trusts_recorder_when_follow_up_prompt_appears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recorded verdict means a changed follow-up prompt is not a lost delivery.
+
+    If Kiro consumes the Enter and renders the next queued (differently titled)
+    prompt after the loop-top check but before this capture, re-consulting the
+    recorder must report success rather than a false "prompt changed" failure.
+    """
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[_PERMISSION_PANE, _PERMISSION_PANE, _PERMISSION_PANE_DATE],
+    )
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    probe_calls = {"n": 0}
+
+    def verdict_recorded() -> bool:
+        probe_calls["n"] += 1
+        # False at the loop top, True once the follow-up prompt is on screen.
+        return probe_calls["n"] >= 2
+
+    send_kiro_permission_verdict(
+        bridge_dir,
+        action="accept",
+        expected_title="Running: pwd",
+        timeout_s=0.1,
+        verdict_recorded=verdict_recorded,
+    )
+
+    assert [call[-1] for call in calls if "send-keys" in call] == ["Enter"]
 
 
 def test_send_kiro_permission_verdict_refuses_accept_when_focus_drifts_after_settle(

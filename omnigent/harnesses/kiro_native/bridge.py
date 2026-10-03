@@ -523,60 +523,32 @@ def _squash_whitespace(text: str) -> str:
     return "".join(text.split())
 
 
-def _contains_at_token_boundaries(tool_line: str, needle: str, *, suffix_only: bool) -> bool:
-    """Whitespace-insensitive containment that still honors token boundaries.
-
-    Rejoined wrapped lines carry a space at each break, and a break can fall
-    mid-token, so compare without whitespace; but the match must start and end
-    where the pane had whitespace, so ``ls`` never matches ``installs``.
-
-    A real token boundary is indistinguishable from a mid-token wrap seam on the
-    rendered pane, so this correlation stays best-effort; the per-request ACP
-    recorder is the authoritative identity signal that gates verdict retries.
-    """
-    haystack: list[str] = []
-    origins: list[int] = []
-    for index, char in enumerate(tool_line):
-        if not char.isspace():
-            haystack.append(char)
-            origins.append(index)
-    squashed_line = "".join(haystack)
-    needle = _squash_whitespace(needle)
-    if not needle or len(needle) > len(squashed_line):
-        return False
-    starts = (
-        [len(squashed_line) - len(needle)]
-        if suffix_only
-        else range(len(squashed_line) - len(needle) + 1)
-    )
-    for start in starts:
-        if not squashed_line.startswith(needle, start):
-            continue
-        end = start + len(needle)
-        starts_token = start == 0 or origins[start] - origins[start - 1] > 1
-        ends_token = end == len(squashed_line) or origins[end] - origins[end - 1] > 1
-        if starts_token and ends_token:
-            return True
-    return False
-
-
 def _kiro_permission_prompt_matches_title(pane: str, expected_title: str | None) -> bool:
-    """Return whether the visible prompt appears to match the parsed request title."""
+    """Return whether the visible prompt appears to match the parsed request title.
+
+    Comparison ignores whitespace so a title that wrapped across physical lines
+    (tmux's soft wrap or the TUI's own hard break, even mid-token) still matches.
+    Only full-string equality is accepted, never substring containment: squashing
+    can never shrink a longer displayed command down to a shorter approved one, so
+    a wrap seam cannot fake a token boundary and authorize a different command.
+    """
     if not expected_title:
         return True
     title = expected_title.strip()
     if not title:
         return True
-    tool_line = _kiro_active_permission_tool_line(pane)
+    tool_line = _kiro_active_permission_tool_line(pane).strip()
     if not tool_line:
         return False
     if _squash_whitespace(title) == _squash_whitespace(tool_line):
         return True
-    if title.startswith("Running:"):
-        return _contains_at_token_boundaries(
-            tool_line, title.removeprefix("Running:"), suffix_only=True
-        )
-    return _contains_at_token_boundaries(tool_line, title, suffix_only=False)
+    # A glyph tool block renders "<ToolName> <command>" while the ACP title
+    # carries only the command, so also compare against the tool line with its
+    # leading tool-name token removed.
+    command = title.removeprefix("Running:").strip() if title.startswith("Running:") else title
+    squashed_command = _squash_whitespace(command)
+    _, _, rest = tool_line.partition(" ")
+    return bool(squashed_command) and _squash_whitespace(rest) == squashed_command
 
 
 def _wait_for_kiro_permission_prompt(
@@ -631,6 +603,11 @@ def _wait_for_kiro_permission_verdict_applied(
             time.sleep(_POLL_INTERVAL_S)
             continue
         if not _kiro_permission_prompt_active(pane):
+            return
+        # Kiro may consume the Enter and immediately render the next queued
+        # prompt; a recorded verdict for this request proves delivery already
+        # landed, so trust it rather than failing on the changed prompt.
+        if verdict_recorded is not None and verdict_recorded():
             return
         if not _kiro_permission_prompt_matches_title(pane, expected_title):
             raise RuntimeError(
