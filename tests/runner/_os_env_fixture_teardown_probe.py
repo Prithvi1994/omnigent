@@ -1,16 +1,16 @@
-"""Pytest plugin recording os_env helper subprocesses that outlive a watched fixture.
+"""Pytest plugin recording os_env helper subprocesses that outlive a test's fixtures.
 
-Load with ``-p tests.runner._os_env_fixture_teardown_probe``. After each
-:data:`WATCHED_FIXTURES` finalizer runs, it appends the ``omnigent.inner.os_env
-helper`` children that were not alive before the test to the JSON-lines file
-named by ``OMNIGENT_FIXTURE_PROBE_LOG``.
+Load with ``-p tests.runner._os_env_fixture_teardown_probe``. For every test
+that used one of :data:`WATCHED_FIXTURES`, once all of its fixtures have been
+torn down it appends the ``omnigent.inner.os_env helper`` children that were
+not alive before the test to the JSON-lines file named by
+``OMNIGENT_FIXTURE_PROBE_LOG``.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from typing import Any
 
 import psutil
 import pytest
@@ -18,7 +18,6 @@ import pytest
 WATCHED_FIXTURES = frozenset({"registry", "glob_client", "make_os_env"})
 
 _before_by_nodeid: dict[str, set[int]] = {}
-_recorded: set[tuple[str, str]] = set()
 
 
 def live_helper_pids() -> set[int]:
@@ -42,28 +41,19 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
     _before_by_nodeid[item.nodeid] = live_helper_pids()
 
 
-def pytest_fixture_post_finalizer(fixturedef: Any, request: Any) -> None:
-    if fixturedef.argname not in WATCHED_FIXTURES:
-        return
+# ``trylast`` runs after pytest's own teardown hook has finalized the test's
+# function-scoped fixtures, so every watched fixture has already been torn down.
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_teardown(item: pytest.Item) -> None:
+    before = _before_by_nodeid.pop(item.nodeid, set())
+    fixtures = sorted(WATCHED_FIXTURES & set(getattr(item, "fixturenames", ())))
     log = os.environ.get("OMNIGENT_FIXTURE_PROBE_LOG")
-    if not log:
+    if not fixtures or not log:
         return
-    nodeid = request.node.nodeid
-    # The hook fires once per registered finalizer; record each fixture once.
-    if (nodeid, fixturedef.argname) in _recorded:
-        return
-    _recorded.add((nodeid, fixturedef.argname))
-    before = _before_by_nodeid.get(nodeid, set())
     record = {
-        "test": nodeid,
-        "fixture": fixturedef.argname,
+        "test": item.nodeid,
+        "fixtures": fixtures,
         "helpers_alive_after_teardown": sorted(live_helper_pids() - before),
     }
     with open(log, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(record) + "\n")
-
-
-@pytest.hookimpl(trylast=True)
-def pytest_runtest_teardown(item: pytest.Item) -> None:
-    _before_by_nodeid.pop(item.nodeid, None)
-    _recorded.difference_update({key for key in _recorded if key[0] == item.nodeid})

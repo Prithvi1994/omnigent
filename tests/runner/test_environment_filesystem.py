@@ -62,7 +62,10 @@ def make_os_env() -> Iterator[OsEnvFactory]:
         except Exception as exc:
             failures.append(exc)
     if failures:
-        raise failures[0]
+        detail = "; ".join(repr(failure) for failure in failures)
+        raise RuntimeError(
+            f"closing {len(failures)} OS environment(s) failed: {detail}"
+        ) from failures[0]
 
 
 @pytest.fixture

@@ -10,11 +10,13 @@ import pytest
 
 pytest_plugins = ["pytester"]
 
-# Reuses the real fixtures so the test exercises the fixtures under test,
-# not copies of them.
+# Reuses the real fixtures so the test exercises the fixtures under test, not
+# copies of them. Each test first proves its operation started a helper, so the
+# teardown check cannot pass vacuously.
 _TOUCH_FILESYSTEM = """
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from tests.runner._os_env_fixture_teardown_probe import live_helper_pids
 from tests.runner.test_environment_filesystem import (  # noqa: F401
     app,
     client,
@@ -29,18 +31,24 @@ _FILESYSTEM = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONME
 
 
 async def test_touch_registry_filesystem(client):
+    before = live_helper_pids()
     assert (await client.get(_FILESYSTEM)).status_code == 200
+    assert live_helper_pids() - before, "the request should have started a helper"
 
 
 async def test_touch_glob_filesystem(glob_client):
+    before = live_helper_pids()
     assert (await glob_client.get(_FILESYSTEM)).status_code == 200
+    assert live_helper_pids() - before, "the request should have started a helper"
 
 
 async def test_touch_factory_env(make_os_env, tmp_path):
     os_env = make_os_env(
         OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
     )
+    before = live_helper_pids()
     assert (await os_env.shell("true"))["exit_code"] == 0
+    assert live_helper_pids() - before, "the shell command should have started a helper"
 """
 
 
@@ -75,8 +83,11 @@ def test_fixture_teardown_stops_the_helper(
         for line in probe_log.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    assert {r["fixture"] for r in records} == {"registry", "glob_client", "make_os_env"}, records
-    leaked = sorted(
-        {(r["fixture"], pid) for r in records for pid in r["helpers_alive_after_teardown"]}
-    )
-    assert not leaked, f"os_env helper processes outlived their fixture: {leaked}"
+    covered = {name for r in records for name in r["fixtures"]}
+    assert covered == {"registry", "glob_client", "make_os_env"}, records
+    leaked = [
+        (r["test"], r["fixtures"], r["helpers_alive_after_teardown"])
+        for r in records
+        if r["helpers_alive_after_teardown"]
+    ]
+    assert not leaked, f"os_env helper processes outlived their fixtures: {leaked}"
