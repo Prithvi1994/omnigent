@@ -653,8 +653,7 @@ def test_supervise_forwarder_resume_does_not_finish_a_just_started_turn(
     """
     _write_forwarder_bridge(tmp_path, active_turn_id=None, thread_id="thread_123")
     client = _FreshThreadRaceClient(resume_turn_status)
-    # Release the live turn end once the resume terminal-status decision has
-    # actually run, so iter_events need not guess a scheduler-pass count.
+    # Signal iter_events once the resume terminal-status decision has run.
     original_post = codex_native_forwarder._post_resume_terminal_status
 
     async def _tracked_post(*args: Any, **kwargs: Any) -> None:

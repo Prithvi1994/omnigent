@@ -2833,8 +2833,6 @@ async def _post_resume_terminal_status(
     status in its resume payload is the just-started turn reported terminal
     during the Codex MCP-startup window (``active_turn_present=false``), not a
     real end: honoring it would finish a still-live turn before any output.
-    Backfill is limited to a persisted recovery turn that is still the latest
-    turn, so a newer turn that started live stays owned by the event stream.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
