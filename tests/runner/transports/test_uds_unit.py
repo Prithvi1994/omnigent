@@ -221,6 +221,13 @@ async def _drive_teardown_once(path: str, loop: asyncio.AbstractEventLoop) -> No
         loop.call_soon(_close_now)
         await asyncio.sleep(0)
 
+        # If anyio changed aclose to suspend, _close_now abandoned a half-driven
+        # close; finish it deterministically so the stream and its reader
+        # registration do not leak into later tests before this assertion fires.
+        if not closed_synchronously:
+            with contextlib.suppress(Exception):
+                await client_stream.aclose()
+
         assert closed_synchronously, (
             "aclose() must complete on the first send to fire the race; anyio "
             "made it suspend, which voids this regression"

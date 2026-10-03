@@ -138,6 +138,9 @@ async def _close_during_pending_write(tmp: Path, iterations: int) -> list[_Deliv
             assert outcomes == [True], f"aclose() must finish synchronously; got {outcomes}"
             peer.close()
             server.close()
+        # Let the final iteration's queued writer callback run before the capture
+        # window closes, so a double-complete on the last socket is still seen.
+        await asyncio.sleep(0)
     return delivered
 
 
@@ -162,6 +165,25 @@ async def test_close_during_pending_write_stays_quiet() -> None:
     install_socket_teardown_guard()
     with tempfile.TemporaryDirectory(prefix="omni-uds-guard-") as tmp:
         delivered = await _close_during_pending_write(Path(tmp), 5)
+    assert not _invalid_state_deliveries(delivered)
+
+
+@_REQUIRES_UDS
+async def test_close_after_read_ready_stays_quiet() -> None:
+    """Readiness completes first, then aclose: the close-side done() guard holds."""
+    install_socket_teardown_guard()
+    loop = asyncio.get_running_loop()
+    with _capturing_loop_exceptions(loop) as delivered:
+        with tempfile.TemporaryDirectory(prefix="omni-uds-guard-") as tmp:
+            stream, peer, server = await _connected_uds_pair(str(Path(tmp) / "cr.sock"))
+            future = stream._wait_until_readable(loop)
+            # The reader callback would complete the future; do it directly, then
+            # close on the same stretch so aclose sees an already-completed future.
+            future.set_result(None)
+            await stream.aclose()
+            await asyncio.sleep(0)
+            peer.close()
+            server.close()
     assert not _invalid_state_deliveries(delivered)
 
 
@@ -327,15 +349,27 @@ def test_unrecognized_waiter_shape_is_reported_not_patched(caplog) -> None:
     )
 
 
+def test_patch_reports_source_unavailable_when_getsource_fails(monkeypatch) -> None:
+    backend = type("Backend", (_UnguardedBackend,), {})
+
+    def _unreadable(_obj: object) -> str:
+        raise OSError("could not get source code")
+
+    monkeypatch.setattr(socket_teardown_guard.inspect, "getsource", _unreadable)
+    with pytest.raises(socket_teardown_guard._BackendSourceUnavailable):
+        socket_teardown_guard._patch_unguarded_methods(backend)
+
+
 def test_install_gives_up_when_backend_source_unreadable(monkeypatch, caplog) -> None:
     monkeypatch.setattr(socket_teardown_guard, "_installed", False)
     monkeypatch.setattr(socket_teardown_guard, "_gave_up", False)
     probes: list[int] = []
 
     def _unreadable(_mixin: type) -> tuple[str, ...]:
-        # OSError is what inspect.getsource raises for a frozen/zipapp backend.
+        # _patch_unguarded_methods raises this once inspect.getsource cannot read
+        # a frozen/zipapp backend; only this sentinel maps to the give-up path.
         probes.append(1)
-        raise OSError("could not get source code")
+        raise socket_teardown_guard._BackendSourceUnavailable("_wait_until_readable")
 
     monkeypatch.setattr(socket_teardown_guard, "_patch_unguarded_methods", _unreadable)
     with caplog.at_level(logging.WARNING, logger=socket_teardown_guard.__name__):

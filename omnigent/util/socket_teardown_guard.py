@@ -34,6 +34,10 @@ _installed = False
 _gave_up = False
 
 
+class _BackendSourceUnavailable(Exception):
+    """Raised when a backend method's source cannot be read for shape detection."""
+
+
 def install_socket_teardown_guard() -> None:
     """Guard anyio's raw-socket teardown against a double ``set_result``.
 
@@ -50,10 +54,10 @@ def install_socket_teardown_guard() -> None:
         from anyio._backends import _asyncio as anyio_asyncio
 
         _patch_unguarded_methods(anyio_asyncio._RawSocketMixin)
-    except (OSError, TypeError):
-        # inspect.getsource cannot read the backend (a frozen/zipapp build), so
-        # the shape can never be inspected here: give up for the process rather
-        # than re-probe on every transport. The cost is the original log noise.
+    except _BackendSourceUnavailable:
+        # A method's source is unreadable (a frozen/zipapp build), so the shape
+        # can never be inspected here: give up for the process rather than
+        # re-probe on every transport. The cost is the original log noise.
         _logger.warning(
             "anyio raw-socket teardown guard not installed: backend source unavailable",
             exc_info=True,
@@ -85,7 +89,10 @@ def _patch_unguarded_methods(mixin: type) -> tuple[str, ...]:
         current = getattr(mixin, name)
         if current is replacement:
             continue
-        source = inspect.getsource(current)
+        try:
+            source = inspect.getsource(current)
+        except (OSError, TypeError) as exc:
+            raise _BackendSourceUnavailable(name) from exc
         if is_racy(source):
             setattr(mixin, name, replacement)
             patched.append(name)
