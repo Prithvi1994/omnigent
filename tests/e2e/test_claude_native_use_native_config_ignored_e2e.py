@@ -51,6 +51,11 @@ _GATEWAY_MODEL = "databricks-claude-sonnet-4-5"
 # Basename of the launch record the recording stub writes into the config home.
 _RECORD_NAME = "claude-launch.json"
 
+# How long to wait for the daemon-spawned runner to launch the Claude terminal.
+# Kept well under the E2E job's 180s per-test timeout so the body's own
+# diagnostic assertion fires instead of being killed by that outer timeout.
+_LAUNCH_DEADLINE_S = 150
+
 # The recording ``claude`` stub. It writes the launch argv + the routing-relevant
 # env the runner handed it (atomically, so the test never reads a partial file),
 # renders a Claude-Code-like composer so the runner's readiness poll is satisfied,
@@ -166,14 +171,20 @@ def native_config_gateway_env() -> Iterator[dict[str, object]]:
         }
     finally:
         with open(os.devnull, "wb") as devnull:
-            subprocess.run(
-                [str(_omnigent_console_script()), "host", "stop", "--all", "--force"],
-                env=env,
-                stdout=devnull,
-                stderr=devnull,
-                timeout=120,
-                check=False,
-            )
+            # Stop the runners/sessions (host daemon) and the auto-spawned local
+            # server; the latter outlives `host stop` and would otherwise leak.
+            for stop_args in (
+                ["host", "stop", "--all", "--force"],
+                ["server", "stop", "--force"],
+            ):
+                subprocess.run(
+                    [str(_omnigent_console_script()), *stop_args],
+                    env=env,
+                    stdout=devnull,
+                    stderr=devnull,
+                    timeout=120,
+                    check=False,
+                )
         shutil.rmtree(root, ignore_errors=True)
 
 
@@ -202,12 +213,12 @@ def test_use_native_config_not_ignored_by_host_daemon(
         env=env,
         encoding="utf-8",
         codec_errors="replace",
-        timeout=300,
+        timeout=_LAUNCH_DEADLINE_S + 10,
         dimensions=(24, 100),
     )
     child.logfile_read = transcript
     try:
-        deadline = time.monotonic() + 280
+        deadline = time.monotonic() + _LAUNCH_DEADLINE_S
         while time.monotonic() < deadline:
             if record_path.exists():
                 break

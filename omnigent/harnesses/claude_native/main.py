@@ -4619,6 +4619,8 @@ async def _prepare_claude_terminal_via_daemon(
             # (last-write-wins) and/or stamp the native-config label
             # (labels upsert-merge, so other labels are untouched). No
             # new flags → leave the stored state so the runner reuses it.
+            # The native-config label is set-only here: a resume without
+            # --use-native-config never clears a previously stamped one.
             resume_patch: _JsonObject = {}
             if persist_args:
                 resume_patch["terminal_launch_args"] = persist_args
