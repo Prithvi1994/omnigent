@@ -252,12 +252,14 @@ def test_resolve_uninstall_ledger_drops_stale_third_party_launch_agents(
         else install_ledger.backfill_ledger_path()
     )
     install_ledger.write_ledger(ledger, path=path)
+    stored = path.read_bytes()
 
     resolved = install_ledger.resolve_uninstall_ledger()
 
     assert resolved is not None
     assert resolved.ledger_source == source
     assert resolved.entries.launch_agents == [own, recorded]
+    assert path.read_bytes() == stored
 
 
 def test_record_and_remove_launch_agent_preserves_other_entries(
