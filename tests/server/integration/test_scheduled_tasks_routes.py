@@ -1828,6 +1828,20 @@ async def test_update_rejects_invalid_name_and_keeps_previous(
     assert got.json()["name"] == "nightly triage"
 
 
+async def test_update_with_null_name_keeps_previous(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    resp = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}", json={"name": None}, headers=_headers()
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["name"] == "nightly triage"
+
+
 async def test_create_and_update_trim_surrounding_whitespace(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
