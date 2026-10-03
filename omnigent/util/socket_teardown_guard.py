@@ -1,21 +1,23 @@
 """Quiet anyio's raw-socket teardown race on the UDS transports.
 
 anyio's asyncio backend parks a pending ``UNIXSocketStream`` read/write on a
-bare ``loop.add_reader(sock, future.set_result, None)`` callback, and its
-``_RawSocketMixin.aclose()`` completes the same future without a ``done()``
-check. When the socket becomes readable on the same event-loop tick the
-stream is closed, both sides complete the future and the loser raises
+bare ``loop.add_reader(sock, future.set_result, None)`` callback, and releases
+before 4.15 also complete that future from ``_RawSocketMixin.aclose()`` without
+a ``done()`` check. When the socket becomes readable on the same event-loop
+tick the stream is closed, both sides complete the future and the loser raises
 ``InvalidStateError`` inside an asyncio callback — surfaced through the loop
-exception handler as ``asyncio: Exception in callback Future.set_result(None)``
-and logged at ERROR by the runner. The httpx UDS transports built by the
-server, the runner, and the harness process manager wrap exactly these
-streams, so an ordinary session or harness teardown with an in-flight read
-can emit that noise on every close.
+exception handler as ``Exception in callback Future.set_result(None)`` and
+logged at ERROR by the runner. The httpx UDS transports built by the server,
+the runner, and the harness process manager wrap exactly these streams, so an
+ordinary session or harness teardown with an in-flight read can emit that
+noise on every close.
 
-:func:`install_socket_teardown_guard` replaces the three racy methods with
-equivalents that only complete a still-pending future. It patches only the
-known racy shape: once an anyio release guards the race itself, the shape
-check stops matching and the install becomes a no-op, retiring this shim.
+:func:`install_socket_teardown_guard` replaces each racy method with an
+equivalent that only completes a still-pending future. The three methods are
+checked independently: anyio 4.15 guards ``aclose()`` but still registers the
+bare readiness callbacks, so the waiters stay patched there while the already
+safe ``aclose()`` is left alone. Once a release guards all of them, the install
+becomes a no-op and this shim retires itself.
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ def install_socket_teardown_guard() -> None:
 
     Idempotent and cheap to call from any UDS transport factory: patches
     ``anyio._backends._asyncio._RawSocketMixin`` at most once per process,
-    and only while the installed anyio still has the unguarded shape.
+    replacing only the methods that still have the unguarded shape.
 
     :returns: ``None``.
     """
@@ -48,30 +50,39 @@ def install_socket_teardown_guard() -> None:
     try:
         from anyio._backends import _asyncio as anyio_asyncio
 
-        mixin = anyio_asyncio._RawSocketMixin
-        if not _has_unguarded_teardown(mixin):
-            return
-        mixin._wait_until_readable = _wait_until_readable
-        mixin._wait_until_writable = _wait_until_writable
-        mixin.aclose = _aclose
+        _patch_unguarded_methods(anyio_asyncio._RawSocketMixin)
     except Exception:  # noqa: BLE001 — best-effort: an unpatched teardown only logs noise
         _logger.debug("anyio raw-socket teardown guard not installed", exc_info=True)
 
 
-def _has_unguarded_teardown(mixin: type) -> bool:
-    """Whether ``mixin`` still has the racy shape this guard understands.
+def _patch_unguarded_methods(mixin: type) -> tuple[str, ...]:
+    """Replace each of ``mixin``'s methods that still has the racy shape.
 
     :param mixin: anyio's ``_RawSocketMixin`` class.
-    :returns: ``True`` when ``aclose`` completes futures without a ``done()``
-        check and both waiters register a bare ``set_result`` I/O callback.
+    :returns: Names of the methods that were replaced, in declaration order.
     """
-    aclose_source = inspect.getsource(mixin.aclose)
-    if ".done()" in aclose_source or ".set_result(None)" not in aclose_source:
-        return False
-    return all(
-        "f.set_result, None" in inspect.getsource(method)
-        for method in (mixin._wait_until_readable, mixin._wait_until_writable)
-    )
+    patched: list[str] = []
+    if _registers_bare_set_result(mixin._wait_until_readable):
+        mixin._wait_until_readable = _wait_until_readable
+        patched.append("_wait_until_readable")
+    if _registers_bare_set_result(mixin._wait_until_writable):
+        mixin._wait_until_writable = _wait_until_writable
+        patched.append("_wait_until_writable")
+    if _completes_without_done_check(mixin.aclose):
+        mixin.aclose = _aclose
+        patched.append("aclose")
+    return tuple(patched)
+
+
+def _registers_bare_set_result(waiter: Any) -> bool:
+    """Whether ``waiter`` hands ``f.set_result`` straight to the loop's I/O callback."""
+    return "f.set_result, None" in inspect.getsource(waiter)
+
+
+def _completes_without_done_check(aclose: Any) -> bool:
+    """Whether ``aclose`` completes pending futures without checking ``done()``."""
+    source = inspect.getsource(aclose)
+    return ".set_result(None)" in source and ".done()" not in source
 
 
 def _complete_if_pending(future: asyncio.Future[None]) -> None:
