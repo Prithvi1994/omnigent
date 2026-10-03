@@ -28,7 +28,8 @@ const RECORD_DIR =
 
 const CLUSTER = ".electron-sidebar-header-actions";
 // Windowed clearance is `left: 5.5rem`; anything inside the old gap counts as
-// realigned, so the threshold is deliberately loose.
+// realigned, so the threshold is deliberately loose. These mirror the cluster
+// offsets in web/src/index.css (the Chromium stand-in test uses the same two).
 const TRAFFIC_LIGHT_CLEARANCE_PX = 88;
 const FULLSCREEN_ALIGNED_MAX_X = 48;
 const SETTLE_MS = 10_000;
@@ -203,10 +204,15 @@ describe(
           JSON.stringify(observations, null, 2),
         );
         // Close first so a failing run still flushes and names its footage.
+        // Guard each cleanup step so one failing step neither masks the test's
+        // own error nor skips removing the temp profile below.
         await electronApp.close().catch(() => {});
-        await stopDisplayCapture();
-        saved = saveRecording(RECORD_DIR, "fullscreen-sidebar-controls");
-        fs.rmSync(userDataDir, { recursive: true, force: true });
+        await stopDisplayCapture().catch(() => {});
+        try {
+          saved = saveRecording(RECORD_DIR, "fullscreen-sidebar-controls");
+        } finally {
+          fs.rmSync(userDataDir, { recursive: true, force: true });
+        }
       }
       assert.ok(saved && saved.length > 0, "no desktop recording was produced");
     });

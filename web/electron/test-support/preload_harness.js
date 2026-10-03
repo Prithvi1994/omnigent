@@ -10,7 +10,7 @@ const PRELOAD = fs.readFileSync(path.join(__dirname, "../src/preload.js"), "utf8
 
 /**
  * @param {(channel: string, args: unknown) => unknown} [respond] Reply for
- *   `ipcRenderer.invoke`; channels it leaves undefined resolve to null.
+ *   `ipcRenderer.invoke`; the default resolves every channel to null.
  */
 function loadPreload(respond = () => null) {
   const exposed = new Map();
@@ -19,7 +19,7 @@ function loadPreload(respond = () => null) {
   const ipcRenderer = {
     invoke: async (channel, args) => {
       invokes.push({ channel, args });
-      return respond(channel, args) ?? null;
+      return respond(channel, args);
     },
     send: () => {},
     on: (channel, listener) =>

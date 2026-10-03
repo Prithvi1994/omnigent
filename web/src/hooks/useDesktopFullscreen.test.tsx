@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const getDesktopFullScreen = vi.fn(() => Promise.resolve(false));
 const unsubscribe = vi.fn();
+const isMacElectronShell = vi.fn(() => true);
 let onChange: ((fullScreen: boolean) => void) | null = null;
 const onDesktopFullScreenChanged = vi.fn((callback: (fullScreen: boolean) => void) => {
   onChange = callback;
@@ -12,6 +13,7 @@ vi.mock("@/lib/nativeBridge", () => ({
   getDesktopFullScreen: () => getDesktopFullScreen(),
   onDesktopFullScreenChanged: (callback: (fullScreen: boolean) => void) =>
     onDesktopFullScreenChanged(callback),
+  isMacElectronShell: () => isMacElectronShell(),
 }));
 
 import { useDesktopFullscreen } from "./useDesktopFullscreen";
@@ -19,6 +21,7 @@ import { useDesktopFullscreen } from "./useDesktopFullscreen";
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  isMacElectronShell.mockReturnValue(true);
   onChange = null;
 });
 
@@ -69,5 +72,14 @@ describe("useDesktopFullscreen", () => {
       resolve(false);
     });
     expect(result.current).toBe(true);
+  });
+
+  it("stays inert outside the macOS desktop shell", async () => {
+    isMacElectronShell.mockReturnValue(false);
+    const { result } = renderHook(() => useDesktopFullscreen());
+    await act(async () => {});
+    expect(onDesktopFullScreenChanged).not.toHaveBeenCalled();
+    expect(getDesktopFullScreen).not.toHaveBeenCalled();
+    expect(result.current).toBe(false);
   });
 });
