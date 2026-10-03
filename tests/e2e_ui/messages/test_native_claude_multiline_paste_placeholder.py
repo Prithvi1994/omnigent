@@ -61,11 +61,27 @@ def _history_displays(nonce: str) -> list[str]:
     path = _history_path()
     if not path.exists():
         return []
-    return [
-        str(json.loads(line).get("display"))
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if nonce in line
-    ]
+    displays: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if nonce not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            # Claude Code appends concurrently; a half-written line is not an entry yet.
+            continue
+        displays.append(str(entry.get("display", "<missing display>")))
+    return displays
+
+
+def _wait_history_displays(nonce: str, *, timeout_s: float) -> list[str]:
+    """Poll Claude Code's history until an entry mentioning *nonce* appears."""
+    deadline = time.monotonic() + timeout_s
+    displays = _history_displays(nonce)
+    while not displays and time.monotonic() < deadline:
+        time.sleep(0.2)
+        displays = _history_displays(nonce)
+    return displays
 
 
 def _input_line(pane: str) -> str:
@@ -154,7 +170,7 @@ def _send_case(
     assert all(line in bubble_text for line in lines if line), (
         f"Chat view lost text for {label}: {lines!r} rendered as {bubble_text!r}"
     )
-    displays = _history_displays(nonce)
+    displays = _wait_history_displays(nonce, timeout_s=10)
     _log.info("%s: Claude Code history recorded %r", label, displays)
     return displays
 

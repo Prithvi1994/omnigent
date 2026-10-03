@@ -4144,24 +4144,25 @@ def _paste_and_submit(
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before sending a message."
         )
-    delivery_diagnostics.set_stage("pasting")
-    # Clear stale text first: raw controls can otherwise become pasted text.
-    # CSI-u sends Ctrl+A/Ctrl+K literally so Claude handles them as keys.
-    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[97;5u")
-    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[107;5u")
     payload = _paste_payload_bytes(text)
+    if not payload:
+        raise RuntimeError(
+            "The message contains only control characters, so there is nothing to "
+            "paste into Claude Code. The message was not delivered."
+        )
     if payload.endswith(b"\\"):
         # A draft ending in "\" turns the submit Enter into a line continuation;
         # a CR inside the paste absorbs it. No other message gets one: Claude Code
         # collapses a paste holding three or more line breaks into a placeholder.
         payload += b"\r"
-    # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
-    # client→server command at ~16KB, so per-byte hex argv blew up with
-    # "command too long" on large payloads (a PR diff in a sub-agent
-    # dispatch). ``load-buffer`` streams the file without that cap, and
-    # ``paste-buffer -p`` wraps it in the same bracketed-paste markers so
-    # interior newlines (mapped to CR above) stay data instead of becoming
-    # per-line submits. See anthropics/claude-code#52126.
+    delivery_diagnostics.set_stage("pasting")
+    # Clear stale text first: raw controls can otherwise become pasted text.
+    # CSI-u sends Ctrl+A/Ctrl+K literally so Claude handles them as keys.
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[97;5u")
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[107;5u")
+    # Use a tmux buffer, not ``send-keys`` argv: tmux caps a client→server
+    # command at ~16KB. ``load-buffer`` avoids the cap; ``paste-buffer -p``
+    # keeps interior CRs as data, not submits (anthropics/claude-code#52126).
     with tempfile.NamedTemporaryFile(
         dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
     ) as paste_file:
