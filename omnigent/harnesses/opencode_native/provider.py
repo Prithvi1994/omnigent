@@ -547,7 +547,11 @@ def _strip_trailing_commas(text: str) -> str:
 
 
 def _load_user_config_file(path: Path) -> dict[str, object] | None:
-    """Parse one user OpenCode config file (JSON, with a JSONC fallback)."""
+    """Parse one user OpenCode config file (JSON, with a JSONC fallback).
+
+    A file that cannot be read or parsed is skipped with a warning so the
+    other config files still contribute.
+    """
     try:
         raw = path.read_text(encoding="utf-8")
         try:
@@ -556,15 +560,13 @@ def _load_user_config_file(path: Path) -> dict[str, object] | None:
             cleaned = _strip_jsonc_comments(raw)
             cleaned = _strip_trailing_commas(cleaned)
             parsed = json.loads(cleaned)
-    except (OSError, UnicodeDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as err:
+        _logger.warning("Skipping user OpenCode config at %s: %s", path, err)
         return None
-    except json.JSONDecodeError:
-        _logger.warning(
-            "Failed to parse user OpenCode config at %s — ignoring this file",
-            path,
-        )
+    if not isinstance(parsed, dict):
+        _logger.warning("Skipping user OpenCode config at %s: top level is not an object", path)
         return None
-    return parsed if isinstance(parsed, dict) else None
+    return parsed
 
 
 def _deep_merge_configs(

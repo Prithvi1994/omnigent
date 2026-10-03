@@ -763,6 +763,34 @@ def test_merge_user_provider_config_later_plugin_list_replaces_earlier(
     assert result["plugin"] == ["/tmp/omnigent-policy.js", "/opt/plugins/from-jsonc"]
 
 
+def test_merge_user_provider_config_skips_unreadable_file_keeps_others(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A file the runner cannot read is skipped; the files before and after it still merge."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "config.json").write_text(
+        '{"provider": {"my-gw": {"options": {"baseURL": "https://my-gw/v1"}}}}',
+        encoding="utf-8",
+    )
+    (cfg_dir / "opencode.json").write_text('{"provider": {"other": {}}}', encoding="utf-8")
+    (cfg_dir / "opencode.jsonc").write_text('{"model": "my-gw/gpt-4"}', encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    real_read_text = Path.read_text
+
+    def _read_text(self: Path, *args: object, **kwargs: object) -> str:
+        if self.name == "opencode.json":
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _read_text)
+
+    result = maybe_merge_user_provider_config({})
+
+    assert result["provider"] == {"my-gw": {"options": {"baseURL": "https://my-gw/v1"}}}
+    assert result["model"] == "my-gw/gpt-4"
+
+
 def test_build_mcp_block_preserves_custom_timeout() -> None:
     from types import SimpleNamespace as N
 

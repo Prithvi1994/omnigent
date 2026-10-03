@@ -1,38 +1,29 @@
-"""E2e: user providers in ``~/.config/opencode/*.json`` must reach the spawned
-``opencode serve``.
+"""E2e: a provider declared in an earlier user config file must reach the spawned
+``opencode serve`` when a later file supplies the model pin.
 
-OpenCode itself deep-merges the user's global config files
-(``config.json`` -> ``opencode.json`` -> ``opencode.jsonc``; later files win on
-conflicting keys, non-conflicting keys from earlier files survive), so a user
-can keep a small ``opencode.jsonc`` model pin next to an ``opencode.json`` that
-declares their custom provider (an OpenAI-compatible endpoint with a custom
-base URL). The runner's per-session ``XDG_CONFIG_HOME`` hides the user's global
-config from the spawned server, and ``maybe_merge_user_provider_config()``
-exists precisely to carry the user's providers into the synthesized
-per-session config.
+OpenCode deep-merges the user's global config (``config.json`` ->
+``opencode.json`` -> ``opencode.jsonc``; later files win on conflicting keys,
+non-conflicting keys from earlier files survive), so users keep a small
+``opencode.jsonc`` model pin next to an ``opencode.json`` that declares their
+custom provider (an OpenAI-compatible endpoint with a custom base URL). The
+runner's per-session ``XDG_CONFIG_HOME`` hides the user's global config from the
+spawned server, and ``maybe_merge_user_provider_config()`` carries the user's
+providers into the synthesized per-session config; this journey checks that
+carry-over at the real process boundary.
 
-Reproduces the reported journeys: ``user_opencode_config_path()`` resolves the
-user config as a SINGLE file (first match of ``opencode.jsonc`` then
-``opencode.json``, never ``config.json``), so
-
-* with both ``opencode.jsonc`` and ``opencode.json`` present, the ``model`` pin
-  from ``.jsonc`` is carried over while the ``provider`` block living in
-  ``.json`` is silently dropped -- the session's opencode server has no such
-  provider, so the user's pinned model is unusable (the attached TUI's model
-  list omits it and turns against it fail);
-* with only ``config.json`` present, the user's providers are dropped
-  entirely, even though the opencode CLI itself loads them.
-
-Journey (full product path, mirroring ``test_host_opencode_native_e2e.py``):
-write the user's global OpenCode config on the host -> connect a host daemon
--> create a host-bound ``opencode-native-ui`` session -> the runner boots
-``opencode serve`` with the synthesized + merged config -> ask the spawned
-server which providers it has (``GET /config/providers``, the same list the
-attached TUI offers as its model picker).
+Journey (mirroring ``test_host_opencode_native_e2e.py``): write the user's
+global OpenCode config on the host -> connect a host daemon -> create a
+host-bound ``opencode-native-ui`` session -> the runner boots ``opencode serve``
+with the synthesized + merged config -> ask the spawned server which providers
+it has (``GET /config/providers``, the list the attached TUI offers in its model
+picker). One case keeps the provider in ``opencode.json`` under an
+``opencode.jsonc`` pin; the other keeps it in ``config.json`` alone. The exact
+file-name discovery is also unit-tested in ``tests/test_opencode_native_provider.py``
+and ``tests/test_opencode_native_bridge.py``.
 
 Each test first checks the ground truth on the installed binary (``opencode
 debug config`` on the same files) so a future upstream change in OpenCode's
-own merge semantics fails loudly as a rig error instead of blaming Omnigent.
+merge semantics fails loudly as a rig error instead of blaming Omnigent.
 
 Needs ``opencode`` and ``tmux`` on PATH (same prerequisites as the sibling
 ``test_opencode_native_launch_config_timeout_e2e.py``); no LLM turn is driven,
@@ -61,17 +52,22 @@ from tests.e2e.helpers import POLL_INTERVAL_S
 
 
 def _functional_opencode_dir() -> str | None:
-    """Return the dir of the first PATH ``opencode`` that answers ``--version``.
+    """Return the dir of the first PATH ``opencode`` real binary that answers ``--version``.
 
-    Some environments put a wrapper shim earlier on PATH that needs extra env
-    (e.g. a gateway-config shim); scan every PATH entry and pick the first
-    binary that actually works, so the daemon's readiness probe and the
-    runner's ``opencode serve`` launch see a functional CLI.
+    Skip shell-script wrappers: some environments put a shim earlier on PATH
+    that rewrites ``XDG_CONFIG_HOME`` to its own gateway config when the caller
+    leaves it unset, which would hide the staged user config from the
+    ground-truth ``debug config`` run. Pick the first non-shim binary that
+    actually works, so both that run and the runner's ``opencode serve`` see the
+    user's config.
     """
     for path_dir in os.environ.get("PATH", "").split(os.pathsep):
         candidate = Path(path_dir) / "opencode"
         if not (candidate.is_file() and os.access(candidate, os.X_OK)):
             continue
+        with candidate.open("rb") as handle:
+            if handle.read(2) == b"#!":
+                continue
         try:
             probe = subprocess.run([str(candidate), "--version"], capture_output=True, timeout=15)
         except (OSError, subprocess.TimeoutExpired):
@@ -211,7 +207,9 @@ def _opencode_cli_effective_config(home: Path) -> dict[str, Any]:
     )
     assert proc.returncode == 0, f"rig failure: `opencode debug config` failed: {proc.stderr}"
     out = proc.stdout
-    return json.loads(out[out.index("{") :])
+    start = out.find("{")
+    assert start != -1, f"rig failure: `opencode debug config` emitted no JSON: {out[:400]!r}"
+    return json.loads(out[start:])
 
 
 def _spawned_provider_ids(state: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
@@ -273,14 +271,12 @@ def test_user_provider_in_opencode_json_reaches_spawned_server(
     tmp_path: Path,
     live_server: str,
 ) -> None:
-    """A provider in ``opencode.json`` must survive an ``opencode.jsonc`` pin.
+    """A provider in ``opencode.json`` must survive an ``opencode.jsonc`` model pin.
 
     The user keeps their custom provider in ``~/.config/opencode/opencode.json``
-    and a small ``opencode.jsonc`` holding only the default-model pin -- a
-    layout the opencode CLI resolves fine (deep merge). The session's spawned
-    server must expose that provider; on the buggy build it exposes the
-    ``.jsonc`` model pin but not the provider that defines it, so the session
-    is pinned to a model that does not exist.
+    and a small ``opencode.jsonc`` holding only the default-model pin, a layout
+    the opencode CLI resolves fine. The session's spawned server must expose that
+    provider; otherwise the session is pinned to a model that does not exist.
     """
     home = tmp_path / "home"
     cfg_dir = home / ".config" / "opencode"
@@ -297,9 +293,9 @@ def test_user_provider_in_opencode_json_reaches_spawned_server(
 
     ground_truth = _opencode_cli_effective_config(home)
     assert _PROVIDER_ID in ground_truth.get("provider", {}), (
-        "rig failure: the installed opencode CLI no longer deep-merges "
-        "opencode.json into its effective global config; this test's premise "
-        f"does not hold for it. Effective config: {json.dumps(ground_truth)[:800]}"
+        "rig failure: the installed opencode CLI does not merge opencode.json into its "
+        "effective global config; this test's premise does not hold for it. "
+        f"Effective config: {json.dumps(ground_truth)[:800]}"
     )
     assert ground_truth.get("model") == "my-gateway/gpt-4"
 
@@ -308,13 +304,9 @@ def test_user_provider_in_opencode_json_reaches_spawned_server(
     )
 
     assert _PROVIDER_ID in provider_ids, (
-        "The user's custom provider (declared in ~/.config/opencode/opencode.json) "
-        "never reached the session's spawned `opencode serve`: the runner's user-config "
-        "merge read only opencode.jsonc, while the opencode CLI itself deep-merges "
-        "config.json -> opencode.json -> opencode.jsonc. The session is left pinned to "
-        f"model {effective.get('model')!r} with no such provider, so the model is "
-        f"unusable in the TUI and turns against it fail.\n"
-        f"Providers seen by the spawned server: {provider_ids}\n"
+        f"The provider declared in opencode.json never reached the session's spawned "
+        f"`opencode serve`, which is pinned to model {effective.get('model')!r} with no such "
+        f"provider.\nProviders seen by the spawned server: {provider_ids}\n"
         f"Spawned server effective config: {json.dumps(effective)[:800]}"
     )
     my_gateway = next(p for p in payload["providers"] if p.get("id") == _PROVIDER_ID)
@@ -330,12 +322,12 @@ def test_user_provider_in_config_json_reaches_spawned_server(
     tmp_path: Path,
     live_server: str,
 ) -> None:
-    """A provider in ``config.json`` (the only user config file) must reach the server.
+    """A provider declared only in ``config.json`` must reach the spawned server.
 
     OpenCode loads ``~/.config/opencode/config.json`` first in its global merge
-    (legacy TOML configs are migrated into it), but the runner's user-config
-    resolution never consults it, so a provider living only there is invisible
-    to the session's spawned server.
+    (legacy configs migrate into it), so a user with their provider there and
+    nothing else expects a working session. The spawned server must expose that
+    provider.
     """
     home = tmp_path / "home"
     cfg_dir = home / ".config" / "opencode"
@@ -346,9 +338,9 @@ def test_user_provider_in_config_json_reaches_spawned_server(
 
     ground_truth = _opencode_cli_effective_config(home)
     assert _PROVIDER_ID in ground_truth.get("provider", {}), (
-        "rig failure: the installed opencode CLI no longer loads config.json "
-        "into its effective global config; this test's premise does not hold "
-        f"for it. Effective config: {json.dumps(ground_truth)[:800]}"
+        "rig failure: the installed opencode CLI does not load config.json into its "
+        "effective global config; this test's premise does not hold for it. "
+        f"Effective config: {json.dumps(ground_truth)[:800]}"
     )
 
     provider_ids, _payload, effective = _run_session_and_get_providers(
@@ -356,11 +348,7 @@ def test_user_provider_in_config_json_reaches_spawned_server(
     )
 
     assert _PROVIDER_ID in provider_ids, (
-        "The user's custom provider (declared in ~/.config/opencode/config.json, "
-        "the only user config file) never reached the session's spawned "
-        "`opencode serve`: the runner's user-config resolution checks only "
-        "opencode.jsonc/opencode.json, while the opencode CLI itself loads "
-        "config.json first in its global merge.\n"
-        f"Providers seen by the spawned server: {provider_ids}\n"
+        f"The provider declared in config.json never reached the session's spawned "
+        f"`opencode serve`.\nProviders seen by the spawned server: {provider_ids}\n"
         f"Spawned server effective config: {json.dumps(effective)[:800]}"
     )
