@@ -19,6 +19,8 @@ from omnigent.harnesses.claude_native import bridge as claude_bridge
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from omnigent.inner.terminal import TerminalInstance
 
 
@@ -569,11 +571,19 @@ def _wait_for_kiro_permission_verdict_applied(
     action: str,
     expected_title: str | None,
     timeout_s: float,
+    verdict_recorded: Callable[[], bool] | None = None,
 ) -> None:
-    """Verify Kiro consumed a verdict, retrying only on the same safe prompt."""
+    """Verify Kiro consumed a verdict, retrying only on the same safe prompt.
+
+    A recorded ACP response for this request also counts as consumed: the pane
+    alone cannot tell a dropped Enter from one that was consumed and followed
+    by an identically titled prompt, which a retry must never answer.
+    """
     deadline = time.monotonic() + min(timeout_s, _PERMISSION_VERDICT_VERIFY_TIMEOUT_S)
     last_enter = time.monotonic()
     while time.monotonic() < deadline:
+        if verdict_recorded is not None and verdict_recorded():
+            return
         pane = _capture_pane(socket_path, tmux_target, join_wrapped=True)
         if not _kiro_permission_prompt_active(pane):
             return
@@ -595,6 +605,8 @@ def _wait_for_kiro_permission_verdict_applied(
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             last_enter = now
         time.sleep(_POLL_INTERVAL_S)
+    if verdict_recorded is not None and verdict_recorded():
+        return
     raise RuntimeError("kiro-native permission prompt did not resolve after verdict delivery")
 
 
@@ -788,8 +800,14 @@ def send_kiro_permission_verdict(
     action: str,
     expected_title: str | None = None,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    verdict_recorded: Callable[[], bool] | None = None,
 ) -> None:
-    """Deliver a one-time Kiro permission verdict to the active TUI prompt."""
+    """Deliver a one-time Kiro permission verdict to the active TUI prompt.
+
+    ``verdict_recorded`` reports whether Kiro's ACP recorder already holds the
+    response for this request, so delivery stops before retrying into a later
+    prompt that happens to render the same title.
+    """
     if action not in {"accept", "decline", "cancel"}:
         raise RuntimeError(f"unsupported Kiro permission action: {action!r}")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
@@ -819,6 +837,7 @@ def send_kiro_permission_verdict(
             action=action,
             expected_title=expected_title,
             timeout_s=timeout_s,
+            verdict_recorded=verdict_recorded,
         )
         return
     for key in ("Down", "Down"):
@@ -840,6 +859,7 @@ def send_kiro_permission_verdict(
         action=action,
         expected_title=expected_title,
         timeout_s=timeout_s,
+        verdict_recorded=verdict_recorded,
     )
 
 

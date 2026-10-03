@@ -55,6 +55,9 @@ from tests.e2e_ui.conftest import (
 )
 
 from .test_kiro_concurrent_permissions import (
+    _FAKE_KIRO_SOURCE as _QUEUED_FAKE_KIRO_SOURCE,
+)
+from .test_kiro_concurrent_permissions import (
     _create_kiro_native_session,
     _kiro_pane_text,
     _pending_elicitations,
@@ -603,3 +606,80 @@ def test_kiro_wrapped_approval_title_still_gets_the_verdict(
     page.wait_for_timeout(2_000)
 
     _assert_verdict_reached_kiro(record_file, bridge_dir)
+
+
+# Two identically titled requests queued together: once the first verdict
+# lands, the fake TUI immediately shows the same prompt again for the second.
+_IDENTICAL_PROMPTS_FAKE_KIRO = _QUEUED_FAKE_KIRO_SOURCE.replace(
+    'COMMANDS = ("alpha", "beta", "gamma")', 'COMMANDS = ("alpha", "alpha")'
+)
+_IDENTICAL_REQUEST_IDS = ("perm-req-1-1", "perm-req-1-2")
+
+
+@pytest.fixture
+def kiro_identical_prompts_session(
+    built_spa: None,
+    tmp_path_factory: pytest.TempPathFactory,
+    request: pytest.FixtureRequest,
+) -> Iterator[tuple[str, str, Path]]:
+    """A runner-bound kiro-native session whose fake TUI queues two identical prompts."""
+    if request.config.getoption("--ui-base-url"):
+        pytest.skip("kiro verdict-delivery e2e requires an isolated spawned server")
+    assert 'COMMANDS = ("alpha", "alpha")' in _IDENTICAL_PROMPTS_FAKE_KIRO
+    server_tmp = tmp_path_factory.mktemp("e2e_ui_kiro_identical_prompts")
+    with _kiro_stack(server_tmp, _IDENTICAL_PROMPTS_FAKE_KIRO) as stack:
+        yield stack
+
+
+@pytest.mark.timeout(600)
+def test_kiro_identical_follow_up_prompt_is_not_answered_by_retry(
+    kiro_identical_prompts_session: tuple[str, str, Path],
+    page: Page,
+) -> None:
+    """A consumed Enter followed by an identical prompt must not be retried.
+
+    Confirm-and-retry re-sends Enter while "the same" prompt stays on the pane.
+    When Kiro queues two identically titled requests, the second prompt looks
+    exactly like an ignored first keypress; only approving its own card may
+    answer it.
+    """
+    from omnigent.harnesses.kiro_native.bridge import acp_record_path
+
+    base_url, session_id, bridge_dir = kiro_identical_prompts_session
+    record_file = acp_record_path(bridge_dir)
+    first_id, second_id = _IDENTICAL_REQUEST_IDS
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _ensure_chat_view(page)
+    _send(page, "Run the two setup commands that each need shell approval.")
+    _wait_for(
+        lambda: set(_IDENTICAL_REQUEST_IDS) <= _recorder_request_ids(record_file),
+        timeout_s=120.0,
+        message="Kiro never raised both ACP permission requests",
+    )
+    first_card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first
+    expect(first_card).to_be_visible(timeout=_FIRST_CARD_TIMEOUT_MS)
+    first_card.get_by_role("button", name="Approve").click()
+    expect(page.locator(f'{_APPROVAL_CARD}[data-state="responded"]').first).to_be_visible(
+        timeout=30_000
+    )
+    _wait_for(
+        lambda: first_id in _recorder_response_ids(record_file),
+        timeout_s=_DELIVERY_CONFIRM_TIMEOUT_S,
+        message="the approved verdict never reached Kiro",
+    )
+
+    # The second request surfaces as its own pending card while its prompt
+    # stays on the pane, and outlives the bridge's verification window unanswered.
+    expect(page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first).to_be_visible(
+        timeout=45_000
+    )
+    _select_view_mode(page, "Terminal")
+    page.wait_for_timeout(8_000)
+    assert second_id not in _recorder_response_ids(record_file), (
+        "the second, identically titled prompt was answered without a web approval"
+    )
+    assert "requires approval" in _kiro_pane_text(bridge_dir)
+    assert _pending_elicitations(base_url, session_id), (
+        "the second request is no longer parked for the user"
+    )

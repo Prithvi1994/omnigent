@@ -186,6 +186,12 @@ def _read_new_permission_events(
     return events, new_offset
 
 
+def _permission_response_recorded(record_file: Path, offset: int, request_id: str) -> bool:
+    """Return whether the recorder holds Kiro's response to *request_id* after *offset*."""
+    events, _offset = _read_new_permission_events(record_file, offset)
+    return any(event.kind == "response" and event.request_id == request_id for event in events)
+
+
 async def supervise_kiro_permission_mirror(
     *,
     base_url: str,
@@ -278,6 +284,11 @@ async def _run_one_permission(
     elicitation_id: str,
 ) -> None:
     """Park one Kiro permission request on the server and deliver the verdict."""
+    record_file = acp_record_path(bridge_dir)
+    try:
+        start_offset = record_file.stat().st_size
+    except OSError:
+        start_offset = 0
     payload = {
         "elicitation_id": elicitation_id,
         "agent": "Kiro",
@@ -317,6 +328,9 @@ async def _run_one_permission(
             bridge_dir,
             action=action,
             expected_title=permission.title,
+            verdict_recorded=lambda: _permission_response_recorded(
+                record_file, start_offset, permission.request_id
+            ),
         )
     except RuntimeError:
         _logger.exception(

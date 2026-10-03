@@ -343,6 +343,67 @@ def test_send_kiro_permission_verdict_retries_ignored_enter(
     assert sent_keys == ["Enter", "Enter"]
 
 
+def test_send_kiro_permission_verdict_stops_once_verdict_is_recorded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recorded response ends delivery even when an identical prompt follows.
+
+    Kiro may queue a second request with the same title; after it consumes the
+    Enter the pane shows that prompt with the default focus, indistinguishable
+    from a dropped keypress. The recorder, not the pane, must stop the retry.
+    """
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RETRY_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE])
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    send_kiro_permission_verdict(
+        bridge_dir,
+        action="accept",
+        expected_title="Running: pwd",
+        timeout_s=0.1,
+        verdict_recorded=lambda: any(call[-1] == "Enter" for call in calls),
+    )
+
+    assert [call[-1] for call in calls if "send-keys" in call] == ["Enter"]
+
+
+def test_send_kiro_permission_verdict_retries_until_verdict_is_recorded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unrecorded Enter on the same safe prompt is still retried."""
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RETRY_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE])
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    send_kiro_permission_verdict(
+        bridge_dir,
+        action="accept",
+        expected_title="Running: pwd",
+        timeout_s=0.1,
+        verdict_recorded=lambda: sum(call[-1] == "Enter" for call in calls) >= 2,
+    )
+
+    assert [call[-1] for call in calls if "send-keys" in call] == ["Enter", "Enter"]
+
+
 def test_send_kiro_permission_verdict_matches_soft_wrapped_title(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
