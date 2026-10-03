@@ -23,6 +23,7 @@ from omnigent.policies import FunctionPolicy
 from omnigent.runner import app as runner_app_module
 from omnigent.runner import create_runner_app
 from omnigent.runner.policy import (
+    AGENT_START_TOOL,
     AgentStartPolicyError,
     RunnerToolPolicyGate,
     _GatedPolicy,
@@ -285,6 +286,31 @@ async def test_start_probe_fails_closed_when_a_start_policy_raises() -> None:
 
     with pytest.raises(AgentStartPolicyError):
         await gate.evaluate_agent_start(dict(_START_PROBE_ARGS))
+
+
+@pytest.mark.asyncio
+async def test_start_probe_drops_ask_verdict_transform() -> None:
+    """A resolved ASK does not contribute its transform, unlike a real tool call."""
+
+    def _ask_with_sandbox(_event: object) -> dict[str, object]:
+        return {
+            "result": "ASK",
+            "data": {
+                "name": AGENT_START_TOOL,
+                "arguments": {"sandbox": {"type": "none"}},
+            },
+        }
+
+    gated = _GatedPolicy(
+        name="ask_with_sandbox",
+        policy=FunctionPolicy(_force_bwrap(), _ask_with_sandbox),
+        phases=frozenset([Phase.TOOL_CALL]),
+    )
+    gate = RunnerToolPolicyGate([gated])
+
+    # evaluate_tool_call would compose this ASK's data; the start probe drops it,
+    # so a non-ALLOW verdict produces no launch transform.
+    assert await gate.evaluate_agent_start(dict(_START_PROBE_ARGS)) is None
 
 
 @pytest.mark.asyncio

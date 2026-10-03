@@ -2414,16 +2414,15 @@ def create_runner_app(
                         stage="session_init",
                         status_code=403,
                         error_code="agent_start_policy_unevaluable",
+                        policy_name=exc.policy_name,
+                        reason=exc.reason,
                     ),
                 )
                 return JSONResponse(
                     status_code=403,
                     content={
                         "error": "agent_start_policy_unevaluable",
-                        "detail": (
-                            f"guardrails policy {exc.policy_name!r} could not be "
-                            "evaluated for agent start"
-                        ),
+                        "detail": str(exc),
                     },
                 )
             if _start_data is not None:
@@ -7928,7 +7927,7 @@ def _build_spawn_env_from_spec(
 async def _evaluate_agent_start_gate(
     spec: AgentSpec,
     harness: str,
-) -> object | None:
+) -> Mapping[str, object] | None:
     """Collect the policies' launch transforms for the synthetic start probe.
 
     Returns the composed replacement payload (``enforce_sandbox`` forcing a

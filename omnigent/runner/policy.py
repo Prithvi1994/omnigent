@@ -250,16 +250,19 @@ class RunnerToolPolicyGate:
     async def evaluate_agent_start(
         self,
         arguments: dict[str, object],
-    ) -> object | None:
+    ) -> Mapping[str, object] | None:
         """
         Run TOOL_CALL policies over the synthetic ``sys_agent_start`` probe.
 
         The probe lets start-aware policies such as ``enforce_sandbox``
-        transform the launch; their ``data`` chains exactly as in
-        :meth:`evaluate_tool_call`. It is not a real tool call, so a clean
-        DENY or ASK from a resolved policy does not gate agent start: a generic
-        allowlist that rejects the probe name is logged and skipped, and the
-        remaining policies still contribute their transforms.
+        transform the launch: an ALLOW result's ``data`` composes into the
+        next policy's input, as in :meth:`evaluate_tool_call`. It is not a real
+        tool call, so a clean DENY or ASK from a resolved policy does not gate
+        agent start -- the verdict is logged and skipped, and (unlike
+        :meth:`evaluate_tool_call`, which still composes ASK ``data``) any
+        transform it carries is dropped. A generic allowlist that rejects the
+        probe name therefore cannot block the launch, and the remaining
+        policies still contribute their ALLOW transforms.
 
         A policy the runner could not evaluate is treated differently from a
         clean verdict. If a tool-phase policy raised, failed to resolve and was
@@ -281,7 +284,7 @@ class RunnerToolPolicyGate:
             content={"name": AGENT_START_TOOL, "arguments": arguments},
             tool_name=AGENT_START_TOOL,
         )
-        composed_data: object | None = None
+        composed_data: Mapping[str, object] | None = None
         for gated in self._policies:
             if Phase.TOOL_CALL not in gated.phases:
                 continue
@@ -328,15 +331,12 @@ class RunnerToolPolicyGate:
                     # the sandbox override as a silent no-op, dropping the
                     # restriction. Fail closed to keep the start transform honest.
                     _logger.error(
-                        "runner policy %r returned a malformed %s transform; "
-                        "refusing agent start",
+                        "runner policy %r returned a malformed %s transform; refusing agent start",
                         gated.name,
                         AGENT_START_TOOL,
                         extra={"session_id": runner_primary_session_id()},
                     )
-                    raise AgentStartPolicyError(
-                        gated.name, "returned a malformed start transform"
-                    )
+                    raise AgentStartPolicyError(gated.name, "returned a malformed start transform")
                 composed_data = result.data
                 ctx = replace(ctx, content=composed_data)
         return composed_data
