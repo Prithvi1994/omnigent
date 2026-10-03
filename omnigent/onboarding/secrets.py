@@ -229,10 +229,10 @@ class SecretDeletion:
 
     :param removed: An entry was removed from the keychain or the file backend.
     :param keyring_error: The :class:`keyring.errors.KeyringError` class name
-        when the OS keychain could not be consulted, so a copy there may
-        survive; ``None`` when the keychain answered.
+        when the OS keychain could not be consulted, or the variable that
+        disabled it, so a copy there may survive; ``None`` when it answered.
     :param survives: The keychain refused the delete and still returns the
-        secret.
+        secret, or could not be read back afterwards.
     :param file_error: The exception class name when the file-backed store
         could not be read or rewritten, so a copy there may survive.
     """
@@ -241,6 +241,17 @@ class SecretDeletion:
     keyring_error: str | None = None
     survives: bool = False
     file_error: str | None = None
+
+    @property
+    def unresolved_reason(self) -> str:
+        """Why a copy may remain, or ``""`` when every reachable copy is gone."""
+        if self.survives:
+            return "the OS keychain still holds the secret"
+        if self.keyring_error is not None:
+            return f"the OS keychain was not consulted or reachable ({self.keyring_error})"
+        if self.file_error is not None:
+            return f"the file-backed secret store could not be read ({self.file_error})"
+        return ""
 
 
 def delete_secret(name: str) -> SecretDeletion:
@@ -259,17 +270,22 @@ def delete_secret(name: str) -> SecretDeletion:
     removed = False
     keyring_error: str | None = None
     survives = False
-    if _use_keyring():
+    if not _use_keyring():
+        # A disabled keychain is unreachable, not empty.
+        keyring_error = _DISABLE_KEYRING_ENV
+    else:
         try:
             keyring.delete_password(_KEYRING_SERVICE, name)
             removed = True
         except keyring.errors.PasswordDeleteError:
             # Raised for an absent entry and for a refused delete alike; a
-            # lookup tells them apart.
+            # lookup tells them apart. If that lookup fails too, assume the
+            # refused entry survives rather than downgrade it to "unreachable".
             try:
                 survives = keyring.get_password(_KEYRING_SERVICE, name) is not None
             except _KEYRING_ERRORS as exc:
                 keyring_error = type(exc).__name__
+                survives = True
         except _KEYRING_ERRORS as exc:
             keyring_error = type(exc).__name__
     file_error: str | None = None

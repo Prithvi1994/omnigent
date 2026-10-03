@@ -43,7 +43,9 @@ class FileKeyring(keyring.backend.KeyringBackend):
     def _write(self, entries: dict[str, str]) -> None:
         path = store_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
 
     def get_password(self, service: str, username: str) -> str | None:
         return self._read().get(_key(service, username))

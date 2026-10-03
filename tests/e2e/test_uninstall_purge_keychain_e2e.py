@@ -30,6 +30,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.e2e._harness_probes import cli_unavailable_reason
+
 pexpect = pytest.importorskip("pexpect")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -184,6 +186,11 @@ class PurgeOutcome:
 
 @pytest.fixture(scope="module")
 def purge_outcome(tmp_path_factory: pytest.TempPathFactory) -> PurgeOutcome:
+    # Without Claude's CLI the wizard offers to install it instead of opening
+    # the credential menu this journey drives.
+    reason = cli_unavailable_reason("claude")
+    if reason is not None:
+        pytest.skip(reason)
     home = tmp_path_factory.mktemp("purge") / "home"
     env = cli_env(home)
     store_anthropic_key_via_setup(env)

@@ -5045,7 +5045,7 @@ def _uninstall_script_path() -> Path:
     raise click.ClickException("uninstall script is missing from this installation")
 
 
-_KEYCHAIN_REF_RE = re.compile(r"keychain:([^\s\"'#,\[\]{}]+)")
+_KEYCHAIN_REF_RE = re.compile(r"keychain:([^\s\"',\[\]{}]+)")
 
 
 def _keychain_secret_names() -> list[str]:
@@ -5067,23 +5067,25 @@ def _keychain_secret_names() -> list[str]:
     except FileNotFoundError:
         return []
     names: set[str] = set()
+    seen: set[int] = set()
 
     def _walk(node: object) -> None:
         if isinstance(node, str):
             name = node.removeprefix("keychain:")
             if name != node and name:
                 names.add(name)
-        elif isinstance(node, dict):
-            for value in node.values():
-                _walk(value)
-        elif isinstance(node, list):
-            for value in node:
+        elif isinstance(node, (dict, list)):
+            # YAML aliases can make the parsed tree self-referential.
+            if id(node) in seen:
+                return
+            seen.add(id(node))
+            for value in node.values() if isinstance(node, dict) else node:
                 _walk(value)
 
     try:
         _walk(yaml.safe_load(text))
     except yaml.YAMLError:
-        names.update(_KEYCHAIN_REF_RE.findall(re.sub(r"#[^\n]*", "", text)))
+        names.update(_KEYCHAIN_REF_RE.findall(re.sub(r"(^|\s)#[^\n]*", "", text)))
     return sorted(names)
 
 
@@ -5147,9 +5149,9 @@ def _write_uninstall_manifest(ledger: InstallLedger, *, purge: bool = False) -> 
                 handle.write("\t".join(["keychain_discovery_error", reason]) + "\n")
                 names = []
             # Names are percent-encoded so a tab or newline cannot split the row;
-            # the third column is the display form with those characters replaced.
+            # the third column is the display form with control characters replaced.
             for name in names:
-                display = re.sub(r"[\t\r\n]", " ", name)
+                display = re.sub(r"[\x00-\x1f\x7f]", " ", name)
                 handle.write("\t".join(["keychain_secret", quote(name, safe=""), display]) + "\n")
     manifest.chmod(0o600)
     return manifest
@@ -5186,14 +5188,19 @@ def _internal_write_ledger(from_env: bool) -> None:
 def _internal_delete_keychain_secret(encoded_name: str) -> None:
     """Delete one Omnigent-stored secret by percent-encoded name; called by uninstall_oss.sh.
 
-    Prints ``removed`` (plus a note), ``absent``, ``file-only <KeyringError>`` or
-    ``unverified <error>`` on stdout; exits 1 when the entry may survive.
+    Prints ``removed``, ``absent``, ``file-only <KeyringError>``, ``partial <error>``
+    or ``unverified <error>`` on stdout; exits 1 when the entry may survive.
     """
     from omnigent.onboarding import secrets
 
     name = unquote(encoded_name)
     outcome = secrets.delete_secret(name)
     if outcome.survives:
+        if outcome.keyring_error:
+            raise click.ClickException(
+                f"the OS keyring refused to delete secret {name!r} and could not be read back "
+                f"({outcome.keyring_error}); the entry may survive"
+            )
         raise click.ClickException(
             f"the OS keyring still holds secret {name!r} after the delete request"
         )
@@ -5205,19 +5212,14 @@ def _internal_delete_keychain_secret(encoded_name: str) -> None:
         )
         raise click.ClickException(
             f"OS keyring inaccessible ({outcome.keyring_error}) and {fallback}; "
-            "unlock the keyring and retry"
+            "make the OS keyring available and retry"
         )
     if outcome.keyring_error is not None:
         click.echo(f"file-only {outcome.keyring_error}")
-    elif outcome.removed:
-        note = (
-            f" file-backed store unreadable ({outcome.file_error})" if outcome.file_error else ""
-        )
-        click.echo(f"removed{note}")
     elif outcome.file_error is not None:
-        click.echo(f"unverified {outcome.file_error}")
+        click.echo(f"{'partial' if outcome.removed else 'unverified'} {outcome.file_error}")
     else:
-        click.echo("absent")
+        click.echo("removed" if outcome.removed else "absent")
 
 
 @cli.group("extensions")

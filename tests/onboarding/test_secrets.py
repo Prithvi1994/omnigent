@@ -48,8 +48,10 @@ def test_secrets_file_created_0600_even_under_permissive_umask() -> None:
 
 def test_delete_secret_removes_it() -> None:
     secrets.store_secret("openrouter", "sk-or-value")
-    secrets.delete_secret("openrouter")
+
+    assert secrets.delete_secret("openrouter").removed is True
     assert secrets.load_secret("openrouter") is None
+    assert secrets.delete_secret("openrouter").removed is False
 
 
 @pytest.mark.parametrize(
@@ -153,11 +155,37 @@ def test_working_keyring_does_not_read_corrupt_fallback(
     assert resolve_secret("keychain:openrouter") == "test-keyring-key"
 
 
-def test_delete_secret_reports_whether_anything_was_removed() -> None:
-    secrets.store_secret("openrouter", "sk-or-value")
+def test_delete_secret_reports_disabled_keyring_as_unreachable() -> None:
+    # The fixture sets OMNIGENT_DISABLE_KEYRING=1; that must not read as "absent".
+    assert secrets.delete_secret("anthropic") == secrets.SecretDeletion(
+        removed=False, keyring_error="OMNIGENT_DISABLE_KEYRING"
+    )
+    secrets.store_secret("anthropic", "sk-file-value")
+    assert secrets.delete_secret("anthropic") == secrets.SecretDeletion(
+        removed=True, keyring_error="OMNIGENT_DISABLE_KEYRING"
+    )
 
-    assert secrets.delete_secret("openrouter") == secrets.SecretDeletion(removed=True)
-    assert secrets.delete_secret("openrouter") == secrets.SecretDeletion(removed=False)
+
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        (secrets.SecretDeletion(removed=True), ""),
+        (
+            secrets.SecretDeletion(removed=False, survives=True),
+            "the OS keychain still holds the secret",
+        ),
+        (
+            secrets.SecretDeletion(removed=True, keyring_error="KeyringLocked"),
+            "the OS keychain was not consulted or reachable (KeyringLocked)",
+        ),
+        (
+            secrets.SecretDeletion(removed=False, file_error="JSONDecodeError"),
+            "the file-backed secret store could not be read (JSONDecodeError)",
+        ),
+    ],
+)
+def test_secret_deletion_unresolved_reason(outcome: secrets.SecretDeletion, expected: str) -> None:
+    assert outcome.unresolved_reason == expected
 
 
 def test_delete_secret_keyring_delete_counts_as_removed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -220,9 +248,10 @@ def test_delete_secret_reports_an_inaccessible_keyring(
     )
 
 
-def test_delete_secret_refused_delete_with_unreadable_keyring_is_inaccessible(
+def test_delete_secret_refused_delete_with_unreadable_keyring_counts_as_surviving(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    secrets.store_secret("anthropic", "sk-file-value")
     monkeypatch.delenv("OMNIGENT_DISABLE_KEYRING")
 
     def delete_password(service: str, username: str) -> None:
@@ -234,8 +263,9 @@ def test_delete_secret_refused_delete_with_unreadable_keyring_is_inaccessible(
     monkeypatch.setattr(keyring, "delete_password", delete_password)
     monkeypatch.setattr(keyring, "get_password", get_password)
 
+    # A removed file copy must not hide that the refused keychain entry may survive.
     assert secrets.delete_secret("anthropic") == secrets.SecretDeletion(
-        removed=False, keyring_error="KeyringLocked"
+        removed=True, keyring_error="KeyringLocked", survives=True
     )
 
 
@@ -268,7 +298,16 @@ def test_delete_secret_keeps_keyring_delete_when_file_store_is_corrupt(
     )
 
 
-def test_delete_secret_reports_corrupt_file_store_without_keyring_entry(tmp_path: Path) -> None:
+def test_delete_secret_reports_corrupt_file_store_without_keyring_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("OMNIGENT_DISABLE_KEYRING")
+
+    def delete_password(service: str, username: str) -> None:
+        raise keyring.errors.PasswordDeleteError("No such password!")
+
+    monkeypatch.setattr(keyring, "delete_password", delete_password)
+    monkeypatch.setattr(keyring, "get_password", lambda service, username: None)
     (tmp_path / "secrets.json").write_text("invalid JSON")
 
     assert secrets.delete_secret("anthropic") == secrets.SecretDeletion(
