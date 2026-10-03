@@ -187,8 +187,12 @@ async def _drive_teardown_once(path: str, loop: asyncio.AbstractEventLoop) -> No
 
         tg.start_soon(_accept)
         client_stream = await anyio.connect_unix(path)
-        while "stream" not in server_box:
+        for _ in range(1000):
+            if "stream" in server_box:
+                break
             await asyncio.sleep(0)
+        else:  # pragma: no cover - accept always completes on a local UDS
+            raise AssertionError("listener never accepted the client connection")
         server_stream = server_box["stream"]
 
         # Park a read, then make the fd readable with no intervening await so

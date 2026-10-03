@@ -18,7 +18,6 @@ import pytest
 from omnigent.util import socket_teardown_guard
 from omnigent.util.socket_teardown_guard import install_socket_teardown_guard
 
-_INVALID_STATE_MESSAGE = "Exception in callback Future.set_result(None)"
 _REQUIRES_UDS = pytest.mark.skipif(
     sys.platform == "win32", reason="Unix domain sockets are POSIX-only"
 )
@@ -137,10 +136,10 @@ async def _close_during_pending_write(tmp: Path, iterations: int) -> list[_Deliv
 
 
 def _invalid_state_deliveries(delivered: list[_Delivery]) -> list[_Delivery]:
+    # Match the exception type, not the asyncio callback message: a reworded
+    # "Exception in callback ..." string must not quietly pass this regression.
     return [
-        (message, exc)
-        for message, exc in delivered
-        if isinstance(exc, asyncio.InvalidStateError) and _INVALID_STATE_MESSAGE in message
+        (message, exc) for message, exc in delivered if isinstance(exc, asyncio.InvalidStateError)
     ]
 
 

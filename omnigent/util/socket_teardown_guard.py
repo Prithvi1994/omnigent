@@ -1,23 +1,19 @@
 """Quiet anyio's raw-socket teardown race on the UDS transports.
 
 anyio's asyncio backend parks a pending ``UNIXSocketStream`` read/write on a
-bare ``loop.add_reader(sock, future.set_result, None)`` callback, and releases
-before 4.15 also complete that future from ``_RawSocketMixin.aclose()`` without
-a ``done()`` check. When the socket becomes readable on the same event-loop
-tick the stream is closed, both sides complete the future and the loser raises
-``InvalidStateError`` inside an asyncio callback — surfaced through the loop
-exception handler as ``Exception in callback Future.set_result(None)`` and
-logged at ERROR by the runner. The httpx UDS transports built by the server,
-the runner, and the harness process manager wrap exactly these streams, so an
-ordinary session or harness teardown with an in-flight read can emit that
-noise on every close.
+bare ``loop.add_reader(sock, future.set_result, None)`` callback, and before
+4.15 ``_RawSocketMixin.aclose()`` completes that future without a ``done()``
+check. When the socket becomes readable on the same event-loop tick the stream
+closes, both sides complete the future and the loser raises
+``InvalidStateError`` inside an asyncio callback. The server, runner, and
+harness-process httpx UDS transports all wrap these streams.
 
-:func:`install_socket_teardown_guard` replaces each racy method with an
-equivalent that only completes a still-pending future. The three methods are
-checked independently: anyio 4.15 guards ``aclose()`` but still registers the
-bare readiness callbacks, so the waiters stay patched there while the already
-safe ``aclose()`` is left alone. Once a release guards all of them, the install
-becomes a no-op and this shim retires itself.
+:func:`install_socket_teardown_guard` replaces each racy method with one that
+completes only a still-pending future, checking the three methods
+independently so an already-guarded ``aclose()`` (anyio 4.15) is left alone
+while its bare readiness callbacks are still patched. Methods whose shape is
+unrecognized are left unchanged, and once a release guards all of them the
+install becomes a no-op.
 """
 
 from __future__ import annotations
@@ -29,9 +25,12 @@ from typing import Any
 
 _logger = logging.getLogger(__name__)
 
-# One-shot process flag: the patch is class-level, so a single install (or a
-# deliberate skip) covers every stream for the process lifetime.
+# One-shot process flag: the patch is class-level, so a single install covers
+# every stream for the process lifetime. It stays unset after a failed attempt
+# so a later transport can retry a transient import error.
 _installed = False
+# Surface a persistent install failure once; retries after it stay at debug.
+_install_failure_logged = False
 
 
 def install_socket_teardown_guard() -> None:
@@ -43,7 +42,7 @@ def install_socket_teardown_guard() -> None:
 
     :returns: ``None``.
     """
-    global _installed
+    global _installed, _install_failure_logged
     if _installed:
         return
     try:
@@ -51,9 +50,14 @@ def install_socket_teardown_guard() -> None:
 
         _patch_unguarded_methods(anyio_asyncio._RawSocketMixin)
     except Exception:  # noqa: BLE001 — best-effort: an unpatched teardown only logs noise
-        # Leave the flag unset so a later transport can retry; a genuinely
-        # missing backend keeps logging only debug noise, not an error.
-        _logger.debug("anyio raw-socket teardown guard not installed", exc_info=True)
+        # Leave the flag unset so a later transport can retry a transient import
+        # error. Report a persistent failure once at warning, then stay quiet so
+        # a frozen build without readable source does not spam every teardown.
+        if _install_failure_logged:
+            _logger.debug("anyio raw-socket teardown guard not installed", exc_info=True)
+        else:
+            _logger.warning("anyio raw-socket teardown guard not installed", exc_info=True)
+            _install_failure_logged = True
         return
     _installed = True
 
@@ -97,8 +101,18 @@ def _registers_bare_set_result(source: str) -> bool:
 
 
 def _completes_without_done_check(source: str) -> bool:
-    """Whether ``aclose`` completes pending futures without checking ``done()``."""
-    return ".set_result(None)" in source and ".done()" not in source
+    """Whether ``aclose`` completes pending futures without checking ``done()``.
+
+    Matches only the known shape, whose ``aclose`` does no readiness
+    deregistration of its own. A future ``aclose`` that added such cleanup falls
+    through to the unrecognized path rather than being replaced and losing it.
+    """
+    return (
+        ".set_result(None)" in source
+        and ".done()" not in source
+        and "remove_reader" not in source
+        and "remove_writer" not in source
+    )
 
 
 def _complete_if_pending(future: asyncio.Future[None]) -> None:
