@@ -8,7 +8,8 @@ sync on every mutation so a change takes effect without a restart.
 Ownership mirrors hosts: tasks are scoped to the calling user (``"local"`` when
 auth is disabled). The RRULE is validated on create/update with
 :func:`validate_rrule` — an invalid rule (bad syntax, never-fires, fires-once, or
-below the minimum-interval floor) is a 400.
+below the minimum-interval floor) is a 400, as is a blank name or one longer than
+the ``scheduled_tasks.name`` column.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.db.account_authority import account_generation, current_account_user
+from omnigent.db.db_models import SCHEDULED_TASK_NAME_MAX_LEN
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
@@ -217,6 +219,15 @@ def _validate_timezone_or_400(timezone: str) -> None:
         ) from exc
 
 
+def _validate_name_or_400(name: str) -> None:
+    """Raise a 400 ``OmnigentError`` if *name* is blank or wider than its column."""
+    if not name.strip() or len(name) > SCHEDULED_TASK_NAME_MAX_LEN:
+        raise OmnigentError(
+            f"name must be 1-{SCHEDULED_TASK_NAME_MAX_LEN} characters and not blank",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
 def create_scheduled_tasks_router(
     store: ScheduledTaskStore,
     *,
@@ -360,6 +371,7 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Create a scheduled task and arm it on the live scheduler."""
         owner = _owner(request)
+        _validate_name_or_400(body.name)
         _validate_rrule_or_400(body.rrule)
         _validate_timezone_or_400(body.timezone)
         permission_mode = validate_session_permission_mode(body.permission_mode)
@@ -544,6 +556,8 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         existing = _require_owned(scheduled_task_id, owner_id)
+        if body.name is not None:
+            _validate_name_or_400(body.name)
         if body.rrule is not None:
             _validate_rrule_or_400(body.rrule)
         if body.timezone is not None:
