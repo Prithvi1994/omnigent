@@ -90,6 +90,7 @@ def _drive_claude_startup(
     ]
 
     master_out, slave_out = pty.openpty()
+    # The second pty only gives the child's stdin a tty; nothing is written to it.
     master_in, slave_in = pty.openpty()
     open_fds = [master_out, master_in, slave_out, slave_in]
     buf = b""

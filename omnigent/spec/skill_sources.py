@@ -170,51 +170,31 @@ def _claude_user_dir(ctx: SkillSourceContext) -> Path:
 
 def _claude_code_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
-    The skill tiers Claude Code itself loads, and no others.
+    The skill tiers the host-spawned Claude launch loads, and no others.
 
-    Claude Code reads workspace/ancestor ``.claude/skills`` plus the user
-    tier ``$CLAUDE_CONFIG_DIR/skills`` (default ``~/.claude/skills``). It
-    does NOT read ``.agents/skills`` (live-verified against its slash
-    menu), so the generic host walk over-reports for this family: a menu
-    entry the CLI can't expand just fails, since a native session sends
-    ``/name`` to the CLI as plaintext.
+    The managed native launch runs ``--setting-sources user``, so Claude
+    Code loads only the user tier ``$CLAUDE_CONFIG_DIR/skills`` (default
+    ``~/.claude/skills``). Project ``.claude/skills`` and ``.agents/skills``
+    are not read: project skills require the ``projectSettings`` source that
+    launch disables, and ``.agents`` was never a Claude tier. Listing a skill
+    the CLI can't expand just fails, since a native session sends ``/name`` to
+    the CLI as plaintext, so the menu must stay within that user tier.
     """
     if ctx.skills_filter == "none":
         return []
     filter_names: set[str] | None = (
         set(ctx.skills_filter) if isinstance(ctx.skills_filter, list) else None
     )
-    dirs: list[Path] = []
-    seen_dirs: set[Path] = set()
-
-    def _add(candidate: Path) -> None:
-        if candidate in seen_dirs or not candidate.is_dir():
-            return
-        seen_dirs.add(candidate)
-        dirs.append(candidate)
-
-    # Workspace-first: each root's .claude/skills, then its ancestors'.
-    for root in ctx.roots:
-        current = root.resolve()
-        while True:
-            _add(current / ".claude" / "skills")
-            parent = current.parent
-            if parent == current:
-                break
-            current = parent
-    # User tier last, so a workspace skill wins a name collision.
-    _add(_claude_user_dir(ctx) / "skills")
-
+    user_skills = _claude_user_dir(ctx) / "skills"
     out: list[SkillSpec] = []
-    for skills_dir in dirs:
-        skipped: list[str] = []
-        for spec in _discover_skills(skills_dir, skipped=skipped):
-            if filter_names is not None and spec.name not in filter_names:
-                continue
-            out.append(spec)
-        # Surface dropped skills so a missing command is diagnosable.
-        for detail in skipped:
-            _log.warning("Skipping skill under %s: %s", skills_dir, detail)
+    skipped: list[str] = []
+    for spec in _discover_skills(user_skills, skipped=skipped):
+        if filter_names is not None and spec.name not in filter_names:
+            continue
+        out.append(spec)
+    # Surface dropped skills so a missing command is diagnosable.
+    for detail in skipped:
+        _log.warning("Skipping skill under %s: %s", user_skills, detail)
     return _dedup(out)
 
 
@@ -458,8 +438,9 @@ def claude_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
 
     A native ``claude-native`` session types ``/name`` into the Claude CLI
     as plaintext, so its menu must mirror exactly the tiers that CLI loads
-    (:func:`_claude_code_skills`: ``.claude/skills`` and the
-    ``$CLAUDE_CONFIG_DIR`` user tier, never ``.agents``). The in-process
+    (:func:`_claude_code_skills`: the ``$CLAUDE_CONFIG_DIR`` user tier only,
+    since the managed launch runs ``--setting-sources user`` and never reads
+    project ``.claude/skills`` or ``.agents``). The in-process
     ``claude-sdk`` harness has no such terminal to match, so it keeps the
     generic host walk it used before this scoping — the terminal-matching
     behavior only affects native harnesses. Enabled plugin slash-commands are

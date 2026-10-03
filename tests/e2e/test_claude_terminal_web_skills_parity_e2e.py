@@ -1,25 +1,23 @@
-"""E2E regression test: the web UI's skill menu diverges from the Claude
-terminal's loaded skills.
+"""E2E regression test: the claude-family web skill menu must match the
+skills the host-spawned Claude terminal can load.
 
 For a claude-family session the web composer's slash-command menu is fed by
 ``GET /v1/skills?session_id={id}`` (``resolve_session_skills`` →
 ``resolve_harness_skills``), while the embedded terminal's menu is whatever
-the real Claude Code CLI discovers itself. Live-verified against Claude Code
-v2.1.212, the two disagree in both directions:
+the real Claude Code CLI discovers itself. The managed native launch runs
+``--setting-sources user``, so the terminal loads only its user tier
+(``$CLAUDE_CONFIG_DIR/skills``, defaulting to ``~/.claude/skills``):
 
-* the web menu surfaces ``<workspace>/.agents/skills/<skill>`` entries (the
-  generic host walk scans ``.agents``), but Claude Code does not read
-  ``.agents/skills`` — so the menu lists commands the terminal cannot
-  invoke (a native session sends ``/name`` to the CLI as plaintext; there
-  is no server-side resolve+inject on that path), and
-* Claude Code lists user-tier skills from ``$CLAUDE_CONFIG_DIR/skills``
-  (defaulting to ``~/.claude/skills``), but the web resolution reads only
-  ``Path.home()/.claude/skills`` — so with a non-default config dir the
-  terminal shows skills the web menu omits.
+* project ``<workspace>/.claude/skills`` is gated behind the disabled
+  ``projectSettings`` source, and ``<workspace>/.agents/skills`` was never a
+  Claude tier — so the web menu must list neither, or it surfaces commands
+  the terminal cannot invoke (a native session sends ``/name`` to the CLI as
+  plaintext; there is no server-side resolve+inject on that path), and
+* the web resolution must honor ``$CLAUDE_CONFIG_DIR`` for the user tier
+  rather than only ``Path.home()/.claude/skills`` — otherwise with a
+  non-default config dir the terminal shows user skills the web menu omits.
 
-These tests assert the FIXED parity contract — the claude-family web menu
-lists exactly what the Claude terminal can load — so they FAIL on the broken
-build and PASS once a fix lands (the fix step's fail→pass target).
+These tests assert that parity contract.
 
 Usage::
 
@@ -58,12 +56,12 @@ def _skill_md(name: str, description: str) -> str:
 
 def _seed_workspace(workspace: Path) -> None:
     """
-    Seed the two workspace skill tiers the bug diverges on.
+    Seed the two project skill tiers the restricted launch excludes.
 
-    ``.claude/skills`` is read by both the Claude Code terminal and the web
-    resolution; ``.agents/skills`` is read ONLY by the web resolution's
-    generic host walk (live-verified: Claude Code v2.1.212's slash menu does
-    not list it).
+    Under ``--setting-sources user`` the host-spawned Claude terminal reads
+    neither tier: project ``.claude/skills`` needs the disabled
+    ``projectSettings`` source, and ``.agents/skills`` was never a Claude
+    tier. The web menu must exclude both to stay in parity.
 
     :param workspace: The session workspace directory to populate.
     """
@@ -174,40 +172,47 @@ async def test_claude_web_menu_lists_only_terminal_loadable_workspace_skills(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    The claude-family web menu must not list ``.agents/skills`` entries.
+    The claude-family web menu must list only user-tier skills.
 
     The user journey: a workspace carries skills under both
     ``.claude/skills/`` and ``.agents/skills/``; the user opens the web
     composer's slash menu and the embedded Claude terminal's slash menu for
-    the same claude-native session and compares them. Live-verified on
-    Claude Code v2.1.212: the terminal lists only the ``.claude/skills``
-    skill; the web menu additionally lists the ``.agents/skills`` one, and
-    selecting it sends ``/agents-only-skill`` to a CLI that has no such
-    command.
-
-    On the broken build the web menu includes ``agents-only-skill`` —
-    exactly the reported "loaded skills are different between claude
-    terminal and web ui".
+    the same claude-native session and compares them. The managed launch runs
+    ``--setting-sources user``, so the terminal loads neither workspace tier
+    (project ``.claude/skills`` needs the disabled ``projectSettings`` source;
+    ``.agents/skills`` is never a Claude tier) — it lists only its user tier.
+    Surfacing either workspace entry in the web menu would list a command the
+    terminal cannot invoke (a native session sends ``/name`` as plaintext).
     """
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    user_skill = home / ".claude" / "skills" / _USER_CFG_SKILL
+    user_skill.mkdir(parents=True)
+    (user_skill / "SKILL.md").write_text(
+        _skill_md(_USER_CFG_SKILL, "user-tier skill (both surfaces)")
+    )
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     _seed_workspace(workspace)
 
     names = _menu_names("claude-native", workspace)
 
-    # Precondition (passes on the broken build too): the tier both surfaces
-    # agree on is listed.
-    assert _CLAUDE_DIR_SKILL in names, (
-        f"precondition: workspace .claude/skills skill missing from menu; got {names}"
+    # Precondition: the user tier both surfaces agree on is listed.
+    assert _USER_CFG_SKILL in names, (
+        f"precondition: user-tier skill missing from menu; got {names}"
     )
 
-    # THE BUG: Claude Code does not discover ``.agents/skills`` (verified
-    # live against its slash menu), so surfacing it in the web menu lists a
-    # command the terminal cannot invoke.
+    # Project .claude/skills is gated behind the disabled projectSettings
+    # source, so the web menu must not surface it either.
+    assert _CLAUDE_DIR_SKILL not in names, (
+        f"web menu for a restricted claude session lists {_CLAUDE_DIR_SKILL!r} "
+        f"from project .claude/skills, which the host-spawned terminal does not "
+        f"load — the two surfaces show different skills. Menu: {names}"
+    )
+
+    # ``.agents/skills`` is never a Claude tier, so the terminal never loads it.
     assert _AGENTS_ONLY_SKILL not in names, (
         f"web menu for a claude session lists {_AGENTS_ONLY_SKILL!r} from "
         f".agents/skills, which the Claude Code terminal does not load — the "
@@ -246,10 +251,17 @@ async def test_claude_web_menu_sources_user_skills_from_claude_config_dir(
 
     names = _menu_names("claude-native", workspace)
 
-    # THE BUG (other direction): the terminal's slash menu lists this skill
-    # as "(user)"; the web menu must list it too or the surfaces diverge.
+    # The terminal's slash menu lists this skill as "(user)"; the web menu
+    # must list it too or the surfaces diverge.
     assert _USER_CFG_SKILL in names, (
         f"Claude terminal loads user skills from $CLAUDE_CONFIG_DIR/skills "
         f"({cfg / 'skills'}), but the web menu omits {_USER_CFG_SKILL!r} — "
         f"the two surfaces show different skills. Menu: {names}"
+    )
+
+    # The project .claude/skills entry the restricted launch skips must not
+    # appear alongside the user tier.
+    assert _CLAUDE_DIR_SKILL not in names, (
+        f"web menu lists project skill {_CLAUDE_DIR_SKILL!r} the restricted "
+        f"terminal does not load. Menu: {names}"
     )

@@ -4,10 +4,11 @@ Drives the fixed journey in a real browser for the after-fix clip: a
 ``claude-native`` session whose workspace carries skills under both
 ``.claude/skills`` and ``.agents/skills``, with a user skill in
 ``$CLAUDE_CONFIG_DIR/skills`` (the env var must be exported to the spawned
-runner before pytest starts, with the skill seeded inside it). Opening the
-composer's ``/`` menu must list the ``.claude`` tier and the config-dir
-user tier — the skills the Claude terminal itself loads — and must NOT
-list the ``.agents/skills`` entry the terminal cannot invoke.
+runner before pytest starts, with the skill seeded inside it). The managed
+launch runs ``--setting-sources user``, so opening the composer's ``/`` menu
+must list only the config-dir user tier — the skill the Claude terminal
+itself loads — and must NOT list the project ``.claude/skills`` nor the
+``.agents/skills`` entries the terminal cannot invoke.
 
 The harness is ``claude-native`` deliberately: the terminal-matching menu
 resolution is native-only, so a native spec is what exercises it. The
@@ -76,7 +77,7 @@ def test_claude_menu_lists_only_terminal_loadable_skills(
     runner_id: str,
     tmp_path: Path,
 ) -> None:
-    """The ``/`` menu shows the Claude tiers and omits ``.agents/skills``.
+    """The ``/`` menu shows only the user tier the restricted launch loads.
 
     :param page: Playwright page (fresh context per test).
     :param live_server: Base URL of the spawned server serving the SPA.
@@ -111,10 +112,11 @@ def test_claude_menu_lists_only_terminal_loadable_skills(
     expect(composer).to_be_visible(timeout=30_000)
     composer.fill("/")
 
-    # Both tiers Claude Code itself loads are listed…
-    expect(page.get_by_test_id("slash-menu-item-claude-dir-skill")).to_be_visible(timeout=15_000)
-    expect(page.get_by_test_id("slash-menu-item-user-cfg-skill")).to_be_visible()
-    # …and the .agents/skills entry the terminal can't invoke is not.
+    # The user-tier skill the restricted launch loads is listed…
+    expect(page.get_by_test_id("slash-menu-item-user-cfg-skill")).to_be_visible(timeout=15_000)
+    # …while the project .claude/skills entry (gated behind the disabled
+    # projectSettings source) and the .agents/skills entry are not.
+    expect(page.get_by_test_id("slash-menu-item-claude-dir-skill")).to_have_count(0)
     expect(page.get_by_test_id("slash-menu-item-agents-only-skill")).to_have_count(0)
     # Hold the corrected menu on screen so the clip ends on the outcome.
     page.wait_for_timeout(1_500)

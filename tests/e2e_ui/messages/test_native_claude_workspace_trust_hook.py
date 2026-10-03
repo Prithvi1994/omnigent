@@ -55,7 +55,11 @@ def _make_untrusted_workspace() -> Path:
     The runner shares the worktree but not ``/tmp``, so the workspace lives
     under the repo for the runner-launched Claude to open it.
     """
-    root = _REPO_ROOT / ".omnigent" / "e2e-untrusted-ws" / uuid.uuid4().hex
+    base = _REPO_ROOT / ".omnigent" / "e2e-untrusted-ws"
+    # Reap any live hook fixture a previously crashed run left in the worktree,
+    # so a developer's own Claude session cannot later load it.
+    shutil.rmtree(base, ignore_errors=True)
+    root = base / uuid.uuid4().hex
     (root / ".claude").mkdir(parents=True)
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     (root / "README.md").write_text("untrusted project\n", encoding="utf-8")

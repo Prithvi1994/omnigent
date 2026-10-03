@@ -156,24 +156,27 @@ def test_none_harness_falls_back_to_generic_host_walk(
     assert [s.name for s in out] == ["ws-skill"]
 
 
-def test_claude_provider_excludes_agents_skills_dirs(
+def test_claude_provider_excludes_project_and_agents_skills_dirs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Claude Code does not read ``.agents/skills``, so its menu must not.
+    """The host-spawned Claude launch reads only its user tier.
 
     A claude-family session's ``/name`` is expanded by the Claude CLI
-    itself; listing a skill it never discovers surfaces a command that
-    fails when invoked (the terminal/web parity gap).
+    itself; the managed launch runs ``--setting-sources user``, so project
+    ``.claude/skills`` and ``.agents/skills`` are never discovered. Listing
+    either would surface a command the terminal cannot invoke (the
+    terminal/web parity gap).
     """
     home = tmp_path / "home"
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    _write_skill(home / ".claude" / "skills", "user-tier-skill")
     workspace = tmp_path / "ws"
-    _write_skill(workspace / ".claude" / "skills", "claude-tier-skill")
+    _write_skill(workspace / ".claude" / "skills", "project-claude-skill")
     _write_skill(workspace / ".agents" / "skills", "workspace-agents-skill")
     _write_skill(home / ".agents" / "skills", "home-agents-skill")
 
     out = resolve_harness_skills(_ctx(workspace, home), "claude-native")
-    assert [s.name for s in out] == ["claude-tier-skill"]
+    assert [s.name for s in out] == ["user-tier-skill"]
 
 
 def test_claude_provider_sources_user_skills_from_config_dir(
@@ -203,11 +206,13 @@ def test_claude_sdk_keeps_generic_walk_native_matches_terminal(
     """The terminal-matching resolution is native-only; SDK keeps the generic walk.
 
     A ``claude-native`` session types ``/name`` into the CLI as plaintext, so
-    its menu must mirror the tiers the CLI loads: ``.claude/skills`` plus the
-    ``$CLAUDE_CONFIG_DIR`` user tier, never ``.agents``. The in-process
-    ``claude-sdk`` harness has no such terminal, so it stays on the generic host
-    walk it used before this scoping — which lists ``.agents/skills`` and ignores
-    ``$CLAUDE_CONFIG_DIR``. The same seeded tree must diverge by harness.
+    its menu must mirror the tiers the restricted launch loads: with
+    ``--setting-sources user`` that is the ``$CLAUDE_CONFIG_DIR`` user tier
+    only — never project ``.claude/skills`` nor ``.agents``. The in-process
+    ``claude-sdk`` harness has no such terminal, so it stays on the generic
+    host walk it used before this scoping — which lists ``.agents/skills`` and
+    the project ``.claude/skills`` and ignores ``$CLAUDE_CONFIG_DIR``. The same
+    seeded tree must diverge by harness.
     """
     home = tmp_path / "home"
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
@@ -222,12 +227,13 @@ def test_claude_sdk_keeps_generic_walk_native_matches_terminal(
     sdk = {s.name for s in resolve_harness_skills(ctx, "claude-sdk")}
     native = {s.name for s in resolve_harness_skills(ctx, "claude-native")}
 
-    # SDK (unchanged): generic walk lists the .agents entry, ignores config-dir.
+    # SDK (unchanged): generic walk lists the workspace tiers, ignores config-dir.
     assert "agents-only-skill" in sdk
     assert "claude-dir-skill" in sdk
     assert "user-cfg-skill" not in sdk
-    # Native: mirrors the CLI — .agents excluded, config-dir user tier sourced.
-    assert native == {"claude-dir-skill", "user-cfg-skill"}
+    # Native (restricted launch): only the config-dir user tier — the project
+    # .claude/skills and .agents entries the terminal can't load are excluded.
+    assert native == {"user-cfg-skill"}
 
 
 def test_codex_native_and_sdk_agree_without_a_configured_codex_home(
@@ -294,17 +300,21 @@ def test_claude_provider_defaults_user_tier_to_home_claude(
     assert [s.name for s in out] == ["default-home-skill"]
 
 
-def test_claude_provider_workspace_skill_wins_user_tier_collision(
+def test_claude_provider_ignores_project_skill_serves_user_tier(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A workspace ``.claude/skills`` name shadows the user tier's (project wins)."""
+    """A project ``.claude/skills`` entry is not read; the user tier is served.
+
+    The restricted launch does not load project skills, so a project copy
+    neither appears nor shadows the user-tier skill of the same name.
+    """
     home = tmp_path / "home"
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     workspace = tmp_path / "ws"
     ws_dir = workspace / ".claude" / "skills" / "shared-name"
     ws_dir.mkdir(parents=True)
     (ws_dir / "SKILL.md").write_text(
-        "---\nname: shared-name\ndescription: workspace copy\n---\nbody\n"
+        "---\nname: shared-name\ndescription: project copy\n---\nbody\n"
     )
     home_dir = home / ".claude" / "skills" / "shared-name"
     home_dir.mkdir(parents=True)
@@ -313,7 +323,7 @@ def test_claude_provider_workspace_skill_wins_user_tier_collision(
     )
 
     out = resolve_harness_skills(_ctx(workspace, home), "claude-native")
-    assert [(s.name, s.description) for s in out] == [("shared-name", "workspace copy")]
+    assert [(s.name, s.description) for s in out] == [("shared-name", "user copy")]
 
 
 def test_claude_plugins_read_from_config_dir(
@@ -823,23 +833,24 @@ def test_claude_workspace_settings_win_over_bundle(
     assert "sp:using-superpowers" not in names
 
 
-def test_non_invocable_host_skill_shadows_same_named_invocable_copy(
+def test_native_project_skill_does_not_shadow_user_tier(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    Documented behavior: a workspace skill marked user-invocable:false
-    shadows a same-named invocable home skill, so it is filtered out
-    entirely rather than falling back to the invocable copy — the
-    project's authoritative copy wins (it shadows in execution too).
+    The restricted native launch does not read the project tier, so a
+    project skill marked user-invocable:false no longer shadows a same-named
+    invocable user-tier skill — the user-tier copy is served instead of being
+    filtered out.
     """
     home = tmp_path / "home"
-    _write_skill(home / ".claude" / "skills", "x")  # home: invocable
+    _write_skill(home / ".claude" / "skills", "x")  # user tier: invocable
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     workspace = tmp_path / "ws"
-    _write_skill(workspace / ".claude" / "skills", "x", user_invocable=False)  # project: internal
+    # project: internal, and not read under --setting-sources user
+    _write_skill(workspace / ".claude" / "skills", "x", user_invocable=False)
 
     out = resolve_harness_skills(_ctx(workspace, home), "claude-native")
-    assert "x" not in [s.name for s in out]
+    assert "x" in [s.name for s in out]
 
 
 def test_claude_provider_string_false_enablement_does_not_enable(

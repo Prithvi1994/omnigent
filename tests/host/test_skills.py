@@ -217,7 +217,12 @@ def test_failed_or_changed_bundle_is_not_cached(tmp_path: Path) -> None:
     assert fetch.call_count == 3
 
 
-def test_directory_catalog_never_downloads_a_session_bundle(tmp_path: Path) -> None:
+def test_directory_catalog_never_downloads_a_session_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The restricted native catalog reads only its user tier; point it at tmp_path.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     directory = tmp_path / ".claude/skills/local"
     directory.mkdir(parents=True)
     (directory / "SKILL.md").write_text(_skill("local"))
