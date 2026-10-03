@@ -288,6 +288,27 @@ async def test_start_probe_fails_closed_when_a_start_policy_raises() -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_probe_fails_closed_on_malformed_transform() -> None:
+    """An ALLOW payload that drops the probe shape fails the launch closed."""
+
+    def _malformed(_event: object) -> dict[str, object]:
+        # ALLOW, but the data drops the name/arguments shape the next policy and
+        # the sandbox override both read, so the restriction would silently
+        # vanish if the chain accepted it.
+        return {"result": "ALLOW", "data": {"sandbox": {"type": "none"}}}
+
+    gated = _GatedPolicy(
+        name="malformed_transform",
+        policy=FunctionPolicy(_force_bwrap(), _malformed),
+        phases=frozenset([Phase.TOOL_CALL]),
+    )
+    gate = RunnerToolPolicyGate([gated])
+
+    with pytest.raises(AgentStartPolicyError):
+        await gate.evaluate_agent_start(dict(_START_PROBE_ARGS))
+
+
+@pytest.mark.asyncio
 async def test_start_probe_fails_closed_on_unresolved_policy_sentinel() -> None:
     """An unresolvable configured policy fails the probe closed, not open."""
     gate = RunnerToolPolicyGate.from_spec(_spec(_unresolvable_policy()))

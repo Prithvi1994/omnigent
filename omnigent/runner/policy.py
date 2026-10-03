@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Literal
 
@@ -261,17 +262,19 @@ class RunnerToolPolicyGate:
         remaining policies still contribute their transforms.
 
         A policy the runner could not evaluate is treated differently from a
-        clean verdict. If a tool-phase policy raised, or failed to resolve and
-        was replaced by the fail-closed sentinel, its intended transform is
-        unknown, so the probe fails closed rather than launching with a
-        possibly-dropped sandbox restriction.
+        clean verdict. If a tool-phase policy raised, failed to resolve and was
+        replaced by the fail-closed sentinel, or returned a transform that does
+        not preserve the probe's ``name``/``arguments`` shape, its intended
+        effect is unknown, so the probe fails closed rather than launching with
+        a possibly-dropped sandbox restriction.
 
         :param arguments: Probe arguments, e.g. ``{"agent_name": "...",
             "harness": "claude-sdk", "sandbox": {...}}``.
         :returns: The composed replacement payload, or ``None`` when no
             policy transformed the probe.
-        :raises AgentStartPolicyError: When a tool-phase policy raised or
-            failed to resolve while evaluating the probe.
+        :raises AgentStartPolicyError: When a tool-phase policy raised, failed
+            to resolve, or returned a malformed start transform while
+            evaluating the probe.
         """
         ctx = EvaluationContext(
             phase=Phase.TOOL_CALL,
@@ -316,6 +319,24 @@ class RunnerToolPolicyGate:
                 )
                 continue
             if result.data is not None:
+                if (
+                    not isinstance(result.data, Mapping)
+                    or result.data.get("name") != AGENT_START_TOOL
+                    or not isinstance(result.data.get("arguments"), Mapping)
+                ):
+                    # A malformed transform would chain into the next policy and
+                    # the sandbox override as a silent no-op, dropping the
+                    # restriction. Fail closed to keep the start transform honest.
+                    _logger.error(
+                        "runner policy %r returned a malformed %s transform; "
+                        "refusing agent start",
+                        gated.name,
+                        AGENT_START_TOOL,
+                        extra={"session_id": runner_primary_session_id()},
+                    )
+                    raise AgentStartPolicyError(
+                        gated.name, "returned a malformed start transform"
+                    )
                 composed_data = result.data
                 ctx = replace(ctx, content=composed_data)
         return composed_data
