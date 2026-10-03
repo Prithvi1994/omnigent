@@ -2407,8 +2407,11 @@ def create_runner_app(
             try:
                 _start_data = await _evaluate_agent_start_gate(spec, harness_name)
             except AgentStartPolicyError as exc:
+                # The gate raises without logging; this is the single record of
+                # the failure. exc_info keeps any underlying policy traceback.
                 _logger.error(
                     "Runner session initialization failed",
+                    exc_info=True,
                     extra=debug_event(
                         "runner_session_init_failed",
                         stage="session_init",

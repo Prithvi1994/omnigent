@@ -292,11 +292,6 @@ class RunnerToolPolicyGate:
                 # The configured policy never resolved, so its intended launch
                 # transform is unknown. Refuse to start rather than risk running
                 # the agent with a sandbox restriction silently dropped.
-                _logger.error(
-                    "runner policy %r failed to resolve; refusing agent start",
-                    gated.name,
-                    extra={"session_id": runner_primary_session_id()},
-                )
                 raise AgentStartPolicyError(gated.name, "failed to resolve")
             try:
                 result: PolicyResult = await gated.policy.evaluate(ctx, {})
@@ -304,12 +299,6 @@ class RunnerToolPolicyGate:
                 # Same fail-closed reasoning: a transform policy such as
                 # enforce_sandbox that raised here would otherwise be dropped,
                 # launching the agent with its weaker declared sandbox.
-                _logger.exception(
-                    "runner policy %r raised on the %s probe; refusing agent start",
-                    gated.name,
-                    AGENT_START_TOOL,
-                    extra={"session_id": runner_primary_session_id()},
-                )
                 raise AgentStartPolicyError(gated.name, "raised on the start probe") from exc
             if result.action != PolicyAction.ALLOW:
                 _logger.warning(
@@ -330,12 +319,6 @@ class RunnerToolPolicyGate:
                     # A malformed transform would chain into the next policy and
                     # the sandbox override as a silent no-op, dropping the
                     # restriction. Fail closed to keep the start transform honest.
-                    _logger.error(
-                        "runner policy %r returned a malformed %s transform; refusing agent start",
-                        gated.name,
-                        AGENT_START_TOOL,
-                        extra={"session_id": runner_primary_session_id()},
-                    )
                     raise AgentStartPolicyError(gated.name, "returned a malformed start transform")
                 composed_data = result.data
                 ctx = replace(ctx, content=composed_data)

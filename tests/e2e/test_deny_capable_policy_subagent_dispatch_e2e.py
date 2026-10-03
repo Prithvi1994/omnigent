@@ -205,6 +205,27 @@ def _wait_for_dispatch_result(
     )
 
 
+def _assert_launching_subagent_handle(result: str) -> None:
+    """Assert the dispatch output is a launching sub-agent handle."""
+    try:
+        handle = json.loads(result)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(
+            f"Expected a JSON sub-agent handle from the dispatch; got: {result!r}"
+        ) from exc
+    assert isinstance(handle, dict), f"Expected a JSON object handle; got: {result!r}"
+    assert handle.get("status") == "launching", (
+        f"Expected status 'launching' from the dispatch; got: {handle!r}"
+    )
+    assert handle.get("kind") == "sub_agent", (
+        f"Expected kind 'sub_agent' from the dispatch; got: {handle!r}"
+    )
+    task_id = handle.get("task_id")
+    assert isinstance(task_id, str) and task_id, (
+        f"Expected a nonempty task id from the dispatch; got: {handle!r}"
+    )
+
+
 def test_deny_capable_policy_allows_subagent_dispatch(
     http_client: httpx.Client,
     live_runner_id: str,
@@ -247,10 +268,7 @@ def test_deny_capable_policy_allows_subagent_dispatch(
         "Deny-capable-policy dispatch must NOT hit the inbox error (the "
         f"policy ALLOWs sys_session_send); got: {result!r}"
     )
-    assert "launching" in result or "task_id" in result or "kind" in result, (
-        "Expected a launching sub-agent handle from the deny-capable-policy "
-        f"dispatch; got: {result!r}"
-    )
+    _assert_launching_subagent_handle(result)
 
 
 def test_allow_only_policy_allows_subagent_dispatch(
@@ -294,6 +312,4 @@ def test_allow_only_policy_allows_subagent_dispatch(
     assert _INBOX_ERROR not in result, (
         f"Control (all-ALLOW policy) dispatch must NOT hit the inbox error; got: {result!r}"
     )
-    assert "launching" in result or "task_id" in result or "kind" in result, (
-        f"Expected a launching sub-agent handle from the control dispatch; got: {result!r}"
-    )
+    _assert_launching_subagent_handle(result)
