@@ -810,6 +810,14 @@ async def test_native_config_launch_ignores_binding_but_keeps_explicit_model(
     monkeypatch.setattr(
         "omnigent.inference_config.resolve_bound_model", _resolve_bound_model_must_not_run
     )
+
+    def _claude_launch_catalog_must_not_run(*_a: object, **_k: object) -> object:
+        raise AssertionError("claude_launch_catalog ran on the native-config path")
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog",
+        _claude_launch_catalog_must_not_run,
+    )
     monkeypatch.setattr("omnigent.config.load_effective_config", dict)
     monkeypatch.setattr(orchestration, "resolve_cli_binary", lambda _: None)
     monkeypatch.setattr(diagnostics, "ClaudeDebugLogFollower", lambda _: Mock())
