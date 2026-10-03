@@ -202,7 +202,6 @@ def test_deep_backfill_observes_external_config_and_launch_agents(
     assert ledger is not None
     assert ledger.entries.injected_external_config[0].path == str(cursor_config)
     assert ledger.entries.injected_external_config[0].marker == "mcpServers.omnigent"
-    assert ledger.entries.launch_agents[0].path == str(launch_agent)
     assert [entry.path for entry in ledger.entries.launch_agents] == [
         str(launch_agent),
         str(systemd_unit),

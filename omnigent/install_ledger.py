@@ -14,7 +14,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-from omnigent.host.service import LAUNCHD_LABEL, SYSTEMD_UNIT
+from omnigent.host.service import (
+    LAUNCHD_LABEL,
+    SYSTEMD_UNIT,
+    launchd_plist_path,
+    systemd_unit_path,
+)
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 SCHEMA_VERSION = 1
@@ -493,14 +498,9 @@ def observed_launch_agents(*, deep: bool) -> list[LaunchAgentEntry]:
     """
     if not deep:
         return []
-    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     known_units = (
-        (
-            "launchd",
-            Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist",
-            LAUNCHD_LABEL,
-        ),
-        ("systemd_user", config_home / "systemd" / "user" / SYSTEMD_UNIT, SYSTEMD_UNIT),
+        ("launchd", launchd_plist_path(), LAUNCHD_LABEL),
+        ("systemd_user", systemd_unit_path(), SYSTEMD_UNIT),
     )
     return [
         LaunchAgentEntry(
