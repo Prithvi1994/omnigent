@@ -16,12 +16,14 @@ global OpenCode config on the host -> connect a host daemon -> create a
 host-bound ``opencode-native-ui`` session -> the runner boots ``opencode serve``
 with the synthesized + merged config -> ask the spawned server which providers
 it has (``GET /config/providers``, the list the attached TUI offers in its model
-picker). One case keeps the provider in ``opencode.json`` under an
-``opencode.jsonc`` pin; the other keeps it in ``config.json`` alone. The exact
-file-name discovery is also unit-tested in ``tests/test_opencode_native_provider.py``
-and ``tests/test_opencode_native_bridge.py``.
+picker). Which file names are discovered (including ``config.json``) and how
+their contents merge is covered by the unit tests in
+``tests/test_opencode_native_provider.py`` and
+``tests/test_opencode_native_bridge.py``; this journey exercises the identical
+spawned-server boundary once, through the ``opencode.json``/``opencode.jsonc``
+split.
 
-Each test first checks the ground truth on the installed binary (``opencode
+The test first checks the ground truth on the installed binary (``opencode
 debug config`` on the same files) so a future upstream change in OpenCode's
 merge semantics fails loudly as a rig error instead of blaming Omnigent.
 
@@ -313,42 +315,4 @@ def test_user_provider_in_opencode_json_reaches_spawned_server(
     assert "gpt-4" in (my_gateway.get("models") or {}), (
         f"Provider {_PROVIDER_ID!r} reached the spawned server without its models map: "
         f"{json.dumps(my_gateway)[:400]}"
-    )
-
-
-@pytest.mark.timeout(420)
-def test_user_provider_in_config_json_reaches_spawned_server(
-    http_client: httpx.Client,
-    tmp_path: Path,
-    live_server: str,
-) -> None:
-    """A provider declared only in ``config.json`` must reach the spawned server.
-
-    OpenCode loads ``~/.config/opencode/config.json`` first in its global merge
-    (legacy configs migrate into it), so a user with their provider there and
-    nothing else expects a working session. The spawned server must expose that
-    provider.
-    """
-    home = tmp_path / "home"
-    cfg_dir = home / ".config" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "config.json").write_text(
-        json.dumps({"provider": _PROVIDER_BLOCK}), encoding="utf-8"
-    )
-
-    ground_truth = _opencode_cli_effective_config(home)
-    assert _PROVIDER_ID in ground_truth.get("provider", {}), (
-        "rig failure: the installed opencode CLI does not load config.json into its "
-        "effective global config; this test's premise does not hold for it. "
-        f"Effective config: {json.dumps(ground_truth)[:800]}"
-    )
-
-    provider_ids, _payload, effective = _run_session_and_get_providers(
-        http_client, tmp_path, live_server, home
-    )
-
-    assert _PROVIDER_ID in provider_ids, (
-        f"The provider declared in config.json never reached the session's spawned "
-        f"`opencode serve`.\nProviders seen by the spawned server: {provider_ids}\n"
-        f"Spawned server effective config: {json.dumps(effective)[:800]}"
     )
