@@ -16,6 +16,7 @@ import {
   UserPlusIcon,
 } from "lucide-react";
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
+import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -42,6 +43,8 @@ import { MOBILE_GLASS_PILL, MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import { useCallback, useEffect, useRef, useState } from "react";
+
+const RIGHT_PANEL_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
 
 /**
  * Gating flags + handlers for the mobile workspace-rail entries (Files ·
@@ -118,6 +121,8 @@ interface ChatHeaderProps {
   subAgentName?: string | null;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
+  /** Effective access to the active session. */
+  permissionLevel?: number | null;
   /** Owner-managed top-level row backing the title-adjacent action menu. */
   actionConversation?: Conversation | null;
   /**
@@ -306,6 +311,7 @@ export function ChatHeader({
   isChildSession,
   subAgentName,
   conversationId,
+  permissionLevel,
   actionConversation = null,
   conversationTitle,
   projectName,
@@ -643,7 +649,11 @@ export function ChatHeader({
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
         {!pending && conversationId && (
-          <AgentInfoButton agent={boundAgent} sessionId={conversationId} />
+          <AgentInfoButton
+            agent={boundAgent}
+            sessionId={conversationId}
+            permissionLevel={permissionLevel}
+          />
         )}
         {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
             null otherwise. Renders on every shell, iOS included. */}
@@ -806,6 +816,7 @@ export function ChatHeader({
                 variant="ghost"
                 size="icon-xs"
                 aria-label={rightPanelOpen ? "Collapse right panel" : "Expand right panel"}
+                aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+]`}
                 onClick={onToggleRightPanel}
                 componentId="chat.header.toggle_right_panel"
                 className="hidden md:inline-flex text-muted-foreground hover:text-foreground border-none"
@@ -817,8 +828,8 @@ export function ChatHeader({
                 )}
               </Button>
             </TooltipTrigger>
-            <TooltipContent>
-              {rightPanelOpen ? "Collapse right panel" : "Expand right panel"}
+            <TooltipContent shortcut={RIGHT_PANEL_KEYS}>
+              <span>{rightPanelOpen ? "Collapse right panel" : "Expand right panel"}</span>
             </TooltipContent>
           </Tooltip>
         )}
