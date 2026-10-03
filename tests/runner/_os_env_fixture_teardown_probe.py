@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 import psutil
 import pytest
@@ -36,6 +37,20 @@ def live_helper_pids() -> set[int]:
     return pids
 
 
+def wait_for_helpers_to_exit(started: set[int], timeout: float = 2.0) -> set[int]:
+    """Return the pids in *started* still alive after *timeout* seconds.
+
+    ``close()`` may escalate to ``kill()`` without waiting, so a helper can be
+    observed for a moment after teardown; only one that stays alive is a leak.
+    """
+    deadline = time.monotonic() + timeout
+    remaining = live_helper_pids() & started
+    while remaining and time.monotonic() < deadline:
+        time.sleep(0.05)
+        remaining = live_helper_pids() & started
+    return remaining
+
+
 def _watched(item: pytest.Item) -> list[str]:
     if not os.environ.get("OMNIGENT_FIXTURE_PROBE_LOG"):
         return []
@@ -59,7 +74,9 @@ def pytest_runtest_teardown(item: pytest.Item) -> None:
     record = {
         "test": item.nodeid,
         "fixtures": fixtures,
-        "helpers_alive_after_teardown": sorted(live_helper_pids() - before),
+        "helpers_alive_after_teardown": sorted(
+            wait_for_helpers_to_exit(live_helper_pids() - before)
+        ),
     }
     with open(os.environ["OMNIGENT_FIXTURE_PROBE_LOG"], "a", encoding="utf-8") as handle:
         handle.write(json.dumps(record) + "\n")

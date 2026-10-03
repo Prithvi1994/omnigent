@@ -10,10 +10,9 @@ import pytest
 
 pytest_plugins = ["pytester"]
 
-# Reuses the real fixtures so the test exercises the fixtures under test, not
-# copies of them. Each test first proves its operation started a helper, so the
-# teardown check cannot pass vacuously; the last one fails during setup after a
-# helper started, so cleanup on the setup-error path is checked too.
+# Reuses the real fixtures so the test exercises the fixtures under test. Each
+# test proves its operation started a helper (so the teardown check cannot pass
+# vacuously); the last one fails during setup to cover that cleanup path too.
 _TOUCH_FILESYSTEM = """
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 import pytest

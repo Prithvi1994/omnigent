@@ -23,7 +23,7 @@ from omnigent.runner import create_runner_app
 from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
-from tests.runner._os_env_fixture_teardown_probe import live_helper_pids
+from tests.runner._os_env_fixture_teardown_probe import live_helper_pids, wait_for_helpers_to_exit
 from tests.runner.helpers import NullServerClient
 
 OsEnvFactory = Callable[[OSEnvSpec], OSEnvironment]
@@ -2185,7 +2185,7 @@ async def test_git_runner_client_stops_its_helper_on_exit(tmp_path: Path) -> Non
         assert resp.status_code == 200, resp.text
         started = live_helper_pids() - before
         assert started, "the filesystem request should have started a helper"
-    assert not (live_helper_pids() & started), "helper outlived _git_runner_client"
+    assert not wait_for_helpers_to_exit(started), "helper outlived _git_runner_client"
 
 
 @pytest.mark.asyncio
