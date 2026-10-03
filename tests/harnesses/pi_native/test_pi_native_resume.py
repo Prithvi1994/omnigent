@@ -255,6 +255,55 @@ def test_dedup_is_scoped_per_call_id() -> None:
     assert results == [("c1", "A"), ("c2", "B")]
 
 
+def _nearest_tool_call_ids(entries: list[dict[str, Any]], index: int) -> set[str]:
+    """Tool call ids of the assistant entry Anthropic would pair entry *index* with."""
+    for prev in reversed(entries[:index]):
+        role = prev["message"]["role"]
+        if role == "toolResult":
+            continue
+        if role != "assistant":
+            return set()
+        return {
+            block["id"] for block in prev["message"]["content"] if block.get("type") == "toolCall"
+        }
+    return set()
+
+
+def test_parallel_tool_results_stay_adjacent_to_their_calls() -> None:
+    """One response with text plus two tool calls rebuilds with each toolResult
+    directly after the assistant entry holding its toolCall; Anthropic rejects a
+    tool_result whose tool_use is not in the immediately preceding assistant message.
+    """
+    items = [
+        _user_item("read both files", item_id="u1"),
+        _assistant_item("Reading both files now.", item_id="a1"),
+        _function_call_item(name="read", call_id="c1", arguments='{"path":"a"}', item_id="fc1"),
+        _function_call_item(name="read", call_id="c2", arguments='{"path":"b"}', item_id="fc2"),
+        _function_output_item(call_id="c1", output="A", item_id="fo1"),
+        _function_output_item(call_id="c2", output="B", item_id="fo2"),
+        _assistant_item("Read both.", item_id="a2"),
+    ]
+    records = pi_session_records_from_session_items(
+        items,
+        session_id="conv_abc",
+        external_session_id=_EXTERNAL_ID,
+        cwd=Path("/repo"),
+    )
+    entries = records[1:]
+    results = [(i, e) for i, e in enumerate(entries) if e["message"]["role"] == "toolResult"]
+    assert [e["message"]["toolCallId"] for _, e in results] == ["c1", "c2"]
+    roles = [e["message"]["role"] for e in entries]
+    for index, entry in results:
+        call_id = entry["message"]["toolCallId"]
+        assert call_id in _nearest_tool_call_ids(entries, index), (
+            f"toolResult {call_id} is not adjacent to the assistant entry holding its "
+            f"toolCall; rebuilt roles: {roles}"
+        )
+    assert entries[0]["parentId"] is None
+    for prev, cur in itertools.pairwise(entries):
+        assert cur["parentId"] == prev["id"]
+
+
 def test_full_tool_roundtrip_chains_correctly() -> None:
     items = [
         _user_item("run ls", item_id="u1"),
