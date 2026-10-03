@@ -215,7 +215,12 @@ def _canonical_problems(
             f"{label}: the canonical bang user message lands after its exec's command item "
             f"(message at {bang_index}, command item at {exec_index})"
         ]
-    between = [str(items[i].get("type")) for i in range(bang_index + 1, exec_index)]
+    # Resource bookkeeping is not part of the conversation order.
+    between = [
+        str(items[i].get("type"))
+        for i in range(bang_index + 1, exec_index)
+        if items[i].get("type") != "resource_event"
+    ]
     if between:
         return [
             f"{label}: {between} separate the canonical bang user message (at {bang_index}) "
