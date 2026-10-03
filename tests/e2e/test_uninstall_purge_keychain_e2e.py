@@ -179,6 +179,7 @@ class PurgeOutcome:
     purge: subprocess.CompletedProcess[str]
     payload: dict[str, object]
     secret_after_purge: str | None
+    lookup_after_purge: subprocess.CompletedProcess[str]
 
 
 @pytest.fixture(scope="module")
@@ -200,12 +201,24 @@ def purge_outcome(tmp_path_factory: pytest.TempPathFactory) -> PurgeOutcome:
 
     after = keyring_get(env, KEYRING_SERVICE, SECRET_NAME)
     secret = after.stdout.strip() or None
-    return PurgeOutcome(home=home, purge=purge, payload=payload, secret_after_purge=secret)
+    return PurgeOutcome(
+        home=home,
+        purge=purge,
+        payload=payload,
+        secret_after_purge=secret,
+        lookup_after_purge=after,
+    )
 
 
 def test_purge_deletes_keychain_secret(purge_outcome: PurgeOutcome) -> None:
     assert purge_outcome.secret_after_purge is None, (
         f"keychain entry {KEYRING_SERVICE}/{SECRET_NAME} survived `uninstall state --purge`"
+    )
+    lookup = purge_outcome.lookup_after_purge
+    # `keyring get` exits 1 silently for a clean miss; a broken backend prints a traceback.
+    assert lookup.returncode == 1 and "Traceback" not in lookup.stderr, (
+        lookup.returncode,
+        lookup.stderr,
     )
 
 

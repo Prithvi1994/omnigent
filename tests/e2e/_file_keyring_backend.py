@@ -17,14 +17,13 @@ import keyring.backend
 import keyring.errors
 
 STORE_ENV = "OMNIGENT_TEST_KEYRING_FILE"
-_DEFAULT_STORE = ".test-keychain.json"
 
 
 def store_path() -> Path:
     configured = os.environ.get(STORE_ENV)
-    if configured:
-        return Path(configured)
-    return Path.home() / _DEFAULT_STORE
+    if not configured:
+        raise RuntimeError(f"{STORE_ENV} must name the JSON store when FileKeyring is selected")
+    return Path(configured)
 
 
 def _key(service: str, username: str) -> str:

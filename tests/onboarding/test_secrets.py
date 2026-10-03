@@ -156,8 +156,8 @@ def test_working_keyring_does_not_read_corrupt_fallback(
 def test_delete_secret_reports_whether_anything_was_removed() -> None:
     secrets.store_secret("openrouter", "sk-or-value")
 
-    assert secrets.delete_secret("openrouter") is True
-    assert secrets.delete_secret("openrouter") is False
+    assert secrets.delete_secret("openrouter") == secrets.SecretDeletion(removed=True)
+    assert secrets.delete_secret("openrouter") == secrets.SecretDeletion(removed=False)
 
 
 def test_delete_secret_keyring_delete_counts_as_removed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -167,11 +167,11 @@ def test_delete_secret_keyring_delete_counts_as_removed(monkeypatch: pytest.Monk
         keyring, "delete_password", lambda service, username: deleted.append((service, username))
     )
 
-    assert secrets.delete_secret("anthropic") is True
+    assert secrets.delete_secret("anthropic") == secrets.SecretDeletion(removed=True)
     assert deleted == [("omnigent", "anthropic")]
 
 
-def test_delete_secret_fails_when_keyring_entry_survives(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_delete_secret_reports_a_surviving_keyring_entry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("OMNIGENT_DISABLE_KEYRING")
 
     def delete_password(service: str, username: str) -> None:
@@ -180,8 +180,9 @@ def test_delete_secret_fails_when_keyring_entry_survives(monkeypatch: pytest.Mon
     monkeypatch.setattr(keyring, "delete_password", delete_password)
     monkeypatch.setattr(keyring, "get_password", lambda service, username: "still-there")
 
-    with pytest.raises(OmnigentError, match="still holds 'anthropic'"):
-        secrets.delete_secret("anthropic")
+    assert secrets.delete_secret("anthropic") == secrets.SecretDeletion(
+        removed=False, survives=True
+    )
 
 
 def test_delete_secret_absent_keyring_entry_still_clears_file_copy(
@@ -196,7 +197,7 @@ def test_delete_secret_absent_keyring_entry_still_clears_file_copy(
     monkeypatch.setattr(keyring, "delete_password", delete_password)
     monkeypatch.setattr(keyring, "get_password", lambda service, username: None)
 
-    assert secrets.delete_secret("anthropic") is True
+    assert secrets.delete_secret("anthropic") == secrets.SecretDeletion(removed=True)
     assert secrets._read_secrets_file() == {}
 
 
@@ -204,7 +205,7 @@ def test_delete_secret_absent_keyring_entry_still_clears_file_copy(
     "error_type",
     [keyring.errors.NoKeyringError, keyring.errors.KeyringLocked, keyring.errors.KeyringError],
 )
-def test_delete_secret_inaccessible_keyring_without_file_copy_is_an_error(
+def test_delete_secret_reports_an_inaccessible_keyring(
     monkeypatch: pytest.MonkeyPatch, error_type: type[keyring.errors.KeyringError]
 ) -> None:
     monkeypatch.delenv("OMNIGENT_DISABLE_KEYRING")
@@ -214,10 +215,28 @@ def test_delete_secret_inaccessible_keyring_without_file_copy_is_an_error(
 
     monkeypatch.setattr(keyring, "delete_password", delete_password)
 
-    with pytest.raises(OmnigentError, match=error_type.__name__) as raised:
-        secrets.delete_secret("anthropic")
+    assert secrets.delete_secret("anthropic") == secrets.SecretDeletion(
+        removed=False, keyring_error=error_type.__name__
+    )
 
-    assert "desktop session unavailable" not in str(raised.value)
+
+def test_delete_secret_refused_delete_with_unreadable_keyring_is_inaccessible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("OMNIGENT_DISABLE_KEYRING")
+
+    def delete_password(service: str, username: str) -> None:
+        raise keyring.errors.PasswordDeleteError("denied")
+
+    def get_password(service: str, username: str) -> str:
+        raise keyring.errors.KeyringLocked("locked")
+
+    monkeypatch.setattr(keyring, "delete_password", delete_password)
+    monkeypatch.setattr(keyring, "get_password", get_password)
+
+    assert secrets.delete_secret("anthropic") == secrets.SecretDeletion(
+        removed=False, keyring_error="KeyringLocked"
+    )
 
 
 def test_delete_secret_inaccessible_keyring_still_clears_file_copy(
@@ -231,5 +250,27 @@ def test_delete_secret_inaccessible_keyring_still_clears_file_copy(
 
     monkeypatch.setattr(keyring, "delete_password", delete_password)
 
-    assert secrets.delete_secret("anthropic") is True
+    assert secrets.delete_secret("anthropic") == secrets.SecretDeletion(
+        removed=True, keyring_error="KeyringLocked"
+    )
     assert secrets._read_secrets_file() == {}
+
+
+def test_delete_secret_keeps_keyring_delete_when_file_store_is_corrupt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("OMNIGENT_DISABLE_KEYRING")
+    monkeypatch.setattr(keyring, "delete_password", lambda service, username: None)
+    (tmp_path / "secrets.json").write_text("invalid JSON")
+
+    assert secrets.delete_secret("anthropic") == secrets.SecretDeletion(
+        removed=True, file_error="JSONDecodeError"
+    )
+
+
+def test_delete_secret_reports_corrupt_file_store_without_keyring_entry(tmp_path: Path) -> None:
+    (tmp_path / "secrets.json").write_text("invalid JSON")
+
+    assert secrets.delete_secret("anthropic") == secrets.SecretDeletion(
+        removed=False, file_error="JSONDecodeError"
+    )
