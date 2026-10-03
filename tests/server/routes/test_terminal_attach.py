@@ -644,7 +644,18 @@ async def test_attach_terminal_runner_close_propagates_close_code(
     assert exc_info.value.code == 4404
 
 
-async def test_attach_terminal_registry_abort_sends_wire_valid_close(app: FastAPI) -> None:
+@pytest.mark.parametrize("trigger", ["deregister", "newest_wins_replace"])
+async def test_attach_terminal_registry_abort_sends_wire_valid_close(
+    app: FastAPI, trigger: str
+) -> None:
+    """Both runner-tunnel abort producers close the browser with retryable 1011,
+    never the reserved abnormal-closure code 1006.
+
+    ``deregister`` retires the tunnel; ``newest_wins_replace`` is a second tunnel
+    for the same runner_id winning (RUNNER.md §2). Both abort the attached
+    channel through the same path. Driven with a fake runner socket and no
+    network, model, or tmux.
+    """
     from websockets.frames import OP_CLOSE, Close, Frame
 
     from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
@@ -656,16 +667,16 @@ async def test_attach_terminal_registry_abort_sends_wire_valid_close(app: FastAP
             pass
 
     registry = TunnelRegistry()
+    hello = HelloFrame(runner_version="test", frame_protocol_version=1)
 
     @asynccontextmanager
     async def factory(path: str):
-        session = registry.register(
-            "runner",
-            _RunnerSocket(),
-            HelloFrame(runner_version="test", frame_protocol_version=1),
-        )
+        session = registry.register("runner", _RunnerSocket(), hello)
         async with _TunneledWSConn(registry=registry, session=session, runner_path=path) as conn:
-            registry.deregister("runner", session=session)
+            if trigger == "deregister":
+                registry.deregister("runner", session=session)
+            else:
+                registry.register("runner", _RunnerSocket(), hello)
             yield conn
 
     set_runner_ws_factory(factory)
@@ -724,93 +735,6 @@ async def test_attach_terminal_normalizes_runner_close_metadata(
     closed = exc_info.value
     assert (closed.code, closed.reason) == (expected_code, expected_reason)
     Frame(OP_CLOSE, Close(closed.code, closed.reason).serialize()).serialize(mask=False)
-
-
-async def test_attach_terminal_tunnel_replacement_sends_wire_valid_close(app: FastAPI) -> None:
-    """A newest-wins tunnel replacement under an attached terminal must also
-    close the browser with a wire-valid code, not the reserved 1006.
-
-    This is the second abort producer named in the report: ``TunnelRegistry``
-    replacing an older session for the same runner_id (``register``) aborts the
-    old session's in-flight channels through the same path as ``deregister``.
-    Driven with fake runner sockets and no network, model, or tmux.
-    """
-    import asyncio
-    import time as _time
-
-    from websockets.exceptions import ProtocolError
-    from websockets.frames import Close
-
-    from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
-    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
-    from omnigent.server._runner_ws_tunnel import _TunneledWSConn
-
-    registry = TunnelRegistry()
-    runner_id = "runner_replace_test"
-    hello = HelloFrame(
-        runner_version="0.1.0-test",
-        frame_protocol_version=1,
-        harnesses=["test"],
-        envs=["test"],
-    )
-
-    class _FakeRunnerWS:
-        async def send_text(self, data: str) -> None:
-            return None
-
-        async def close(self, *, code: int = 1000, reason: str = "") -> None:
-            return None
-
-    created: dict[str, object] = {}
-
-    def factory(path: str):
-        if "session" not in created:
-            created["session"] = registry.register(runner_id, _FakeRunnerWS(), hello)
-        return _TunneledWSConn(
-            registry=registry,
-            session=created["session"],  # type: ignore[arg-type]
-            runner_path=path,
-        )
-
-    set_runner_ws_factory(factory)
-
-    with TestClient(app).websocket_connect(
-        "/v1/sessions/conv_replace/resources/terminals/terminal_bash_main/attach"
-    ) as ws:
-        deadline = _time.monotonic() + 10
-        old_session = None
-        while _time.monotonic() < deadline:
-            old_session = created.get("session")
-            if old_session is not None and old_session.ws_channels:  # type: ignore[attr-defined]
-                break
-            _time.sleep(0.02)
-        assert old_session is not None and old_session.ws_channels, (  # type: ignore[attr-defined]
-            "proxy never opened a tunnel WS channel"
-        )
-
-        # A new tunnel for the same runner_id wins (RUNNER.md section 2) and
-        # aborts the old session's attached channel. register() must run on the
-        # server loop, so schedule it onto the channel's owner loop.
-        async def _reregister() -> object:
-            return registry.register(runner_id, _FakeRunnerWS(), hello)
-
-        asyncio.run_coroutine_threadsafe(
-            _reregister(),
-            old_session.loop,  # type: ignore[attr-defined]
-        ).result(timeout=5)
-
-        with pytest.raises(WebSocketDisconnect) as exc_info:
-            ws.receive_bytes()
-
-    code = exc_info.value.code
-    reason = exc_info.value.reason or ""
-
-    try:
-        Close(code, reason).check()
-    except ProtocolError as exc:
-        pytest.fail(f"browser received a wire-invalid close code {code!r}: {exc}")
-    assert code != 1006, f"browser received the reserved abnormal-closure code {code!r}"
-    assert reason == "tunnel aborted", f"abort reason not forwarded to browser: {reason!r}"
 
 
 # ── WS attach: local fallback when no ws factory ─────────

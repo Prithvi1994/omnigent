@@ -32,6 +32,11 @@ _WS_CLOSE_UNEXPECTED_CONDITION: Final[int] = 1011
 _WS_CLOSE_APPLICATION_MIN: Final[int] = 3000
 _WS_CLOSE_APPLICATION_MAX: Final[int] = 4999
 _WS_CLOSE_REASON_MAX_BYTES: Final[int] = 123
+# RFC 6455 close codes legal in a close frame on the wire; mirrors websockets'
+# EXTERNAL_CLOSE_CODES (excludes reserved 1004/1005/1006/1015).
+_WS_CLOSE_WIRE_CODES: Final[frozenset[int]] = frozenset(
+    {1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014}
+)
 
 # A local tmux liveness probe should never stall bridge teardown.
 _TMUX_HAS_SESSION_TIMEOUT_S: Final[float] = 2.0
@@ -45,10 +50,8 @@ def normalize_ws_close(code: int | None, reason: str | None) -> tuple[int, str]:
     :returns: A legal code and at most 123 complete UTF-8 reason bytes.
         Missing or non-wire codes become retryable 1011.
     """
-    from websockets.frames import EXTERNAL_CLOSE_CODES
-
     if code is not None and (
-        code in EXTERNAL_CLOSE_CODES
+        code in _WS_CLOSE_WIRE_CODES
         or _WS_CLOSE_APPLICATION_MIN <= code <= _WS_CLOSE_APPLICATION_MAX
     ):
         wire_code = code
