@@ -4151,9 +4151,7 @@ def _paste_and_submit(
             "paste into Claude Code. The message was not delivered."
         )
     if payload.endswith(b"\\"):
-        # A draft ending in "\" turns the submit Enter into a line continuation;
-        # a CR inside the paste absorbs it. No other message gets one: Claude Code
-        # collapses a paste holding three or more line breaks into a placeholder.
+        # Append a CR only when a trailing backslash would consume the submit Enter.
         payload += b"\r"
     delivery_diagnostics.set_stage("pasting")
     # Clear stale text first: raw controls can otherwise become pasted text.

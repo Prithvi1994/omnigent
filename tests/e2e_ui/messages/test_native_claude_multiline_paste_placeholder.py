@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import time
 import uuid
 from collections.abc import Callable
@@ -36,7 +35,6 @@ from .test_native_claude_render_parity import (
 _log = logging.getLogger(__name__)
 
 _PROMPT_GLYPH = "❯"
-_PLACEHOLDER_RE = re.compile(r"\[Pasted text #\d+[^\]]*\]")
 _TURN_TIMEOUT_MS = 90_000
 _TUI_READY_TIMEOUT_S = 120.0
 
@@ -90,10 +88,6 @@ def _input_line(pane: str) -> str:
     return rows[-1] if rows else ""
 
 
-def _placeholders(pane: str) -> set[str]:
-    return set(_PLACEHOLDER_RE.findall(pane))
-
-
 def _wait_pane(
     base_url: str,
     session_id: str,
@@ -131,8 +125,6 @@ def _send_multiline(page: Page, lines: tuple[str, ...]) -> None:
 def _send_case(
     page: Page,
     *,
-    base_url: str,
-    session_id: str,
     mock_llm_server_url: str,
     label: str,
     lines: tuple[str, ...],
@@ -144,29 +136,7 @@ def _send_case(
     set_fallback_mock_llm(mock_llm_server_url, "default", token)
     set_fallback_mock_llm(mock_llm_server_url, _CLAUDE_MOCK_MODEL, token)
     _ensure_chat_view(page)
-    known_placeholders = _placeholders(_pane_text(base_url, session_id))
     _send_multiline(page, lines)
-
-    # Watch the input box while the bridge pastes and submits. The draft is
-    # visible only until the submit Enter lands, so it is logged, not asserted.
-    _open_terminal_view(page)
-    _wait_terminal_connected(page)
-    draft = _wait_pane(
-        base_url,
-        session_id,
-        lambda pane: nonce in pane or bool(_placeholders(pane) - known_placeholders),
-        timeout_s=30,
-    )
-    _log.info("%s: input box while delivered: %r", label, _input_line(draft or ""))
-    # The submit has landed once the input box is back to the bare prompt.
-    _wait_pane(
-        base_url,
-        session_id,
-        lambda pane: _input_line(pane) in ("", _PROMPT_GLYPH),
-        timeout_s=10,
-    )
-
-    _ensure_chat_view(page)
     expect(page.locator(_ASSISTANT, has_text=token).first).to_be_visible(timeout=_TURN_TIMEOUT_MS)
     expect(page.locator(_WORKING)).to_have_count(0, timeout=_TURN_TIMEOUT_MS)
     expect(page.locator(_USER)).to_have_count(expected_user_bubbles, timeout=30_000)
@@ -212,8 +182,6 @@ def test_native_claude_multiline_message_stays_readable_in_terminal(
         first_lines[label] = lines[0]
         history[label] = _send_case(
             page,
-            base_url=base_url,
-            session_id=session_id,
             mock_llm_server_url=mock_llm_server_url,
             label=label,
             lines=lines,
@@ -245,6 +213,8 @@ def test_native_claude_multiline_message_stays_readable_in_terminal(
             "three-line message (two line breaks) recorded in Claude Code history as "
             f"{history['two-line-breaks']} instead of its text"
         )
-    if not recalled_line.endswith(first_lines["two-line-breaks"]):
+    if recalled is None:
+        problems.append("ArrowUp did not change the input box within the timeout")
+    elif not recalled_line.endswith(first_lines["two-line-breaks"]):
         problems.append(f"ArrowUp recalled {recalled_line!r} instead of the message text")
     assert not problems, "\n".join(problems)
