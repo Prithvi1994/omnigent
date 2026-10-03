@@ -20,9 +20,10 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -34,12 +35,13 @@ from tests.e2e._native_resume_helpers import (
 )
 
 pytestmark = pytest.mark.skipif(
-    shutil.which("claude") is None or shutil.which("tmux") is None,
-    reason="needs `claude` and `tmux` on PATH to launch a native tmux terminal",
+    sys.platform != "linux" or shutil.which("claude") is None or shutil.which("tmux") is None,
+    reason="needs Linux /proc plus `claude` and `tmux` on PATH to launch a native tmux terminal",
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _BOOT_TIMEOUT_S = 180.0
+_TEARDOWN_TIMEOUT_S = 30.0
 _STRIP_EXACT = frozenset(
     {
         "OMNIGENT",
@@ -191,6 +193,19 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _wait_until(predicate: Callable[[], bool], timeout_s: float) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.5)
+    return predicate()
+
+
+def _terminal_gone(socket_path: str, pane_pids: list[int]) -> bool:
+    return not _server_alive(socket_path) and not any(_pid_alive(pid) for pid in pane_pids)
+
+
 def _wait_for_terminal(install: _ScratchInstall, handle: PtyHandle) -> tuple[str, list[int]]:
     deadline = time.monotonic() + _BOOT_TIMEOUT_S
     while time.monotonic() < deadline:
@@ -253,7 +268,8 @@ def test_native_terminal_outlives_stop_and_uninstall(scratch_install: _ScratchIn
 
     stop = install.run_cli("stop", timeout=180)
     assert stop.returncode == 0, f"omnigent stop failed: {stop.stdout}\n{stop.stderr}"
-    time.sleep(10)  # the graceful daemon -> runner -> kill-server chain gets its full grace
+    # Teardown can trail the command, so poll to a deadline instead of a fixed grace.
+    _wait_until(lambda: _terminal_gone(socket_path, pane_pids), _TEARDOWN_TIMEOUT_S)
     server_after_stop = _server_alive(socket_path)
     claude_after_stop = [pid for pid in pane_pids if _pid_alive(pid)]
 
@@ -261,7 +277,7 @@ def test_native_terminal_outlives_stop_and_uninstall(scratch_install: _ScratchIn
     assert uninstall.returncode == 0, (
         f"omnigent uninstall failed: {uninstall.stdout}\n{uninstall.stderr}"
     )
-    time.sleep(5)
+    _wait_until(lambda: _terminal_gone(socket_path, pane_pids), _TEARDOWN_TIMEOUT_S)
     assert not (install.home / ".omnigent").exists()
     server_after_uninstall = _server_alive(socket_path)
     claude_after_uninstall = [pid for pid in pane_pids if _pid_alive(pid)]
