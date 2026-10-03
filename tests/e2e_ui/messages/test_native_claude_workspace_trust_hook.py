@@ -134,12 +134,14 @@ def test_unreviewed_project_hook_does_not_run_at_startup(
         if session_id is not None:
             with contextlib.suppress(Exception):
                 httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        reset_mock_llm(mock_llm_server_url)
+        with contextlib.suppress(Exception):
+            reset_mock_llm(mock_llm_server_url)
         shutil.rmtree(workspace, ignore_errors=True)
         if respawned is not None:
-            respawned.terminate()
-            try:
-                respawned.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                respawned.kill()
-                respawned.wait(timeout=5)
+            with contextlib.suppress(Exception):
+                respawned.terminate()
+                try:
+                    respawned.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    respawned.kill()
+                    respawned.wait(timeout=5)

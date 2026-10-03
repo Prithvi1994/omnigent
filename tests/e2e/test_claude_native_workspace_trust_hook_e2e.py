@@ -91,20 +91,25 @@ def _drive_claude_startup(
 
     master_out, slave_out = pty.openpty()
     master_in, slave_in = pty.openpty()
-    proc = subprocess.Popen(
-        launch_args,
-        stdin=slave_in,
-        stdout=slave_out,
-        stderr=slave_out,
-        cwd=str(workspace),
-        env={**env, "TERM": "xterm-256color"},
-    )
-    os.close(slave_out)
-    os.close(slave_in)
-
+    open_fds = [master_out, master_in, slave_out, slave_in]
     buf = b""
-    deadline = time.time() + _LAUNCH_BUDGET_S
     try:
+        proc = subprocess.Popen(
+            launch_args,
+            stdin=slave_in,
+            stdout=slave_out,
+            stderr=slave_out,
+            cwd=str(workspace),
+            env={**env, "TERM": "xterm-256color"},
+        )
+        # Drop our copies of the slave ends so master reads EOF once the CLI
+        # exits; the child keeps its own.
+        os.close(slave_out)
+        os.close(slave_in)
+        open_fds.remove(slave_out)
+        open_fds.remove(slave_in)
+
+        deadline = time.time() + _LAUNCH_BUDGET_S
         while time.time() < deadline:
             if marker.exists():
                 break
@@ -119,7 +124,6 @@ def _drive_claude_startup(
                 buf += chunk
         # Give a just-launched hook a beat to flush its marker.
         time.sleep(1.0)
-    finally:
         # Still running here means Claude booted into its interactive wait; an
         # already-exited process crashed before SessionStart, so marker absence
         # would not prove the gate held.
@@ -129,8 +133,10 @@ def _drive_claude_startup(
             proc.wait(timeout=5)
         except (subprocess.TimeoutExpired, OSError):
             proc.kill()
-            proc.wait(timeout=5)
-        for fd in (master_out, master_in):
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                proc.wait(timeout=5)
+    finally:
+        for fd in open_fds:
             with contextlib.suppress(OSError):
                 os.close(fd)
 
@@ -180,8 +186,8 @@ def _seed_unreviewed_workspace(
         encoding="utf-8",
     )
 
-    # omnigent's real pre-launch trust seed. No prompt, no confirmation --- and
-    # it lands in the launch HOME, not an isolated home.
+    # omnigent's real pre-launch trust seed: no prompt, no confirmation, and it
+    # lands in the same HOME the launched CLI reads (fake_home, set above).
     ensure_claude_workspace_trusted(workspace)
 
     claude_config = json.loads((fake_home / ".claude.json").read_text(encoding="utf-8"))
