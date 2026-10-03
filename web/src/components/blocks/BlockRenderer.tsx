@@ -789,6 +789,16 @@ function renderItem(
           <FilePathAwareMessageResponse mode={isTextStreaming ? "streaming" : "static"}>
             {item.text}
           </FilePathAwareMessageResponse>
+          {item.previewInterrupted && item.itemId?.startsWith("live:") && (
+            <div
+              role="status"
+              aria-live="polite"
+              data-testid="stream-interruption-notice"
+              className="mt-1 select-none text-xs text-muted-foreground"
+            >
+              Live output interrupted. Full response will appear when complete.
+            </div>
+          )}
         </div>
       );
     case "reasoning":
@@ -863,6 +873,7 @@ function renderItem(
       return (
         <ErrorBanner
           key={key}
+          itemId={item.itemId}
           message={item.message}
           source={item.source}
           code={item.code}
@@ -870,7 +881,17 @@ function renderItem(
           cause={item.cause}
           remediation={item.remediation}
           level={item.level}
-          onRetry={onRetryError ? () => onRetryError(item) : undefined}
+          relatedErrors={item.relatedErrors}
+          onRetry={
+            onRetryError
+              ? (actionableError) =>
+                  onRetryError(
+                    actionableError.itemId === item.itemId && actionableError.code === item.code
+                      ? item
+                      : { kind: "error", ...actionableError },
+                  )
+              : undefined
+          }
         />
       );
     case "policy_denied":
