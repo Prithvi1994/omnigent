@@ -809,6 +809,9 @@ class ClaudeTranscriptItem:
         handback; transported separately from model-visible message content.
     :param agent_message_candidate: Unproven team-shaped user text; the server
         must correlate it by text without draining unrelated pending input.
+    :param shell_command_echo: The user-message echo of a ``!`` shell exec. A
+        bang typed in the terminal queues no web input, so the server must
+        drain only an exact pending match, never the oldest entry.
     """
 
     source_id: str
@@ -819,6 +822,7 @@ class ClaudeTranscriptItem:
     is_compact_noop: bool = False
     subagent_return_id: str | None = None
     agent_message_candidate: bool = False
+    shell_command_echo: bool = False
 
 
 @dataclass(frozen=True)
@@ -8395,7 +8399,9 @@ def _bang_echo_item(
     previous reply, the exec cards, and the follow-up reply all merge
     into one assistant bubble, and a web-composer bang's optimistic
     bubble has no persisted message to reconcile against (its
-    pending-input entry is drained by this echo's persist).
+    pending-input entry is drained by this echo's persist). The echo
+    carries the composer's exact text, so that drain matches by text; a
+    bang typed in the terminal matches nothing and drains nothing.
 
     :param content: Transcript markup carrying ``<bash-input>``.
     :param source_key: Base transcript record key used for source ids.
@@ -8414,6 +8420,7 @@ def _bang_echo_item(
             "content": [{"type": "input_text", "text": f"!{input_match.group(1)}"}],
         },
         response_id=response_id,
+        shell_command_echo=True,
     )
 
 

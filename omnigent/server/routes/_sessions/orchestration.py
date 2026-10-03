@@ -2752,9 +2752,13 @@ async def _persist_external_conversation_item_unlocked(
         # to the oldest entry, except for Kiro, whose prompt text is exact.
         text = _message_text(item.data.content) or ""
         agent_message_candidate = body.data.get("agent_message_candidate") is True
+        # A ``!`` shell exec typed in the terminal mirrors like a web one but
+        # queued nothing, so a positional drain would hand it another user's
+        # message. Like ambiguous team markup, it may only drain an exact match.
+        exact_match_only = agent_message_candidate or body.data.get("shell_command_echo") is True
         matched = pending_inputs.resolve_matching_text(session_id, text, hold=True)
         drained = matched.matched
-        if agent_message_candidate:
+        if exact_match_only:
             # Ambiguous markup can be direct terminal input. Only its exact
             # pending match is evidence of a web submission; preserve others.
             held_older = [*matched.skipped, *matched.uncertain]
@@ -2769,7 +2773,7 @@ async def _persist_external_conversation_item_unlocked(
             # message would brand everything queued in between undelivered.
             # Leave the older entries queued for a later mirror instead.
             held_older = [*matched.skipped, *matched.uncertain]
-        if drained is None and not agent_message_candidate and not _is_kiro_native_session(conv):
+        if drained is None and not exact_match_only and not _is_kiro_native_session(conv):
             drained = pending_inputs.resolve_oldest(session_id, hold=True)
             if drained is not None:
                 # The mirror's true owner may be any entry still queued, so none

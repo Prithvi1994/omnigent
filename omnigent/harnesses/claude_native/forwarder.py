@@ -1810,6 +1810,7 @@ def _external_conversation_item_event(item: ClaudeTranscriptItem) -> dict[str, o
                 else {}
             ),
             **({"agent_message_candidate": True} if item.agent_message_candidate else {}),
+            **({"shell_command_echo": True} if item.shell_command_echo else {}),
         },
     }
 
@@ -5195,6 +5196,7 @@ async def _post_external_conversation_item(
                         else {}
                     ),
                     **({"agent_message_candidate": True} if item.agent_message_candidate else {}),
+                    **({"shell_command_echo": True} if item.shell_command_echo else {}),
                 },
             },
         )

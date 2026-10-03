@@ -3059,6 +3059,11 @@ def test_read_transcript_items_since_bang_exec_opens_its_own_turn(
         "role": "user",
         "content": [{"type": "input_text", "text": "! echo probe"}],
     }
+    # Only the echo is flagged: the server drains a pending web input for it
+    # by exact text alone, so a terminal-typed bang cannot take another
+    # user's queued message.
+    assert echo.shell_command_echo is True
+    assert not any(item.shell_command_echo for item in items if item is not echo)
     prior_reply = items[1]
     assert echo.response_id != prior_reply.response_id
     assert echo.response_id == items[3].response_id == items[4].response_id
