@@ -286,8 +286,6 @@ def pi_session_records_from_session_items(
             continue
         blocks = _pi_assistant_blocks_from_item(item)
         if blocks is None:
-            # Not part of an assistant response, so any open response ended.
-            flush_group()
             if item.get("type") == "function_call_output":
                 call_id = item.get("call_id")
                 if isinstance(call_id, str) and call_id:
@@ -304,6 +302,10 @@ def pi_session_records_from_session_items(
                 timestamp=timestamp,
             )
             if entry is not None:
+                # Only a replayable entry ends the open response. An item that maps
+                # to nothing (e.g. reasoning) must not split the response, or its
+                # parallel tool results would be orphaned from their calls again.
+                flush_group()
                 append_entry(entry)
             continue
         rid = response_id if isinstance(response_id, str) and response_id else None

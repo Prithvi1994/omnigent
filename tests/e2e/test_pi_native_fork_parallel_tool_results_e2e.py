@@ -597,13 +597,9 @@ def pi_fork_rig(
     shared_env["NO_PROXY"] = _merged_no_proxy(shared_env)
     shared_env["no_proxy"] = shared_env["NO_PROXY"]
 
-    # The runner-owned pi tmux socket lives under
-    # ``tempfile.mkdtemp(prefix="omnigent-terminal-")``, which honors TMPDIR.
-    # A Unix domain socket path is capped at ~108 bytes (``sun_path``); a deep
-    # checkout/tmp prefix (e.g. a nested worktree or ``tmp_path_factory`` root)
-    # blows that limit and pi-native fails to launch with ``tmux launch failed
-    # ... File name too long``. Pin a short ``/tmp`` base for the stack so the
-    # socket path stays well under the limit regardless of the ambient TMPDIR.
+    # pi's tmux socket path (under TMPDIR) is capped at ~108 bytes (sun_path);
+    # a deep worktree/tmp prefix overflows it and tmux fails with "File name too
+    # long". Pin a short /tmp base so the socket path stays under the limit.
     short_tmp = Path(tempfile.mkdtemp(prefix="pi-fork-", dir="/tmp"))
     for _tmp_key in ("TMPDIR", "TMP", "TEMP"):
         shared_env[_tmp_key] = str(short_tmp)
@@ -983,9 +979,8 @@ def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
         _send_message(base_url, fork_id, f"What did the tools return? {_FOLLOWUP_MARKER}")
 
         # --- Step 4: the clone's provider request must honor Anthropic's
-        # pairing contract. With the bug the rebuilt history orphans the
-        # parallel tool results and the sidecar answers with the real API's
-        # HTTP 400; the assertion names the orphaned tool_use ids.
+        # pairing contract. With the bug the rebuilt history orphans the parallel
+        # results and the sidecar answers HTTP 400, naming the orphaned ids.
         record = _wait_for_request(
             pi_sidecar,
             lambda r: _FOLLOWUP_MARKER in _last_user_text(r),
@@ -1001,6 +996,32 @@ def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
             "tool_result blocks' and the clone cannot continue: "
             f"{record['violations']}."
         )
+
+        # The clone must actually carry the parallel pair, so ``not violations``
+        # cannot pass on an empty or stripped rebuild: each call id appears once
+        # as a tool_use and once as its paired tool_result.
+        history = record["body"].get("messages", [])
+        use_ids = [
+            b.get("id")
+            for m in history
+            for b in (m.get("content") or [])
+            if isinstance(b, dict) and b.get("type") == "tool_use"
+        ]
+        result_ids = [
+            b.get("tool_use_id")
+            for m in history
+            for b in (m.get("content") or [])
+            if isinstance(b, dict) and b.get("type") == "tool_result"
+        ]
+        for call_id in (_CALL_ID_A, _CALL_ID_B):
+            assert use_ids.count(call_id) == 1, (
+                f"rebuilt history has {use_ids.count(call_id)} tool_use blocks for "
+                f"{call_id} (expected exactly 1): tool_use={use_ids}"
+            )
+            assert result_ids.count(call_id) == 1, (
+                f"rebuilt history has {result_ids.count(call_id)} tool_result blocks for "
+                f"{call_id} (expected exactly 1): tool_result={result_ids}"
+            )
 
         # And the user-visible outcome: the clone's turn completes.
         _wait_for_items(

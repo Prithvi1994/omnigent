@@ -392,6 +392,58 @@ def test_parallel_tool_calls_merge_into_one_assistant_message() -> None:
     assert [r["id"] for r in records[1:]] == [r["id"] for r in again[1:]]
 
 
+def test_reasoning_between_parallel_calls_keeps_results_adjacent() -> None:
+    # A reasoning item has no Pi entry. Interleaved between two parallel calls
+    # of one response it must not end the response, or the results would be
+    # orphaned behind a second assistant message again.
+    items = [
+        _user_item("read both files", item_id="u1", response_id="pi-user-1"),
+        _function_call_item(
+            name="read",
+            call_id="call_a",
+            arguments='{"path": "alpha.txt"}',
+            item_id="fc_a",
+            response_id="r-tools",
+        ),
+        {"type": "reasoning", "id": "re1", "response_id": "r-tools", "content": "thinking"},
+        _function_call_item(
+            name="read",
+            call_id="call_b",
+            arguments='{"path": "beta.txt"}',
+            item_id="fc_b",
+            response_id="r-tools",
+        ),
+        _function_output_item(
+            call_id="call_a", output="alpha", item_id="fo_a", response_id="r-tools"
+        ),
+        _function_output_item(
+            call_id="call_b", output="beta", item_id="fo_b", response_id="r-tools"
+        ),
+        _assistant_item("Both files read.", item_id="a2", response_id="r-final"),
+    ]
+    records = pi_session_records_from_session_items(
+        items, session_id="conv_abc", external_session_id=_EXTERNAL_ID, cwd=Path("/repo")
+    )
+    entries = records[1:]
+    assert [e["message"]["role"] for e in entries] == [
+        "user",
+        "assistant",
+        "toolResult",
+        "toolResult",
+        "assistant",
+    ]
+    merged = entries[1]["message"]
+    assert [(b["type"], b.get("id")) for b in merged["content"]] == [
+        ("toolCall", "call_a"),
+        ("toolCall", "call_b"),
+    ]
+    for index, entry in enumerate(entries):
+        if entry["message"]["role"] != "toolResult":
+            continue
+        call_id = entry["message"]["toolCallId"]
+        assert call_id in _nearest_tool_call_ids(entries, index)
+
+
 def test_response_text_between_call_and_result_stays_with_the_call() -> None:
     # A single call whose response text is stored between the call and its
     # output: the text must merge into the call's assistant message rather
