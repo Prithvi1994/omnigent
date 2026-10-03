@@ -453,6 +453,10 @@ def test_advanced_settings_sheet_stays_below_ios_safe_area(
         if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
             page.wait_for_timeout(1_500)
 
+        assert sheet.evaluate("el => el.scrollHeight > el.clientHeight"), (
+            f"the {label} advanced-settings page fits the menu, so the safe-area cap is "
+            "not exercised"
+        )
         assert sheet_box["y"] >= safe_top, (
             f"the {label} advanced-settings sheet starts at y={sheet_box['y']:.0f}px, inside "
             f"the {safe_top}px iOS status-bar safe area; its Back row is at "

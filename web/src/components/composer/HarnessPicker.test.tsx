@@ -206,6 +206,8 @@ describe("HarnessPicker", () => {
 
   it("opens the mobile configuration page at the top of a scrolled menu", () => {
     render(<PickerFixture mobile />);
+    // Opening a menu must (re)attach the shared safe-area boundary.
+    getSafeAreaCollisionBoundary().remove();
     fireEvent.pointerDown(screen.getByRole("button", { name: "Harness" }), { button: 0 });
     const menu = screen.getByTestId("menu");
     expect(getSafeAreaCollisionBoundary().isConnected).toBe(true);

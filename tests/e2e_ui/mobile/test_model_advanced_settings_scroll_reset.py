@@ -49,6 +49,7 @@ def _scroll_list_to_end(page: Page, menu: Locator) -> int:
     :returns: The resulting scroll offset, which must be positive.
     """
     menu.hover()
+    state = {"top": 0, "max": 0}
     for _ in range(40):
         page.mouse.wheel(0, 400)
         state = menu.evaluate(
@@ -109,7 +110,9 @@ def test_drill_in_page_opens_at_top_of_scrolled_list(
         trigger.click()
         back = page.get_by_test_id("new-chat-landing-page-back")
         expect(back).to_be_visible()
-        assert page.evaluate("() => window.__scrollAtTap") == scrolled, (
+        scroll_at_tap = page.evaluate("() => window.__scrollAtTap")
+        assert scroll_at_tap is not None, "no pointerdown reached the menu before the page opened"
+        assert scroll_at_tap == scrolled, (
             "the harness list was no longer at its end when the control was tapped"
         )
         menu_box = _settled_box(page, menu)
