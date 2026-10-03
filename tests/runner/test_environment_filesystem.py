@@ -16,7 +16,11 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
-from omnigent.entities.environment_filesystem import FilesystemPathNotFound, PathUnreachable
+from omnigent.entities.environment_filesystem import (
+    FilesystemPathNotFound,
+    PathUnreachable,
+    PermissionDenied,
+)
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
 from omnigent.inner.sandbox import ReachableRoot
@@ -2349,6 +2353,11 @@ def test_resolve_browse_target_can_judge_a_symlink_by_where_it_sits(tmp_path: Pa
         resolve_browse_target(
             str(intruder), roots, unconfined=False, need_write=True, follow_leaf=False
         )
+    for leaf in (".", ".."):
+        with pytest.raises(PathUnreachable):
+            resolve_browse_target(
+                f"{grant}/{leaf}", roots, unconfined=False, need_write=True, follow_leaf=False
+            )
 
 
 @pytest.mark.asyncio
@@ -2373,6 +2382,41 @@ async def test_delete_absolute_routes_grant_covered_paths_through_the_helper(
     assert not inside.exists() and not outside.exists()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "shell_result",
+    [
+        pytest.param({"error": "os_env helper failed", "exit_code": None}, id="helper-error"),
+        pytest.param(
+            {"stdout": "", "stderr": "Traceback: boom", "exit_code": 1}, id="nonzero-exit"
+        ),
+        pytest.param({"stdout": "not json", "stderr": "", "exit_code": 0}, id="malformed-output"),
+    ],
+)
+async def test_delete_absolute_unconfirmed_helper_reply_is_an_error_not_a_success(
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shell_result: dict[str, object],
+) -> None:
+    os_env = registry._primary_envs["conv_test"]
+
+    async def failing_shell(command: str, **kwargs: object) -> dict[str, object]:
+        return dict(shell_result)
+
+    monkeypatch.setattr(os_env, "shell", failing_shell)
+    victim = workspace / "victim.txt"
+    victim.write_text("still here\n")
+
+    resp = await client.request("DELETE", _absolute_delete_url(victim))
+
+    assert resp.status_code == 500, resp.text
+    assert resp.json()["error"]["code"] == "resource_error"
+    assert "not confirmed" in resp.json()["error"]["message"]
+    assert victim.exists()
+
+
 def test_delete_nofollow_without_dir_fd_support_is_unsupported(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2389,7 +2433,7 @@ def test_delete_nofollow_without_dir_fd_support_is_unsupported(
     assert plain.exists()
 
 
-def test_delete_nofollow_recursive_needs_python_3_11_in_the_helper(
+def test_delete_nofollow_recursive_needs_a_symlink_safe_rmtree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2397,7 +2441,7 @@ def test_delete_nofollow_recursive_needs_python_3_11_in_the_helper(
 
     tree = tmp_path / "tree"
     (tree / "sub").mkdir(parents=True)
-    monkeypatch.setattr(sys, "version_info", (3, 10, 0, "final", 0))
+    monkeypatch.setattr(shutil.rmtree, "avoids_symlink_attacks", False)
 
     refused = _delete_nofollow(str(tree), True)
     removed = _delete_nofollow(str(tree / "sub"), False)
@@ -2405,6 +2449,69 @@ def test_delete_nofollow_recursive_needs_python_3_11_in_the_helper(
     assert refused["code"] == "unsupported"
     assert removed == {"deleted": True, "type": "directory", "bytes_deleted": None}
     assert tree.is_dir() and not (tree / "sub").exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_absolute_via_helper_does_not_depend_on_ambient_python3(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shipped script runs under the runner's interpreter: a broken or old
+    ``python3`` on the helper's PATH must not affect a grant-covered delete."""
+    shims = tmp_path / "shims"
+    shims.mkdir()
+    shim = shims / "python3"
+    shim.write_text("#!/bin/sh\necho 'ambient python3 must not be used' >&2\nexit 1\n")
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shims}{os.pathsep}{os.environ['PATH']}")
+    ws = tmp_path / "workspace"
+    (ws / "tree" / "sub").mkdir(parents=True)
+    (ws / "tree" / "sub" / "file.txt").write_text("bye\n")
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    reg = SessionResourceRegistry()
+    reg._primary_envs["conv_test"] = os_env
+    app = create_runner_app(
+        resource_registry=reg,
+        runner_workspace=ws,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    helper_targets = _record_helper_deletes(monkeypatch)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            resp = await client.request(
+                "DELETE", _absolute_delete_url(ws / "tree", recursive=True)
+            )
+    finally:
+        os_env.close()
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["type"] == "directory"
+    assert helper_targets == [str(ws / "tree")]
+    assert not (ws / "tree").exists()
+
+
+@pytest.mark.asyncio
+async def test_permission_denied_from_a_filesystem_operation_is_403(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def refuse(self: CallerProcessFilesystem, path: str, *, recursive: bool = False) -> None:
+        raise PermissionDenied(f"Write access to {path!r} is blocked by sandbox")
+
+    monkeypatch.setattr(CallerProcessFilesystem, "delete", refuse)
+
+    resp = await client.request("DELETE", _absolute_delete_url("/anything/at/all.txt"))
+
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"] == {
+        "code": "permission_denied",
+        "message": "Write access to '/anything/at/all.txt' is blocked by sandbox",
+    }
 
 
 @pytest.mark.asyncio

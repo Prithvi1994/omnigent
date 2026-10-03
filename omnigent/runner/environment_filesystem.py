@@ -15,6 +15,7 @@ import base64
 import os
 import re
 import stat
+import sys
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal, ParamSpec, cast
@@ -244,8 +245,8 @@ def _delete_nofollow(path: str, recursive: bool) -> dict[str, object]:
     without ``dir_fd`` support (Windows) get ``unsupported`` rather than a
     path-based fallback, whose check-then-act gap would reintroduce the bug.
 
-    Self-contained on purpose: the sandboxed helper runs this function's
-    source in its own ``python3``, so it must not use module-level names.
+    Imports stay inside this function because its source executes in the
+    sandboxed helper.
 
     :param path: Normalized absolute path of the entry to remove.
     :param recursive: Remove a directory together with its contents.
@@ -256,7 +257,6 @@ def _delete_nofollow(path: str, recursive: bool) -> dict[str, object]:
     import os
     import shutil
     import stat
-    import sys
 
     if not (
         all(op in os.supports_dir_fd for op in (os.open, os.stat, os.unlink, os.rmdir))
@@ -298,11 +298,11 @@ def _delete_nofollow(path: str, recursive: bool) -> dict[str, object]:
         if stat.S_ISDIR(st.st_mode):
             if not recursive:
                 os.rmdir(name, dir_fd=fd)
-            elif sys.version_info >= (3, 11):
+            elif shutil.rmtree.avoids_symlink_attacks:
                 shutil.rmtree(name, dir_fd=fd)
             else:
                 return {
-                    "error": "Recursive delete needs Python 3.11 or newer in the sandbox",
+                    "error": "Recursive delete needs a symlink-safe rmtree on this platform",
                     "code": "unsupported",
                 }
             entry_type = "directory"
@@ -599,9 +599,11 @@ def _contained_entry(candidate: str, prefix: str) -> str | None:
     :param candidate: Absolute path of the entry.
     :param prefix: Boundary from :func:`omnigent.inner.sandbox.containment_prefix`.
     :returns: The entry's path with its parent resolved, or ``None`` when it
-        lies outside *prefix*.
+        lies outside *prefix* or its leaf is ``.`` or ``..``.
     """
     parent, name = os.path.split(candidate.rstrip(os.sep) or os.sep)
+    if name in (".", ".."):
+        return None
     probe = os.path.join(os.path.realpath(parent), name)
     if not probe.endswith(os.sep):
         probe += os.sep
@@ -1609,11 +1611,13 @@ print(json.dumps({'r': results, 't': truncated}))
     async def _helper_delete_nofollow(self, target: str, *, recursive: bool) -> OpResult:
         """Run :func:`_delete_nofollow` inside the sandboxed helper.
 
-        The helper's ``python3`` cannot import this package, so the script
-        carries the function's source; ``-I`` keeps a workspace ``json.py``
-        or ``shutil.py`` from shadowing the standard library. As in
-        ``_helper_stat``, the path rides as a JSON literal inside a
-        shell-quoted script and never reaches the shell as bare text.
+        The script carries the function's source and runs under the runner's
+        own interpreter, which the helper itself was launched with and so is
+        visible inside the sandbox, rather than PATH's ``python3``; ``-I``
+        keeps a workspace ``json.py`` or ``shutil.py`` from shadowing the
+        standard library. As in ``_helper_stat``, the path rides as a JSON
+        literal inside a shell-quoted script and never reaches the shell as
+        bare text.
 
         :param target: Normalized absolute path of the entry to remove.
         :param recursive: Remove a directory together with its contents.
@@ -1636,7 +1640,7 @@ print(json.dumps({'r': results, 't': truncated}))
         )
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -I -c {_shell_quote(script)}",
+            f"{_shell_quote(sys.executable)} -I -c {_shell_quote(script)}",
         )
         unconfirmed = f"Delete completion was not confirmed for {target!r}"
         if "error" in result or result.get("exit_code", 1) != 0:
@@ -1656,15 +1660,10 @@ print(json.dumps({'r': results, 't': truncated}))
     async def _delete_absolute(self, path: str, *, recursive: bool) -> DeleteFilesystemResult:
         """Delete the entry an absolute *path* names, following no symlink.
 
-        Authorization stays owner-only at the server. Here the parents are
-        resolved once, as every other filesystem route resolves them, and the
-        grants are checked against that entry with its leaf unfollowed, since
-        the entry rather than its target is what gets removed. The same
-        resolved entry is handed to :func:`_delete_nofollow`, whose walk
-        refuses a component that turns into a symlink afterwards. The
-        mutation runs in-process when the path was admitted only because the
-        environment is unconfined and otherwise inside the sandboxed helper so
-        its policy still applies.
+        Resolve the parents once (as every other route does), authorize the
+        entry with its leaf unfollowed, then hand that entry to
+        :func:`_delete_nofollow` through the sandboxed helper, or in-process
+        only when the environment is unconfined.
 
         :param path: Absolute path supplied by the caller.
         :param recursive: Remove a directory together with its contents.
@@ -1737,6 +1736,8 @@ print(json.dumps({'r': results, 't': truncated}))
         :raises InvalidPath: If attempting to delete the root.
         :raises FilesystemPathNotFound: If the path does not exist.
         :raises DirectoryNotEmpty: If non-empty without recursive.
+        :raises PathUnreachable: Absolute route only; see :meth:`_delete_absolute`,
+            which can also raise :class:`PermissionDenied` and :class:`ResourceError`.
         """
         if self._absolute(path):
             return await self._delete_absolute(path, recursive=recursive)
