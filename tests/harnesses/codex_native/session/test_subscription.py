@@ -18,10 +18,13 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
 )
 from tests.harnesses.codex_native.session._support import (
+    _agent_message_event,
+    _completed_event,
     _elicitation_tracker,
     _expected_status_data,
     _FakeCodexAppServerClient,
     _recording_forwarder_client,
+    _started_event,
     _usage_coalescer,
     _write_forwarder_bridge,
 )
@@ -577,6 +580,132 @@ def test_subscribe_until_ready_replays_completed_turn_status(
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id is None
+
+
+class _FreshThreadRaceClient:
+    """App-server double for the fresh-thread resume race.
+
+    A freshly created thread has no rollout, so the first ``thread/resume``
+    fails and the subscribe task parks. The thread's first turn then starts
+    live, releasing the park; the retry ``thread/resume`` lands inside the
+    MCP-startup window, where Codex returns the *just-started* turn with a
+    terminal status (``active_turn_present=false``) even though it is still
+    running and completes ~40-50s later.
+    """
+
+    def __init__(self, resume_turn_status: str) -> None:
+        self.resume_turn_status = resume_turn_status
+        self.connected = False
+        self.closed = False
+        self._resume_calls = 0
+        self.second_resume_issued = asyncio.Event()
+
+    async def connect(self) -> None:
+        self.connected = True
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method != "thread/resume":
+            return {"result": {}}
+        self._resume_calls += 1
+        if self._resume_calls == 1:
+            raise RuntimeError(
+                "{'code': -32600, 'message': 'no rollout found for thread id thread_123'}"
+            )
+        self.second_resume_issued.set()
+        # Codex returns the just-started turn as terminal under
+        # active_turn_present=false; the forwarder keys off turn status.
+        return {
+            "result": {
+                "active_turn_present": False,
+                "thread": {
+                    "id": "thread_123",
+                    "turns": [{"id": "turn_abc", "status": self.resume_turn_status, "items": []}],
+                },
+            }
+        }
+
+    async def iter_events(self):
+        yield _started_event("turn_abc")
+        # Let the resume-backfill terminal-status decision settle before the
+        # real turn end arrives (same cooperative-drain idiom as the parks
+        # test above), so ordering is deterministic without wall-clock waits.
+        await self.second_resume_issued.wait()
+        for _ in range(50):
+            await asyncio.sleep(0)
+        yield _agent_message_event("turn_abc", "item_agent", "the real worker answer")
+        yield _completed_event("turn_abc", thread_id="thread_123")
+
+    async def respond(self, *_args: Any, **_kwargs: Any) -> None:
+        pass
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.parametrize("resume_turn_status", ["completed", "interrupted", "cancelled"])
+def test_supervise_forwarder_resume_does_not_finish_a_just_started_turn(
+    resume_turn_status: str,
+    tmp_path: Path,
+) -> None:
+    """A just-started, still-live turn must not be finished by resume state.
+
+    Unlike the reconnect-after-completion case above, here the forwarder
+    observes the turn's live ``turn/started`` and its real ``turn/completed``
+    arrives afterward with output -- so the turn was in flight when the
+    fresh-thread retry ``thread/resume`` reported it terminal. Treating that
+    resume status as a terminal edge publishes a premature ``idle`` before any
+    assistant output, which the runner turns into a ``completed`` /
+    'produced no output' sub-agent while Codex keeps working and the real
+    result is dropped. The turn may only be reported finished at its real end.
+    """
+    _write_forwarder_bridge(tmp_path, active_turn_id=None, thread_id="thread_123")
+    client = _FreshThreadRaceClient(resume_turn_status)
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.content:
+            posted.append(json.loads(request.content))
+        return httpx.Response(202, json={"queued": False})
+
+    async def run() -> None:
+        await codex_native_forwarder.supervise_forwarder(
+            base_url="http://127.0.0.1:8000",
+            headers={},
+            session_id="conv_123",
+            bridge_dir=tmp_path,
+            app_server_url=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            client=client,  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(handler),
+        )
+
+    asyncio.run(run())
+
+    status_edges = [
+        (index, payload["data"].get("status"))
+        for index, payload in enumerate(posted)
+        if payload.get("type") == "external_session_status"
+        and payload["data"].get("response_id") == "codex_turn_abc"
+    ]
+    first_output_index = next(
+        (
+            index
+            for index, payload in enumerate(posted)
+            if payload.get("type") in ("external_conversation_item", "external_output_text_delta")
+            and "turn_abc" in json.dumps(payload.get("data", {}))
+        ),
+        None,
+    )
+
+    assert first_output_index is not None, "the live turn's real output was never delivered"
+    idle_before_output = [
+        index for index, status in status_edges if status == "idle" and index < first_output_index
+    ]
+    assert not idle_before_output, (
+        "forwarder reported the turn idle before it produced any output "
+        f"(premature thread/resume terminal edge for a still-live turn); "
+        f"status edges={status_edges} first_output_index={first_output_index}"
+    )
 
 
 @pytest.mark.parametrize(

@@ -2790,6 +2790,7 @@ async def _replay_resume_response(
         bridge_dir=bridge_dir,
         thread_id=thread_id,
         turns=turns,
+        replay_from_turn_id=replay_from_turn_id,
     )
 
 
@@ -2814,6 +2815,7 @@ async def _post_resume_terminal_status(
     bridge_dir: Path,
     thread_id: str | None,
     turns: list[object],
+    replay_from_turn_id: str | None = None,
 ) -> None:
     """
     Publish a missing terminal status edge from ``thread/resume`` data.
@@ -2825,15 +2827,24 @@ async def _post_resume_terminal_status(
     live terminal boundary was observed. It deliberately does not infer
     terminal state from transcript items alone.
 
+    Only a reconnect recovering a persisted interrupted turn
+    (*replay_from_turn_id* set) can have missed that boundary. A fresh
+    subscription tracks the turn live via the event stream, so a terminal
+    status in its resume payload is the just-started turn reported terminal
+    during the Codex MCP-startup window (``active_turn_present=false``), not a
+    real end: honoring it would finish a still-live turn before any output.
+
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param bridge_dir: Native Codex bridge directory.
     :param thread_id: Codex thread id from the resume payload, e.g.
         ``"thread_123"``.
     :param turns: Raw Codex resume turn list.
+    :param replay_from_turn_id: Persisted active turn this subscription is
+        recovering, or ``None`` for a fresh subscription.
     :returns: None.
     """
-    if thread_id is None:
+    if thread_id is None or replay_from_turn_id is None:
         return
     edge = _resume_terminal_status_edge_for_latest_turn(bridge_dir, thread_id, turns)
     await _post_turn_status_edge(client, session_id, edge)
