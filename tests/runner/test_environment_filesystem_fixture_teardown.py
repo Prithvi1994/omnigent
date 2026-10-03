@@ -52,7 +52,8 @@ def test_fixture_teardown_stops_the_helper(
     probe_log = tmp_path / "probe.jsonl"
     repo_root = str(Path(__file__).resolve().parents[2])
     monkeypatch.setenv(
-        "PYTHONPATH", os.pathsep.join([repo_root, os.environ.get("PYTHONPATH", "")])
+        "PYTHONPATH",
+        os.pathsep.join(p for p in (repo_root, os.environ.get("PYTHONPATH", "")) if p),
     )
     # Autoload would pull in every installed plugin (pytest-playwright,
     # structlog); the inner run needs only asyncio and the probe.

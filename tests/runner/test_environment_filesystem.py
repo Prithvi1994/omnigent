@@ -23,6 +23,7 @@ from omnigent.runner import create_runner_app
 from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
+from tests.runner._os_env_fixture_teardown_probe import live_helper_pids
 from tests.runner.helpers import NullServerClient
 
 OsEnvFactory = Callable[[OSEnvSpec], OSEnvironment]
@@ -54,8 +55,14 @@ def make_os_env() -> Iterator[OsEnvFactory]:
         return os_env
 
     yield _create
+    failures: list[Exception] = []
     for os_env in created:
-        os_env.close()
+        try:
+            os_env.close()
+        except Exception as exc:
+            failures.append(exc)
+    if failures:
+        raise failures[0]
 
 
 @pytest.fixture
@@ -69,10 +76,12 @@ def registry(workspace: Path) -> Iterator[SessionResourceRegistry]:
         ),
     )
     assert os_env is not None
-    reg = SessionResourceRegistry()
-    reg._primary_envs["conv_test"] = os_env
-    yield reg
-    os_env.close()
+    try:
+        reg = SessionResourceRegistry()
+        reg._primary_envs["conv_test"] = os_env
+        yield reg
+    finally:
+        os_env.close()
 
 
 @pytest.fixture
@@ -1570,15 +1579,15 @@ async def glob_client(glob_workspace: Path) -> AsyncIterator[httpx.AsyncClient]:
         ),
     )
     assert os_env is not None
-    reg = SessionResourceRegistry()
-    reg._primary_envs["conv_test"] = os_env
-    app = create_runner_app(
-        resource_registry=reg,
-        runner_workspace=glob_workspace,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
-    transport = httpx.ASGITransport(app=app)
     try:
+        reg = SessionResourceRegistry()
+        reg._primary_envs["conv_test"] = os_env
+        app = create_runner_app(
+            resource_registry=reg,
+            runner_workspace=glob_workspace,
+            server_client=NullServerClient(),  # type: ignore[arg-type]
+        )
+        transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
             yield c
     finally:
@@ -2148,20 +2157,33 @@ async def _git_runner_client(
         )
     )
     assert os_env is not None
-    reg = SessionResourceRegistry()
-    reg._primary_envs[session_id] = os_env
-    app = create_runner_app(
-        resource_registry=reg,
-        runner_workspace=runner_workspace if runner_workspace is not None else ws,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
     try:
+        reg = SessionResourceRegistry()
+        reg._primary_envs[session_id] = os_env
+        app = create_runner_app(
+            resource_registry=reg,
+            runner_workspace=runner_workspace if runner_workspace is not None else ws,
+            server_client=NullServerClient(),  # type: ignore[arg-type]
+        )
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://runner"
         ) as client:
             yield client
     finally:
         os_env.close()
+
+
+@pytest.mark.asyncio
+async def test_git_runner_client_stops_its_helper_on_exit(tmp_path: Path) -> None:
+    """Leaving ``_git_runner_client`` closes the environment and its helper subprocess."""
+    base = f"/v1/sessions/conv_lifecycle/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    before = live_helper_pids()
+    async with _git_runner_client(tmp_path, "conv_lifecycle") as client:
+        resp = await client.get(f"{base}/filesystem")
+        assert resp.status_code == 200, resp.text
+        started = live_helper_pids() - before
+        assert started, "the filesystem request should have started a helper"
+    assert not (live_helper_pids() & started), "helper outlived _git_runner_client"
 
 
 @pytest.mark.asyncio

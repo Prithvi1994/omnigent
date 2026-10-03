@@ -291,10 +291,16 @@ def test_session_resources_e2e(
     yaml_path.write_text(_AGENT_YAML)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    # Stand in for a shell an Omnigent runner launched: it carries that runner's
+    # workspace and isolation flag, neither of which may reach this session.
+    inherited_workspace = tmp_path / "inherited-workspace"
+    inherited_workspace.mkdir()
     db_path = tmp_path / "test.db"
     binding_token = secrets.token_urlsafe(32)
     runner_id = token_bound_runner_id(binding_token)
     env = dict(mock_credentials_env)
+    env["OMNIGENT_RUNNER_WORKSPACE"] = str(inherited_workspace)
+    env["OMNIGENT_RUNNER_ISOLATE_SESSION"] = "1"
 
     with _omnigent_server(
         python=python,
@@ -471,6 +477,7 @@ def test_session_resources_e2e(
             # Confirm gone
             resp = client.get(f"{fs}/_e2e_test.txt")
             assert resp.status_code == 404
+            assert list(inherited_workspace.iterdir()) == []
 
             # ── Shell execution ───────────────────────────────
             shell_url = f"/v1/sessions/{session_id}/resources/environments/default/shell"
