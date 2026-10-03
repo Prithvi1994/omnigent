@@ -7,6 +7,7 @@ by ``omnigent login``.
 from __future__ import annotations
 
 import contextlib
+import sys
 import time
 
 import pytest
@@ -786,6 +787,118 @@ def test_refresh_stored_token_refused_leaves_entry(token_dir, monkeypatch) -> No
     assert entry["refresh_token"] == "refresh-1"
 
 
+def test_refresh_404_on_loopback_is_quiet(token_dir, monkeypatch, caplog) -> None:
+    """A loopback server without /oauth/token is expected and must stay quiet.
+
+    A local/header-mode dev server has no refresh route, so a near-expiry
+    token would 404 on every reconnect. That case logs at debug (no warning,
+    no misleading "run omnigent login" advice) so it doesn't spam the host
+    daemon's reconnect loop.
+    """
+    import logging
+
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+
+    def _fake_post(url, *, data=None, timeout=None):
+        return httpx.Response(404, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    with caplog.at_level(logging.DEBUG, logger="omnigent.cli_auth"):
+        assert refresh_stored_token("http://localhost:6767") is None
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+    assert any(
+        r.levelno == logging.DEBUG and "no /oauth/token" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_refresh_404_on_remote_warns_without_relogin_advice(
+    token_dir, monkeypatch, caplog
+) -> None:
+    """A remote 404 is still surfaced, but not blamed on credentials.
+
+    A missing /oauth/token route on a real server (wrong URL, or a build
+    without session refresh) is not fixed by re-login, so the warning must
+    not tell the user to run `omnigent login`.
+    """
+    import logging
+
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    url = "https://omni.example.com"
+    store_token(
+        url,
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+
+    def _fake_post(u, *, data=None, timeout=None):
+        return httpx.Response(404, request=httpx.Request("POST", u))
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    with caplog.at_level(logging.WARNING, logger="omnigent.cli_auth"):
+        assert refresh_stored_token(url) is None
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("404" in m for m in warnings)
+    assert not any("omnigent login" in m for m in warnings)
+
+
+def test_safe_log_url_strips_userinfo_and_query() -> None:
+    """The log sanitizer drops credential-bearing URL parts, keeps identity."""
+    from omnigent.cli_auth import _safe_log_url
+
+    # Userinfo and query (both can carry secrets) are removed; scheme, host,
+    # port, and path (the useful, non-secret identity) are kept.
+    assert (
+        _safe_log_url("https://user:s3cr3t@ws.example.com/api/2.0/omnigent?access_token=leak")
+        == "https://ws.example.com/api/2.0/omnigent"
+    )
+    assert _safe_log_url("http://127.0.0.1:6767") == "http://127.0.0.1:6767"
+    # Unparseable input degrades to a placeholder rather than leaking.
+    assert _safe_log_url("not a url") == "<server>"
+
+
+def test_refresh_refusal_log_redacts_url_credentials(token_dir, monkeypatch, caplog) -> None:
+    """A refusal must log the sanitized URL, never embedded credentials."""
+    import logging
+
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    url = "https://user:s3cr3t@omni.example.com/api?access_token=leak"
+    store_token(
+        url,
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+
+    def _fake_post(u, *, data=None, timeout=None):
+        return httpx.Response(403, json={"error": "denied"}, request=httpx.Request("POST", u))
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    with caplog.at_level(logging.WARNING, logger="omnigent.cli_auth"):
+        assert refresh_stored_token(url) is None
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "s3cr3t" not in messages and "leak" not in messages
+    assert "omni.example.com" in messages
+
+
 def test_refresh_stored_token_skips_when_already_fresh(token_dir, monkeypatch) -> None:
     """A concurrent refresher already renewed → return the valid token
     without a network call (the lock-then-recheck path)."""
@@ -928,3 +1041,44 @@ def test_refresh_rejects_unusable_response_fields(token_dir, monkeypatch) -> Non
     assert refresh_stored_token("http://localhost:6767") == "fresh"
     entry = json.loads((token_dir / "auth_tokens.json").read_text())["http://localhost:6767"]
     assert entry["expires_at"] < time.time() + 4000
+
+
+def _purge_tui_sdk_modules() -> None:
+    """Drop loaded ``omnigent_ui_sdk`` modules so the no-import assertions
+    below hold regardless of what earlier tests imported."""
+    for mod_name in list(sys.modules):
+        if mod_name == "omnigent_ui_sdk" or mod_name.startswith("omnigent_ui_sdk."):
+            sys.modules.pop(mod_name, None)
+
+
+def test_token_file_path_honors_data_dir_without_tui_sdk(tmp_path, monkeypatch) -> None:
+    """The token-path lookup must not import the prompt_toolkit-laden TUI SDK.
+
+    Every CLI startup that touches auth calls this; routing it through
+    ``omnigent_ui_sdk.terminal`` (-> prompt_toolkit -> XML parsing ->
+    pyexpat) crashed the CLI outright on interpreters whose ``pyexpat``
+    extension cannot load.
+    """
+    from omnigent.cli_auth import _token_file_path
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    _purge_tui_sdk_modules()
+
+    assert _token_file_path() == tmp_path / "auth_tokens.json"
+    assert "omnigent_ui_sdk.terminal" not in sys.modules, (
+        "computing the auth token path imported the TUI SDK"
+    )
+
+
+def test_token_file_path_defaults_to_home_state_dir(tmp_path, monkeypatch) -> None:
+    """Without ``OMNIGENT_DATA_DIR`` the token file lives under ``~/.omnigent``."""
+    from omnigent.cli_auth import _token_file_path
+
+    monkeypatch.delenv("OMNIGENT_DATA_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _purge_tui_sdk_modules()
+
+    assert _token_file_path() == tmp_path / ".omnigent" / "auth_tokens.json"
+    assert "omnigent_ui_sdk.terminal" not in sys.modules, (
+        "computing the auth token path imported the TUI SDK"
+    )

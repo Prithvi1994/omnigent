@@ -1,7 +1,9 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
 import type { Conversation } from "@/hooks/useConversations";
@@ -77,7 +79,9 @@ function renderHeader(props: {
   hasHeaderMenu?: boolean;
   hasAgentInfo?: boolean;
   hasRailContent?: boolean;
+  rightPanelOpen?: boolean;
   showFilesPanel?: boolean;
+  pending?: boolean;
   mobileMenu?: typeof mobileMenu;
   onOpenSidebar?: (peek?: boolean) => void;
   onFork?: () => void;
@@ -113,8 +117,9 @@ function renderHeader(props: {
             hasHeaderMenu={props.hasHeaderMenu ?? false}
             showFilesPanel={props.showFilesPanel ?? false}
             hasRailContent={props.hasRailContent ?? true}
-            rightPanelOpen={false}
+            rightPanelOpen={props.rightPanelOpen ?? false}
             onToggleRightPanel={() => {}}
+            pending={props.pending}
             mobileMenu={props.mobileMenu ?? mobileMenu}
           />
         </TooltipProvider>
@@ -172,6 +177,38 @@ describe("ChatHeader — deployed Share presentation", () => {
   });
 });
 
+describe("ChatHeader — pending session presentation", () => {
+  it("shows the full desktop control shell disabled while Workspace remains available", () => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "temp:12345678",
+      conversationTitle: "Inspect the workspace",
+      pending: true,
+    });
+
+    expect(screen.getByRole("button", { name: "Add to project" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Agent tools and policies" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Chat view" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Terminal view" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Conversation actions" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Share session" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeEnabled();
+  });
+
+  it("collapses pending controls into one disabled mobile actions button", () => {
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "temp:12345678",
+      conversationTitle: "Inspect the workspace",
+      pending: true,
+    });
+
+    expect(screen.getByRole("button", { name: "Session actions" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Share session" })).toBeNull();
+  });
+});
+
 describe("ChatHeader — workspace pane alignment", () => {
   it("uses the desktop workspace offset without changing the mobile inset", () => {
     const { container } = renderHeader({ sidebarOpen: true });
@@ -179,6 +216,35 @@ describe("ChatHeader — workspace pane alignment", () => {
 
     expect(header).not.toBeNull();
     expect(header).toHaveClass("inset-x-0", "md:right-[var(--workspace-panel-offset,0px)]");
+  });
+});
+
+describe("ChatHeader — workspace pane shortcut", () => {
+  it.each([
+    { rightPanelOpen: false, label: "Expand right panel" },
+    { rightPanelOpen: true, label: "Collapse right panel" },
+  ])("shows the shortcut when the action is '$label'", ({ rightPanelOpen, label }) => {
+    vi.useFakeTimers();
+    try {
+      renderHeader({
+        sidebarOpen: true,
+        conversationId: "conv_workspace_shortcut",
+        rightPanelOpen,
+      });
+      const trigger = screen.getByRole("button", { name: label });
+
+      expect(trigger).toHaveAttribute("aria-keyshortcuts", `${ARIA_MOD_KEY}+Alt+]`);
+      fireEvent.focus(trigger);
+      act(() => vi.advanceTimersByTime(1000));
+
+      const tooltip = screen.getByRole("tooltip");
+      expect(tooltip).toHaveTextContent(label);
+      expect(
+        Array.from(tooltip.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent),
+      ).toEqual([MOD_KEY, ALT_KEY, "]"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -335,6 +401,24 @@ describe("ChatHeader — conversation breadcrumb", () => {
     expect(screen.getByText("check-account-eligibility")).toBeInTheDocument();
   });
 
+  it.each([
+    ["claude-native-ui", "claude-code-native-ui", "Claude Code"],
+    ["claude-native-ui", null, "Claude Code"],
+    ["codex-native-ui", "codex-native-ui", "Codex"],
+  ] as const)("uses the product name for %s with wrapper %s", (name, wrapperLabel, displayName) => {
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: "child-9",
+      isChildSession: true,
+      conversationTitle: "Fix the login bug",
+      titleLinkTo: "/c/parent-123",
+      boundAgent: { id: "a1", name },
+      wrapperLabel,
+    });
+    expect(screen.getByText(displayName)).toBeInTheDocument();
+    expect(screen.queryByText(name)).toBeNull();
+  });
+
   it("names the product, not the internal wrapper row, on a native sub-agent", () => {
     // A Claude Code Task child is bound to its parent's `claude-native-ui`
     // agent — an Omnigent internal the server hides everywhere else
@@ -444,60 +528,44 @@ function makeTerminalFirstCtx(
  * mounts. QueryClientProvider covers AgentInfoButton's react-query hooks; it
  * self-hides here (no agent info), leaving the toggle as the asserted control.
  */
-function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
+function renderHeaderWithSession(
+  ctx: TerminalFirstContextValue | null,
+  overrides: Partial<ComponentProps<typeof ChatHeader>> = {},
+) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const header = (
+    <ChatHeader
+      sidebarOpen
+      onOpenSidebar={() => {}}
+      isChildSession={false}
+      conversationId="sess-1"
+      conversationTitle={null}
+      projectName={null}
+      boundAgent={undefined}
+      wrapperLabel={null}
+      canShare={false}
+      canFork={false}
+      onShare={() => {}}
+      onFork={() => {}}
+      hasAgentInfo={false}
+      onAgentInfo={() => {}}
+      hasHeaderMenu={false}
+      showFilesPanel={false}
+      hasRailContent={false}
+      rightPanelOpen={false}
+      onToggleRightPanel={() => {}}
+      mobileMenu={mobileMenu}
+      {...overrides}
+    />
+  );
   return render(
     <MemoryRouter initialEntries={["/c/sess-1"]}>
       <QueryClientProvider client={qc}>
         <TooltipProvider>
           {ctx ? (
-            <TerminalFirstContextProvider value={ctx}>
-              <ChatHeader
-                sidebarOpen
-                onOpenSidebar={() => {}}
-                isChildSession={false}
-                conversationId="sess-1"
-                conversationTitle={null}
-                projectName={null}
-                boundAgent={undefined}
-                wrapperLabel={null}
-                canShare={false}
-                canFork={false}
-                onShare={() => {}}
-                onFork={() => {}}
-                hasAgentInfo={false}
-                onAgentInfo={() => {}}
-                hasHeaderMenu={false}
-                showFilesPanel={false}
-                hasRailContent={false}
-                rightPanelOpen={false}
-                onToggleRightPanel={() => {}}
-                mobileMenu={mobileMenu}
-              />
-            </TerminalFirstContextProvider>
+            <TerminalFirstContextProvider value={ctx}>{header}</TerminalFirstContextProvider>
           ) : (
-            <ChatHeader
-              sidebarOpen
-              onOpenSidebar={() => {}}
-              isChildSession={false}
-              conversationId="sess-1"
-              conversationTitle={null}
-              projectName={null}
-              boundAgent={undefined}
-              wrapperLabel={null}
-              canShare={false}
-              canFork={false}
-              onShare={() => {}}
-              onFork={() => {}}
-              hasAgentInfo={false}
-              onAgentInfo={() => {}}
-              hasHeaderMenu={false}
-              showFilesPanel={false}
-              hasRailContent={false}
-              rightPanelOpen={false}
-              onToggleRightPanel={() => {}}
-              mobileMenu={mobileMenu}
-            />
+            header
           )}
         </TooltipProvider>
       </QueryClientProvider>
@@ -568,21 +636,26 @@ describe("ChatHeader — floating mobile controls", () => {
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
     expect(trigger.parentElement).not.toHaveClass("max-md:px-1", "max-md:py-1");
     expect(trigger).toHaveClass("size-10");
-    expect(toggle).toHaveClass("size-10");
+    expect(toggle).toHaveClass("size-6", "max-md:size-11");
   });
 
-  it("insets both pill edges around the switcher and trailing kebab", () => {
-    // The track paints its own background to its edge, so with the pill's
-    // zero padding it sat flush against the leading border, while the expanded
-    // kebab sat flush against the trailing border. The inset is
-    // conditional: a lone kebab must stay the 40px circle asserted above.
+  it("folds the Chat/Terminal switch into the header kebab on mobile", () => {
+    // The narrow mobile header can't carry the segmented track beside the "…"
+    // menu, so the track is dropped and the switch rides inside the kebab.
     isMobileMock.mockReturnValue(true);
-    renderHeaderWithSession(makeTerminalFirstCtx());
+    renderHeaderWithSession(makeTerminalFirstCtx(), {
+      // terminalFirst surfaces the fallback kebab even without other actions.
+      mobileMenu: { ...mobileMenu, terminalFirst: true },
+    });
 
-    const cluster = screen.getByTestId("view-mode-toggle").parentElement;
-    expect(cluster).toHaveClass("max-md:has-data-[slot=view-mode-toggle]:px-1.5");
-    // The guard keys off the track's own data-slot, so it has to be present.
-    expect(screen.getByTestId("view-mode-toggle")).toHaveAttribute("data-slot", "view-mode-toggle");
+    // The segmented track is gone on mobile.
+    expect(screen.queryByTestId("view-mode-toggle")).toBeNull();
+
+    // Opening the kebab reveals the Chat/Terminal entries.
+    fireEvent.pointerDown(screen.getByTestId("session-actions-menu"), { button: 0 });
+    fireEvent.click(screen.getByTestId("session-actions-menu"));
+    expect(screen.getByTestId("view-mode-menu-chat")).toBeInTheDocument();
+    expect(screen.getByTestId("view-mode-menu-terminal")).toBeInTheDocument();
   });
 
   it("rounds the kebab's own background so no square shows inside the pill", () => {
@@ -797,6 +870,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
         .map((item) => (item.textContent ?? "").replace(svgTitleText(item), "").trim()),
     ).toEqual([
       "Pin",
+      "Export",
       "Rename",
       "Mark as unread",
       "Add to project",

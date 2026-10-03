@@ -33,10 +33,13 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from omnigent.process_logging import data_dir
 from omnigent.util.server_url import is_workspace_hosted_url
 
 if TYPE_CHECKING:
     import httpx
+
+    from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 
 _logger = logging.getLogger(__name__)
 _TOKEN_FILE_NAME = "auth_tokens.json"
@@ -58,9 +61,7 @@ def _token_file_path() -> Path:
 
     :returns: Path to ``<data-dir>/auth_tokens.json``.
     """
-    from omnigent_ui_sdk.terminal._config import state_dir
-
-    return Path(state_dir()) / _TOKEN_FILE_NAME
+    return data_dir() / _TOKEN_FILE_NAME
 
 
 def _normalize_server_url(server_url: str) -> str:
@@ -73,6 +74,32 @@ def _normalize_server_url(server_url: str) -> str:
     :returns: Normalized URL string.
     """
     return server_url.rstrip("/")
+
+
+def _safe_log_url(url: str) -> str:
+    """Strip credential-bearing parts from a URL before it reaches a log.
+
+    A URL can carry secrets in its userinfo (``https://user:token@host``) or
+    query string (``?access_token=...``), so logging one verbatim risks
+    leaking them. Keep the non-secret identity — scheme, host, port, path —
+    and drop userinfo, query, and fragment. Server URLs here carry no
+    credentials, but sanitizing at the sink keeps that guarantee local to the
+    log call instead of trusting every caller.
+
+    :param url: A server URL, e.g. ``"https://ws.example.com/api/2.0/omnigent"``.
+    :returns: The sanitized URL, or ``"<server>"`` when it cannot be parsed.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    try:
+        parts = urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return "<server>"
+    if not parts.scheme or not host:
+        return "<server>"
+    netloc = host if port is None else f"{host}:{port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
 def _write_tokens_file(path: Path, data: dict[str, dict[str, str | float]]) -> None:
@@ -442,6 +469,9 @@ def refresh_stored_token(server_url: str, *, timeout: float = 10.0) -> str | Non
 
 def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | None:
     """Perform the refresh exchange; caller holds the token-file lock."""
+    # Log only the sanitized URL — the raw one may embed credentials, and the
+    # refresh token is never logged.
+    safe = _safe_log_url(normalized)
     entry = _load_entry(server_url)
     if entry is None:
         return None
@@ -469,31 +499,53 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
             timeout=timeout,
         )
     except httpx.HTTPError as exc:
-        _logger.warning("Token refresh against %s failed: %s", normalized, exc)
+        _logger.warning("Token refresh against %s failed: %s", safe, exc)
+        return None
+    if resp.status_code == 404:
+        # No ``/oauth/token`` route: a local/header-mode dev server or an
+        # older build that never issues refreshable sessions. Re-login
+        # cannot add the route, so the "run `omnigent login`" advice below
+        # is misleading. On a loopback target this is the expected case and
+        # would otherwise spam a warning on every near-expiry reconnect, so
+        # keep it at debug; a remote 404 (wrong URL / too-old server) still
+        # warrants a visible, non-credential-blaming note.
+        from omnigent_client._http import is_loopback_url
+
+        if is_loopback_url(normalized):
+            _logger.debug(
+                "Token refresh against %s skipped: server has no /oauth/token endpoint.",
+                safe,
+            )
+        else:
+            _logger.warning(
+                "Token refresh against %s returned HTTP 404 — the server does not "
+                "expose /oauth/token (wrong URL or a build without session refresh).",
+                safe,
+            )
         return None
     if resp.status_code != 200:
         _logger.warning(
             "Token refresh against %s refused (HTTP %d) — run `omnigent login %s` "
             "to re-authenticate.",
-            normalized,
+            safe,
             resp.status_code,
-            normalized,
+            safe,
         )
         return None
     try:
         payload = resp.json()
     except ValueError:
-        _logger.warning("Token refresh against %s returned a malformed response", normalized)
+        _logger.warning("Token refresh against %s returned a malformed response", safe)
         return None
     if not isinstance(payload, dict):
-        _logger.warning("Token refresh against %s returned a malformed response", normalized)
+        _logger.warning("Token refresh against %s returned a malformed response", safe)
         return None
     access_token = payload.get("access_token")
     new_refresh = payload.get("refresh_token")
     # Only overwrite the stored pair with genuinely usable material —
     # a null/non-string field must never clobber a working credential.
     if not isinstance(access_token, str) or not access_token:
-        _logger.warning("Token refresh against %s returned no access token", normalized)
+        _logger.warning("Token refresh against %s returned no access token", safe)
         return None
     if not isinstance(new_refresh, str) or not new_refresh:
         # A server that renews without returning refresh material keeps the
@@ -512,7 +564,7 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
     # A fresh token means any earlier expiry warning is stale; allow
     # a new one if this credential ever lapses again.
     _warned_expired_servers.discard(normalized)
-    _logger.info("Refreshed login session for %s", normalized)
+    _logger.info("Refreshed login session for %s", safe)
     return access_token
 
 
@@ -629,6 +681,10 @@ def databricks_request_headers(
     Both values are omitted when absent, so single-workspace and
     local-unauthenticated callers get ``{}`` and are unaffected.
 
+    Also folds in this machine's telemetry installation ID (omitted when
+    telemetry is opted out of), so a server-side emitter can attribute an event
+    to the machine that produced it without a lookup.
+
     Also folds in any opaque dev/test headers from
     :data:`DATABRICKS_EXTRA_HEADERS_ENV_VAR` (request-routing selectors set by
     some Databricks deployments) so every chokepoint that builds headers through
@@ -650,10 +706,15 @@ def databricks_request_headers(
         server URL. When omitted, the selector from the stored login record is
         used. An explicit value wins over stored state.
     :returns: A header dict carrying ``Authorization``, ``X-Databricks-Org-Id``,
-        ``X-Databricks-Omnigent-Slice-Key``, and/or the configured extra headers
-        as available, possibly empty.
+        ``X-Databricks-Omnigent-Slice-Key``, ``X-Omnigent-Installation-Id``,
+        and/or the configured extra headers as available, possibly empty.
     """
-    headers: dict[str, str] = {}
+    from omnigent.telemetry.request_headers import telemetry_request_headers
+
+    # This machine's installation ID, so a server-side telemetry emitter can
+    # name the machine an event came from without a lookup. Empty when
+    # telemetry is opted out of.
+    headers: dict[str, str] = telemetry_request_headers()
     if bearer_token:
         headers["Authorization"] = f"Bearer {bearer_token}"
     org_id = org_id or load_databricks_org_id(server_url)
@@ -721,6 +782,7 @@ def open_server_client(
     follow_redirects: bool = False,
     transport: httpx.AsyncBaseTransport | None = None,
     host_id: str | None = None,
+    event_dispatcher: RunnerEventDispatcher | None = None,
 ) -> httpx.AsyncClient:
     """Open an :class:`httpx.AsyncClient` to an Omnigent server, keyed for routing.
 
@@ -773,6 +835,18 @@ def open_server_client(
         kwargs["timeout"] = timeout
     if transport is not None:
         kwargs["transport"] = transport
+    if event_dispatcher is not None:
+        from omnigent.runner.transports.ws_tunnel.event_delivery import TunnelEventClient
+
+        return TunnelEventClient(
+            event_dispatcher=event_dispatcher,
+            base_url=server_url,
+            headers=pinned,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            trust_env=not is_loopback_url(server_url),
+            **kwargs,
+        )
     return httpx.AsyncClient(
         base_url=server_url,
         headers=pinned,
