@@ -376,7 +376,6 @@ def test_parallel_tool_calls_merge_into_one_assistant_message() -> None:
         ("toolCall", "call_b"),
         ("text", None),
     ]
-    # Both results directly follow the assistant message holding their calls.
     assert {entries[2]["message"]["toolCallId"], entries[3]["message"]["toolCallId"]} == {
         "call_a",
         "call_b",

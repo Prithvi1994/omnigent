@@ -49,6 +49,7 @@ Excluded from default ``pytest`` runs via ``--ignore=tests/e2e``. Invoke::
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import io
 import json
@@ -110,6 +111,7 @@ _LOOPBACK_NO_PROXY = "localhost,127.0.0.1"
 # Proxy-blind client: CI forces an egress proxy via HTTP(S)_PROXY env vars that
 # must not intercept loopback requests to the spawned server.
 _client = httpx.Client(trust_env=False, timeout=30.0)
+atexit.register(_client.close)
 
 
 # ── Anthropic pairing contract ──────────────────────────────────────────────
@@ -628,14 +630,16 @@ def pi_fork_rig(
 
     server_log = work / "server.log"
     runner_log = work / "runner.log"
-    server_handle = server_log.open("w")
-    runner_handle = runner_log.open("w")
     import subprocess
     import sys
 
+    server_handle: io.TextIOWrapper | None = None
+    runner_handle: io.TextIOWrapper | None = None
     server_proc: subprocess.Popen[bytes] | None = None
     runner_proc: subprocess.Popen[bytes] | None = None
     try:
+        server_handle = server_log.open("w")
+        runner_handle = runner_log.open("w")
         server_proc = subprocess.Popen(
             [
                 sys.executable,
@@ -697,8 +701,9 @@ def pi_fork_rig(
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait(timeout=5)
-        server_handle.close()
-        runner_handle.close()
+        for handle in (server_handle, runner_handle):
+            if handle is not None:
+                handle.close()
         import shutil as _shutil
 
         _shutil.rmtree(short_tmp, ignore_errors=True)
