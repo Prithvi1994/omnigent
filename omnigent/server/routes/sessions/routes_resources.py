@@ -2269,7 +2269,10 @@ def register_resources_routes(
             raise HTTPException(status_code=405)
 
         if status >= 400:
-            if payload.get("error", {}).get("code") == "runner_upgrade_required":
+            if payload.get("error", {}).get("code") in (
+                "runner_upgrade_required",
+                "workspace_root_changed",
+            ):
                 return JSONResponse(status_code=status, content=payload)
             # Re-derive the typed session-lifecycle 410 (agent deleted or
             # rebound) with its client-safe message instead of forwarding

@@ -99,6 +99,16 @@ def workspace_delete_metadata() -> dict[str, object]:
     }
 
 
+class _WorkspaceRootChanged(RuntimeError):
+    """The environment root no longer names its original directory."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Workspace root changed since environment creation; "
+            "create a new environment before deleting"
+        )
+
+
 @contextlib.contextmanager
 def _open_parent_beneath(
     root: Path,
@@ -117,7 +127,7 @@ def _open_parent_beneath(
         if root_identity is not None:
             root_stat = os.fstat(descriptor)
             if (root_stat.st_dev, root_stat.st_ino) != root_identity:
-                raise OSError(errno.ELOOP, "Workspace root changed since helper startup")
+                raise _WorkspaceRootChanged()
         for name in parts[:-1]:
             next_descriptor = os.open(
                 name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=descriptor
@@ -473,7 +483,17 @@ class _HelperProcessClient:
         self._egress_handle: EgressProxyHandle | None = None
         self._lock = threading.Lock()
         self._closed = False
+        if self._copy_on_write_environment is not None:
+            self._copy_on_write_environment.prepare(self.sandbox)
+        self._root_identity = self._stat_root_identity(self.cwd)
         atexit.register(self.close)
+
+    def _stat_root_identity(self, root: Path) -> tuple[int, int]:
+        namespace = self.sandbox.copy_on_write_namespace
+        if namespace is not None:
+            root = Path(f"/proc/{namespace[0]}/root") / root.relative_to(root.anchor)
+        root_stat = root.stat()
+        return root_stat.st_dev, root_stat.st_ino
 
     def request(self, payload: OpRequest) -> OpResult:
         with self._lock:
@@ -540,7 +560,7 @@ class _HelperProcessClient:
             sandbox = with_additional_write_roots(sandbox, [self._tmpdir])
             set_sandbox_env(env, self._tmpdir)
             if self.start_in_scratch:
-                helper_cwd = self._tmpdir
+                helper_cwd = self._tmpdir.resolve()
                 env["PWD"] = str(self._tmpdir)
             if sandbox.credential_proxy is not None:
                 # Resolve real secrets in the parent. Real secrets stay
@@ -583,10 +603,15 @@ class _HelperProcessClient:
         if self._tmpdir is not None:
             set_sandbox_env(env, self._tmpdir)
 
+        expected_root_identity = (
+            self._stat_root_identity(helper_cwd) if self.start_in_scratch else self._root_identity
+        )
+        root_identity: list[JsonValue] = [expected_root_identity[0], expected_root_identity[1]]
         config: dict[str, JsonValue] = {
             "cwd": str(helper_cwd),
             "shell_path": self.shell_path,
             "sandbox": sandbox.to_jsonable(),
+            "root_identity": root_identity,
         }
         # S4 (security): include the per-helper Proxy-Authorization
         # token IF egress is active. Delivered ONLY via the pipe FD,
@@ -942,15 +967,20 @@ class CallerProcessOSEnvironment(OSEnvironment):
                 self.sandbox.copy_on_write_roots
             )
             self._owns_copy_on_write = True
-        self._helper = _HelperProcessClient(
-            cwd=self.cwd,
-            shell_path=self.shell_path,
-            sandbox=self.sandbox,
-            start_in_scratch=self._start_in_scratch,
-            egress_rules=self._egress_rules,
-            egress_allow_private_destinations=self._egress_allow_private_destinations,
-            copy_on_write_environment=self._copy_on_write_environment,
-        )
+        try:
+            self._helper = _HelperProcessClient(
+                cwd=self.cwd,
+                shell_path=self.shell_path,
+                sandbox=self.sandbox,
+                start_in_scratch=self._start_in_scratch,
+                egress_rules=self._egress_rules,
+                egress_allow_private_destinations=self._egress_allow_private_destinations,
+                copy_on_write_environment=self._copy_on_write_environment,
+            )
+        except OSError:
+            if self._owns_copy_on_write and self._copy_on_write_environment is not None:
+                self._copy_on_write_environment.close()
+            raise
 
     async def read(
         self,
@@ -1116,6 +1146,7 @@ def _handle_helper_request(
     shell_path: str,
     sandbox: SandboxPolicy,
     root_identity: tuple[int, int] | None = None,
+    root_matches: bool = True,
 ) -> OpResult:
     op = request.get("op")
     if op == "delete":
@@ -1124,7 +1155,12 @@ def _handle_helper_request(
         if not isinstance(raw_path, str) or not isinstance(recursive, bool):
             return {"error": "Invalid delete request", "code": "invalid_path"}
         return _delete_impl(
-            cwd, raw_path, sandbox, recursive=recursive, root_identity=root_identity
+            cwd,
+            raw_path,
+            sandbox,
+            recursive=recursive,
+            root_identity=root_identity,
+            root_matches=root_matches,
         )
 
     if op == "read":
@@ -1222,6 +1258,7 @@ def _delete_impl(
     *,
     recursive: bool,
     root_identity: tuple[int, int] | None = None,
+    root_matches: bool = True,
 ) -> OpResult:
     """Delete a leaf inside the helper using its anchored parent descriptor."""
     if "\x00" in raw_path:
@@ -1236,6 +1273,8 @@ def _delete_impl(
     if not absolute and not SAFE_WORKSPACE_DELETE_SUPPORTED:
         return {"error": "No-follow workspace delete is unsupported", "code": "unsupported"}
     try:
+        if not absolute and not root_matches:
+            raise _WorkspaceRootChanged()
         if absolute:
             target = Path(path)
             if sandbox.active:
@@ -1248,6 +1287,8 @@ def _delete_impl(
             name,
         ):
             return _delete_leaf(name, recursive=recursive, parent_descriptor=parent_descriptor)
+    except _WorkspaceRootChanged as exc:
+        return {"error": str(exc), "code": "workspace_root_changed"}
     except OSError as exc:
         code = "delete_failed"
         if exc.errno == errno.ENOENT:
@@ -1878,6 +1919,18 @@ def _run_helper(config: JsonValue) -> int:
         raise ValueError("Invalid os_env helper config payload")
     if not isinstance(sandbox_value, dict):
         raise ValueError("Invalid os_env helper sandbox payload")
+    root_identity_value = config.get("root_identity")
+    if not isinstance(root_identity_value, list) or len(root_identity_value) != 2:
+        raise ValueError("Invalid os_env helper root identity")
+    root_device, root_inode = root_identity_value
+    if (
+        not isinstance(root_device, int)
+        or isinstance(root_device, bool)
+        or not isinstance(root_inode, int)
+        or isinstance(root_inode, bool)
+    ):
+        raise ValueError("Invalid os_env helper root identity")
+    root_identity = (root_device, root_inode)
 
     # S4 (security): if the parent shipped a Proxy-Authorization
     # token via the config FD, splice it into HTTP_PROXY / HTTPS_PROXY
@@ -1912,7 +1965,7 @@ def _run_helper(config: JsonValue) -> int:
     sandbox = SandboxPolicy.from_jsonable(sandbox_value)
     activate_sandbox(sandbox)
     root_stat = os.stat(".")
-    root_identity = (root_stat.st_dev, root_stat.st_ino)
+    root_matches = (root_stat.st_dev, root_stat.st_ino) == root_identity
 
     for line in sys.stdin:
         line = line.strip()
@@ -1928,6 +1981,7 @@ def _run_helper(config: JsonValue) -> int:
                 shell_path=shell_path_value,
                 sandbox=sandbox,
                 root_identity=root_identity,
+                root_matches=root_matches,
             )
         except Exception as exc:  # noqa: BLE001 — helper loop surfaces any error through the JSON response envelope
             response = {"error": f"os_env helper exception: {exc}"}

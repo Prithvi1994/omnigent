@@ -7,21 +7,26 @@ import json
 import os
 import shutil
 import socket
+import sys
+import tempfile
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import cast
+from unittest.mock import Mock
 
 import httpx
 import pytest
 
+from omnigent.entities.environment_filesystem import ResourceError
 from omnigent.inner import os_env as os_env_module
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import CallerProcessOSEnvironment, create_os_environment
 from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.runner import create_runner_app
-from omnigent.runner.environment_filesystem import CallerProcessFilesystem, InvalidPath
+from omnigent.runner.environment_filesystem import CallerProcessFilesystem
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runner.transports.ws_tunnel.serve import _send_hello
+from omnigent.sandbox.copy_on_write import CopyOnWriteEnvironment
 from tests.runner.helpers import NullServerClient
 
 CAPABILITY = "workspace_delete_nofollow_v1"
@@ -96,8 +101,9 @@ async def test_delete_uses_runner_helper_not_workspace_package(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("symlinked_ancestor", [False, True])
+@pytest.mark.parametrize("helper_state", ["unstarted", "running", "restarted"])
 async def test_delete_refuses_changed_workspace_ancestor(
-    tmp_path: Path, symlinked_ancestor: bool
+    tmp_path: Path, symlinked_ancestor: bool, helper_state: str
 ) -> None:
     ancestor = tmp_path / "ancestor"
     root = ancestor / "workspace"
@@ -116,18 +122,145 @@ async def test_delete_refuses_changed_workspace_ancestor(
     env = create_os_environment(
         OSEnvSpec(cwd=str(configured_root), sandbox=OSEnvSandboxSpec(type="none"))
     )
+    assert isinstance(env, CallerProcessOSEnvironment)
     try:
         fs = CallerProcessFilesystem(env)
-        assert (await fs.delete("initial")).deleted is True
+        if helper_state != "unstarted":
+            assert (await fs.delete("initial")).deleted is True
+        else:
+            assert env._helper._proc is None
         moved = tmp_path / "moved"
         ancestor.rename(moved)
         ancestor.symlink_to(outside, target_is_directory=True)
-        with pytest.raises(InvalidPath, match="Workspace root changed"):
+        if helper_state == "restarted":
+            with env._helper._lock:
+                env._helper._stop_locked()
+        with pytest.raises(ResourceError, match="Workspace root changed") as error:
             await fs.delete("victim")
+        assert error.value.code == "workspace_root_changed"
         assert outside_victim.read_bytes() == b"outside bytes"
         assert (moved / "workspace" / "victim").read_bytes() == b"workspace bytes"
     finally:
         env.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("helper_state", ["unstarted", "running", "restarted"])
+async def test_workspace_root_changed_returns_conflict(
+    client: httpx.AsyncClient,
+    environment: CallerProcessOSEnvironment,
+    workspace: Path,
+    helper_state: str,
+) -> None:
+    if helper_state != "unstarted":
+        assert (await environment.shell("true"))["exit_code"] == 0
+    previous = workspace.with_name("previous")
+    workspace.rename(previous)
+    workspace.mkdir()
+    (workspace / "victim").write_bytes(b"replacement bytes")
+    if helper_state == "restarted":
+        with environment._helper._lock:
+            environment._helper._stop_locked()
+    response = await client.delete(f"{FS_URL}/victim")
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "workspace_root_changed"
+    assert "Workspace root changed" in response.json()["error"]["message"]
+    assert (workspace / "victim").read_bytes() == b"replacement bytes"
+    assert (previous / "victim").read_bytes() == b"workspace bytes"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sandbox_type",
+    [
+        pytest.param(
+            "darwin_seatbelt",
+            marks=pytest.mark.skipif(
+                sys.platform != "darwin" or not shutil.which("sandbox-exec"),
+                reason="darwin_seatbelt requires macOS + sandbox-exec",
+            ),
+        ),
+        pytest.param(
+            "linux_bwrap",
+            marks=pytest.mark.skipif(
+                not sys.platform.startswith("linux") or not shutil.which("bwrap"),
+                reason="linux_bwrap requires Linux + bwrap",
+            ),
+        ),
+    ],
+)
+async def test_scratch_delete_under_active_sandbox(
+    workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sandbox_type: str
+) -> None:
+    temporary = tmp_path / "temporary"
+    temporary.mkdir()
+    alias = tmp_path / "temporary-alias"
+    alias.symlink_to(temporary, target_is_directory=True)
+    monkeypatch.setattr(tempfile, "tempdir", str(alias))
+    env = create_os_environment(
+        OSEnvSpec(
+            cwd=str(workspace),
+            start_in_scratch=True,
+            sandbox=OSEnvSandboxSpec(
+                type=sandbox_type, read_paths=[str(Path(__file__).resolve().parents[2])]
+            ),
+        )
+    )
+    assert isinstance(env, CallerProcessOSEnvironment)
+    try:
+        result = await env.shell("printf scratch > victim")
+        assert result["exit_code"] == 0, result
+        scratch = Path(result["cwd"])
+        assert scratch != workspace
+        assert (scratch / "victim").read_bytes() == b"scratch"
+        assert (await CallerProcessFilesystem(env).delete("victim")).deleted is True
+        assert not (scratch / "victim").exists()
+        assert (workspace / "victim").read_bytes() == b"workspace bytes"
+    finally:
+        env.close()
+
+
+def test_root_identity_uses_prepared_environment_view(
+    workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    view = tmp_path / "namespace-view"
+    view.mkdir()
+    view_stat = view.stat()
+    native_stat = Path.stat
+    namespace_path = Path("/proc/123/root") / workspace.relative_to(workspace.anchor)
+
+    def stat_root(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if path == namespace_path:
+            return view_stat
+        return native_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", stat_root)
+    policy = SandboxPolicy(
+        backend_type="none",
+        active=False,
+        read_roots=None,
+        write_roots=[],
+        write_files=[],
+        allow_network=True,
+        copy_on_write_roots=[workspace],
+    )
+    copy_on_write = Mock(spec=CopyOnWriteEnvironment)
+
+    def prepare(sandbox: SandboxPolicy) -> None:
+        sandbox.copy_on_write_namespace = (123, 456, 789)
+
+    copy_on_write.prepare.side_effect = prepare
+    helper = os_env_module._HelperProcessClient(
+        cwd=workspace,
+        shell_path="/bin/sh",
+        sandbox=policy,
+        copy_on_write_environment=cast(CopyOnWriteEnvironment, copy_on_write),
+    )
+    try:
+        copy_on_write.prepare.assert_called_once_with(policy)
+        assert helper._root_identity == (view_stat.st_dev, view_stat.st_ino)
+    finally:
+        helper.close()
 
 
 @pytest.mark.asyncio

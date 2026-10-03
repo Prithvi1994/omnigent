@@ -3887,6 +3887,60 @@ async def test_filesystem_delete_proxies_to_runner(
 
 
 @pytest.mark.asyncio
+async def test_workspace_root_changed_conflict_reaches_server(
+    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import CallerProcessOSEnvironment, create_os_environment
+    from omnigent.runner import create_runner_app
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from omnigent.runner.routing import RunnerRouter
+    from omnigent.server.routes.sessions import routes_resources
+    from tests.runner.helpers import NullServerClient
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "victim").write_bytes(b"original bytes")
+    env = create_os_environment(
+        OSEnvSpec(cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert isinstance(env, CallerProcessOSEnvironment)
+    registry = SessionResourceRegistry()
+    registry._primary_envs["79b22ebd2309e48fdeb450c65611d51b"] = env
+    runner_app = create_runner_app(
+        resource_registry=registry, runner_workspace=workspace, server_client=NullServerClient()
+    )
+    publish = Mock()
+    monkeypatch.setattr(routes_resources, "_publish_changed_files_invalidated", publish)
+    try:
+        assert (await env.shell("true"))["exit_code"] == 0
+        previous = tmp_path / "previous"
+        workspace.rename(previous)
+        workspace.mkdir()
+        (workspace / "victim").write_bytes(b"replacement bytes")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=runner_app), base_url="http://runner"
+        ) as actual_runner:
+
+            class ForwardingRunner(_FakeRunnerClient):
+                async def delete(
+                    self, url: str, *, timeout: float | None = None
+                ) -> httpx.Response:
+                    return await actual_runner.delete(url)
+
+            set_runner_router(cast(RunnerRouter, _FakeRunnerRouter(ForwardingRunner())))
+            response = await client.delete(f"{_FS_BASE}/filesystem/victim")
+        assert response.status_code == 409, response.text
+        assert response.json()["error"]["code"] == "workspace_root_changed"
+        assert "Workspace root changed" in response.json()["error"]["message"]
+        assert (workspace / "victim").read_bytes() == b"replacement bytes"
+        assert (previous / "victim").read_bytes() == b"original bytes"
+        publish.assert_not_called()
+    finally:
+        env.close()
+
+
+@pytest.mark.asyncio
 async def test_workspace_delete_gate_checks_the_executing_runner(
     client: httpx.AsyncClient,
     tmp_path: Path,

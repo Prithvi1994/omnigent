@@ -63,6 +63,12 @@ _SEARCH_SCAN_BUDGET = 50000
 _Params = ParamSpec("_Params")
 
 
+class WorkspaceRootChanged(ResourceError):
+    """The environment root changed after it was initialized."""
+
+    code = "workspace_root_changed"
+
+
 def _shell_quote(s: str) -> str:
     """Shell-quote a string for safe interpolation.
 
@@ -1418,6 +1424,7 @@ print(json.dumps({'r': results, 't': truncated}))
         :raises InvalidPath: If attempting to delete the root.
         :raises FilesystemPathNotFound: If the path does not exist.
         :raises DirectoryNotEmpty: If non-empty without recursive.
+        :raises WorkspaceRootChanged: If the initialized workspace root changed.
         """
         validated, _direct = self._write_route(path)
         if not validated:
@@ -1433,6 +1440,8 @@ print(json.dumps({'r': results, 't': truncated}))
                 raise FilesystemPathNotFound(message)
             if result.get("code") == "invalid_path":
                 raise InvalidPath(message)
+            if result.get("code") == "workspace_root_changed":
+                raise WorkspaceRootChanged(message)
             if result.get("code") == "directory_not_empty":
                 raise DirectoryNotEmpty(message)
             raise ResourceError(message)
