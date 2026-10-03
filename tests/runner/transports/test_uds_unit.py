@@ -180,7 +180,7 @@ async def _count_invalid_state_on_uds_teardown(iterations: int) -> int:
 async def _drive_teardown_once(path: str, loop: asyncio.AbstractEventLoop) -> None:
     listener = await anyio.create_unix_listener(path)
     server_box: dict[str, object] = {}
-    async with anyio.create_task_group() as tg:
+    async with listener, anyio.create_task_group() as tg:
 
         async def _accept() -> None:
             server_box["stream"] = await listener.accept()
@@ -198,16 +198,18 @@ async def _drive_teardown_once(path: str, loop: asyncio.AbstractEventLoop) -> No
 
         def _close_now() -> None:
             coro = client_stream.aclose()
-            with contextlib.suppress(StopIteration):
+            try:
                 coro.send(None)  # aclose sets the result before its first await
+            except StopIteration:
+                return
+            coro.close()
 
         loop.call_soon(_close_now)
         await asyncio.sleep(0)
 
-        with contextlib.suppress(BaseException):
+        with contextlib.suppress(Exception):
             await server_stream.aclose()
         tg.cancel_scope.cancel()
-    await listener.aclose()
 
 
 @_REQUIRES_UDS

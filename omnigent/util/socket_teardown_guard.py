@@ -46,13 +46,16 @@ def install_socket_teardown_guard() -> None:
     global _installed
     if _installed:
         return
-    _installed = True
     try:
         from anyio._backends import _asyncio as anyio_asyncio
 
         _patch_unguarded_methods(anyio_asyncio._RawSocketMixin)
     except Exception:  # noqa: BLE001 — best-effort: an unpatched teardown only logs noise
+        # Leave the flag unset so a later transport can retry; a genuinely
+        # missing backend keeps logging only debug noise, not an error.
         _logger.debug("anyio raw-socket teardown guard not installed", exc_info=True)
+        return
+    _installed = True
 
 
 def _patch_unguarded_methods(mixin: type) -> tuple[str, ...]:
@@ -61,27 +64,40 @@ def _patch_unguarded_methods(mixin: type) -> tuple[str, ...]:
     :param mixin: anyio's ``_RawSocketMixin`` class.
     :returns: Names of the methods that were replaced, in declaration order.
     """
+    replacements = (
+        ("_wait_until_readable", _registers_bare_set_result, _wait_until_readable),
+        ("_wait_until_writable", _registers_bare_set_result, _wait_until_writable),
+        ("aclose", _completes_without_done_check, _aclose),
+    )
     patched: list[str] = []
-    if _registers_bare_set_result(mixin._wait_until_readable):
-        mixin._wait_until_readable = _wait_until_readable
-        patched.append("_wait_until_readable")
-    if _registers_bare_set_result(mixin._wait_until_writable):
-        mixin._wait_until_writable = _wait_until_writable
-        patched.append("_wait_until_writable")
-    if _completes_without_done_check(mixin.aclose):
-        mixin.aclose = _aclose
-        patched.append("aclose")
+    unrecognized: list[str] = []
+    for name, is_racy, replacement in replacements:
+        current = getattr(mixin, name)
+        if current is replacement:
+            continue
+        source = inspect.getsource(current)
+        if is_racy(source):
+            setattr(mixin, name, replacement)
+            patched.append(name)
+        elif ".done()" not in source:
+            unrecognized.append(name)
+    if unrecognized:
+        # Neither the known racy shape nor a done()-guarded one: upstream changed
+        # and the shim can no longer tell whether the race is still live.
+        _logger.info(
+            "anyio raw-socket teardown guard left %s unpatched: unrecognized shape",
+            ", ".join(unrecognized),
+        )
     return tuple(patched)
 
 
-def _registers_bare_set_result(waiter: Any) -> bool:
-    """Whether ``waiter`` hands ``f.set_result`` straight to the loop's I/O callback."""
-    return "f.set_result, None" in inspect.getsource(waiter)
+def _registers_bare_set_result(source: str) -> bool:
+    """Whether a waiter hands ``f.set_result`` straight to the loop's I/O callback."""
+    return "f.set_result, None" in source
 
 
-def _completes_without_done_check(aclose: Any) -> bool:
+def _completes_without_done_check(source: str) -> bool:
     """Whether ``aclose`` completes pending futures without checking ``done()``."""
-    source = inspect.getsource(aclose)
     return ".set_result(None)" in source and ".done()" not in source
 
 

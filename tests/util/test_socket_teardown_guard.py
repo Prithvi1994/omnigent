@@ -1,12 +1,14 @@
-"""anyio raw-socket teardown guard: close-during-read stays quiet, streams still work."""
+"""anyio raw-socket teardown guard: close-during-I/O stays quiet, streams still work."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import socket
 import sys
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,8 @@ _INVALID_STATE_MESSAGE = "Exception in callback Future.set_result(None)"
 _REQUIRES_UDS = pytest.mark.skipif(
     sys.platform == "win32", reason="Unix domain sockets are POSIX-only"
 )
+
+_Delivery = tuple[str, BaseException | None]
 
 
 async def _connected_uds_pair(
@@ -38,8 +42,17 @@ async def _connected_uds_pair(
     return stream, peer, server
 
 
+async def _wait_until_parked(stream: Any, future_attr: str = "_receive_future") -> None:
+    """Spin until a pending receive/send has registered its readiness future."""
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if getattr(stream, future_attr, None) is not None:
+            return
+    raise AssertionError(f"stream never parked on {future_attr}")
+
+
 async def _park_pending_read(stream: Any) -> asyncio.Task[None]:
-    """Start a ``receive()`` and spin until it parks on ``add_reader``."""
+    """Start a ``receive()`` and wait until it parks on ``add_reader``."""
 
     async def _receive() -> None:
         # The teardown under test abandons this read; its outcome is irrelevant.
@@ -47,20 +60,15 @@ async def _park_pending_read(stream: Any) -> asyncio.Task[None]:
             await stream.receive()
 
     task = asyncio.ensure_future(_receive())
-    for _ in range(50):
-        await asyncio.sleep(0)
-        if getattr(stream, "_receive_future", None) is not None:
-            break
+    await _wait_until_parked(stream, "_receive_future")
     return task
 
 
-async def _close_during_pending_read(
-    tmp: Path, iterations: int
-) -> list[tuple[str, BaseException | None]]:
-    """Close streams while a read is parked; return what reached the loop handler."""
-    loop = asyncio.get_running_loop()
+@contextlib.contextmanager
+def _capturing_loop_exceptions(loop: asyncio.AbstractEventLoop) -> Iterator[list[_Delivery]]:
+    """Collect what the loop's exception handler receives while the block runs."""
     previous_handler = loop.get_exception_handler()
-    delivered: list[tuple[str, BaseException | None]] = []
+    delivered: list[_Delivery] = []
 
     def _capture(_loop: asyncio.AbstractEventLoop, context: dict[str, object]) -> None:
         exc = context.get("exception")
@@ -69,8 +77,22 @@ async def _close_during_pending_read(
 
     loop.set_exception_handler(_capture)
     try:
+        yield delivered
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+
+async def _finish(*tasks: asyncio.Task[None]) -> None:
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _close_during_pending_read(tmp: Path, iterations: int) -> list[_Delivery]:
+    """Close streams while a read is parked; return what reached the loop handler."""
+    with _capturing_loop_exceptions(asyncio.get_running_loop()) as delivered:
         for i in range(iterations):
-            stream, peer, server = await _connected_uds_pair(str(tmp / f"s{i}.sock"))
+            stream, peer, server = await _connected_uds_pair(str(tmp / f"r{i}.sock"))
             recv_task = await _park_pending_read(stream)
             # Peer EOF queues the reader callback; aclose() on the same
             # stretch used to double-complete the reader future.
@@ -78,18 +100,43 @@ async def _close_during_pending_read(
             aclose_task = asyncio.ensure_future(stream.aclose())
             for _ in range(4):
                 await asyncio.sleep(0)
-            recv_task.cancel()
-            aclose_task.cancel()
-            await asyncio.gather(recv_task, aclose_task, return_exceptions=True)
+            await _finish(recv_task, aclose_task)
             server.close()
-    finally:
-        loop.set_exception_handler(previous_handler)
     return delivered
 
 
-def _invalid_state_deliveries(
-    delivered: list[tuple[str, BaseException | None]],
-) -> list[tuple[str, BaseException | None]]:
+def _drive_aclose(stream: Any) -> None:
+    """Run ``aclose()`` synchronously inside a loop callback.
+
+    Driving the coroutine here completes the readiness future on the same loop
+    iteration the queued readiness callback fires, which is the teardown race.
+    """
+    coro = stream.aclose()
+    try:
+        coro.send(None)
+    except StopIteration:
+        return
+    coro.close()
+
+
+async def _close_during_pending_write(tmp: Path, iterations: int) -> list[_Delivery]:
+    """Park a writer, then close on the same tick; return what reached the handler."""
+    loop = asyncio.get_running_loop()
+    with _capturing_loop_exceptions(loop) as delivered:
+        for i in range(iterations):
+            stream, peer, server = await _connected_uds_pair(str(tmp / f"w{i}.sock"))
+            # A fresh socket is immediately writable, so parking a writer queues
+            # its readiness callback for this tick; aclose() then completes the
+            # same _send_future the queued callback is about to complete.
+            stream._wait_until_writable(loop)
+            loop.call_soon(_drive_aclose, stream)
+            await asyncio.sleep(0)
+            peer.close()
+            server.close()
+    return delivered
+
+
+def _invalid_state_deliveries(delivered: list[_Delivery]) -> list[_Delivery]:
     return [
         (message, exc)
         for message, exc in delivered
@@ -102,6 +149,14 @@ async def test_close_during_pending_read_stays_quiet() -> None:
     install_socket_teardown_guard()
     with tempfile.TemporaryDirectory(prefix="omni-uds-guard-") as tmp:
         delivered = await _close_during_pending_read(Path(tmp), 5)
+    assert not _invalid_state_deliveries(delivered)
+
+
+@_REQUIRES_UDS
+async def test_close_during_pending_write_stays_quiet() -> None:
+    install_socket_teardown_guard()
+    with tempfile.TemporaryDirectory(prefix="omni-uds-guard-") as tmp:
+        delivered = await _close_during_pending_write(Path(tmp), 5)
     assert not _invalid_state_deliveries(delivered)
 
 
@@ -129,6 +184,17 @@ async def test_waiter_guard_alone_quiets_close_during_read(monkeypatch) -> None:
 
 
 @_REQUIRES_UDS
+async def test_waiter_guard_alone_quiets_close_during_write(monkeypatch) -> None:
+    from anyio._backends import _asyncio as anyio_asyncio
+
+    install_socket_teardown_guard()
+    monkeypatch.setattr(anyio_asyncio._RawSocketMixin, "aclose", _upstream_guarded_aclose)
+    with tempfile.TemporaryDirectory(prefix="omni-uds-guard-") as tmp:
+        delivered = await _close_during_pending_write(Path(tmp), 5)
+    assert not _invalid_state_deliveries(delivered)
+
+
+@_REQUIRES_UDS
 async def test_stream_roundtrip_still_works_after_guard() -> None:
     install_socket_teardown_guard()
     loop = asyncio.get_running_loop()
@@ -137,7 +203,7 @@ async def test_stream_roundtrip_still_works_after_guard() -> None:
 
         # Park the read first so the patched _wait_until_readable path runs.
         recv_task = asyncio.ensure_future(stream.receive())
-        await asyncio.sleep(0.05)
+        await _wait_until_parked(stream, "_receive_future")
         await loop.sock_sendall(peer, b"ping")
         assert await recv_task == b"ping"
 
@@ -206,6 +272,24 @@ class _FullyGuardedBackend:
             self._receive_future.set_result(None)
 
 
+class _RenamedWaiters:
+    """Bare callbacks under a renamed local: the shim cannot tell whether they are safe."""
+
+    def _wait_until_readable(self, loop: asyncio.AbstractEventLoop) -> asyncio.Future[None]:
+        fut = self._receive_future = asyncio.Future()
+        loop.add_reader(self._raw_socket, fut.set_result, None)
+        return fut
+
+    def _wait_until_writable(self, loop: asyncio.AbstractEventLoop) -> asyncio.Future[None]:
+        fut = self._send_future = asyncio.Future()
+        loop.add_writer(self._raw_socket, fut.set_result, None)
+        return fut
+
+    async def aclose(self) -> None:
+        if self._receive_future and not self._receive_future.done():
+            self._receive_future.set_result(None)
+
+
 def test_unguarded_backend_patches_every_method() -> None:
     backend = type("Backend", (_UnguardedBackend,), {})
     patched = socket_teardown_guard._patch_unguarded_methods(backend)
@@ -225,6 +309,17 @@ def test_guarded_close_backend_still_patches_waiters() -> None:
 def test_fully_guarded_backend_is_left_alone() -> None:
     backend = type("Backend", (_FullyGuardedBackend,), {})
     assert socket_teardown_guard._patch_unguarded_methods(backend) == ()
+
+
+def test_unrecognized_waiter_shape_is_reported_not_patched(caplog) -> None:
+    backend = type("Backend", (_RenamedWaiters,), {})
+    with caplog.at_level(logging.INFO, logger=socket_teardown_guard.__name__):
+        assert socket_teardown_guard._patch_unguarded_methods(backend) == ()
+    assert backend._wait_until_readable is _RenamedWaiters._wait_until_readable
+    assert any(
+        "_wait_until_readable, _wait_until_writable" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 async def test_create_uds_client_installs_guard(monkeypatch) -> None:
