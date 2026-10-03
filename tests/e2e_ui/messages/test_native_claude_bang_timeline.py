@@ -12,6 +12,7 @@ keep that shape.
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -35,9 +36,11 @@ _log = logging.getLogger(__name__)
 _TERMINAL_CARD = '[data-testid="terminal-command-card"]'
 _FEED_ENTRY = f'[data-testid="message-bubble"], {_TERMINAL_CARD}'
 
-# Canonical reconciliation regroups the feed a beat after the exec cards
-# first render, so the settled state needs a short wait.
-_RECONCILE_SETTLE_MS = 2_000
+# Canonical reconciliation regroups the feed a beat after the exec cards first
+# render, so feed snapshots wait until it stops changing rather than sleeping a
+# fixed interval a slow runner could outlast.
+_FEED_SETTLE_TIMEOUT_MS = 8_000
+_FEED_SETTLE_QUIET_MS = 600
 
 
 def _set_reply(mock_url: str, token: str) -> None:
@@ -66,11 +69,31 @@ def _feed_entries(page: Page) -> list[tuple[str, str]]:
     return entries
 
 
+def _settled_feed(page: Page) -> list[tuple[str, str]]:
+    """Return the feed once it stops changing, after canonical reconciliation.
+
+    Polls :func:`_feed_entries` until two reads spanning ``_FEED_SETTLE_QUIET_MS``
+    agree, bounded by ``_FEED_SETTLE_TIMEOUT_MS``. On timeout it returns the last
+    snapshot, so a stalled reconciliation still surfaces as a timeline problem.
+    """
+    deadline = time.monotonic() + _FEED_SETTLE_TIMEOUT_MS / 1000
+    previous = _feed_entries(page)
+    stable_since = time.monotonic()
+    while time.monotonic() < deadline:
+        page.wait_for_timeout(100)
+        current = _feed_entries(page)
+        if current != previous:
+            previous, stable_since = current, time.monotonic()
+        elif (time.monotonic() - stable_since) * 1000 >= _FEED_SETTLE_QUIET_MS:
+            return current
+    return previous
+
+
 def _canonical_items(base_url: str, session_id: str) -> list[dict[str, Any]]:
     """Fetch the session's canonical transcript items in server order."""
     resp = httpx.get(
         f"{base_url}/v1/sessions/{session_id}/items",
-        params={"limit": 100, "order": "asc"},
+        params={"limit": 1000, "order": "asc"},
         timeout=15.0,
     )
     resp.raise_for_status()
@@ -106,7 +129,6 @@ def _run_bang(page: Page, probe: str, *, reply: str) -> str:
         timeout=_MOCK_TURN_TIMEOUT_MS
     )
     expect(page.locator(_WORKING)).to_have_count(0, timeout=_MOCK_TURN_TIMEOUT_MS)
-    page.wait_for_timeout(_RECONCILE_SETTLE_MS)
     return command
 
 
@@ -140,21 +162,23 @@ def _timeline_problems(
     )
     if exec_index is None:
         problems.append(f"{label}: the exec's command card is not visible in the feed")
-    output_index = next(
-        (
-            i
-            for i, (kind, text) in enumerate(entries)
-            if kind == "terminal:output" and probe in text
-        ),
-        None,
+    # The mock exec's output card renders a fixed stdout string, not the probe,
+    # so it is matched by position: the first output card below the
+    # probe-matched command card.
+    output_index = (
+        next(
+            (
+                i
+                for i, (kind, _text) in enumerate(entries)
+                if kind == "terminal:output" and i > exec_index
+            ),
+            None,
+        )
+        if exec_index is not None
+        else None
     )
     if output_index is None:
-        problems.append(f"{label}: the exec's output card is not visible in the feed")
-    elif exec_index is not None and output_index < exec_index:
-        problems.append(
-            f"{label}: the exec output renders above its command card "
-            f"(output at {output_index}, card at {exec_index})"
-        )
+        problems.append(f"{label}: the exec's output card is not visible below its command card")
     bang_indexes = [
         i for i, (kind, text) in enumerate(entries) if kind == "message:user" and command in text
     ]
@@ -318,7 +342,7 @@ def test_native_claude_bang_exec_keeps_chat_timeline(
     _set_reply(mock_llm_server_url, follow_up_1)
     first_probe = f"bang-order-{nonce}"
     first_command = _run_bang(page, first_probe, reply=follow_up_1)
-    first_feed = _feed_entries(page)
+    first_feed = _settled_feed(page)
     page.screenshot(path=str(shots / "2-after-first-bang.png"))
     _log.info("feed after first bang:\n%s", _format_feed(first_feed))
     problems += _timeline_problems(
@@ -334,7 +358,7 @@ def test_native_claude_bang_exec_keeps_chat_timeline(
     _set_reply(mock_llm_server_url, follow_up_2)
     second_probe = f"bang-second-{nonce}"
     second_command = _run_bang(page, second_probe, reply=follow_up_2)
-    second_feed = _feed_entries(page)
+    second_feed = _settled_feed(page)
     page.screenshot(path=str(shots / "3-after-second-bang.png"))
     _log.info("feed after second bang:\n%s", _format_feed(second_feed))
     problems += _timeline_problems(

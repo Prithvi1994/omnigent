@@ -411,7 +411,7 @@ def _ran_as_shell_command(base_url: str, session_id: str, marker: str) -> bool:
     """
     resp = httpx.get(
         f"{base_url}/v1/sessions/{session_id}/items",
-        params={"limit": 100, "order": "asc"},
+        params={"limit": 1000, "order": "asc"},
         timeout=15.0,
     )
     resp.raise_for_status()
