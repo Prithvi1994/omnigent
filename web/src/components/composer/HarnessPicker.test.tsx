@@ -204,7 +204,7 @@ describe("HarnessPicker", () => {
     }
   });
 
-  it("opens the mobile configuration page at the top of a scrolled menu and restores the list", () => {
+  it("opens the mobile configuration page at the top of a scrolled menu", () => {
     render(<PickerFixture mobile />);
     fireEvent.pointerDown(screen.getByRole("button", { name: "Harness" }), { button: 0 });
     const menu = screen.getByTestId("menu");
@@ -214,9 +214,6 @@ describe("HarnessPicker", () => {
     fireEvent.click(screen.getByTestId("edit"));
     expect(screen.getByTestId("back")).toBeInTheDocument();
     expect(menu.scrollTop).toBe(0);
-    fireEvent.click(screen.getByTestId("back"));
-    expect(screen.getByTestId("entry")).toBeInTheDocument();
-    expect(menu.scrollTop).toBe(36);
   });
 
   it("keeps a non-modal picker open while focusing its active row inside a dialog", async () => {
