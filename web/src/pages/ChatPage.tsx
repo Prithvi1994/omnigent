@@ -3841,6 +3841,15 @@ function ComposerImpl(
                   role="status"
                   tabIndex={0}
                   aria-label="Slash command output"
+                  // The panel is focusable for scrolling, so Escape here must
+                  // dismiss it too — mirror the textarea path and restore focus.
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      setCommandError(null);
+                      textareaRef.current?.focus();
+                    }
+                  }}
                   className={cn(
                     "absolute inset-x-0 bottom-full mb-2 overflow-y-auto overscroll-contain rounded-[12px] border border-border bg-popover px-3 py-2 shadow-menu",
                     COMPOSER_POPOVER_Z,

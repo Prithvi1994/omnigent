@@ -1231,6 +1231,25 @@ describe("Composer slash-command submit routing", () => {
     expect(onStop).toHaveBeenCalledTimes(1);
   });
 
+  it("dismisses floating command output when Escape fires inside the focused panel", () => {
+    const onStop = vi.fn();
+    render(
+      <Composer {...composerProps({ onSendSlashCommand: vi.fn(), isWorking: true, onStop })} />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/help" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    const panel = screen.getByTestId("composer-command-output");
+
+    // A keyboard user can focus the scrollable panel; Escape there dismisses it
+    // and returns focus to the composer without stopping the running turn.
+    panel.focus();
+    fireEvent.keyDown(panel, { key: "Escape" });
+    expect(screen.queryByTestId("composer-command-output")).not.toBeInTheDocument();
+    expect(onStop).not.toHaveBeenCalled();
+    expect(ta).toHaveFocus();
+  });
+
   it("treats /effort as plaintext when effort controls are hidden", () => {
     const onSend = vi.fn();
     const onSendSlashCommand = vi.fn();
