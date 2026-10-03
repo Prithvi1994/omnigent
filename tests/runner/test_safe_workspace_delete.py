@@ -77,6 +77,21 @@ def _helper_delete(workspace: Path, path: str, *, recursive: bool = False) -> di
 
 
 @pytest.mark.asyncio
+async def test_delete_uses_runner_helper_not_workspace_package(
+    client: httpx.AsyncClient, workspace: Path
+) -> None:
+    package = workspace / "omnigent"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        "raise RuntimeError('workspace checkout must not supply the delete helper')\n"
+    )
+    response = await client.delete(f"{FS_URL}/victim")
+    assert response.status_code == 200, response.text
+    assert response.json()["deleted"] is True
+    assert not (workspace / "victim").exists()
+
+
+@pytest.mark.asyncio
 async def test_symlinked_parent_preserves_outside_bytes(
     client: httpx.AsyncClient, workspace: Path, tmp_path: Path
 ) -> None:

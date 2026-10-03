@@ -633,6 +633,7 @@ class _HelperProcessClient:
             config_arg = ["--config-fd", str(r_fd)]
         helper_argv = [
             sys.executable,
+            "-P",
             "-m",
             "omnigent.inner.os_env",
             "helper",
