@@ -1,35 +1,18 @@
 """E2e: a provider declared in an earlier user config file must reach the spawned
-``opencode serve`` when a later file supplies the model pin.
+``opencode serve`` when a later file only supplies the model pin.
 
-OpenCode deep-merges the user's global config (``config.json`` ->
-``opencode.json`` -> ``opencode.jsonc``; later files win on conflicting keys,
-non-conflicting keys from earlier files survive), so users keep a small
-``opencode.jsonc`` model pin next to an ``opencode.json`` that declares their
-custom provider (an OpenAI-compatible endpoint with a custom base URL). The
-runner's per-session ``XDG_CONFIG_HOME`` hides the user's global config from the
-spawned server, and ``maybe_merge_user_provider_config()`` carries the user's
-providers into the synthesized per-session config; this journey checks that
-carry-over at the real process boundary.
+The runner's per-session ``XDG_CONFIG_HOME`` hides the user's global config from
+the spawned server, so ``maybe_merge_user_provider_config()`` carries the user's
+providers across. This drives the real daemon-to-runner-to-server boundary (host
+daemon -> host-bound ``opencode-native-ui`` session -> ``opencode serve`` ->
+``GET /config/providers``) for the ``opencode.json``/``opencode.jsonc`` split.
+File-name discovery (including ``config.json``) and merge semantics are
+unit-tested in ``tests/test_opencode_native_provider.py`` and
+``tests/test_opencode_native_bridge.py``. The ground truth is first checked
+against the installed CLI (``opencode debug config``) so an upstream merge change
+fails as a rig error, not an Omnigent failure.
 
-Journey (mirroring ``test_host_opencode_native_e2e.py``): write the user's
-global OpenCode config on the host -> connect a host daemon -> create a
-host-bound ``opencode-native-ui`` session -> the runner boots ``opencode serve``
-with the synthesized + merged config -> ask the spawned server which providers
-it has (``GET /config/providers``, the list the attached TUI offers in its model
-picker). Which file names are discovered (including ``config.json``) and how
-their contents merge is covered by the unit tests in
-``tests/test_opencode_native_provider.py`` and
-``tests/test_opencode_native_bridge.py``; this journey exercises the identical
-spawned-server boundary once, through the ``opencode.json``/``opencode.jsonc``
-split.
-
-The test first checks the ground truth on the installed binary (``opencode
-debug config`` on the same files) so a future upstream change in OpenCode's
-merge semantics fails loudly as a rig error instead of blaming Omnigent.
-
-Needs ``opencode`` and ``tmux`` on PATH (same prerequisites as the sibling
-``test_opencode_native_launch_config_timeout_e2e.py``); no LLM turn is driven,
-so no model credentials are required.
+Needs ``opencode`` and ``tmux`` on PATH; no LLM turn is driven.
 """
 
 from __future__ import annotations
@@ -211,7 +194,13 @@ def _opencode_cli_effective_config(home: Path) -> dict[str, Any]:
     out = proc.stdout
     start = out.find("{")
     assert start != -1, f"rig failure: `opencode debug config` emitted no JSON: {out[:400]!r}"
-    return json.loads(out[start:])
+    try:
+        return json.loads(out[start:])
+    except json.JSONDecodeError as err:
+        raise AssertionError(
+            f"rig failure: could not parse `opencode debug config` output as JSON: {err}; "
+            f"output was: {out[:400]!r}"
+        ) from err
 
 
 def _spawned_provider_ids(state: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
