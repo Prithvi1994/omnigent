@@ -614,18 +614,27 @@ collect_keychain_secret_names() {
 }
 
 purge_keychain_secrets() {
+  helper_out="$(mktemp "${TMPDIR:-/tmp}/omnigent-uninstall-secret-helper.XXXXXX")" || return 1
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     if [ "$DRY_RUN" = true ]; then
       record_action keychain_secret "$name" remove reported "" "would remove from the OS keychain (service omnigent)"
     elif [ -z "${OMNIGENT_UNINSTALL_PYTHON:-}" ]; then
       record_action keychain_secret "$name" remove reported "" "left in the OS keychain (service omnigent); remove it manually"
-    elif "$OMNIGENT_UNINSTALL_PYTHON" -m omnigent _internal delete-keychain-secret "$name" >/dev/null 2>&1; then
-      record_action keychain_secret "$name" remove done "" "removed from the OS keychain (service omnigent)"
+    elif "$OMNIGENT_UNINSTALL_PYTHON" -m omnigent _internal delete-keychain-secret "$name" >"$helper_out" 2>&1; then
+      if [ "$(awk 'NF { line=$0 } END { print line }' "$helper_out")" = absent ]; then
+        record_action keychain_secret "$name" remove skipped "" "no entry in the OS keychain (service omnigent)"
+      else
+        record_action keychain_secret "$name" remove done "" "removed from the OS keychain (service omnigent)"
+      fi
     else
-      record_action keychain_secret "$name" remove failed "" "failed to remove from the OS keychain (service omnigent)"
+      # Keep the helper's last line (its error) so a locked keychain, a missing
+      # module, and a crash stay distinguishable in the report.
+      reason="$(awk 'NF { line=$0 } END { sub(/^Error: /, "", line); print line }' "$helper_out" | tr -d '\000-\037' | cut -c1-240)"
+      record_action keychain_secret "$name" remove failed "" "failed to remove from the OS keychain (service omnigent)${reason:+: $reason}"
     fi
   done <"$SECRETS_FILE"
+  rm -f "$helper_out"
 }
 
 purge_state() {

@@ -125,28 +125,17 @@ def test_uninstall_cli_uses_exclusive_manifest_and_cleans_temp_script(
     assert not temp_script_dir.exists()
 
 
-def test_uninstall_cli_manifest_carries_keychain_secrets_and_python_helper(
-    monkeypatch, tmp_path: Path
-) -> None:
+def _uninstall_manifest_rows(
+    monkeypatch, tmp_path: Path, config_text: str
+) -> tuple[list[list[str]], object]:
+    """Run ``uninstall state --purge --yes`` with a stub script; return manifest rows + helper."""
     runner = CliRunner()
     script = tmp_path / "uninstall_oss.sh"
     script.write_text("#!/bin/sh\nexit 0\n")
     script.chmod(0o755)
     config_home = tmp_path / "config-home"
     config_home.mkdir()
-    (config_home / "config.yaml").write_text(
-        "providers:\n"
-        "  anthropic:\n"
-        "    kind: key\n"
-        "    anthropic:\n"
-        "      api_key_ref: keychain:anthropic\n"
-        "  openai:\n"
-        "    kind: key\n"
-        "    openai:\n"
-        "      api_key_ref: env:OPENAI_API_KEY\n"
-        "cursor:\n"
-        "  api_key_ref: keychain:cursor\n"
-    )
+    (config_home / "config.yaml").write_text(config_text)
     ledger = new_ledger(source="installer", strategy="install", deep=False)
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
     monkeypatch.setattr(cli_module, "_uninstall_script_path", lambda: script)
@@ -165,33 +154,77 @@ def test_uninstall_cli_manifest_carries_keychain_secrets_and_python_helper(
     result = runner.invoke(cli_module.cli, ["uninstall", "state", "--purge", "--yes"])
 
     assert result.exit_code == 0, result.output
-    assert seen["python"] == sys.executable
     rows = seen["rows"]
     assert isinstance(rows, list)
+    return rows, seen["python"]
+
+
+def test_uninstall_cli_manifest_carries_keychain_secrets_and_python_helper(
+    monkeypatch, tmp_path: Path
+) -> None:
+    rows, python = _uninstall_manifest_rows(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  anthropic:\n"
+        "    kind: key\n"
+        "    anthropic:\n"
+        "      api_key_ref: keychain:anthropic\n"
+        "  openai:\n"
+        "    kind: key\n"
+        "    openai:\n"
+        "      api_key_ref: env:OPENAI_API_KEY\n"
+        "cursor:\n"
+        "  api_key_ref: keychain:cursor\n"
+        "odd:\n"
+        '  api_key_ref: "keychain:tab\\there"\n',
+    )
+
+    assert python == sys.executable
+    # A delimiter inside a name must neither split its row nor leak into another.
     assert [row for row in rows if row[0] == "keychain_secret"] == [
         ["keychain_secret", "anthropic"],
         ["keychain_secret", "cursor"],
+        ["keychain_secret", "tab%09here"],
     ]
 
 
-def test_internal_delete_keychain_secret_deletes_stored_secret(
+def test_uninstall_cli_manifest_scans_malformed_config_for_keychain_refs(
+    monkeypatch, tmp_path: Path
+) -> None:
+    rows, _ = _uninstall_manifest_rows(
+        monkeypatch,
+        tmp_path,
+        "providers:\n  anthropic: {\n    api_key_ref: keychain:anthropic\n",
+    )
+
+    assert [row for row in rows if row[0] == "keychain_secret"] == [
+        ["keychain_secret", "anthropic"],
+    ]
+
+
+def test_internal_delete_keychain_secret_decodes_name_and_reports_result(
     monkeypatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
     from omnigent.onboarding import secrets
 
-    secrets.store_secret("anthropic", "test-key-value")
+    secrets.store_secret("tab\there", "test-key-value")
     runner = CliRunner()
 
-    result = runner.invoke(cli_module.cli, ["_internal", "delete-keychain-secret", "anthropic"])
+    removed = runner.invoke(cli_module.cli, ["_internal", "delete-keychain-secret", "tab%09here"])
+    absent = runner.invoke(cli_module.cli, ["_internal", "delete-keychain-secret", "tab%09here"])
 
-    assert result.exit_code == 0, result.output
-    assert secrets.load_secret("anthropic") is None
+    assert removed.exit_code == 0, removed.output
+    assert removed.output.strip() == "removed"
+    assert secrets.load_secret("tab\there") is None
+    assert absent.exit_code == 0, absent.output
+    assert absent.output.strip() == "absent"
 
 
 def test_internal_delete_keychain_secret_reports_failure(monkeypatch) -> None:
-    def _boom(name: str) -> None:
+    def _boom(name: str) -> bool:
         raise RuntimeError("keyring exploded")
 
     monkeypatch.setattr("omnigent.onboarding.secrets.delete_secret", _boom)

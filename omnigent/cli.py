@@ -9,6 +9,7 @@ import copy
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -22,6 +23,7 @@ from dataclasses import asdict, dataclass
 from importlib import import_module, resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TypeAlias, cast
+from urllib.parse import quote, unquote
 
 import click
 import psutil
@@ -5043,17 +5045,33 @@ def _uninstall_script_path() -> Path:
     raise click.ClickException("uninstall script is missing from this installation")
 
 
+_KEYCHAIN_REF_RE = re.compile(r"keychain:([^\s\"'#,\[\]{}]+)")
+
+
 def _keychain_secret_names() -> list[str]:
     """Collect the secret names the global config references as ``keychain:<name>``.
 
     Those secrets live in the OS keychain (keyring service ``omnigent``),
     outside the state dir, so ``uninstall --purge`` must delete or report
     them explicitly — removing ``~/.omnigent`` alone leaves them behind.
+    A config the YAML parser rejects is scanned as text, so a damaged file
+    cannot hide the secrets it references.
 
     :returns: Sorted unique secret names, e.g. ``["anthropic", "cursor"]``.
     """
-    from omnigent.onboarding.provider_config import load_config
+    from omnigent.onboarding.provider_config import _config_path
 
+    path = Path(_config_path())
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        click.echo(
+            f"warning: could not read {path} ({exc}); OS-keychain secrets were not discovered",
+            err=True,
+        )
+        return []
     names: set[str] = set()
 
     def _walk(node: object) -> None:
@@ -5068,7 +5086,10 @@ def _keychain_secret_names() -> list[str]:
             for value in node:
                 _walk(value)
 
-    _walk(load_config())
+    try:
+        _walk(yaml.safe_load(text))
+    except yaml.YAMLError:
+        names.update(_KEYCHAIN_REF_RE.findall(text))
     return sorted(names)
 
 
@@ -5119,8 +5140,9 @@ def _write_uninstall_manifest(ledger: InstallLedger) -> Path:
                 )
                 + "\n"
             )
+        # Percent-encoded so no name can carry a tab or newline into the TSV.
         for name in _keychain_secret_names():
-            handle.write("\t".join(["keychain_secret", name]) + "\n")
+            handle.write("\t".join(["keychain_secret", quote(name, safe="")]) + "\n")
     manifest.chmod(0o600)
     return manifest
 
@@ -5152,15 +5174,20 @@ def _internal_write_ledger(from_env: bool) -> None:
 
 
 @_internal.command("delete-keychain-secret")
-@click.argument("name")
-def _internal_delete_keychain_secret(name: str) -> None:
-    """Delete one Omnigent-stored secret; called by uninstall_oss.sh --purge."""
+@click.argument("encoded_name")
+def _internal_delete_keychain_secret(encoded_name: str) -> None:
+    """Delete one Omnigent-stored secret by percent-encoded name; called by uninstall_oss.sh.
+
+    Prints ``removed`` or ``absent``; exits 1 when the entry may survive.
+    """
     from omnigent.onboarding import secrets
 
+    name = unquote(encoded_name)
     try:
-        secrets.delete_secret(name)
+        removed = secrets.delete_secret(name)
     except Exception as exc:
         raise click.ClickException(f"could not delete secret {name!r}: {exc}") from exc
+    click.echo("removed" if removed else "absent")
 
 
 @cli.group("extensions")

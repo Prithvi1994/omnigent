@@ -151,3 +151,85 @@ def test_working_keyring_does_not_read_corrupt_fallback(
     (tmp_path / "secrets.json").write_text("invalid JSON")
 
     assert resolve_secret("keychain:openrouter") == "test-keyring-key"
+
+
+def test_delete_secret_reports_whether_anything_was_removed() -> None:
+    secrets.store_secret("openrouter", "sk-or-value")
+
+    assert secrets.delete_secret("openrouter") is True
+    assert secrets.delete_secret("openrouter") is False
+
+
+def test_delete_secret_keyring_delete_counts_as_removed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OMNIGENT_DISABLE_KEYRING")
+    deleted: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        keyring, "delete_password", lambda service, username: deleted.append((service, username))
+    )
+
+    assert secrets.delete_secret("anthropic") is True
+    assert deleted == [("omnigent", "anthropic")]
+
+
+def test_delete_secret_fails_when_keyring_entry_survives(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OMNIGENT_DISABLE_KEYRING")
+
+    def delete_password(service: str, username: str) -> None:
+        raise keyring.errors.PasswordDeleteError("Can't delete password in keychain: denied")
+
+    monkeypatch.setattr(keyring, "delete_password", delete_password)
+    monkeypatch.setattr(keyring, "get_password", lambda service, username: "still-there")
+
+    with pytest.raises(OmnigentError, match="still holds 'anthropic'"):
+        secrets.delete_secret("anthropic")
+
+
+def test_delete_secret_absent_keyring_entry_still_clears_file_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secrets.store_secret("anthropic", "sk-file-value")
+    monkeypatch.delenv("OMNIGENT_DISABLE_KEYRING")
+
+    def delete_password(service: str, username: str) -> None:
+        raise keyring.errors.PasswordDeleteError("No such password!")
+
+    monkeypatch.setattr(keyring, "delete_password", delete_password)
+    monkeypatch.setattr(keyring, "get_password", lambda service, username: None)
+
+    assert secrets.delete_secret("anthropic") is True
+    assert secrets._read_secrets_file() == {}
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [keyring.errors.NoKeyringError, keyring.errors.KeyringLocked, keyring.errors.KeyringError],
+)
+def test_delete_secret_inaccessible_keyring_without_file_copy_is_an_error(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[keyring.errors.KeyringError]
+) -> None:
+    monkeypatch.delenv("OMNIGENT_DISABLE_KEYRING")
+
+    def delete_password(service: str, username: str) -> None:
+        raise error_type("desktop session unavailable")
+
+    monkeypatch.setattr(keyring, "delete_password", delete_password)
+
+    with pytest.raises(OmnigentError, match=error_type.__name__) as raised:
+        secrets.delete_secret("anthropic")
+
+    assert "desktop session unavailable" not in str(raised.value)
+
+
+def test_delete_secret_inaccessible_keyring_still_clears_file_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secrets.store_secret("anthropic", "sk-file-value")
+    monkeypatch.delenv("OMNIGENT_DISABLE_KEYRING")
+
+    def delete_password(service: str, username: str) -> None:
+        raise keyring.errors.KeyringLocked("locked")
+
+    monkeypatch.setattr(keyring, "delete_password", delete_password)
+
+    assert secrets.delete_secret("anthropic") is True
+    assert secrets._read_secrets_file() == {}

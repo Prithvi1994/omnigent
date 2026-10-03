@@ -222,23 +222,52 @@ def load_secret(name: str) -> str | None:
     return stored
 
 
-def delete_secret(name: str) -> None:
-    """Delete the secret stored under *name*, if present.
+def delete_secret(name: str) -> bool:
+    """Delete the secret stored under *name* from the backends that hold it.
 
-    Tries the OS keychain when enabled; on a :class:`keyring.errors.KeyringError`
-    (which includes ``PasswordDeleteError`` for an absent entry) it falls
-    back to the file backend. Deleting a name that does not exist is a
-    no-op in either backend.
+    Tries the OS keychain when enabled and confirms a refused delete left
+    nothing behind, then removes any file-backed copy. A keychain that is
+    inaccessible (locked, headless, no backend) is tolerated only when the
+    file backend held the secret, mirroring :func:`load_secret`; otherwise
+    the access failure is reported instead of claiming the secret is gone.
 
     :param name: The stable secret name to delete, e.g. ``"anthropic"``.
+    :returns: ``True`` when an entry was removed, ``False`` when no backend
+        held *name*.
+    :raises OmnigentError: If the keychain entry survives the delete, or the
+        keychain is inaccessible and no file-backed secret exists.
     """
+    removed = False
+    keyring_error_name: str | None = None
     if _use_keyring():
         try:
             keyring.delete_password(_KEYRING_SERVICE, name)
-            return
-        except _KEYRING_ERRORS:
-            pass
+            removed = True
+        except keyring.errors.PasswordDeleteError:
+            # Raised for an absent entry and for a refused delete alike; a
+            # lookup tells them apart.
+            try:
+                remaining = keyring.get_password(_KEYRING_SERVICE, name)
+            except _KEYRING_ERRORS as exc:
+                keyring_error_name = type(exc).__name__
+            else:
+                if remaining is not None:
+                    raise OmnigentError(
+                        f"the OS keyring still holds {name!r} after the delete request.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+        except _KEYRING_ERRORS as exc:
+            keyring_error_name = type(exc).__name__
     secrets = _read_secrets_file()
     if name in secrets:
         del secrets[name]
         _write_secrets_file(secrets)
+        removed = True
+    elif keyring_error_name is not None:
+        raise OmnigentError(
+            f"OS keyring inaccessible ({keyring_error_name}) and no file-backed "
+            f"secret {name!r} exists. Check that a keyring backend is available "
+            "and unlocked, then retry.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return removed

@@ -668,11 +668,19 @@ def _state_with_install_signal(home: Path) -> Path:
     return state
 
 
-def _fake_secret_helper(tmp_path: Path, *, exit_code: int = 0) -> tuple[Path, Path]:
+def _fake_secret_helper(
+    tmp_path: Path, *, exit_code: int = 0, stdout: str = "", stderr: str = ""
+) -> tuple[Path, Path]:
     """A stand-in for OMNIGENT_UNINSTALL_PYTHON that logs its arguments."""
     log = tmp_path / "helper.log"
     helper = tmp_path / "fake-python"
-    helper.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >>{log}\nexit {exit_code}\n")
+    lines = ["#!/bin/sh", f"printf '%s\\n' \"$*\" >>{log}"]
+    if stdout:
+        lines.append(f"printf '%s\\n' '{stdout}'")
+    if stderr:
+        lines.append(f"printf '%s\\n' '{stderr}' >&2")
+    lines.append(f"exit {exit_code}")
+    helper.write_text("\n".join(lines) + "\n")
     helper.chmod(0o755)
     return helper, log
 
@@ -746,7 +754,11 @@ def test_uninstall_script_purge_records_failed_keychain_secret_delete(tmp_path: 
     _state_with_install_signal(home)
     manifest = tmp_path / "manifest.tsv"
     manifest.write_text("keychain_secret\tanthropic\n")
-    helper, _ = _fake_secret_helper(tmp_path, exit_code=1)
+    helper, _ = _fake_secret_helper(
+        tmp_path,
+        exit_code=1,
+        stderr="Error: could not delete secret anthropic: OS keyring inaccessible (KeyringLocked)",
+    )
 
     result = _run_uninstall(
         home,
@@ -763,6 +775,35 @@ def test_uninstall_script_purge_records_failed_keychain_secret_delete(tmp_path: 
     assert result.returncode == 1
     actions = _keychain_actions(json.loads(result.stdout))
     assert [(name, status) for name, status, _ in actions] == [("anthropic", "failed")]
+    assert actions[0][2] == (
+        "failed to remove from the OS keychain (service omnigent): "
+        "could not delete secret anthropic: OS keyring inaccessible (KeyringLocked)"
+    )
+
+
+def test_uninstall_script_purge_skips_absent_keychain_secret(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _state_with_install_signal(home)
+    manifest = tmp_path / "manifest.tsv"
+    manifest.write_text("keychain_secret\tanthropic\n")
+    helper, _ = _fake_secret_helper(tmp_path, stdout="absent")
+
+    result = _run_uninstall(
+        home,
+        "state",
+        "--purge",
+        "--yes",
+        "--json",
+        env_updates={
+            "OMNIGENT_UNINSTALL_LEDGER_MANIFEST": str(manifest),
+            "OMNIGENT_UNINSTALL_PYTHON": str(helper),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    actions = _keychain_actions(json.loads(result.stdout))
+    assert [(name, status) for name, status, _ in actions] == [("anthropic", "skipped")]
+    assert "no entry in the OS keychain" in actions[0][2]
 
 
 def test_uninstall_script_purge_dry_run_previews_keychain_secrets(tmp_path: Path) -> None:
