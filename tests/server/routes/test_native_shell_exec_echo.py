@@ -16,6 +16,7 @@ from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 _WEB_MESSAGE = [{"type": "input_text", "text": "please review the diff"}]
+_ATTACHMENT = {"type": "input_file", "file_id": "file_diff", "filename": "diff.patch"}
 _BANG = [{"type": "input_text", "text": "! pwd"}]
 _FORWARDER = "forwarder@example.com"
 
@@ -70,6 +71,14 @@ def _consumed_user_authored(publish: Mock) -> list[object]:
     ]
 
 
+def _consumed_shell_command_echo(publish: Mock) -> list[object]:
+    return [
+        call.args[1]["data"]["shell_command_echo"]
+        for call in publish.call_args_list
+        if call.args[1]["type"] == "session.input.consumed"
+    ]
+
+
 def _message_by_text(store: SqlAlchemyConversationStore, session_id: str, text: str) -> Any:
     [item] = [
         item
@@ -100,6 +109,9 @@ async def test_web_bang_echo_drains_only_its_own_queued_entry(
     # Flagged human-authored so it renders as a user bubble on reload.
     assert echo.data.user_authored is True
     assert _cleared_pending_ids(publish) == [bang]
+    # It matched a composer send but is still a shell exec; the consumed
+    # event flags it so the client never pops it off the FIFO by position.
+    assert _consumed_shell_command_echo(publish) == [True]
     assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == [older]
 
 
@@ -115,7 +127,9 @@ async def test_terminal_bang_echo_leaves_unrelated_queued_web_message_alone(
     """
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="Review")
-    web = pending_inputs.record(conv.id, _WEB_MESSAGE, created_by="alice@example.com")
+    web = pending_inputs.record(
+        conv.id, [_ATTACHMENT, *_WEB_MESSAGE], created_by="alice@example.com"
+    )
     publish = Mock()
     monkeypatch.setattr("omnigent.runtime.session_stream.publish", publish)
 
@@ -125,13 +139,17 @@ async def test_terminal_bang_echo_leaves_unrelated_queued_web_message_alone(
 
     echo = _message_by_text(store, conv.id, "! pwd")
     assert echo.created_by == _FORWARDER
-    # user_authored (with no cleared_pending_id) tells the web client this is a
-    # terminal-typed message that owns no optimistic bubble, so it must not pop
-    # the unrelated queued web message's bubble off the FIFO head.
+    # The consumed event's explicit shell_command_echo flag — not authorship —
+    # tells the web client this terminal-typed exec owns no optimistic bubble,
+    # so it must not pop the unrelated queued web message off the FIFO head.
     assert echo.data.user_authored is True
     assert _cleared_pending_ids(publish) == [None]
     assert _consumed_user_authored(publish) == [True]
-    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == [web]
+    assert _consumed_shell_command_echo(publish) == [True]
+    # The web message (and its attachment) stays queued for its own mirror.
+    [retained] = pending_inputs.snapshot_for(conv.id)
+    assert retained["pending_id"] == web
+    assert _ATTACHMENT in retained["content"]
 
     await _persist_external_conversation_item(
         conv.id, conv, _web_mirror_body(_WEB_MESSAGE), store, created_by=_FORWARDER
@@ -139,5 +157,8 @@ async def test_terminal_bang_echo_leaves_unrelated_queued_web_message_alone(
 
     mirrored = _message_by_text(store, conv.id, "please review the diff")
     assert mirrored.created_by == "alice@example.com"
+    # The text-only mirror re-adopts the queued entry's attachment block.
+    assert any(block.get("type") == "input_file" for block in mirrored.data.content)
     assert _cleared_pending_ids(publish) == [None, web]
+    assert _consumed_shell_command_echo(publish) == [True, False]
     assert pending_inputs.snapshot_for(conv.id) == []

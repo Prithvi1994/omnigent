@@ -7988,10 +7988,9 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     );
 
     it("leaves an unrelated queued web message when a terminal bang drains nothing", () => {
-      // A `!` shell exec typed in the terminal round-trips as a user-authored
-      // echo that drained no pending entry (clearedPendingId unset). It owns no
-      // optimistic bubble here, so it renders fresh and must not pop another
-      // user's queued message off the FIFO head.
+      // A `!` shell exec typed in the terminal round-trips as an echo the
+      // server flags shellCommandEcho; it drained no pending entry and owns no
+      // optimistic bubble here, so it must not pop a queued web message's head.
       const queued = {
         tempId: "pend_web",
         content: [{ type: "input_text" as const, text: "please review the diff" }],
@@ -8003,11 +8002,35 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         itemId: "msg_bang",
         itemType: "message",
         createdBy: "forwarder@example.com",
+        shellCommandEcho: true,
         data: { role: "user", content: bang, user_authored: true },
       });
       expect(useChatStore.getState().pendingUserMessages).toEqual([queued]);
       expect(useChatStore.getState().blocks).toMatchObject([
         { type: "user_message", ctx: { itemId: "msg_bang" }, content: bang },
+      ]);
+    });
+
+    it("settles a web send whose text differs from the queued head without the bang flag", () => {
+      // A genuine web send is user_authored with no clearedPendingId and no
+      // shellCommandEcho. Its committed text can differ from the optimistic head
+      // (attachment placeholder vs text), so it must pop the head, not strand it.
+      const head = {
+        tempId: "pend_web",
+        content: [{ type: "input_text" as const, text: "[Attached: diff.patch]" }],
+      };
+      const committed = [{ type: "input_text" as const, text: "please review the diff" }];
+      useChatStore.setState({ blocks: [], pendingUserMessages: [head] });
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_web",
+        itemType: "message",
+        createdBy: "alice@example.com",
+        data: { role: "user", content: committed, user_authored: true },
+      });
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+      expect(useChatStore.getState().blocks).toMatchObject([
+        { type: "user_message", ctx: { itemId: "msg_web" }, content: committed },
       ]);
     });
 

@@ -448,7 +448,15 @@ def _wait_for_transcript_message(
                 f"{marker!r} ran as a `!` shell command instead of landing as a chat turn"
             )
         items = _ordered_message_items(base_url, session_id)
-        if any(item.get("role") == role and marker in _item_text(item) for item in items):
+        # A `!`-prefixed user item is shell mode's echo of the exec, not the
+        # chat turn; skip it so the shell-command check still fires instead of
+        # this matching the echo and passing before the command item lands.
+        if any(
+            item.get("role") == role
+            and marker in _item_text(item)
+            and not (role == "user" and _item_text(item).lstrip().startswith("!"))
+            for item in items
+        ):
             return
         page.wait_for_timeout(500)
     raise AssertionError(

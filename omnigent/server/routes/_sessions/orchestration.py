@@ -2800,11 +2800,10 @@ async def _persist_external_conversation_item_unlocked(
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
             item = item.model_copy(update={"created_by": created_by})
-        if agent_message_candidate or shell_command_echo:
-            # Both are human-authored terminal input: mark them so the item
-            # renders as a user bubble on reload and, when a terminal bang
-            # drains no pending entry, the web client never pops an unrelated
-            # queued message's optimistic bubble for it.
+        if exact_match_only:
+            # Human-authored terminal input (agent-message candidate or bang
+            # echo): mark it so it renders as a user bubble on reload. FIFO
+            # protection rides the consumed event's shell_command_echo flag.
             item = item.model_copy(
                 update={"data": item.data.model_copy(update={"user_authored": True})}
             )
@@ -2937,6 +2936,7 @@ def _publish_persisted_external_item(
         persisted,
         cleared_pending_id=cleared_pending_id,
         message_id=message_id if isinstance(message_id, str) else None,
+        shell_command_echo=body.data.get("shell_command_echo") is True,
     )
     _drive_terminal_resolved_elicitation(session_id, persisted)
 

@@ -140,6 +140,21 @@ def _timeline_problems(
     )
     if exec_index is None:
         problems.append(f"{label}: the exec's command card is not visible in the feed")
+    output_index = next(
+        (
+            i
+            for i, (kind, text) in enumerate(entries)
+            if kind == "terminal:output" and probe in text
+        ),
+        None,
+    )
+    if output_index is None:
+        problems.append(f"{label}: the exec's output card is not visible in the feed")
+    elif exec_index is not None and output_index < exec_index:
+        problems.append(
+            f"{label}: the exec output renders above its command card "
+            f"(output at {output_index}, card at {exec_index})"
+        )
     bang_indexes = [
         i for i, (kind, text) in enumerate(entries) if kind == "message:user" and command in text
     ]

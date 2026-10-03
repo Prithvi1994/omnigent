@@ -7354,14 +7354,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       applyToConversation((s) => {
         const eventContent = userContentFromEvent(event);
         const pendingHead = s.pendingUserMessages[0];
-        // Human input typed in the terminal (team markup or a `!` shell exec)
-        // that drained no pending entry owns no optimistic bubble here, so only
-        // an exact content match may be its own: anything else must leave an
-        // unrelated queued message's bubble in place.
-        const terminalAuthored = event.data.user_authored === true && !event.clearedPendingId;
+        // A native shell-mode (`!`) exec echo drains no pending entry and owns no
+        // optimistic bubble here, so unless its text matches the head it must leave
+        // an unrelated queued web bubble in place. The server flags it explicitly.
+        const shellCommandEcho = event.shellCommandEcho === true;
         const unmatchedEnvelope =
           eventContent !== null &&
-          (isClaudeAgentMessageContent(eventContent) || terminalAuthored) &&
+          (isClaudeAgentMessageContent(eventContent) || shellCommandEcho) &&
           (!pendingHead || contentKeyOf(pendingHead.content) !== contentKeyOf(eventContent));
         if (hasCommittedItem(s.blocks, event.itemId)) {
           // The committed copy is already in `blocks` — the forwarder-mirrored
