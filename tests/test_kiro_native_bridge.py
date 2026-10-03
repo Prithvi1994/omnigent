@@ -263,88 +263,21 @@ def test_send_kiro_permission_verdict_accepts_plain_running_title(
     assert [call[-1] for call in calls if "send-keys" in call] == ["Enter"]
 
 
-def test_send_kiro_permission_verdict_accepts_hard_wrapped_running_title(
+def test_send_kiro_permission_verdict_rejects_a_hard_wrapped_running_title(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A title broken mid-token across physical lines must still correlate."""
-    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
-    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
-    bridge_dir = tmp_path / "bridge"
-    calls = _install_fake_tmux(
-        monkeypatch,
-        pane_outputs=[
-            _PERMISSION_PANE_WITH_HARD_WRAPPED_TITLE,
-            _PERMISSION_PANE_WITH_HARD_WRAPPED_TITLE,
-            _READY_PANE,
-        ],
-    )
-    write_tmux_target(
-        bridge_dir,
-        socket_path=Path("/tmp/tmux.sock"),
-        tmux_target="main",
-    )
+    """A title the TUI hard-wrapped mid-token is ambiguous and must fail closed.
 
-    send_kiro_permission_verdict(
-        bridge_dir,
-        action="accept",
-        expected_title=_HARD_WRAPPED_TITLE,
-        timeout_s=0.1,
-    )
-
-    assert [call[-1] for call in calls if "send-keys" in call] == ["Enter"]
-
-
-def test_send_kiro_permission_verdict_matches_mid_token_wrapped_tool_block(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A glyph tool block wrapped mid-token must still match the ACP title."""
-    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
-    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
-    bridge_dir = tmp_path / "bridge"
-    calls = _install_fake_tmux(
-        monkeypatch,
-        pane_outputs=[
-            _PERMISSION_PANE_WITH_MID_WORD_WRAP,
-            _PERMISSION_PANE_WITH_MID_WORD_WRAP,
-            _READY_PANE,
-        ],
-    )
-    write_tmux_target(
-        bridge_dir,
-        socket_path=Path("/tmp/tmux.sock"),
-        tmux_target="main",
-    )
-
-    send_kiro_permission_verdict(
-        bridge_dir,
-        action="accept",
-        expected_title="Running: cd /private/tmp/review && git status --porcelain=v1",
-        timeout_s=0.1,
-    )
-
-    assert [call[-1] for call in calls if "send-keys" in call] == ["Enter"]
-
-
-def test_send_kiro_permission_verdict_retries_ignored_enter(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A rendered prompt must disappear before web delivery counts as successful."""
+    ``capture-pane -J`` cannot rejoin a hard break, so the mid-token seam reaches
+    the matcher as a join space the approved command lacks. Rather than guess the
+    original token boundary, the pre-send gate rejects the prompt and sends no
+    key, leaving the TUI blocked instead of risking a different command.
+    """
     monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
-    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
-    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
-    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RETRY_INTERVAL_S", 0.0)
     bridge_dir = tmp_path / "bridge"
     calls = _install_fake_tmux(
-        monkeypatch,
-        pane_outputs=[
-            _PERMISSION_PANE,
-            _PERMISSION_PANE,
-            _PERMISSION_PANE,
-            _READY_PANE,
-        ],
+        monkeypatch, pane_outputs=[_PERMISSION_PANE_WITH_HARD_WRAPPED_TITLE]
     )
     write_tmux_target(
         bridge_dir,
@@ -352,16 +285,78 @@ def test_send_kiro_permission_verdict_retries_ignored_enter(
         tmux_target="main",
     )
 
-    send_kiro_permission_verdict(
+    with pytest.raises(RuntimeError, match="permission prompt was not safely focused"):
+        send_kiro_permission_verdict(
+            bridge_dir,
+            action="accept",
+            expected_title=_HARD_WRAPPED_TITLE,
+            timeout_s=0.01,
+        )
+
+    assert [call[-1] for call in calls if "send-keys" in call] == []
+
+
+def test_send_kiro_permission_verdict_rejects_a_mid_token_wrapped_tool_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A glyph tool block hard-wrapped mid-token must fail closed, not match.
+
+    ``--porce`` / ``lain=v1`` rejoins with a seam space (``--porce lain=v1``) the
+    approved ``--porcelain=v1`` lacks, so collapsing whitespace keeps them
+    distinct and the gate refuses to deliver a verdict.
+    """
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE_WITH_MID_WORD_WRAP])
+    write_tmux_target(
         bridge_dir,
-        action="accept",
-        expected_title="Running: pwd",
-        timeout_s=0.1,
-        verdict_recorded=lambda: False,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
     )
 
-    sent_keys = [call[-1] for call in calls if "send-keys" in call]
-    assert sent_keys == ["Enter", "Enter"]
+    with pytest.raises(RuntimeError, match="permission prompt was not safely focused"):
+        send_kiro_permission_verdict(
+            bridge_dir,
+            action="accept",
+            expected_title="Running: cd /private/tmp/review && git status --porcelain=v1",
+            timeout_s=0.01,
+        )
+
+    assert [call[-1] for call in calls if "send-keys" in call] == []
+
+
+def test_send_kiro_permission_verdict_rejects_a_missing_argument_separator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Collapsing whitespace must not fuse arguments: ``a /tmp/b`` != ``a/tmp/b``.
+
+    An approved ``touch /tmp/a /tmp/b`` must not be matched by a displayed
+    ``touch /tmp/a/tmp/b`` -- distinct commands differing only by a separator --
+    so the gate rejects it and sends no key.
+    """
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[_PERMISSION_PANE.replace("↓ Shell pwd", "↓ Shell touch /tmp/a/tmp/b")],
+    )
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    with pytest.raises(RuntimeError, match="permission prompt was not safely focused"):
+        send_kiro_permission_verdict(
+            bridge_dir,
+            action="accept",
+            expected_title="Running: touch /tmp/a /tmp/b",
+            timeout_s=0.01,
+        )
+
+    assert [call[-1] for call in calls if "send-keys" in call] == []
 
 
 def test_send_kiro_permission_verdict_never_retries_without_a_recorder(
@@ -372,7 +367,6 @@ def test_send_kiro_permission_verdict_never_retries_without_a_recorder(
     monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
-    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RETRY_INTERVAL_S", 0.0)
     bridge_dir = tmp_path / "bridge"
     calls = _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE])
     write_tmux_target(
@@ -488,7 +482,6 @@ def test_send_kiro_permission_verdict_rejects_a_failed_capture_as_delivery(
     monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
-    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RETRY_INTERVAL_S", 0.0)
     bridge_dir = tmp_path / "bridge"
     calls = _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE, _PERMISSION_PANE, ""])
     write_tmux_target(
@@ -521,7 +514,6 @@ def test_send_kiro_permission_verdict_stops_once_verdict_is_recorded(
     monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
-    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RETRY_INTERVAL_S", 0.0)
     bridge_dir = tmp_path / "bridge"
     calls = _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE])
     write_tmux_target(
@@ -539,34 +531,6 @@ def test_send_kiro_permission_verdict_stops_once_verdict_is_recorded(
     )
 
     assert [call[-1] for call in calls if "send-keys" in call] == ["Enter"]
-
-
-def test_send_kiro_permission_verdict_retries_until_verdict_is_recorded(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An unrecorded Enter on the same safe prompt is still retried."""
-    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
-    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
-    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
-    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RETRY_INTERVAL_S", 0.0)
-    bridge_dir = tmp_path / "bridge"
-    calls = _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE])
-    write_tmux_target(
-        bridge_dir,
-        socket_path=Path("/tmp/tmux.sock"),
-        tmux_target="main",
-    )
-
-    send_kiro_permission_verdict(
-        bridge_dir,
-        action="accept",
-        expected_title="Running: pwd",
-        timeout_s=0.1,
-        verdict_recorded=lambda: sum(call[-1] == "Enter" for call in calls) >= 2,
-    )
-
-    assert [call[-1] for call in calls if "send-keys" in call] == ["Enter", "Enter"]
 
 
 def test_send_kiro_permission_verdict_matches_soft_wrapped_title(
@@ -622,7 +586,6 @@ def test_send_kiro_permission_verdict_fails_if_prompt_never_closes(
     monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
-    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RETRY_INTERVAL_S", 0.0)
     bridge_dir = tmp_path / "bridge"
     _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE])
     write_tmux_target(
@@ -637,43 +600,15 @@ def test_send_kiro_permission_verdict_fails_if_prompt_never_closes(
         )
 
 
-def test_send_kiro_permission_verdict_does_not_retry_a_changed_prompt(
+def test_send_kiro_permission_verdict_fails_closed_when_a_follow_up_prompt_appears(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
-    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
-    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
-    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RETRY_INTERVAL_S", 0.0)
-    bridge_dir = tmp_path / "bridge"
-    calls = _install_fake_tmux(
-        monkeypatch,
-        pane_outputs=[_PERMISSION_PANE, _PERMISSION_PANE, _PERMISSION_PANE_DATE],
-    )
-    write_tmux_target(
-        bridge_dir,
-        socket_path=Path("/tmp/tmux.sock"),
-        tmux_target="main",
-    )
+    """A queued follow-up prompt with no recorded verdict fails closed, no resend.
 
-    with pytest.raises(RuntimeError, match="prompt changed before verdict delivery completed"):
-        send_kiro_permission_verdict(
-            bridge_dir, action="accept", expected_title="Running: pwd", timeout_s=0.1
-        )
-
-    sent_keys = [call[-1] for call in calls if "send-keys" in call]
-    assert sent_keys == ["Enter"]
-
-
-def test_send_kiro_permission_verdict_trusts_recorder_when_follow_up_prompt_appears(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A recorded verdict means a changed follow-up prompt is not a lost delivery.
-
-    If Kiro consumes the Enter and renders the next queued (differently titled)
-    prompt after the loop-top check but before this capture, re-consulting the
-    recorder must report success rather than a false "prompt changed" failure.
+    After the single Enter, Kiro renders a differently titled queued prompt while
+    this request's verdict is never recorded. Resending Enter could answer that
+    queued request, so delivery must send Enter once and then raise.
     """
     monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
@@ -689,12 +624,57 @@ def test_send_kiro_permission_verdict_trusts_recorder_when_follow_up_prompt_appe
         tmux_target="main",
     )
 
-    probe_calls = {"n": 0}
+    with pytest.raises(RuntimeError, match="did not resolve after verdict delivery"):
+        send_kiro_permission_verdict(
+            bridge_dir,
+            action="accept",
+            expected_title="Running: pwd",
+            timeout_s=0.1,
+            verdict_recorded=lambda: False,
+        )
+
+    sent_keys = [call[-1] for call in calls if "send-keys" in call]
+    assert sent_keys == ["Enter"]
+
+
+def test_send_kiro_permission_verdict_accepts_without_resending_into_a_queued_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow-consumed accept Enter is confirmed by the recorder, never resent.
+
+    Kiro buffers the single Enter and only consumes it after a second request
+    has queued its own prompt. A resend would be read by that queued request, so
+    delivery waits for this request's recorded verdict and sends Enter once; the
+    queued request stays unanswered.
+    """
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    # The first prompt stays up, then the queued second request renders its own
+    # prompt, all before Kiro consumes the buffered Enter.
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[
+            _PERMISSION_PANE,
+            _PERMISSION_PANE,
+            _PERMISSION_PANE_DATE,
+            _PERMISSION_PANE_DATE,
+        ],
+    )
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    polls = {"n": 0}
 
     def verdict_recorded() -> bool:
-        probe_calls["n"] += 1
-        # False at the loop top, True once the follow-up prompt is on screen.
-        return probe_calls["n"] >= 2
+        # The verdict only lands after the buffered Enter is finally consumed.
+        polls["n"] += 1
+        return polls["n"] >= 3
 
     send_kiro_permission_verdict(
         bridge_dir,
@@ -705,6 +685,53 @@ def test_send_kiro_permission_verdict_trusts_recorder_when_follow_up_prompt_appe
     )
 
     assert [call[-1] for call in calls if "send-keys" in call] == ["Enter"]
+
+
+def test_send_kiro_permission_verdict_declines_without_resending_into_a_queued_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow-consumed reject Enter is confirmed by the recorder, never resent.
+
+    After navigating to reject and sending one Enter, the queued second request
+    renders its prompt before Kiro consumes the Enter. Resending would turn that
+    queued request into an answer, so delivery sends Down, Down, Enter once and
+    waits for the recorded verdict; the queued request stays unanswered.
+    """
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[
+            _PERMISSION_PANE,
+            _PERMISSION_PANE_REJECT_FOCUSED,
+            _PERMISSION_PANE_REJECT_FOCUSED,
+            _PERMISSION_PANE_DATE,
+        ],
+    )
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    polls = {"n": 0}
+
+    def verdict_recorded() -> bool:
+        polls["n"] += 1
+        return polls["n"] >= 3
+
+    send_kiro_permission_verdict(
+        bridge_dir,
+        action="decline",
+        expected_title="Running: pwd",
+        timeout_s=0.1,
+        verdict_recorded=verdict_recorded,
+    )
+
+    assert [call[-1] for call in calls if "send-keys" in call] == ["Down", "Down", "Enter"]
 
 
 def test_send_kiro_permission_verdict_refuses_accept_when_focus_drifts_after_settle(

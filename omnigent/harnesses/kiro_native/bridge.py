@@ -64,7 +64,6 @@ _SUBMIT_RETRY_INTERVAL_S = 0.5
 _PERMISSION_KEY_INTERVAL_S = 0.3
 _PERMISSION_ENTER_SETTLE_S = 0.5
 _PERMISSION_VERDICT_VERIFY_TIMEOUT_S = 5.0
-_PERMISSION_VERDICT_RETRY_INTERVAL_S = 0.5
 # Pane rows above "requires approval" searched for the rendered tool block.
 _PERMISSION_TOOL_BLOCK_SCAN_LINES = 24
 _KIRO_SEPARATOR = "────"
@@ -519,18 +518,29 @@ def _kiro_active_permission_tool_line(pane: str) -> str:
     return " ".join(command_lines)
 
 
-def _squash_whitespace(text: str) -> str:
-    return "".join(text.split())
+def _collapse_whitespace(text: str) -> str:
+    """Collapse each run of whitespace to a single space.
+
+    Soft wraps rejoined by ``capture-pane -J`` leave no seam, but the TUI's own
+    hard line breaks reach us as separate physical lines joined with a space.
+    Collapsing (rather than deleting) whitespace preserves those separators, so a
+    mid-token hard wrap keeps the extra space and fails the equality check in
+    :func:`_kiro_permission_prompt_matches_title` instead of fusing two tokens.
+    """
+    return " ".join(text.split())
 
 
 def _kiro_permission_prompt_matches_title(pane: str, expected_title: str | None) -> bool:
-    """Return whether the visible prompt appears to match the parsed request title.
+    """Return whether the visible prompt matches the parsed request title.
 
-    Comparison ignores whitespace so a title that wrapped across physical lines
-    (tmux's soft wrap or the TUI's own hard break, even mid-token) still matches.
-    Only full-string equality is accepted, never substring containment: squashing
-    can never shrink a longer displayed command down to a shorter approved one, so
-    a wrap seam cannot fake a token boundary and authorize a different command.
+    Whitespace runs are collapsed to a single space, so a title soft-wrapped by
+    the terminal (rejoined seamlessly by ``capture-pane -J``) still matches. The
+    TUI's own hard line breaks instead reach us as separate physical lines joined
+    with a space, so a mid-token hard wrap keeps that extra space, no longer
+    compares equal to the un-wrapped command, and fails closed rather than fusing
+    two tokens. Only full-string equality is accepted, never substring
+    containment, so a wrap seam cannot fake a token boundary and authorize a
+    different command.
     """
     if not expected_title:
         return True
@@ -540,15 +550,15 @@ def _kiro_permission_prompt_matches_title(pane: str, expected_title: str | None)
     tool_line = _kiro_active_permission_tool_line(pane).strip()
     if not tool_line:
         return False
-    if _squash_whitespace(title) == _squash_whitespace(tool_line):
+    if _collapse_whitespace(title) == _collapse_whitespace(tool_line):
         return True
     # A glyph tool block renders "<ToolName> <command>" while the ACP title
     # carries only the command, so also compare against the tool line with its
     # leading tool-name token removed.
     command = title.removeprefix("Running:").strip() if title.startswith("Running:") else title
-    squashed_command = _squash_whitespace(command)
+    collapsed_command = _collapse_whitespace(command)
     _, _, rest = tool_line.partition(" ")
-    return bool(squashed_command) and _squash_whitespace(rest) == squashed_command
+    return bool(collapsed_command) and _collapse_whitespace(rest) == collapsed_command
 
 
 def _wait_for_kiro_permission_prompt(
@@ -578,59 +588,31 @@ def _wait_for_kiro_permission_verdict_applied(
     socket_path: str,
     tmux_target: str,
     *,
-    action: str,
-    expected_title: str | None,
     timeout_s: float,
     verdict_recorded: Callable[[], bool] | None = None,
 ) -> None:
-    """Verify Kiro consumed a verdict, retrying only on the same safe prompt.
+    """Confirm Kiro consumed the single delivered verdict without resending it.
 
-    Bounded by ``_PERMISSION_VERDICT_VERIFY_TIMEOUT_S``. Retries need
-    ``verdict_recorded`` (Kiro's ACP response for this request): the pane alone
-    cannot tell a dropped Enter from an identical follow-up prompt, which a retry
-    must never answer, so without the callback the verdict is only verified.
+    The caller types ``Enter`` exactly once against a prompt it already verified
+    is the right one. A key still buffered in Kiro's input queue is
+    indistinguishable from a discarded one, so resending it could be consumed by
+    a newly queued prompt and authorize a different request. This only observes
+    delivery -- a recorded ACP response for this request, or the approval prompt
+    leaving the pane -- bounded by ``_PERMISSION_VERDICT_VERIFY_TIMEOUT_S``, and
+    fails closed on timeout instead of retrying.
     """
     deadline = time.monotonic() + min(timeout_s, _PERMISSION_VERDICT_VERIFY_TIMEOUT_S)
-    last_enter = time.monotonic()
     while time.monotonic() < deadline:
         if verdict_recorded is not None and verdict_recorded():
             return
         pane = _capture_pane(socket_path, tmux_target, join_wrapped=True)
-        if not pane:
-            # A tmux capture failure returns "": that is not a vanished prompt,
-            # so keep polling and let verdict_recorded (or the timeout) decide
-            # rather than reading a dropped Enter as a confirmed delivery.
-            time.sleep(_POLL_INTERVAL_S)
-            continue
-        if not _kiro_permission_prompt_active(pane):
+        # An empty capture is a tmux read failure, not a vanished prompt. When a
+        # recorder is supplied it is the delivery authority: a vanished prompt may
+        # be the TUI redrawing or the next queued request, so keep polling until
+        # the recorder confirms this request's response. Only fall back to the
+        # pane state when no recorder was supplied.
+        if pane and not _kiro_permission_prompt_active(pane) and verdict_recorded is None:
             return
-        # Kiro may consume the Enter and immediately render the next queued
-        # prompt; a recorded verdict for this request proves delivery already
-        # landed, so trust it rather than failing on the changed prompt.
-        if verdict_recorded is not None and verdict_recorded():
-            return
-        if not _kiro_permission_prompt_matches_title(pane, expected_title):
-            raise RuntimeError(
-                "kiro-native permission prompt changed before verdict delivery completed"
-            )
-        focus_is_safe = (
-            _kiro_permission_focus_on_one_time_allow(pane)
-            if action == "accept"
-            else _kiro_permission_focus_on_reject(pane)
-        )
-        if not focus_is_safe:
-            raise RuntimeError(
-                "kiro-native permission focus changed before verdict delivery completed"
-            )
-        now = time.monotonic()
-        if (
-            verdict_recorded is not None
-            and now - last_enter >= _PERMISSION_VERDICT_RETRY_INTERVAL_S
-        ):
-            if verdict_recorded():
-                return
-            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-            last_enter = now
         time.sleep(_POLL_INTERVAL_S)
     if verdict_recorded is not None and verdict_recorded():
         return
@@ -832,8 +814,8 @@ def send_kiro_permission_verdict(
     """Deliver a one-time Kiro permission verdict to the active TUI prompt.
 
     ``verdict_recorded`` reports whether Kiro's ACP recorder already holds this
-    request's response; without it a lingering prompt is verified but never
-    retried. See :func:`_wait_for_kiro_permission_verdict_applied`.
+    request's response, confirming the single Enter was consumed. Enter is
+    never resent. See :func:`_wait_for_kiro_permission_verdict_applied`.
     """
     if action not in {"accept", "decline", "cancel"}:
         raise RuntimeError(f"unsupported Kiro permission action: {action!r}")
@@ -861,8 +843,6 @@ def send_kiro_permission_verdict(
         _wait_for_kiro_permission_verdict_applied(
             socket_path,
             tmux_target,
-            action=action,
-            expected_title=expected_title,
             timeout_s=timeout_s,
             verdict_recorded=verdict_recorded,
         )
@@ -883,8 +863,6 @@ def send_kiro_permission_verdict(
     _wait_for_kiro_permission_verdict_applied(
         socket_path,
         tmux_target,
-        action=action,
-        expected_title=expected_title,
         timeout_s=timeout_s,
         verdict_recorded=verdict_recorded,
     )

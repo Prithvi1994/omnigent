@@ -5,9 +5,10 @@ the same user-visible divergence — Omnigent shows the approval resolved with n
 pending elicitation while the native Kiro pane stays blocked on the same
 ``requires approval`` prompt:
 
-1. post-delivery: ``send_kiro_permission_verdict`` types one ``Enter``, sleeps,
-   and returns unconditionally, so an Enter that Kiro drops under load is still
-   reported as a delivered verdict (no ACP response is ever recorded);
+1. post-delivery: ``send_kiro_permission_verdict`` types one ``Enter`` and
+   returns without confirming Kiro consumed it, so a verdict that only lands
+   after a delay under load is reported delivered before any ACP response is
+   recorded -- and a blind resend to recover it could answer a queued request;
 2. pre-delivery: ``_kiro_active_permission_tool_line`` reduces the rendered
    tool block to one physical line, so a command title that wraps at 80 columns
    (or a ``╰ working_dir=…`` metadata row) fails the fail-closed title check
@@ -28,9 +29,11 @@ runner → kiro-native bridge → tmux TUI → ACP recorder → permission mirro
 The real ``kiro-cli`` authenticates against Kiro's own backend and cannot run
 in CI, so ``OMNIGENT_KIRO_PATH`` points at a fake TUI speaking the contracts
 the bridge drives (same seam as ``test_kiro_concurrent_permissions``), with the
-reported fault injected per test: ``drop-first-enter`` swallows the first
-Enter on the approval picker; ``wrapped-title`` renders the real wrapped
-80-column tool block with a working-dir row and separator.
+reported fault injected per test: ``delay-first-enter`` accepts the single
+Enter on the approval picker but applies the verdict only after a pause and
+never resends it; ``wrapped-title`` emits the long command title on one logical
+line that the 80-column pane soft-wraps (so ``capture-pane -J`` rejoins it), with
+a working-dir row and separator.
 """
 
 from __future__ import annotations
@@ -83,15 +86,17 @@ _DELIVERY_CONFIRM_TIMEOUT_S = 45.0
 _REQUEST_ID = "perm-req-1"
 
 # Minimal fake ``kiro-cli`` TUI (see module docstring). ``__FAKE_MODE__`` selects the
-# injected fault: ``drop-first-enter`` swallows the first Enter on the picker;
+# injected fault: ``delay-first-enter`` applies the single Enter after a pause;
 # ``wrapped-title`` renders the 80-column wrapped tool block with a working_dir row.
 _FAKE_KIRO_TEMPLATE = r'''#!/usr/bin/env python3
 """Fake kiro-cli TUI for the verdict-delivery regression tests."""
 import json
 import os
 import sys
+import threading
 
 MODE = "__FAKE_MODE__"
+_DEFER_S = 1.5
 RECORD_PATH = os.environ.get("KIRO_ACP_RECORD_PATH", "")
 SEP = "─" * 44
 READY_MARKER = "ask a question or describe a task"
@@ -103,9 +108,13 @@ OPTIONS = (
 PASTE_START = b"\x1b[200~"
 PASTE_END = b"\x1b[201~"
 SHORT_TITLE = "Running: touch /tmp/kiro-e2e-step"
-# The 80-column wrap of the long command title, exactly as rendered.
-WRAP_FIRST = "Running: cd /tmp/omnigent-e2e-worktrees/fix-kiro-native-verdict-"
-WRAP_REST = "1eea && git status --porcelain=v1 --untracked-files=all"
+# A long command title emitted on one logical line: the 80-column pane soft-wraps
+# it and ``capture-pane -J`` rejoins the seam, so a terminal wrap must not abort
+# verdict delivery.
+WRAP_TITLE = (
+    "Running: cd /tmp/omnigent-e2e-worktrees/fix-kiro-native-verdict-1eea"
+    " && git status --porcelain=v1 --untracked-files=all"
+)
 WORKING_DIR_ROW = (
     "╰ working_dir=/tmp/omnigent-e2e-worktrees/fix-kiro-native-verdict-1eea"
 )
@@ -134,8 +143,7 @@ class FakeKiro:
         if self.active is not None:
             lines.append("")
             if MODE == "wrapped-title":
-                lines.append(WRAP_FIRST)
-                lines.append(WRAP_REST)
+                lines.append(WRAP_TITLE)
                 lines.append(WORKING_DIR_ROW)
                 lines.append(SEP)
                 lines.append(" shell requires approval")
@@ -161,7 +169,7 @@ class FakeKiro:
             return
         self.turn += 1
         self.transcript.append("> " + text[:64])
-        title = WRAP_FIRST + WRAP_REST if MODE == "wrapped-title" else SHORT_TITLE
+        title = WRAP_TITLE if MODE == "wrapped-title" else SHORT_TITLE
         request = {
             "id": "perm-req-%d" % self.turn,
             "title": title,
@@ -212,13 +220,23 @@ class FakeKiro:
         self.focus = 0
         self.render()
 
+    def _apply_deferred(self):
+        # Fires from the delay timer: the single buffered Enter is finally
+        # consumed, as Kiro would under load. No further keypress is involved.
+        if self.active is not None and self.active.get("deferred"):
+            self.resolve_active(True)
+
     def on_enter(self):
         if self.active is not None:
             if self.focus == 0:
-                if MODE == "drop-first-enter" and not self.active.get("dropped"):
-                    # The reported under-load behavior: the first Enter on the
-                    # approval picker is consumed without any effect.
-                    self.active["dropped"] = True
+                if MODE == "delay-first-enter" and not self.active.get("deferred"):
+                    # The reported under-load behavior: Kiro accepts the single
+                    # Enter but applies the verdict only after a pause; the key is
+                    # never lost, so delivery confirms it without resending.
+                    self.active["deferred"] = True
+                    timer = threading.Timer(_DEFER_S, self._apply_deferred)
+                    timer.daemon = True
+                    timer.start()
                     return
                 self.resolve_active(True)
             elif self.focus == len(OPTIONS) - 1:
@@ -394,12 +412,14 @@ def _kiro_stack(server_tmp: Path, shim_source: str) -> Iterator[tuple[str, str, 
         "RUNNER_SERVER_URL": base_url,
     }
 
-    log_handle = open(log_path, "w")  # noqa: SIM115
-    runner_log_handle = open(runner_log_path, "w")  # noqa: SIM115
     proc: subprocess.Popen[bytes] | None = None
     runner_proc: subprocess.Popen[bytes] | None = None
     session_id: str | None = None
+    log_handle = None
+    runner_log_handle = None
     try:
+        log_handle = open(log_path, "w")  # noqa: SIM115
+        runner_log_handle = open(runner_log_path, "w")  # noqa: SIM115
         proc = subprocess.Popen(
             [
                 sys.executable,
@@ -495,8 +515,10 @@ def _kiro_stack(server_tmp: Path, shim_source: str) -> Iterator[tuple[str, str, 
             except subprocess.TimeoutExpired:
                 child.kill()
                 child.wait(timeout=10)
-        log_handle.close()
-        runner_log_handle.close()
+        if log_handle is not None:
+            log_handle.close()
+        if runner_log_handle is not None:
+            runner_log_handle.close()
 
 
 @pytest.fixture
@@ -507,7 +529,7 @@ def kiro_fault_session(
 ) -> Iterator[tuple[str, str, Path]]:
     """A runner-bound kiro-native session backed by the fault-injecting fake TUI.
 
-    Parametrize indirectly with the fake's mode (``drop-first-enter`` or
+    Parametrize indirectly with the fake's mode (``delay-first-enter`` or
     ``wrapped-title``).
     """
     if request.config.getoption("--ui-base-url"):
@@ -569,12 +591,12 @@ def _assert_verdict_reached_kiro(record_file: Path, bridge_dir: Path) -> None:
 
 
 @pytest.mark.timeout(600)
-@pytest.mark.parametrize("kiro_fault_session", ["drop-first-enter"], indirect=True)
+@pytest.mark.parametrize("kiro_fault_session", ["delay-first-enter"], indirect=True)
 def test_kiro_web_approval_confirms_tmux_verdict_delivery(
     kiro_fault_session: tuple[str, str, Path],
     page: Page,
 ) -> None:
-    """An Enter that Kiro drops must be retried, not reported as delivered."""
+    """A slowly consumed Enter must be confirmed as delivered from one keypress."""
     from omnigent.harnesses.kiro_native.bridge import acp_record_path
 
     base_url, session_id, bridge_dir = kiro_fault_session
@@ -634,16 +656,16 @@ def kiro_identical_prompts_session(
 
 
 @pytest.mark.timeout(600)
-def test_kiro_identical_follow_up_prompt_is_not_answered_by_retry(
+def test_kiro_identical_follow_up_prompt_stays_unanswered_without_approval(
     kiro_identical_prompts_session: tuple[str, str, Path],
     page: Page,
 ) -> None:
-    """A consumed Enter followed by an identical prompt must not be retried.
+    """An identically titled queued prompt must not be answered by a resend.
 
-    Confirm-and-retry re-sends Enter while "the same" prompt stays on the pane.
-    When Kiro queues two identically titled requests, the second prompt looks
-    exactly like an ignored first keypress; only approving its own card may
-    answer it.
+    The bridge types one Enter for the approved request and never resends. When
+    Kiro queues two identically titled requests, the second prompt looks exactly
+    like an ignored first keypress; because delivery never resends, only
+    approving the second request's own card may answer it.
     """
     from omnigent.harnesses.kiro_native.bridge import acp_record_path
 
