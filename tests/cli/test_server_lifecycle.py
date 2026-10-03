@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -13,6 +16,7 @@ from click.testing import CliRunner
 
 from omnigent.cli import _HostDaemonRecord, _SessionPagesResult, cli
 from omnigent.host.local_server import LocalServerInfo, LocalServerStartup
+from omnigent.native import owner_claim
 
 
 def _record(
@@ -448,29 +452,56 @@ def test_stop_reports_untracked_orphan_server(monkeypatch: pytest.MonkeyPatch) -
     assert "Nothing to stop." not in result.output
 
 
-def test_stop_reaps_orphaned_terminals(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """``stop`` reaps a managed terminal whose owning runner died uncleanly.
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="needs tmux on PATH")
+def test_stop_kills_orphaned_managed_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``stop`` tears down a session terminal whose owning runner died uncleanly.
 
-    A SIGKILL'd runner leaves its detached tmux terminal server with no owner
-    to reap it; the off-switch must sweep it and say so, not leave the server
-    and its harness child running.
+    A SIGKILL'd runner leaves its detached private-socket tmux server (session
+    ``main``) with no owner; the off-switch must not leave that server and its
+    harness child running.
     """
     monkeypatch.setattr("omnigent.cli._list_daemon_records", list)
     monkeypatch.setattr("omnigent.cli.local_server_url_if_healthy", lambda: None)
     monkeypatch.setattr("omnigent.cli.stop_local_omnigent_server", Mock())
     monkeypatch.setattr("omnigent.cli.stop_untracked_local_server", lambda: None)
-    monkeypatch.setattr("omnigent.inner.terminal._tmux_available", lambda: True)
-    monkeypatch.setattr("omnigent.inner.terminal._terminals_tmp_root", lambda: tmp_path)
-    orphan = tmp_path / "omnigent-terminal-orphan"
-    orphan.mkdir()
-    # 2147483647 is not a real PID, so the instance's owner counts as dead.
-    (orphan / "owner.pid").write_text("2147483647")
+    # Short scratch root: pytest's tmp_path can overrun the unix socket path limit.
+    tmp_root = Path(tempfile.mkdtemp(prefix="omnigent-stop-"))
+    monkeypatch.setattr("omnigent.inner.terminal._terminals_tmp_root", lambda: tmp_root)
+    monkeypatch.setenv("TMPDIR", str(tmp_root))
+    instance_dir = tmp_root / "omnigent-terminal-orphan"
+    instance_dir.mkdir()
+    # 2147483647 exceeds pid_max, so the recorded owner counts as dead.
+    (instance_dir / owner_claim.OWNER_PID_FILENAME).write_text(
+        f"2147483647\npid_ns={owner_claim.current_pid_namespace()}\n"
+        f"boot={owner_claim.current_boot_id()}\n"
+    )
+    socket_path = instance_dir / "tmux.sock"
+    subprocess.run(
+        ["tmux", "-S", str(socket_path), "new-session", "-d", "-s", "main", "sleep 300"],
+        check=True,
+        capture_output=True,
+    )
 
-    result = CliRunner().invoke(cli, ["stop"])
+    def _server_alive() -> bool:
+        return (
+            subprocess.run(
+                ["tmux", "-S", str(socket_path), "list-sessions"], capture_output=True
+            ).returncode
+            == 0
+        )
 
-    assert result.exit_code == 0, result.output
-    assert "1 orphaned terminal(s)" in result.output
-    assert not orphan.exists()  # the leaked instance dir was swept
+    try:
+        assert _server_alive()
+
+        result = CliRunner().invoke(cli, ["stop"])
+
+        assert result.exit_code == 0, result.output
+        assert "1 orphaned terminal(s)" in result.output
+        assert not _server_alive(), "orphaned managed tmux server survived `omnigent stop`"
+        assert not instance_dir.exists()
+    finally:
+        subprocess.run(["tmux", "-S", str(socket_path), "kill-server"], capture_output=True)
+        shutil.rmtree(tmp_root, ignore_errors=True)
 
 
 def test_server_stop_finds_untracked_orphan_when_pidfile_lost(

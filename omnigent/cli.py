@@ -4982,9 +4982,10 @@ def stop(force: bool) -> None:
 
     The off switch, and the counterpart of ``omnigent start``: stops every host
     daemon (local and remote-targeted) and the detached background server.
-    Runners are reaped when their daemon exits. To stop only hosting while
-    keeping the local server (web UI / history) up, use ``omnigent host stop``
-    instead.
+    Runners are reaped when their daemon exits, and session terminals whose
+    runner already died uncleanly are swept so they never outlive the stop. To
+    stop only hosting while keeping the local server (web UI / history) up, use
+    ``omnigent host stop`` instead.
 
     :param force: Continue past individual failures and SIGKILL daemons that
         do not exit on SIGTERM.
@@ -5008,9 +5009,8 @@ def stop(force: bool) -> None:
     # this, that server survives the off-switch — the exact "I ran stop and a
     # server is still on the default port" symptom.
     orphan_pid = stop_untracked_local_server()
-    # A runner that died without graceful teardown (SIGKILL, OOM) leaves its
-    # detached tmux terminal with no owner to reap it; that server and its
-    # harness child would otherwise outlive the off-switch.
+    # A runner that died without graceful teardown leaves its detached tmux
+    # terminal (and harness child) with no owner left to reap it.
     from omnigent.inner.terminal import reap_orphaned_terminals
 
     reaped_terminals = reap_orphaned_terminals()

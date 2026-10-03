@@ -664,58 +664,154 @@ def test_uninstall_script_rerun_is_idempotent(tmp_path: Path) -> None:
     assert "Omnigent installer" not in profile.read_text()
 
 
-@pytest.mark.skipif(shutil.which("tmux") is None, reason="needs tmux on PATH")
-def test_uninstall_script_kills_managed_private_socket_terminal(tmp_path: Path) -> None:
-    """The tmux sweep also kills managed terminals on private per-instance sockets.
-
-    Managed session terminals are detached tmux servers on
-    ``$TMPDIR/omnigent-terminal-*/tmux.sock`` (session ``main``), invisible to
-    the default-socket ``omnigent:*`` sweep; without a private-socket sweep
-    they outlive ``omnigent uninstall --purge``.
-    """
-    home = tmp_path / "home"
-    state = home / ".omnigent"
-    state.mkdir(parents=True)
-    (state / "installation_id").write_text("install-123\n")
-    # A short scratch TMPDIR: the deep pytest tmp_path overruns the ~108-char
-    # unix socket path limit, so tmux could not even create the server there.
-    scratch_tmp = Path(tempfile.mkdtemp(prefix="omnigent-un-"))
-    terminal_dir = scratch_tmp / "omnigent-terminal-test"
-    terminal_dir.mkdir(parents=True)
-    socket_path = terminal_dir / "tmux.sock"
+def _start_private_tmux_server(socket_path: Path) -> None:
     subprocess.run(
         ["tmux", "-S", str(socket_path), "new-session", "-d", "-s", "main", "sleep 300"],
         check=True,
         capture_output=True,
     )
 
-    def _server_alive() -> bool:
-        return (
-            subprocess.run(
-                ["tmux", "-S", str(socket_path), "list-sessions"], capture_output=True
-            ).returncode
-            == 0
-        )
 
+def _tmux_server_alive(socket_path: Path) -> bool:
+    return (
+        subprocess.run(
+            ["tmux", "-S", str(socket_path), "list-sessions"], capture_output=True
+        ).returncode
+        == 0
+    )
+
+
+def _kill_tmux_server(socket_path: Path) -> None:
+    subprocess.run(["tmux", "-S", str(socket_path), "kill-server"], capture_output=True)
+
+
+def _purge_env(tmp_path: Path, scratch_tmp: Path) -> tuple[str, dict[str, str]]:
+    """PATH with a no-op ``uv`` so the wheel step passes, plus the scratch TMPDIR."""
+    fake_bin, _ = _fake_uv(tmp_path)
+    return f"{fake_bin}:{os.environ.get('PATH', '')}", {"TMPDIR": str(scratch_tmp)}
+
+
+def _tmux_actions(result: subprocess.CompletedProcess[str]) -> list[dict[str, object]]:
+    return [
+        action for action in json.loads(result.stdout)["actions"] if action["artifact"] == "tmux"
+    ]
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="needs tmux on PATH")
+def test_uninstall_script_kills_managed_private_socket_terminal(tmp_path: Path) -> None:
+    """Purging state also stops a session terminal left on a private tmux socket.
+
+    Managed terminals run on ``$TMPDIR/omnigent-terminal-*/tmux.sock`` as
+    session ``main``, which the default-socket ``omnigent:*`` sweep never sees.
+    """
+    home = tmp_path / "home"
+    state = home / ".omnigent"
+    state.mkdir(parents=True)
+    (state / "installation_id").write_text("install-123\n")
+    # Short scratch TMPDIR: tmp_path can overrun the unix socket path limit.
+    scratch_tmp = Path(tempfile.mkdtemp(prefix="omnigent-un-"))
+    terminal_dir = scratch_tmp / "omnigent-terminal-leaked"
+    terminal_dir.mkdir()
+    socket_path = terminal_dir / "tmux.sock"
+    path, env_updates = _purge_env(tmp_path, scratch_tmp)
+    _start_private_tmux_server(socket_path)
     try:
-        assert _server_alive()
-        env_updates = {"TMPDIR": str(scratch_tmp)}
+        assert _tmux_server_alive(socket_path)
 
-        dry = _run_uninstall(home, "state", "--dry-run", "--json", env_updates=env_updates)
+        dry = _run_uninstall(
+            home, "--purge", "--dry-run", "--json", path=path, env_updates=env_updates
+        )
         assert dry.returncode == 0, dry.stderr
-        assert _server_alive()  # dry-run only reports
+        assert _tmux_server_alive(socket_path)
         assert terminal_dir.is_dir()
+        assert any(action["status"] == "reported" for action in _tmux_actions(dry))
 
-        result = _run_uninstall(home, "state", "--yes", "--json", env_updates=env_updates)
+        result = _run_uninstall(
+            home, "--purge", "--yes", "--json", path=path, env_updates=env_updates
+        )
         assert result.returncode == 0, result.stderr
-        assert not _server_alive()  # the private-socket tmux server was killed
-        assert not terminal_dir.exists()  # and its instance dir removed
+        assert not state.exists()
+        assert not _tmux_server_alive(socket_path), (
+            "private-socket tmux server survived `uninstall --purge`"
+        )
+        assert not terminal_dir.exists()
         assert any(
-            action["artifact"] == "tmux"
-            and action["status"] == "done"
-            and "managed terminal" in action["detail"]
-            for action in json.loads(result.stdout)["actions"]
+            action["status"] == "done" and "managed terminal" in str(action["detail"])
+            for action in _tmux_actions(result)
         )
     finally:
-        subprocess.run(["tmux", "-S", str(socket_path), "kill-server"], capture_output=True)
+        _kill_tmux_server(socket_path)
+        shutil.rmtree(scratch_tmp, ignore_errors=True)
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="needs tmux on PATH")
+def test_uninstall_script_keeps_managed_terminal_dir_when_kill_fails(tmp_path: Path) -> None:
+    """A terminal that refuses ``kill-server`` keeps its socket for a later retry.
+
+    Removing the instance dir anyway would report success while the server and
+    its harness child keep running with no way left to reach them.
+    """
+    home = tmp_path / "home"
+    state = home / ".omnigent"
+    state.mkdir(parents=True)
+    (state / "installation_id").write_text("install-123\n")
+    scratch_tmp = Path(tempfile.mkdtemp(prefix="omnigent-un-"))
+    terminal_dir = scratch_tmp / "omnigent-terminal-stuck"
+    terminal_dir.mkdir()
+    socket_path = terminal_dir / "tmux.sock"
+    path, env_updates = _purge_env(tmp_path, scratch_tmp)
+    real_tmux = shutil.which("tmux")
+    assert real_tmux is not None
+    # A tmux whose kill-server fails, as a client/server version mismatch does.
+    stubborn_tmux = tmp_path / "bin" / "tmux"
+    stubborn_tmux.write_text(
+        '#!/bin/sh\nfor arg in "$@"; do [ "$arg" = kill-server ] && exit 1; done\n'
+        f'exec "{real_tmux}" "$@"\n'
+    )
+    stubborn_tmux.chmod(0o755)
+    _start_private_tmux_server(socket_path)
+    try:
+        result = _run_uninstall(
+            home, "--purge", "--yes", "--json", path=path, env_updates=env_updates
+        )
+        assert result.returncode == 1, result.stdout
+        assert _tmux_server_alive(socket_path)
+        assert socket_path.is_socket()
+        assert any(
+            action["status"] == "failed" and action["path"] == str(terminal_dir)
+            for action in _tmux_actions(result)
+        )
+    finally:
+        _kill_tmux_server(socket_path)
+        shutil.rmtree(scratch_tmp, ignore_errors=True)
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="needs tmux on PATH")
+def test_uninstall_script_skips_symlinked_managed_terminal_socket(tmp_path: Path) -> None:
+    """A symlinked ``tmux.sock`` is never followed: it could point at another server."""
+    home = tmp_path / "home"
+    state = home / ".omnigent"
+    state.mkdir(parents=True)
+    (state / "installation_id").write_text("install-123\n")
+    scratch_tmp = Path(tempfile.mkdtemp(prefix="omnigent-un-"))
+    bystander_socket = scratch_tmp / "bystander" / "tmux.sock"
+    bystander_socket.parent.mkdir()
+    decoy_dir = scratch_tmp / "omnigent-terminal-decoy"
+    decoy_dir.mkdir()
+    (decoy_dir / "tmux.sock").symlink_to(bystander_socket)
+    path, env_updates = _purge_env(tmp_path, scratch_tmp)
+    _start_private_tmux_server(bystander_socket)
+    try:
+        result = _run_uninstall(
+            home, "--purge", "--yes", "--json", path=path, env_updates=env_updates
+        )
+        assert result.returncode == 0, result.stdout
+        assert _tmux_server_alive(bystander_socket)
+        assert decoy_dir.is_dir()
+        assert any(
+            action["status"] == "skipped" and action["path"] == str(decoy_dir)
+            for action in _tmux_actions(result)
+        )
+    finally:
+        _kill_tmux_server(bystander_socket)
         shutil.rmtree(scratch_tmp, ignore_errors=True)

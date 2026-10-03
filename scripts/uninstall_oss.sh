@@ -217,19 +217,33 @@ stop_processes() {
     done <"$sessions_file"
     rm -f "$sessions_file"
     # Managed session terminals run on private per-instance sockets
-    # ($TMPDIR/omnigent-terminal-*/tmux.sock), so the default-socket sweep
-    # above never sees them; kill those servers and their instance dirs too.
+    # ($TMPDIR/omnigent-terminal-*/tmux.sock) that the default-socket sweep
+    # above never sees. Only this user's real instance dirs are touched, and a
+    # symlinked socket is left alone since it could redirect the kill elsewhere.
     for terminal_dir in "${TMPDIR:-/tmp}"/omnigent-terminal-*; do
-      [ -d "$terminal_dir" ] || continue
+      [ -d "$terminal_dir" ] && [ ! -L "$terminal_dir" ] || continue
+      [ -n "$(find "$terminal_dir" -prune -user "$(id -u)" 2>/dev/null)" ] || continue
+      terminal_socket="$terminal_dir/tmux.sock"
+      if [ -L "$terminal_socket" ]; then
+        record_action tmux "$terminal_dir" stop skipped "" "tmux socket is a symlink; left in place"
+        continue
+      fi
       if [ "$DRY_RUN" = true ]; then
         record_action tmux "$terminal_dir" stop reported "" "would kill managed terminal tmux server"
         continue
       fi
-      if [ -S "$terminal_dir/tmux.sock" ]; then
-        tmux -S "$terminal_dir/tmux.sock" kill-server 2>/dev/null || true
+      terminal_detail="removed stale managed terminal dir"
+      if [ -S "$terminal_socket" ]; then
+        tmux -S "$terminal_socket" kill-server >/dev/null 2>&1 || true
+        if tmux -S "$terminal_socket" list-sessions >/dev/null 2>&1; then
+          # Keep the socket so a later run can still reach the server.
+          record_action tmux "$terminal_dir" stop failed "" "tmux kill-server left the managed terminal running"
+          continue
+        fi
+        terminal_detail="killed managed terminal tmux server"
       fi
       if rm -rf "$terminal_dir" 2>/dev/null; then
-        record_action tmux "$terminal_dir" stop done "" "killed managed terminal tmux server"
+        record_action tmux "$terminal_dir" stop done "" "$terminal_detail"
       else
         record_action tmux "$terminal_dir" stop failed "" "failed to remove managed terminal dir"
       fi
