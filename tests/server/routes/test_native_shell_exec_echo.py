@@ -62,6 +62,14 @@ def _cleared_pending_ids(publish: Mock) -> list[str | None]:
     ]
 
 
+def _consumed_user_authored(publish: Mock) -> list[object]:
+    return [
+        call.args[1]["data"]["data"].get("user_authored")
+        for call in publish.call_args_list
+        if call.args[1]["type"] == "session.input.consumed"
+    ]
+
+
 def _message_by_text(store: SqlAlchemyConversationStore, session_id: str, text: str) -> Any:
     [item] = [
         item
@@ -89,6 +97,8 @@ async def test_web_bang_echo_drains_only_its_own_queued_entry(
 
     echo = _message_by_text(store, conv.id, "! pwd")
     assert echo.created_by == "carol@example.com"
+    # Flagged human-authored so it renders as a user bubble on reload.
+    assert echo.data.user_authored is True
     assert _cleared_pending_ids(publish) == [bang]
     assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == [older]
 
@@ -115,7 +125,12 @@ async def test_terminal_bang_echo_leaves_unrelated_queued_web_message_alone(
 
     echo = _message_by_text(store, conv.id, "! pwd")
     assert echo.created_by == _FORWARDER
+    # user_authored (with no cleared_pending_id) tells the web client this is a
+    # terminal-typed message that owns no optimistic bubble, so it must not pop
+    # the unrelated queued web message's bubble off the FIFO head.
+    assert echo.data.user_authored is True
     assert _cleared_pending_ids(publish) == [None]
+    assert _consumed_user_authored(publish) == [True]
     assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == [web]
 
     await _persist_external_conversation_item(

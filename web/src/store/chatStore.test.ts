@@ -7987,6 +7987,30 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       },
     );
 
+    it("leaves an unrelated queued web message when a terminal bang drains nothing", () => {
+      // A `!` shell exec typed in the terminal round-trips as a user-authored
+      // echo that drained no pending entry (clearedPendingId unset). It owns no
+      // optimistic bubble here, so it renders fresh and must not pop another
+      // user's queued message off the FIFO head.
+      const queued = {
+        tempId: "pend_web",
+        content: [{ type: "input_text" as const, text: "please review the diff" }],
+      };
+      const bang = [{ type: "input_text" as const, text: "! pwd" }];
+      useChatStore.setState({ blocks: [], pendingUserMessages: [queued] });
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_bang",
+        itemType: "message",
+        createdBy: "forwarder@example.com",
+        data: { role: "user", content: bang, user_authored: true },
+      });
+      expect(useChatStore.getState().pendingUserMessages).toEqual([queued]);
+      expect(useChatStore.getState().blocks).toMatchObject([
+        { type: "user_message", ctx: { itemId: "msg_bang" }, content: bang },
+      ]);
+    });
+
     it("is a no-op for non-message item types (e.g. function_call_output from other client)", () => {
       const existingBlocks: AnyBlock[] = [];
       useChatStore.setState({ blocks: existingBlocks, pendingUserMessages: [] });

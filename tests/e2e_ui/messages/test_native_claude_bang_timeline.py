@@ -5,7 +5,8 @@ an ordinary text turn must leave the abstracted chat view in send order: the
 prior assistant reply stays its own visible bubble (not regrouped under a
 collapsed "Worked for" row), the bang lands exactly once as a user bubble, the
 exec's command and output cards render below that bubble and stay visible, and
-the follow-up reply lands after the cards. A second bang must keep that shape.
+the follow-up reply stays a visible bubble below the bang. A second bang must
+keep that shape.
 """
 
 from __future__ import annotations
@@ -90,15 +91,20 @@ def _summarize(items: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _run_bang(page: Page, probe: str) -> str:
+def _run_bang(page: Page, probe: str, *, reply: str) -> str:
     """Send ``! echo <probe>`` from the composer and wait for the turn to settle.
 
+    :param reply: Token of the follow-up assistant reply the mock answers with;
+        the turn has not settled until it is on screen.
     :returns: The exact composer text, which the user bubble must echo.
     """
     command = f"! echo {probe}"
     _send(page, command)
     input_card = page.locator(f'{_TERMINAL_CARD}[data-terminal-kind="input"]', has_text=probe)
     expect(input_card.first).to_be_attached(timeout=_MOCK_TURN_TIMEOUT_MS)
+    expect(page.locator(_ASSISTANT, has_text=reply).first).to_be_visible(
+        timeout=_MOCK_TURN_TIMEOUT_MS
+    )
     expect(page.locator(_WORKING)).to_have_count(0, timeout=_MOCK_TURN_TIMEOUT_MS)
     page.wait_for_timeout(_RECONCILE_SETTLE_MS)
     return command
@@ -108,6 +114,7 @@ def _timeline_problems(
     entries: list[tuple[str, str]],
     *,
     prior_reply_token: str,
+    follow_up_token: str,
     command: str,
     probe: str,
     label: str,
@@ -116,6 +123,7 @@ def _timeline_problems(
 
     :param entries: Feed snapshot from :func:`_feed_entries`.
     :param prior_reply_token: Token of the assistant reply that settled before this bang.
+    :param follow_up_token: Token of the assistant reply to this bang's exec output.
     :param command: The exact composer text of the bang, e.g. ``"! echo probe"``.
     :param probe: The unique echo argument identifying this exec's cards.
     :param label: Prefix for the problem descriptions, e.g. ``"first bang"``.
@@ -171,6 +179,26 @@ def _timeline_problems(
                 f"{label}: the prior assistant reply was regrouped under a collapsed "
                 f"'Worked for' row: {prior_text!r}"
             )
+    follow_up_index = next(
+        (
+            i
+            for i, (kind, text) in enumerate(entries)
+            if kind == "message:assistant" and follow_up_token in text
+        ),
+        None,
+    )
+    if follow_up_index is None:
+        problems.append(
+            f"{label}: the follow-up reply {follow_up_token!r} is not visible in the feed"
+        )
+    elif bang_index is not None and follow_up_index < bang_index:
+        # The reply bubble wraps the exec cards, so its feed entry precedes the
+        # standalone card entries; only its position relative to the bang bubble
+        # is meaningful here.
+        problems.append(
+            f"{label}: the follow-up reply renders above the bang bubble "
+            f"(reply at {follow_up_index}, bubble at {bang_index})"
+        )
     return problems
 
 
@@ -274,13 +302,14 @@ def test_native_claude_bang_exec_keeps_chat_timeline(
     follow_up_1 = f"after-bang-1-{nonce}"
     _set_reply(mock_llm_server_url, follow_up_1)
     first_probe = f"bang-order-{nonce}"
-    first_command = _run_bang(page, first_probe)
+    first_command = _run_bang(page, first_probe, reply=follow_up_1)
     first_feed = _feed_entries(page)
     page.screenshot(path=str(shots / "2-after-first-bang.png"))
     _log.info("feed after first bang:\n%s", _format_feed(first_feed))
     problems += _timeline_problems(
         first_feed,
         prior_reply_token=first_reply,
+        follow_up_token=follow_up_1,
         command=first_command,
         probe=first_probe,
         label="first bang",
@@ -289,13 +318,14 @@ def test_native_claude_bang_exec_keeps_chat_timeline(
     follow_up_2 = f"after-bang-2-{nonce}"
     _set_reply(mock_llm_server_url, follow_up_2)
     second_probe = f"bang-second-{nonce}"
-    second_command = _run_bang(page, second_probe)
+    second_command = _run_bang(page, second_probe, reply=follow_up_2)
     second_feed = _feed_entries(page)
     page.screenshot(path=str(shots / "3-after-second-bang.png"))
     _log.info("feed after second bang:\n%s", _format_feed(second_feed))
     problems += _timeline_problems(
         second_feed,
         prior_reply_token=follow_up_1,
+        follow_up_token=follow_up_2,
         command=second_command,
         probe=second_probe,
         label="second bang",

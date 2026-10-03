@@ -143,9 +143,8 @@ async def test_forwarder_posts_visible_transcript_items(tmp_path: Path) -> None:
     )
     try:
         # Collect the eight transcript items. The transcript path publishes no
-        # session status at all — Claude's status file owns the badge — which
-        # ``test_forwarder_publishes_no_status_for_assistant_output`` asserts
-        # directly.
+        # session status (Claude's status file owns the badge); see
+        # ``test_forwarder_publishes_no_status_for_assistant_output``.
         requests = [await _get_recorded_item_request(server) for _index in range(8)]
     finally:
         task.cancel()

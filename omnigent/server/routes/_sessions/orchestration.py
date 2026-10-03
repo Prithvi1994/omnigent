@@ -2752,10 +2752,11 @@ async def _persist_external_conversation_item_unlocked(
         # to the oldest entry, except for Kiro, whose prompt text is exact.
         text = _message_text(item.data.content) or ""
         agent_message_candidate = body.data.get("agent_message_candidate") is True
+        shell_command_echo = body.data.get("shell_command_echo") is True
         # A ``!`` shell exec typed in the terminal mirrors like a web one but
         # queued nothing, so a positional drain would hand it another user's
         # message. Like ambiguous team markup, it may only drain an exact match.
-        exact_match_only = agent_message_candidate or body.data.get("shell_command_echo") is True
+        exact_match_only = agent_message_candidate or shell_command_echo
         matched = pending_inputs.resolve_matching_text(session_id, text, hold=True)
         drained = matched.matched
         if exact_match_only:
@@ -2799,7 +2800,11 @@ async def _persist_external_conversation_item_unlocked(
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
             item = item.model_copy(update={"created_by": created_by})
-        if agent_message_candidate:
+        if agent_message_candidate or shell_command_echo:
+            # Both are human-authored terminal input: mark them so the item
+            # renders as a user bubble on reload and, when a terminal bang
+            # drains no pending entry, the web client never pops an unrelated
+            # queued message's optimistic bubble for it.
             item = item.model_copy(
                 update={"data": item.data.model_copy(update={"user_authored": True})}
             )
