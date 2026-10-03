@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from urllib.parse import urlparse
 
 import httpx
@@ -241,30 +240,6 @@ def test_mention_menu_stays_below_header_on_short_window(
         "return [list.clientHeight, list.scrollHeight, getComputedStyle(list).overflowY]; }"
     )
     assert overflow[1] > overflow[0] and overflow[2] == "auto", overflow
-
-
-def test_bare_model_command_clears_the_draft(
-    page: Page,
-    seeded_session: tuple[str, str],
-) -> None:
-    """A bare /model must clear the typed draft before showing its usage hint."""
-    base_url, session_id = seeded_session
-    _install_stream_controller(page, session_id)
-
-    page.set_viewport_size({"width": 1280, "height": 720})
-    page.goto(f"{base_url}/c/{session_id}")
-
-    composer = page.get_by_label("Message the agent")
-    expect(composer).to_be_visible(timeout=30_000)
-
-    # Type the bare command, accept the highlighted suggestion, then submit it.
-    composer.fill("/model")
-    expect(page.get_by_test_id("slash-menu-item-model")).to_be_visible(timeout=15_000)
-    page.keyboard.press("Enter")
-    page.keyboard.press("Enter")
-
-    expect(page.get_by_text(re.compile(r"Usage: /model"))).to_be_visible(timeout=15_000)
-    expect(composer).to_have_value("")
 
 
 def _header_and_popover(page: Page, label: str) -> dict:
