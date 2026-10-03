@@ -546,6 +546,12 @@ def _strip_trailing_commas(text: str) -> str:
     return "".join(result)
 
 
+_SKIPPED_CONFIG_CONSEQUENCE = (
+    "any provider defined only here is dropped, so a model pin in another config "
+    "file that points at it may no longer resolve"
+)
+
+
 def _load_user_config_file(path: Path) -> dict[str, object] | None:
     """Parse one user OpenCode config file (JSON, with a JSONC fallback).
 
@@ -562,19 +568,17 @@ def _load_user_config_file(path: Path) -> dict[str, object] | None:
             parsed = json.loads(cleaned)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as err:
         _logger.warning(
-            "Skipping user OpenCode config at %s: %s; any provider defined only here is "
-            "dropped, so a model pin in another config file that points at it may no "
-            "longer resolve",
+            "Skipping user OpenCode config at %s: %s; %s",
             path,
             err,
+            _SKIPPED_CONFIG_CONSEQUENCE,
         )
         return None
     if not isinstance(parsed, dict):
         _logger.warning(
-            "Skipping user OpenCode config at %s: top level is not an object; any provider "
-            "defined only here is dropped, so a model pin in another config file that points "
-            "at it may no longer resolve",
+            "Skipping user OpenCode config at %s: top level is not an object; %s",
             path,
+            _SKIPPED_CONFIG_CONSEQUENCE,
         )
         return None
     return parsed

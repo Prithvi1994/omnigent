@@ -31,6 +31,7 @@ import httpx
 import pytest
 
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.harnesses.opencode_native.bridge import _ID_HASH_CHARS
 from omnigent.native.native_coding_agents import OPENCODE_NATIVE_AGENT_NAME
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import POLL_INTERVAL_S
@@ -50,9 +51,12 @@ def _functional_opencode_dir() -> str | None:
         candidate = Path(path_dir) / "opencode"
         if not (candidate.is_file() and os.access(candidate, os.X_OK)):
             continue
-        with candidate.open("rb") as handle:
-            if handle.read(2) == b"#!":
-                continue
+        try:
+            with candidate.open("rb") as handle:
+                if handle.read(2) == b"#!":
+                    continue
+        except OSError:
+            continue
         try:
             probe = subprocess.run([str(candidate), "--version"], capture_output=True, timeout=15)
         except (OSError, subprocess.TimeoutExpired):
@@ -152,7 +156,7 @@ def _wait_for_terminal(
 
 def _bridge_state(home: Path, session_id: str, timeout: float = 60.0) -> dict[str, Any]:
     """Read the session's opencode-native ``state.json`` from the daemon's home."""
-    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:_ID_HASH_CHARS]
     state_path = home / ".omnigent" / "opencode-native" / digest / "state.json"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -298,4 +302,10 @@ def test_user_provider_in_opencode_json_reaches_spawned_server(
     assert "gpt-4" in (my_gateway.get("models") or {}), (
         f"Provider {_PROVIDER_ID!r} reached the spawned server without its models map: "
         f"{json.dumps(my_gateway)[:400]}"
+    )
+    assert effective.get("model") == "my-gateway/gpt-4", (
+        "The opencode.jsonc model pin did not survive into the spawned server's effective "
+        "config, so the session would not default to the restored provider. Spawned server "
+        f"model: {effective.get('model')!r}, expected 'my-gateway/gpt-4'.\n"
+        f"Spawned server effective config: {json.dumps(effective)[:800]}"
     )
