@@ -2833,8 +2833,8 @@ async def _post_resume_terminal_status(
     status in its resume payload is the just-started turn reported terminal
     during the Codex MCP-startup window (``active_turn_present=false``), not a
     real end: honoring it would finish a still-live turn before any output.
-    Even on that reconnect, only the recovered turn is closed; a newer turn
-    that starts live during recovery stays owned by the live event stream.
+    Backfill is limited to a persisted recovery turn that is still the latest
+    turn, so a newer turn that started live stays owned by the event stream.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -2867,8 +2867,8 @@ def _resume_terminal_status_edge_for_latest_turn(
     :param thread_id: Codex thread id from the resume payload, e.g.
         ``"thread_123"``.
     :param turns: Raw Codex resume turn list.
-    :param expected_turn_id: When set, only close this turn; a newer turn that
-        started live during a reconnect stays owned by the live event stream.
+    :param expected_turn_id: When set, emit an edge only when this is the latest
+        turn; a newer turn that started live stays owned by the event stream.
     :returns: Terminal status edge when the latest turn is terminal and
         belongs to the bridge's current thread; otherwise ``None``.
     """

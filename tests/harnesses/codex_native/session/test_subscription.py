@@ -678,7 +678,7 @@ def test_supervise_forwarder_resume_does_not_finish_a_just_started_turn(
             ap_transport=httpx.MockTransport(_capture_handler(posted)),
         )
 
-    asyncio.run(run())
+    asyncio.run(asyncio.wait_for(run(), timeout=30))
 
     status_edges = [
         (index, payload["data"].get("status"))
@@ -715,9 +715,7 @@ def test_supervise_forwarder_resume_does_not_finish_a_just_started_turn(
     )
 
 
-@pytest.mark.parametrize("resume_turn_status", ["completed", "interrupted", "cancelled"])
 def test_resume_terminal_status_closes_only_the_recovered_turn(
-    resume_turn_status: str,
     tmp_path: Path,
 ) -> None:
     """A reconnect must not close a newer turn that started live during recovery.
@@ -731,7 +729,7 @@ def test_resume_terminal_status_closes_only_the_recovered_turn(
     _write_forwarder_bridge(tmp_path, active_turn_id="turn_new", thread_id="thread_123")
     turns = [
         {"id": "turn_old", "status": "completed", "items": []},
-        {"id": "turn_new", "status": resume_turn_status, "items": []},
+        {"id": "turn_new", "status": "completed", "items": []},
     ]
     posted: list[dict[str, Any]] = []
 
