@@ -64,6 +64,9 @@ _SUBMIT_RETRY_INTERVAL_S = 0.5
 _PERMISSION_KEY_INTERVAL_S = 0.3
 _PERMISSION_ENTER_SETTLE_S = 0.5
 _PERMISSION_VERDICT_VERIFY_TIMEOUT_S = 5.0
+# Gap before a still-unconfirmed verdict Enter is typed again; see
+# _wait_for_kiro_permission_verdict_applied for when a resend is allowed.
+_PERMISSION_VERDICT_RESEND_INTERVAL_S = 1.0
 # Pane rows above "requires approval" searched for the rendered tool block.
 _PERMISSION_TOOL_BLOCK_SCAN_LINES = 24
 _KIRO_SEPARATOR = "────"
@@ -584,35 +587,65 @@ def _wait_for_kiro_permission_prompt(
     )
 
 
+def _kiro_permission_prompt_safely_focused(
+    pane: str, *, action: str, expected_title: str | None
+) -> bool:
+    """Whether *pane* shows the approved request's prompt with *action*'s row focused."""
+    if not _kiro_permission_prompt_active(pane):
+        return False
+    focus_is_safe = (
+        _kiro_permission_focus_on_one_time_allow(pane)
+        if action == "accept"
+        else _kiro_permission_focus_on_reject(pane)
+    )
+    return focus_is_safe and _kiro_permission_prompt_matches_title(pane, expected_title)
+
+
 def _wait_for_kiro_permission_verdict_applied(
     socket_path: str,
     tmux_target: str,
     *,
+    action: str,
+    expected_title: str | None,
     timeout_s: float,
     verdict_recorded: Callable[[], bool] | None = None,
+    resend_allowed: Callable[[], bool] | None = None,
 ) -> None:
-    """Confirm Kiro consumed the single delivered verdict without resending it.
+    """Confirm Kiro consumed the delivered verdict, resending it only when safe.
 
-    The caller types ``Enter`` exactly once against a prompt it already verified
-    is the right one. A key still buffered in Kiro's input queue is
-    indistinguishable from a discarded one, so resending it could be consumed by
-    a newly queued prompt and authorize a different request. This only observes
-    delivery -- a recorded ACP response for this request, or the approval prompt
-    leaving the pane -- bounded by ``_PERMISSION_VERDICT_VERIFY_TIMEOUT_S``, and
-    fails closed on timeout instead of retrying.
+    ``verdict_recorded`` (Kiro's ACP response for this request) is the delivery
+    authority. A key Kiro discarded under load looks exactly like one still
+    buffered in its input queue, and a resent key is read by whichever prompt
+    Kiro shows next, so Enter is typed again only while no response is recorded,
+    the pane still shows this request's prompt with the intended row focused,
+    and ``resend_allowed`` reports no other permission request outstanding -- a
+    buffered duplicate then has no other prompt to reach. Without both callbacks
+    delivery is only verified. Bounded by ``_PERMISSION_VERDICT_VERIFY_TIMEOUT_S``;
+    fails closed on timeout.
     """
     deadline = time.monotonic() + min(timeout_s, _PERMISSION_VERDICT_VERIFY_TIMEOUT_S)
+    last_enter = time.monotonic()
     while time.monotonic() < deadline:
         if verdict_recorded is not None and verdict_recorded():
             return
         pane = _capture_pane(socket_path, tmux_target, join_wrapped=True)
-        # An empty capture is a tmux read failure, not a vanished prompt. When a
-        # recorder is supplied it is the delivery authority: a vanished prompt may
-        # be the TUI redrawing or the next queued request, so keep polling until
-        # the recorder confirms this request's response. Only fall back to the
-        # pane state when no recorder was supplied.
+        # An empty capture is a tmux read failure, not a vanished prompt. With a
+        # recorder, a vanished prompt may be a redraw or the next queued request,
+        # so only the recorder-less fallback reads it as delivery.
         if pane and not _kiro_permission_prompt_active(pane) and verdict_recorded is None:
             return
+        if (
+            verdict_recorded is not None
+            and resend_allowed is not None
+            and time.monotonic() - last_enter >= _PERMISSION_VERDICT_RESEND_INTERVAL_S
+            and _kiro_permission_prompt_safely_focused(
+                pane, action=action, expected_title=expected_title
+            )
+            and resend_allowed()
+            and not verdict_recorded()
+        ):
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            last_enter = time.monotonic()
         time.sleep(_POLL_INTERVAL_S)
     if verdict_recorded is not None and verdict_recorded():
         return
@@ -810,12 +843,15 @@ def send_kiro_permission_verdict(
     expected_title: str | None = None,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
     verdict_recorded: Callable[[], bool] | None = None,
+    resend_allowed: Callable[[], bool] | None = None,
 ) -> None:
     """Deliver a one-time Kiro permission verdict to the active TUI prompt.
 
     ``verdict_recorded`` reports whether Kiro's ACP recorder already holds this
-    request's response, confirming the single Enter was consumed. Enter is
-    never resent. See :func:`_wait_for_kiro_permission_verdict_applied`.
+    request's response, confirming the Enter was consumed. ``resend_allowed``
+    reports that no other permission request is outstanding, which is what
+    permits a dropped Enter to be typed again. See
+    :func:`_wait_for_kiro_permission_verdict_applied`.
     """
     if action not in {"accept", "decline", "cancel"}:
         raise RuntimeError(f"unsupported Kiro permission action: {action!r}")
@@ -832,10 +868,8 @@ def send_kiro_permission_verdict(
     if action == "accept":
         time.sleep(_PERMISSION_ENTER_SETTLE_S)
         pane = _capture_pane(socket_path, tmux_target, join_wrapped=True)
-        if not (
-            _kiro_permission_prompt_active(pane)
-            and _kiro_permission_focus_on_one_time_allow(pane)
-            and _kiro_permission_prompt_matches_title(pane, expected_title)
+        if not _kiro_permission_prompt_safely_focused(
+            pane, action=action, expected_title=expected_title
         ):
             raise RuntimeError("kiro-native allow option was not safely focused before delivery")
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
@@ -843,18 +877,19 @@ def send_kiro_permission_verdict(
         _wait_for_kiro_permission_verdict_applied(
             socket_path,
             tmux_target,
+            action=action,
+            expected_title=expected_title,
             timeout_s=timeout_s,
             verdict_recorded=verdict_recorded,
+            resend_allowed=resend_allowed,
         )
         return
     for key in ("Down", "Down"):
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, key)
         time.sleep(_PERMISSION_KEY_INTERVAL_S)
     pane = _capture_pane(socket_path, tmux_target, join_wrapped=True)
-    if not (
-        _kiro_permission_prompt_active(pane)
-        and _kiro_permission_focus_on_reject(pane)
-        and _kiro_permission_prompt_matches_title(pane, expected_title)
+    if not _kiro_permission_prompt_safely_focused(
+        pane, action=action, expected_title=expected_title
     ):
         raise RuntimeError("kiro-native reject option was not safely focused before delivery")
     time.sleep(_PERMISSION_ENTER_SETTLE_S)
@@ -863,8 +898,11 @@ def send_kiro_permission_verdict(
     _wait_for_kiro_permission_verdict_applied(
         socket_path,
         tmux_target,
+        action=action,
+        expected_title=expected_title,
         timeout_s=timeout_s,
         verdict_recorded=verdict_recorded,
+        resend_allowed=resend_allowed,
     )
 
 

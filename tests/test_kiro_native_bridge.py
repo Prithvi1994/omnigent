@@ -359,14 +359,19 @@ def test_send_kiro_permission_verdict_rejects_a_missing_argument_separator(
     assert [call[-1] for call in calls if "send-keys" in call] == []
 
 
-def test_send_kiro_permission_verdict_never_retries_without_a_recorder(
+def test_send_kiro_permission_verdict_never_resends_without_a_recorder(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Without a consumption signal a lingering prompt is verified, not retried."""
+    """Without a consumption signal a lingering prompt is verified, never resent.
+
+    The pane alone cannot tell a dropped Enter from an identical queued prompt,
+    so even with no other request outstanding the key is typed once.
+    """
     monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RESEND_INTERVAL_S", 0.0)
     bridge_dir = tmp_path / "bridge"
     calls = _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE])
     write_tmux_target(
@@ -377,7 +382,11 @@ def test_send_kiro_permission_verdict_never_retries_without_a_recorder(
 
     with pytest.raises(RuntimeError, match="did not resolve after verdict delivery"):
         send_kiro_permission_verdict(
-            bridge_dir, action="accept", expected_title="Running: pwd", timeout_s=0.02
+            bridge_dir,
+            action="accept",
+            expected_title="Running: pwd",
+            timeout_s=0.02,
+            resend_allowed=lambda: True,
         )
 
     assert [call[-1] for call in calls if "send-keys" in call] == ["Enter"]
@@ -477,11 +486,12 @@ def test_send_kiro_permission_verdict_rejects_a_failed_capture_as_delivery(
     """A tmux capture that returns "" is a failure, not a vanished prompt.
 
     An Enter dropped under load followed by a failed capture must not be read as
-    a confirmed delivery, and the blank pane must not trigger a blind retry.
+    a confirmed delivery, and the blank pane must not trigger a blind resend.
     """
     monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RESEND_INTERVAL_S", 0.0)
     bridge_dir = tmp_path / "bridge"
     calls = _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE, _PERMISSION_PANE, ""])
     write_tmux_target(
@@ -497,6 +507,7 @@ def test_send_kiro_permission_verdict_rejects_a_failed_capture_as_delivery(
             expected_title="Running: pwd",
             timeout_s=0.02,
             verdict_recorded=lambda: False,
+            resend_allowed=lambda: True,
         )
 
     assert [call[-1] for call in calls if "send-keys" in call] == ["Enter"]
@@ -509,11 +520,12 @@ def test_send_kiro_permission_verdict_stops_once_verdict_is_recorded(
     """A recorded response ends delivery even when an identical prompt follows.
 
     A queued request with the same title renders an identical prompt the moment
-    Kiro consumes the Enter, so the recorder, not the pane, must stop the retry.
+    Kiro consumes the Enter, so the recorder, not the pane, must stop the resend.
     """
     monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RESEND_INTERVAL_S", 0.0)
     bridge_dir = tmp_path / "bridge"
     calls = _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE])
     write_tmux_target(
@@ -528,7 +540,141 @@ def test_send_kiro_permission_verdict_stops_once_verdict_is_recorded(
         expected_title="Running: pwd",
         timeout_s=0.1,
         verdict_recorded=lambda: any(call[-1] == "Enter" for call in calls),
+        resend_allowed=lambda: True,
     )
+
+    assert [call[-1] for call in calls if "send-keys" in call] == ["Enter"]
+
+
+def test_send_kiro_permission_verdict_resends_a_dropped_enter_until_recorded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dropped Enter is typed again while the same safe prompt lingers unanswered."""
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RESEND_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE])
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    send_kiro_permission_verdict(
+        bridge_dir,
+        action="accept",
+        expected_title="Running: pwd",
+        timeout_s=0.1,
+        verdict_recorded=lambda: sum(call[-1] == "Enter" for call in calls) >= 2,
+        resend_allowed=lambda: True,
+    )
+
+    assert [call[-1] for call in calls if "send-keys" in call] == ["Enter", "Enter"]
+
+
+def test_send_kiro_permission_verdict_resends_a_dropped_decline_enter_until_recorded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dropped reject Enter is typed again only while the reject row stays focused."""
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RESEND_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch, pane_outputs=[_PERMISSION_PANE, _PERMISSION_PANE_REJECT_FOCUSED]
+    )
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    send_kiro_permission_verdict(
+        bridge_dir,
+        action="decline",
+        expected_title="Running: pwd",
+        timeout_s=0.1,
+        verdict_recorded=lambda: sum(call[-1] == "Enter" for call in calls) >= 2,
+        resend_allowed=lambda: True,
+    )
+
+    assert [call[-1] for call in calls if "send-keys" in call] == [
+        "Down",
+        "Down",
+        "Enter",
+        "Enter",
+    ]
+
+
+def test_send_kiro_permission_verdict_does_not_resend_while_another_request_is_queued(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With another request outstanding a lingering prompt fails closed, no resend.
+
+    Kiro has queued a second request behind the approved one. An unanswered
+    identical prompt may be that request rendered after a slow first Enter, and
+    a resent key could land on it, so delivery types Enter once and raises.
+    """
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RESEND_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE])
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    with pytest.raises(RuntimeError, match="did not resolve after verdict delivery"):
+        send_kiro_permission_verdict(
+            bridge_dir,
+            action="accept",
+            expected_title="Running: pwd",
+            timeout_s=0.02,
+            verdict_recorded=lambda: False,
+            resend_allowed=lambda: False,
+        )
+
+    assert [call[-1] for call in calls if "send-keys" in call] == ["Enter"]
+
+
+def test_send_kiro_permission_verdict_does_not_resend_when_focus_drifts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resend requires the intended row to still be focused on the same prompt."""
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RESEND_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[_PERMISSION_PANE, _PERMISSION_PANE, _PERMISSION_PANE_TRUST_FOCUSED],
+    )
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    with pytest.raises(RuntimeError, match="did not resolve after verdict delivery"):
+        send_kiro_permission_verdict(
+            bridge_dir,
+            action="accept",
+            expected_title="Running: pwd",
+            timeout_s=0.02,
+            verdict_recorded=lambda: False,
+            resend_allowed=lambda: True,
+        )
 
     assert [call[-1] for call in calls if "send-keys" in call] == ["Enter"]
 
@@ -606,13 +752,14 @@ def test_send_kiro_permission_verdict_fails_closed_when_a_follow_up_prompt_appea
 ) -> None:
     """A queued follow-up prompt with no recorded verdict fails closed, no resend.
 
-    After the single Enter, Kiro renders a differently titled queued prompt while
-    this request's verdict is never recorded. Resending Enter could answer that
-    queued request, so delivery must send Enter once and then raise.
+    After the Enter, Kiro renders a differently titled queued prompt while this
+    request's verdict is never recorded. Even with a resend permitted, that
+    prompt is not the approved one, so delivery sends Enter once and then raises.
     """
     monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RESEND_INTERVAL_S", 0.0)
     bridge_dir = tmp_path / "bridge"
     calls = _install_fake_tmux(
         monkeypatch,
@@ -631,6 +778,7 @@ def test_send_kiro_permission_verdict_fails_closed_when_a_follow_up_prompt_appea
             expected_title="Running: pwd",
             timeout_s=0.1,
             verdict_recorded=lambda: False,
+            resend_allowed=lambda: True,
         )
 
     sent_keys = [call[-1] for call in calls if "send-keys" in call]
@@ -643,10 +791,10 @@ def test_send_kiro_permission_verdict_accepts_without_resending_into_a_queued_re
 ) -> None:
     """A slow-consumed accept Enter is confirmed by the recorder, never resent.
 
-    Kiro buffers the single Enter and only consumes it after a second request
-    has queued its own prompt. A resend would be read by that queued request, so
-    delivery waits for this request's recorded verdict and sends Enter once; the
-    queued request stays unanswered.
+    Kiro buffers the Enter and only consumes it after a second request has
+    queued its own prompt. The mirror reports that queued request, so no resend
+    is permitted; delivery waits for this request's recorded verdict and sends
+    Enter once, and the queued request stays unanswered.
     """
     monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
@@ -682,6 +830,7 @@ def test_send_kiro_permission_verdict_accepts_without_resending_into_a_queued_re
         expected_title="Running: pwd",
         timeout_s=0.1,
         verdict_recorded=verdict_recorded,
+        resend_allowed=lambda: False,
     )
 
     assert [call[-1] for call in calls if "send-keys" in call] == ["Enter"]
@@ -694,9 +843,9 @@ def test_send_kiro_permission_verdict_declines_without_resending_into_a_queued_r
     """A slow-consumed reject Enter is confirmed by the recorder, never resent.
 
     After navigating to reject and sending one Enter, the queued second request
-    renders its prompt before Kiro consumes the Enter. Resending would turn that
-    queued request into an answer, so delivery sends Down, Down, Enter once and
-    waits for the recorded verdict; the queued request stays unanswered.
+    renders its prompt before Kiro consumes the Enter. The mirror reports that
+    queued request, so delivery sends Down, Down, Enter once and waits for the
+    recorded verdict; the queued request stays unanswered.
     """
     monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
     monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
@@ -729,6 +878,7 @@ def test_send_kiro_permission_verdict_declines_without_resending_into_a_queued_r
         expected_title="Running: pwd",
         timeout_s=0.1,
         verdict_recorded=verdict_recorded,
+        resend_allowed=lambda: False,
     )
 
     assert [call[-1] for call in calls if "send-keys" in call] == ["Down", "Down", "Enter"]

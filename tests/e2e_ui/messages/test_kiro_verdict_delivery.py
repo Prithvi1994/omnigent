@@ -6,9 +6,9 @@ pending elicitation while the native Kiro pane stays blocked on the same
 ``requires approval`` prompt:
 
 1. post-delivery: ``send_kiro_permission_verdict`` types one ``Enter`` and
-   returns without confirming Kiro consumed it, so a verdict that only lands
-   after a delay under load is reported delivered before any ACP response is
-   recorded -- and a blind resend to recover it could answer a queued request;
+   returns without confirming Kiro consumed it, so an Enter Kiro drops under
+   load is reported delivered while no ACP response is ever recorded -- and a
+   blind resend to recover it could answer a queued request;
 2. pre-delivery: ``_kiro_active_permission_tool_line`` reduces the rendered
    tool block to one physical line, so a command title that wraps at 80 columns
    (or a ``╰ working_dir=…`` metadata row) fails the fail-closed title check
@@ -29,9 +29,10 @@ runner → kiro-native bridge → tmux TUI → ACP recorder → permission mirro
 The real ``kiro-cli`` authenticates against Kiro's own backend and cannot run
 in CI, so ``OMNIGENT_KIRO_PATH`` points at a fake TUI speaking the contracts
 the bridge drives (same seam as ``test_kiro_concurrent_permissions``), with the
-reported fault injected per test: ``delay-first-enter`` accepts the single
-Enter on the approval picker but applies the verdict only after a pause and
-never resends it; ``wrapped-title`` emits the long command title on one logical
+reported fault injected per test: ``drop-first-enter`` silently ignores the
+first Enter on the approval picker, so delivery must type it again once the
+recorder shows no response and no other request is outstanding;
+``wrapped-title`` emits the long command title on one logical
 line that the 80-column pane soft-wraps (so ``capture-pane -J`` rejoins it), with
 a working-dir row and separator.
 """
@@ -86,17 +87,15 @@ _DELIVERY_CONFIRM_TIMEOUT_S = 45.0
 _REQUEST_ID = "perm-req-1"
 
 # Minimal fake ``kiro-cli`` TUI (see module docstring). ``__FAKE_MODE__`` selects the
-# injected fault: ``delay-first-enter`` applies the single Enter after a pause;
+# injected fault: ``drop-first-enter`` ignores the first Enter on the prompt;
 # ``wrapped-title`` renders the 80-column wrapped tool block with a working_dir row.
 _FAKE_KIRO_TEMPLATE = r'''#!/usr/bin/env python3
 """Fake kiro-cli TUI for the verdict-delivery regression tests."""
 import json
 import os
 import sys
-import threading
 
 MODE = "__FAKE_MODE__"
-_DEFER_S = 1.5
 RECORD_PATH = os.environ.get("KIRO_ACP_RECORD_PATH", "")
 SEP = "─" * 44
 READY_MARKER = "ask a question or describe a task"
@@ -137,6 +136,7 @@ class FakeKiro:
         self.focus = 0
         self.draft = ""
         self.turn = 0
+        self.enter_dropped = False
 
     def render(self):
         lines = list(self.transcript[-6:])
@@ -220,24 +220,15 @@ class FakeKiro:
         self.focus = 0
         self.render()
 
-    def _apply_deferred(self):
-        # Fires from the delay timer: the single buffered Enter is finally
-        # consumed, as Kiro would under load. No further keypress is involved.
-        if self.active is not None and self.active.get("deferred"):
-            self.resolve_active(True)
-
     def on_enter(self):
         if self.active is not None:
+            if MODE == "drop-first-enter" and not self.enter_dropped:
+                # The reported under-load behavior: Kiro silently drops the
+                # first Enter and the same prompt stays on the pane.
+                self.enter_dropped = True
+                self.render()
+                return
             if self.focus == 0:
-                if MODE == "delay-first-enter" and not self.active.get("deferred"):
-                    # The reported under-load behavior: Kiro accepts the single
-                    # Enter but applies the verdict only after a pause; the key is
-                    # never lost, so delivery confirms it without resending.
-                    self.active["deferred"] = True
-                    timer = threading.Timer(_DEFER_S, self._apply_deferred)
-                    timer.daemon = True
-                    timer.start()
-                    return
                 self.resolve_active(True)
             elif self.focus == len(OPTIONS) - 1:
                 self.resolve_active(False)
@@ -529,7 +520,7 @@ def kiro_fault_session(
 ) -> Iterator[tuple[str, str, Path]]:
     """A runner-bound kiro-native session backed by the fault-injecting fake TUI.
 
-    Parametrize indirectly with the fake's mode (``delay-first-enter`` or
+    Parametrize indirectly with the fake's mode (``drop-first-enter`` or
     ``wrapped-title``).
     """
     if request.config.getoption("--ui-base-url"):
@@ -591,12 +582,12 @@ def _assert_verdict_reached_kiro(record_file: Path, bridge_dir: Path) -> None:
 
 
 @pytest.mark.timeout(600)
-@pytest.mark.parametrize("kiro_fault_session", ["delay-first-enter"], indirect=True)
+@pytest.mark.parametrize("kiro_fault_session", ["drop-first-enter"], indirect=True)
 def test_kiro_web_approval_confirms_tmux_verdict_delivery(
     kiro_fault_session: tuple[str, str, Path],
     page: Page,
 ) -> None:
-    """A slowly consumed Enter must be confirmed as delivered from one keypress."""
+    """A dropped Enter must be typed again until the recorder confirms the verdict."""
     from omnigent.harnesses.kiro_native.bridge import acp_record_path
 
     base_url, session_id, bridge_dir = kiro_fault_session
@@ -662,9 +653,9 @@ def test_kiro_identical_follow_up_prompt_stays_unanswered_without_approval(
 ) -> None:
     """An identically titled queued prompt must not be answered by a resend.
 
-    The bridge types one Enter for the approved request and never resends. When
-    Kiro queues two identically titled requests, the second prompt looks exactly
-    like an ignored first keypress; because delivery never resends, only
+    When Kiro queues two identically titled requests, the second prompt looks
+    exactly like an ignored first keypress. The recorded verdict ends delivery,
+    and while another request is queued the bridge never resends, so only
     approving the second request's own card may answer it.
     """
     from omnigent.harnesses.kiro_native.bridge import acp_record_path
