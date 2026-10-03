@@ -8392,16 +8392,11 @@ def _bang_echo_item(
     """
     Build the user-message echo of a shell-mode exec, e.g. ``"! pwd"``.
 
-    The ``<bash-input>`` record is the only transcript trace of the
-    user's ``!`` send: Claude never writes a plain user message for it,
-    and after the exec it starts a model turn on the output. Without a
-    user item between them, the web feed has no turn boundary — the
-    previous reply, the exec cards, and the follow-up reply all merge
-    into one assistant bubble, and a web-composer bang's optimistic
-    bubble has no persisted message to reconcile against (its
-    pending-input entry is drained by this echo's persist). The echo
-    carries the composer's exact text, so that drain matches by text; a
-    bang typed in the terminal matches nothing and drains nothing.
+    Claude records a ``!`` send only as ``<bash-input>`` and resumes the
+    model turn on its output, so without this echo the previous reply,
+    exec cards, and follow-up merge into one assistant bubble. The echo
+    carries the composer's exact text, so its persist drains only a
+    matching web-composer pending entry; a terminal bang matches none.
 
     :param content: Transcript markup carrying ``<bash-input>``.
     :param source_key: Base transcript record key used for source ids.
