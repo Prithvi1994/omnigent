@@ -2833,6 +2833,8 @@ async def _post_resume_terminal_status(
     status in its resume payload is the just-started turn reported terminal
     during the Codex MCP-startup window (``active_turn_present=false``), not a
     real end: honoring it would finish a still-live turn before any output.
+    Even on that reconnect, only the recovered turn is closed; a newer turn
+    that starts live during recovery stays owned by the live event stream.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -2846,7 +2848,9 @@ async def _post_resume_terminal_status(
     """
     if thread_id is None or replay_from_turn_id is None:
         return
-    edge = _resume_terminal_status_edge_for_latest_turn(bridge_dir, thread_id, turns)
+    edge = _resume_terminal_status_edge_for_latest_turn(
+        bridge_dir, thread_id, turns, expected_turn_id=replay_from_turn_id
+    )
     await _post_turn_status_edge(client, session_id, edge)
 
 
@@ -2854,6 +2858,7 @@ def _resume_terminal_status_edge_for_latest_turn(
     bridge_dir: Path,
     thread_id: str,
     turns: list[object],
+    expected_turn_id: str | None = None,
 ) -> _CodexTurnStatusEdge | None:
     """
     Return the Omnigent terminal status represented by the latest resume turn.
@@ -2862,6 +2867,8 @@ def _resume_terminal_status_edge_for_latest_turn(
     :param thread_id: Codex thread id from the resume payload, e.g.
         ``"thread_123"``.
     :param turns: Raw Codex resume turn list.
+    :param expected_turn_id: When set, only close this turn; a newer turn that
+        started live during a reconnect stays owned by the live event stream.
     :returns: Terminal status edge when the latest turn is terminal and
         belongs to the bridge's current thread; otherwise ``None``.
     """
@@ -2873,6 +2880,8 @@ def _resume_terminal_status_edge_for_latest_turn(
             continue
         turn_id = _turn_id_from_payload(turn)
         if turn_id is None:
+            return None
+        if expected_turn_id is not None and turn_id != expected_turn_id:
             return None
         if state.active_turn_id is not None and state.active_turn_id != turn_id:
             return None

@@ -19,6 +19,7 @@ from omnigent.harnesses.codex_native.bridge import (
 )
 from tests.harnesses.codex_native.session._support import (
     _agent_message_event,
+    _capture_handler,
     _completed_event,
     _elicitation_tracker,
     _expected_status_data,
@@ -588,9 +589,8 @@ class _FreshThreadRaceClient:
     A freshly created thread has no rollout, so the first ``thread/resume``
     fails and the subscribe task parks. The thread's first turn then starts
     live, releasing the park; the retry ``thread/resume`` lands inside the
-    MCP-startup window, where Codex returns the *just-started* turn with a
-    terminal status (``active_turn_present=false``) even though it is still
-    running and completes ~40-50s later.
+    MCP-startup window, where Codex returns the still-running *just-started*
+    turn with a terminal status (``active_turn_present=false``).
     """
 
     def __init__(self, resume_turn_status: str) -> None:
@@ -666,11 +666,6 @@ def test_supervise_forwarder_resume_does_not_finish_a_just_started_turn(
     monkeypatch.setattr(codex_native_forwarder, "_post_resume_terminal_status", _tracked_post)
     posted: list[dict[str, Any]] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.content:
-            posted.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": False})
-
     async def run() -> None:
         await codex_native_forwarder.supervise_forwarder(
             base_url="http://127.0.0.1:8000",
@@ -680,7 +675,7 @@ def test_supervise_forwarder_resume_does_not_finish_a_just_started_turn(
             app_server_url=str(tmp_path / "app-server.sock"),
             thread_id="thread_123",
             client=client,  # type: ignore[arg-type]
-            ap_transport=httpx.MockTransport(handler),
+            ap_transport=httpx.MockTransport(_capture_handler(posted)),
         )
 
     asyncio.run(run())
@@ -717,6 +712,53 @@ def test_supervise_forwarder_resume_does_not_finish_a_just_started_turn(
         "forwarder never reported the turn idle after its real output "
         "(the live turn/completed terminal edge must still finish the turn); "
         f"status edges={status_edges} first_output_index={first_output_index}"
+    )
+
+
+@pytest.mark.parametrize("resume_turn_status", ["completed", "interrupted", "cancelled"])
+def test_resume_terminal_status_closes_only_the_recovered_turn(
+    resume_turn_status: str,
+    tmp_path: Path,
+) -> None:
+    """A reconnect must not close a newer turn that started live during recovery.
+
+    While recovering a persisted interrupted turn (``replay_from_turn_id``), a
+    newer turn can start live and advance ``active_turn_id``. If that newer turn
+    also appears terminal in the resume payload (the same MCP-startup artifact),
+    the forwarder must not publish its terminal edge or clear its active id: the
+    live event stream still owns it. Backfill closes only the recovered turn.
+    """
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_new", thread_id="thread_123")
+    turns = [
+        {"id": "turn_old", "status": "completed", "items": []},
+        {"id": "turn_new", "status": resume_turn_status, "items": []},
+    ]
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with _recording_forwarder_client(posted) as client:
+            await codex_native_forwarder._post_resume_terminal_status(
+                client,
+                session_id="conv_123",
+                bridge_dir=tmp_path,
+                thread_id="thread_123",
+                turns=turns,
+                replay_from_turn_id="turn_old",
+            )
+
+    asyncio.run(run())
+
+    status_edges = [
+        payload for payload in posted if payload.get("type") == "external_session_status"
+    ]
+    assert not status_edges, (
+        "forwarder closed a newer live turn from resume metadata while "
+        f"recovering turn_old; posted={posted}"
+    )
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == "turn_new", (
+        "recovering turn_old must not clear the newer live turn's active id"
     )
 
 
