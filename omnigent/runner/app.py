@@ -2402,9 +2402,32 @@ def create_runner_app(
             )
             harness_name = canonicalize_harness(raw_harness) or raw_harness
 
-            _start_data = await _evaluate_agent_start_gate(spec, harness_name)
+            from omnigent.runner.policy import AgentStartPolicyError
+
+            try:
+                _start_data = await _evaluate_agent_start_gate(spec, harness_name)
+            except AgentStartPolicyError as exc:
+                _logger.error(
+                    "Runner session initialization failed",
+                    extra=debug_event(
+                        "runner_session_init_failed",
+                        stage="session_init",
+                        status_code=403,
+                        error_code="agent_start_policy_unevaluable",
+                    ),
+                )
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "agent_start_policy_unevaluable",
+                        "detail": (
+                            f"guardrails policy {exc.policy_name!r} could not be "
+                            "evaluated for agent start"
+                        ),
+                    },
+                )
             if _start_data is not None:
-                _apply_sandbox_override_from_verdict(spec, _start_data)
+                _apply_sandbox_override_from_start_data(spec, _start_data)
 
             await _ensure_session_subagent_router(
                 session_id,
@@ -7931,26 +7954,26 @@ async def _evaluate_agent_start_gate(
     )
 
 
-def _apply_sandbox_override_from_verdict(
+def _apply_sandbox_override_from_start_data(
     spec: AgentSpec,
-    verdict_data: object,
+    start_data: object,
 ) -> None:
-    """Apply sandbox override from a policy verdict's ``data`` field.
+    """Apply the start probe's composed sandbox transform to *spec*.
 
-    The ``enforce_sandbox`` policy returns replacement ``data`` shaped
-    as ``{"name": "sys_agent_start", "arguments": {"sandbox": {...}}}``.
-    This extracts the ``sandbox`` dict and mutates ``spec.os_env``
-    in-place.
+    The ``enforce_sandbox`` policy returns replacement data shaped as
+    ``{"name": "sys_agent_start", "arguments": {"sandbox": {...}}}``. This
+    extracts the ``sandbox`` dict and mutates ``spec.os_env`` in-place.
 
     :param spec: The agent spec (``AgentSpec``) — mutated in-place.
-    :param verdict_data: The ``PolicyVerdict.data`` payload, expected
-        to be a dict with ``arguments.sandbox``.
+    :param start_data: The composed transform payload from
+        :meth:`RunnerToolPolicyGate.evaluate_agent_start`, expected to be a
+        mapping with ``arguments.sandbox``.
     """
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
-    if not isinstance(verdict_data, Mapping):
+    if not isinstance(start_data, Mapping):
         return
-    args = verdict_data.get("arguments")
+    args = start_data.get("arguments")
     if not isinstance(args, Mapping):
         return
     sandbox_override = args.get("sandbox")

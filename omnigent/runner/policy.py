@@ -61,6 +61,10 @@ class _GatedPolicy:
     name: str
     policy: FunctionPolicy
     phases: frozenset[Phase]
+    # True when ``policy`` is the fail-closed stand-in for a spec policy that
+    # could not be resolved. Its DENY is a load failure, not a real verdict, so
+    # the start probe refuses to launch instead of silently dropping a transform.
+    fail_closed: bool = False
 
 
 @dataclass(frozen=True)
@@ -109,6 +113,22 @@ _ALLOW: PolicyVerdict = PolicyVerdict(action="allow")
 # Synthetic tool name the runner probes before spawning an agent; start-aware
 # policies such as ``enforce_sandbox`` key on it to transform the launch.
 AGENT_START_TOOL = "sys_agent_start"
+
+
+class AgentStartPolicyError(RuntimeError):
+    """A guardrails policy could not be evaluated for the start probe.
+
+    Raised when a tool-phase policy raised or failed to resolve while the
+    runner probed ``sys_agent_start``. Such a policy might have restricted the
+    launch (e.g. ``enforce_sandbox``), so the runner fails session init closed
+    rather than starting the agent with the un-transformed spec.
+    """
+
+    def __init__(self, policy_name: str, reason: str) -> None:
+        """Record the offending policy name and why it could not be evaluated."""
+        self.policy_name = policy_name
+        self.reason = reason
+        super().__init__(f"guardrails policy {policy_name!r} {reason}; refusing agent start")
 
 
 def _resolve_failure_diagnostic(ps: FunctionPolicySpec, exc: BaseException) -> str:
@@ -183,7 +203,12 @@ class RunnerToolPolicyGate:
                 )
                 policy = _unresolved_policy_sentinel(ps, exc)
                 phases = frozenset([Phase.TOOL_CALL, Phase.TOOL_RESULT])
-            out.append(_GatedPolicy(name=ps.name, policy=policy, phases=phases))
+                fail_closed = True
+            else:
+                fail_closed = False
+            out.append(
+                _GatedPolicy(name=ps.name, policy=policy, phases=phases, fail_closed=fail_closed)
+            )
         return cls(out)
 
     def reset_turn(self) -> None:
@@ -230,15 +255,23 @@ class RunnerToolPolicyGate:
 
         The probe lets start-aware policies such as ``enforce_sandbox``
         transform the launch; their ``data`` chains exactly as in
-        :meth:`evaluate_tool_call`. It is not a real tool call, so DENY
-        and ASK verdicts do not gate agent start: a generic allowlist that
-        rejects the probe name is logged and skipped, and the remaining
-        policies still contribute their transforms.
+        :meth:`evaluate_tool_call`. It is not a real tool call, so a clean
+        DENY or ASK from a resolved policy does not gate agent start: a generic
+        allowlist that rejects the probe name is logged and skipped, and the
+        remaining policies still contribute their transforms.
+
+        A policy the runner could not evaluate is treated differently from a
+        clean verdict. If a tool-phase policy raised, or failed to resolve and
+        was replaced by the fail-closed sentinel, its intended transform is
+        unknown, so the probe fails closed rather than launching with a
+        possibly-dropped sandbox restriction.
 
         :param arguments: Probe arguments, e.g. ``{"agent_name": "...",
             "harness": "claude-sdk", "sandbox": {...}}``.
         :returns: The composed replacement payload, or ``None`` when no
             policy transformed the probe.
+        :raises AgentStartPolicyError: When a tool-phase policy raised or
+            failed to resolve while evaluating the probe.
         """
         ctx = EvaluationContext(
             phase=Phase.TOOL_CALL,
@@ -249,17 +282,29 @@ class RunnerToolPolicyGate:
         for gated in self._policies:
             if Phase.TOOL_CALL not in gated.phases:
                 continue
+            if gated.fail_closed:
+                # The configured policy never resolved, so its intended launch
+                # transform is unknown. Refuse to start rather than risk running
+                # the agent with a sandbox restriction silently dropped.
+                _logger.error(
+                    "runner policy %r failed to resolve; refusing agent start",
+                    gated.name,
+                    extra={"session_id": runner_primary_session_id()},
+                )
+                raise AgentStartPolicyError(gated.name, "failed to resolve")
             try:
                 result: PolicyResult = await gated.policy.evaluate(ctx, {})
-            except Exception:
+            except Exception as exc:
+                # Same fail-closed reasoning: a transform policy such as
+                # enforce_sandbox that raised here would otherwise be dropped,
+                # launching the agent with its weaker declared sandbox.
                 _logger.exception(
-                    "runner policy %r raised on the %s probe; skipping it, "
-                    "tool_call policies do not gate agent start",
+                    "runner policy %r raised on the %s probe; refusing agent start",
                     gated.name,
                     AGENT_START_TOOL,
                     extra={"session_id": runner_primary_session_id()},
                 )
-                continue
+                raise AgentStartPolicyError(gated.name, "raised on the start probe") from exc
             if result.action != PolicyAction.ALLOW:
                 _logger.warning(
                     "runner policy %r returned %s for the %s probe; ignoring it, "

@@ -19,9 +19,14 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.policies import FunctionPolicy
 from omnigent.runner import app as runner_app_module
 from omnigent.runner import create_runner_app
-from omnigent.runner.policy import RunnerToolPolicyGate
+from omnigent.runner.policy import (
+    AgentStartPolicyError,
+    RunnerToolPolicyGate,
+    _GatedPolicy,
+)
 from omnigent.spec.types import (
     AgentSpec,
     ExecutorSpec,
@@ -70,6 +75,18 @@ def _force_bwrap() -> FunctionPolicySpec:
         function=FunctionRef(
             path="omnigent.policies.builtins.safety.enforce_sandbox",
             arguments={"sandbox_type": "linux_bwrap", "allow_network": False},
+        ),
+    )
+
+
+def _unresolvable_policy() -> FunctionPolicySpec:
+    """A tool-call policy whose function path cannot be imported."""
+    return FunctionPolicySpec(
+        name="unresolvable_sandbox",
+        on=[PhaseSelector(phase=Phase.TOOL_CALL)],
+        function=FunctionRef(
+            path="omnigent.policies.builtins.does_not_exist",
+            arguments={},
         ),
     )
 
@@ -250,3 +267,51 @@ async def test_start_probe_without_transforms_keeps_real_tool_enforcement() -> N
     denied = await gate.evaluate_tool_call("shell", {"command": "ls"})
     assert denied.action == "deny"
     assert denied.policy_name == "allowlist_then_deny"
+
+
+@pytest.mark.asyncio
+async def test_start_probe_fails_closed_when_a_start_policy_raises() -> None:
+    """A policy that raises aborts the launch instead of dropping its transform."""
+
+    def _boom(_event: object) -> dict[str, object]:
+        raise RuntimeError("transform policy bug")
+
+    gated = _GatedPolicy(
+        name="force_bwrap",
+        policy=FunctionPolicy(_force_bwrap(), _boom),
+        phases=frozenset([Phase.TOOL_CALL]),
+    )
+    gate = RunnerToolPolicyGate([gated])
+
+    with pytest.raises(AgentStartPolicyError):
+        await gate.evaluate_agent_start(dict(_START_PROBE_ARGS))
+
+
+@pytest.mark.asyncio
+async def test_start_probe_fails_closed_on_unresolved_policy_sentinel() -> None:
+    """An unresolvable configured policy fails the probe closed, not open."""
+    gate = RunnerToolPolicyGate.from_spec(_spec(_unresolvable_policy()))
+
+    with pytest.raises(AgentStartPolicyError):
+        await gate.evaluate_agent_start(dict(_START_PROBE_ARGS))
+
+    # The sentinel keeps denying real tool calls — fail-closed posture intact.
+    denied = await gate.evaluate_tool_call("sys_session_send", {"agent": "child"})
+    assert denied.action == "deny"
+
+
+@pytest.mark.asyncio
+async def test_session_init_fails_closed_when_a_start_policy_cannot_resolve() -> None:
+    """Session init refuses to spawn when a configured tool policy cannot resolve."""
+    session_id = "conv_unresolvable_policy_init"
+    try:
+        resp, pm = await _create_session(_spec(_unresolvable_policy()), session_id)
+
+        assert resp.status_code == 403, (
+            f"an unresolvable policy must fail session init closed; "
+            f"got {resp.status_code}: {resp.text}"
+        )
+        assert not pm.has_session(session_id), "harness spawned despite the unevaluable policy"
+        assert session_id not in runner_app_module._session_inboxes_ref
+    finally:
+        runner_app_module._session_inboxes_ref.pop(session_id, None)

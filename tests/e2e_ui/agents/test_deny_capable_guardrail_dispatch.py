@@ -47,10 +47,9 @@ from tests.e2e_ui.conftest import (
 
 _SUBAGENT_ROW = '[data-testid="subagent-row"]'
 
-# Sentinel ending the parent's dispatch turn so the test can wait on it.
-# It renders on both the buggy and fixed builds (a failed dispatch returns
-# an error string and the turn still runs to its scripted end), so the
-# worker row — not the sentinel — is the discriminating signal.
+# Sentinel ending the parent's dispatch turn so the test can wait on it. It
+# renders on both the buggy and fixed builds, so the worker row (not the
+# sentinel) is the discriminating signal.
 _PARENT_TURN_DONE = "PARENT_DISPATCH_TURN_DONE"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 
