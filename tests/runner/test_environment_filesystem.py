@@ -1568,33 +1568,32 @@ def glob_workspace(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-async def glob_client(glob_workspace: Path) -> AsyncIterator[httpx.AsyncClient]:
+async def glob_client(
+    glob_workspace: Path, make_os_env: OsEnvFactory
+) -> AsyncIterator[httpx.AsyncClient]:
     """httpx client for a runner app backed by ``glob_workspace``.
 
     :param glob_workspace: The populated workspace root.
+    :param make_os_env: Factory whose teardown closes the environment.
     :returns: Async HTTP client for the runner app.
     """
-    os_env = create_os_environment(
+    os_env = make_os_env(
         OSEnvSpec(
             type="caller_process",
             cwd=str(glob_workspace),
             sandbox=OSEnvSandboxSpec(type="none"),
         ),
     )
-    assert os_env is not None
-    try:
-        reg = SessionResourceRegistry()
-        reg._primary_envs["conv_test"] = os_env
-        app = create_runner_app(
-            resource_registry=reg,
-            runner_workspace=glob_workspace,
-            server_client=NullServerClient(),  # type: ignore[arg-type]
-        )
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
-            yield c
-    finally:
-        os_env.close()
+    reg = SessionResourceRegistry()
+    reg._primary_envs["conv_test"] = os_env
+    app = create_runner_app(
+        resource_registry=reg,
+        runner_workspace=glob_workspace,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
+        yield c
 
 
 @pytest.mark.asyncio

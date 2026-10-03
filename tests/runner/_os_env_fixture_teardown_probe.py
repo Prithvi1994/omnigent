@@ -36,24 +36,30 @@ def live_helper_pids() -> set[int]:
     return pids
 
 
+def _watched(item: pytest.Item) -> list[str]:
+    if not os.environ.get("OMNIGENT_FIXTURE_PROBE_LOG"):
+        return []
+    return sorted(WATCHED_FIXTURES & set(getattr(item, "fixturenames", ())))
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item: pytest.Item) -> None:
-    _before_by_nodeid[item.nodeid] = live_helper_pids()
+    if _watched(item):
+        _before_by_nodeid[item.nodeid] = live_helper_pids()
 
 
 # ``trylast`` runs after pytest's own teardown hook has finalized the test's
 # function-scoped fixtures, so every watched fixture has already been torn down.
 @pytest.hookimpl(trylast=True)
 def pytest_runtest_teardown(item: pytest.Item) -> None:
-    before = _before_by_nodeid.pop(item.nodeid, set())
-    fixtures = sorted(WATCHED_FIXTURES & set(getattr(item, "fixturenames", ())))
-    log = os.environ.get("OMNIGENT_FIXTURE_PROBE_LOG")
-    if not fixtures or not log:
+    before = _before_by_nodeid.pop(item.nodeid, None)
+    fixtures = _watched(item)
+    if before is None or not fixtures:
         return
     record = {
         "test": item.nodeid,
         "fixtures": fixtures,
         "helpers_alive_after_teardown": sorted(live_helper_pids() - before),
     }
-    with open(log, "a", encoding="utf-8") as handle:
+    with open(os.environ["OMNIGENT_FIXTURE_PROBE_LOG"], "a", encoding="utf-8") as handle:
         handle.write(json.dumps(record) + "\n")

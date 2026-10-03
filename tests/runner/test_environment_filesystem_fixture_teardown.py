@@ -12,9 +12,11 @@ pytest_plugins = ["pytester"]
 
 # Reuses the real fixtures so the test exercises the fixtures under test, not
 # copies of them. Each test first proves its operation started a helper, so the
-# teardown check cannot pass vacuously.
+# teardown check cannot pass vacuously; the last one fails during setup after a
+# helper started, so cleanup on the setup-error path is checked too.
 _TOUCH_FILESYSTEM = """
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
+import pytest
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from tests.runner._os_env_fixture_teardown_probe import live_helper_pids
 from tests.runner.test_environment_filesystem import (  # noqa: F401
@@ -49,6 +51,19 @@ async def test_touch_factory_env(make_os_env, tmp_path):
     before = live_helper_pids()
     assert (await os_env.shell("true"))["exit_code"] == 0
     assert live_helper_pids() - before, "the shell command should have started a helper"
+
+
+@pytest.fixture
+async def env_then_setup_failure(make_os_env, tmp_path):
+    os_env = make_os_env(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert (await os_env.shell("true"))["exit_code"] == 0
+    raise RuntimeError("injected setup failure")
+
+
+async def test_setup_failure_after_helper_start(env_then_setup_failure):
+    raise AssertionError("setup should have failed before the test body")
 """
 
 
@@ -76,8 +91,10 @@ def test_fixture_teardown_stops_the_helper(
         "-o",
         "asyncio_mode=auto",
     )
-    result.assert_outcomes(passed=3)
+    result.assert_outcomes(passed=3, errors=1)
+    result.stdout.fnmatch_lines(["*injected setup failure*"])
 
+    assert probe_log.exists(), "probe wrote no records; was OMNIGENT_FIXTURE_PROBE_LOG propagated?"
     records = [
         json.loads(line)
         for line in probe_log.read_text(encoding="utf-8").splitlines()
