@@ -75,8 +75,10 @@ def claude_native_skill_args(
     bundle's ``skills/<dir>/SKILL.md`` files as plugin skills when the
     bundle is passed via ``--plugin-dir``, and gates host skills
     (``~/.claude/skills/``, project ``.claude/skills/``) via
-    ``--setting-sources``. ``skills_filter`` maps the same way the SDK
-    maps it onto ``setting_sources`` (matching the wrapped variants):
+    ``--setting-sources``. ``skills_filter`` maps broadly the way the
+    SDK maps it onto ``setting_sources``, but native does not mirror the
+    SDK exactly: by default it also drops the workspace scope (see
+    ``include_workspace_settings`` below).
 
     - ``"all"`` → host skills included. With
       ``include_workspace_settings=True`` no ``--setting-sources`` is
