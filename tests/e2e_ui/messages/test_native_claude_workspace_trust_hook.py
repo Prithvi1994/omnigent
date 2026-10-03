@@ -1,8 +1,8 @@
 """claude-native must not run an unreviewed workspace's project hooks at startup.
 
-Reproduces OMNI-6384: the runner pre-seeds Claude Code's workspace trust before
-launch, so Claude boots an unreviewed workspace with no trust gate and loads its
-project ``.claude/settings.json`` under the CLI's default setting sources. A
+The runner pre-seeds Claude Code's workspace trust before launch, so Claude
+boots an unreviewed workspace with no trust gate and loads its project
+``.claude/settings.json`` under the CLI's default setting sources. A
 ``SessionStart`` command hook there then executes as the runner user with no
 confirmation. Drives the real product path (session create -> runner bind ->
 real Claude in the Terminal view) and asserts the project hook did not run.
@@ -10,6 +10,7 @@ real Claude in the Terminal view) and asserts the project hook did not run.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import shlex
@@ -131,7 +132,8 @@ def test_unreviewed_project_hook_does_not_run_at_startup(
             )
     finally:
         if session_id is not None:
-            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+            with contextlib.suppress(Exception):
+                httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
         reset_mock_llm(mock_llm_server_url)
         shutil.rmtree(workspace, ignore_errors=True)
         if respawned is not None:

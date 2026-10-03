@@ -131,26 +131,18 @@ def test_claude_native_skill_args_with_bundle(
         assert args[args.index("--setting-sources") + 1] == expect_setting_sources
 
 
-def test_claude_native_skill_args_default_drops_workspace_settings(tmp_path: Path) -> None:
+def test_claude_native_skill_args_default_drops_workspace_settings() -> None:
     """
-    Security regression: with its default arguments (``skills_filter="all"``,
-    ``include_workspace_settings=False``) the native launch restricts Claude's
-    setting sources to ``user`` — never the workspace scope.
+    Security regression: with its default arguments the no-bundle native launch
+    (the ``omnigent claude`` host path) restricts Claude's setting sources to
+    ``user`` — never the workspace scope.
 
     A launch that pre-accepts Claude's workspace-trust dialog
     (``ensure_claude_workspace_trusted``) must not also let an unreviewed
-    workspace's ``.claude/settings.json`` (e.g. a ``SessionStart`` hook) run
-    at startup. Dropping the workspace-scoped sources is what prevents that,
-    so this must hold for the *default* argument shape, not only when a caller
-    opts in.
+    workspace's ``.claude/settings.json`` (e.g. a ``SessionStart`` hook) run at
+    startup. The bundled default is already covered by ``[all-default]``; this
+    pins the no-bundle default, which that matrix does not reach.
     """
-    bundle = _make_bundle_with_skill(tmp_path)
-
-    args = claude_native_skill_args(bundle, agent_name="researcher")
-
-    assert "--setting-sources" in args
-    assert args[args.index("--setting-sources") + 1] == "user"
-    # No-bundle default path is likewise scoped to user only.
     assert claude_native_skill_args(None) == ["--setting-sources", "user"]
 
 

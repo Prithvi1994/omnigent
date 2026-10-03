@@ -8154,6 +8154,36 @@ def test_ensure_trusted_creates_config_when_missing(
     assert data["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"] is True
 
 
+def test_ensure_trusted_honors_config_dir_over_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``$CLAUDE_CONFIG_DIR`` takes precedence over ``$HOME`` for the trust seed.
+
+    The helper writes ``$CLAUDE_CONFIG_DIR/.claude.json`` when that variable is
+    set and leaves ``$HOME/.claude.json`` untouched. A caller (or test) that
+    isolates only ``HOME`` but inherits an ambient ``CLAUDE_CONFIG_DIR`` would
+    otherwise persist trust into the external config, so this pins the
+    precedence that isolation must respect.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    config_dir = tmp_path / "external-config"
+    config_dir.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    ensure_claude_workspace_trusted(workspace)
+
+    data = json.loads((config_dir / ".claude.json").read_text())
+    assert data["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"] is True
+    # HOME is left alone — the seed followed CLAUDE_CONFIG_DIR, not ~.
+    assert not (home / ".claude.json").exists()
+
+
 def test_ensure_trusted_preserves_existing_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

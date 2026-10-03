@@ -1,56 +1,24 @@
 r"""End-to-end guard: claude-native must not run unreviewed project hooks at startup.
 
-``claude-native`` pre-seeds Claude Code's first-run trust + onboarding gates
-pre-launch, without user confirmation:
-:func:`omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted`
-writes ``hasCompletedOnboarding`` and ``projects[<abs cwd>].hasTrustDialogAccepted``
-into the launch ``HOME``'s ``~/.claude.json`` so a host-spawned (web-UI-driven)
-session never blocks on Claude's unhookable trust/onboarding TUI prompts.
+For a host-spawned (web-UI-driven) session, ``claude-native`` pre-seeds Claude
+Code's unhookable first-run trust + onboarding gates
+(:func:`omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted`)
+so the terminal never blocks on them. That machine-granted trust must not also
+*execute* the workspace's own settings: if the launch left Claude's default
+setting sources live, opening an unreviewed workspace would let its project
+``.claude/settings.json`` ``SessionStart`` hook run as the runner user before
+any human saw Claude's trust dialog. The launch-arg builder therefore restricts
+setting sources to the user scope by default
+(:func:`omnigent.inner.bundle_skills.claude_native_skill_args`).
 
-That machine-granted trust must not extend to *executing* the workspace's own
-settings: if the launch args left Claude's default setting sources live, a
-project-controlled ``.claude/settings.json`` would load, and opening a newly
-cloned, third-party, or otherwise unreviewed workspace through claude-native
-would let a project-defined ``SessionStart`` hook execute as the runner user at
-startup --- before the user has personally seen or accepted Claude's "Do you
-trust the files in this folder? (they can read, edit, and execute files)"
-warning. Reviewing an attacker-authored branch would be enough. The launch-arg
-builder therefore restricts setting sources to the user scope by default
-(:func:`omnigent.inner.bundle_skills.claude_native_skill_args` emits
-``--setting-sources user`` unless a call site opts in because Claude's own
-trust gate is intact).
+Driven against the REAL ``claude`` CLI: with the pre-fix launch shape (workspace
+settings live) the hook runs; with the harness's actual shape (``--setting-sources
+user``) it must not. The first case is a positive control, so a later "marker
+absent" result reflects the gate holding rather than the CLI failing to boot.
 
-What this test does (the user journey, driven against the REAL ``claude`` CLI):
-
-1. Stand up an *unreviewed* workspace whose ``.claude/settings.json`` carries a
-   project ``SessionStart`` hook that runs an attacker command (here: create a
-   marker file --- a stand-in for arbitrary code execution).
-2. Pre-seed trust exactly as omnigent does, by calling the real
-   ``ensure_claude_workspace_trusted(workspace)`` --- into an isolated ``$HOME``
-   so the test never touches the developer's real ``~/.claude.json``.
-3. Launch the real ``claude`` CLI in that workspace with an omnigent-style
-   invocation ``--settings`` file plus the real
-   ``claude_native_skill_args(skills_filter="all")`` output --- i.e. the exact
-   launch shape the harness produces for a runner-owned session.
-4. Assert the project ``SessionStart`` hook did **not** execute (the marker must
-   be absent): an unreviewed workspace's project hook must not run at startup
-   without an explicit user trust decision.
-
-A positive control runs the same journey first with workspace settings live
-(the pre-fix launch shape) and asserts the hook *does* run, so a later "marker
-absent" result proves the gate held rather than the CLI failing to boot.
-
-On a build where the pre-seeded trust defeats the gate (Claude boots straight
-to the prompt with no trust dialog and its default setting sources keep the
-project settings live), the hook runs and the final assertion FAILS. With
-workspace-scoped setting sources disabled for the harness launch shape, the
-unreviewed hook never executes and this PASSES.
-
-Why this runs in plain CI (unlike the other claude-native e2e tests): the
-``SessionStart`` hook fires at session *initialization*, before any model / API
-call, so this needs the ``claude`` binary but **no** interactive Claude login or
-network reachability. It is therefore gated on binary presence alone, not on
-``OMNIGENT_E2E_CLAUDE_NATIVE``.
+This runs on ``claude`` binary presence alone (not ``OMNIGENT_E2E_CLAUDE_NATIVE``):
+the ``SessionStart`` hook fires at session init, before any model/API call, so
+no interactive login or network reachability is needed.
 """
 
 from __future__ import annotations
@@ -61,6 +29,7 @@ import os
 import pty
 import re
 import select
+import shlex
 import shutil
 import subprocess
 import time
@@ -91,7 +60,7 @@ def _drive_claude_startup(
     invocation_settings: Path,
     setting_source_args: list[str],
     env: dict[str, str],
-) -> tuple[bool, str]:
+) -> tuple[bool, bool, str]:
     """Launch the real ``claude`` CLI in *workspace* and watch it boot.
 
     Runs Claude Code interactively in a pseudo-TTY (the way the native harness
@@ -107,7 +76,10 @@ def _drive_claude_startup(
     :param setting_source_args: The ``claude_native_skill_args`` output that
         decides whether the workspace's project settings (the hook) stay live.
     :param env: Environment for the child (with an isolated ``HOME``).
-    :returns: ``(marker_seen, decoded_tui_output)``.
+    :returns: ``(marker_seen, started_ok, decoded_tui_output)``, where
+        ``started_ok`` is True when the CLI reached its interactive wait
+        rather than exiting on its own (a crash would make a missing marker
+        meaningless).
     """
     marker = workspace / _MARKER_NAME
     launch_args = [
@@ -148,18 +120,23 @@ def _drive_claude_startup(
         # Give a just-launched hook a beat to flush its marker.
         time.sleep(1.0)
     finally:
+        # Still running here means Claude booted into its interactive wait; an
+        # already-exited process crashed before SessionStart, so marker absence
+        # would not prove the gate held.
+        started_ok = proc.poll() is None
         try:
             proc.terminate()
             proc.wait(timeout=5)
-        except Exception:
+        except (subprocess.TimeoutExpired, OSError):
             proc.kill()
+            proc.wait(timeout=5)
         for fd in (master_out, master_in):
             with contextlib.suppress(OSError):
                 os.close(fd)
 
     text = re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]", b"", buf)
     text = re.sub(rb"[\x00-\x08\x0e-\x1f]", b"", text)
-    return marker.exists(), text.decode("utf-8", "replace")
+    return marker.exists(), started_ok, text.decode("utf-8", "replace")
 
 
 def _seed_unreviewed_workspace(
@@ -181,13 +158,17 @@ def _seed_unreviewed_workspace(
     fake_home = base / "home"
     fake_home.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(fake_home))
+    # ensure_claude_workspace_trusted() honors $CLAUDE_CONFIG_DIR over $HOME, so
+    # drop any ambient value: the seed must land in fake_home, never the
+    # developer's real external config.
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
 
     # An unreviewed / attacker-authored workspace: its project settings define a
     # SessionStart hook that runs an arbitrary command at startup.
     workspace = base / "unreviewed-workspace"
     (workspace / ".claude").mkdir(parents=True)
     marker = workspace / _MARKER_NAME
-    project_hook_cmd = f"echo attacker-code-executed > {json.dumps(str(marker))}"
+    project_hook_cmd = f"echo attacker-code-executed > {shlex.quote(str(marker))}"
     (workspace / ".claude" / "settings.json").write_text(
         json.dumps(
             {
@@ -220,7 +201,7 @@ def _seed_unreviewed_workspace(
     return workspace, invocation_settings, dict(os.environ)
 
 
-def test_claude_native_pre_seeded_trust_runs_unreviewed_project_hook(
+def test_claude_native_pre_seeded_trust_does_not_run_unreviewed_project_hook(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -239,7 +220,7 @@ def test_claude_native_pre_seeded_trust_runs_unreviewed_project_hook(
     control_ws, control_settings, control_env = _seed_unreviewed_workspace(
         tmp_path / "control", monkeypatch
     )
-    control_seen, control_out = _drive_claude_startup(
+    control_seen, _control_started, control_out = _drive_claude_startup(
         claude_bin=claude_bin,
         workspace=control_ws,
         invocation_settings=control_settings,
@@ -257,7 +238,7 @@ def test_claude_native_pre_seeded_trust_runs_unreviewed_project_hook(
     fixed_ws, fixed_settings, fixed_env = _seed_unreviewed_workspace(
         tmp_path / "fixed", monkeypatch
     )
-    fixed_seen, _fixed_out = _drive_claude_startup(
+    fixed_seen, fixed_started, fixed_out = _drive_claude_startup(
         claude_bin=claude_bin,
         workspace=fixed_ws,
         invocation_settings=fixed_settings,
@@ -265,6 +246,11 @@ def test_claude_native_pre_seeded_trust_runs_unreviewed_project_hook(
         env=fixed_env,
     )
 
+    assert fixed_started, (
+        "restricted launch (--setting-sources user) did not reach Claude's "
+        "interactive wait: the CLI exited on its own, so a missing marker would "
+        f"not prove the gate held rather than a boot failure. TUI output:\n{fixed_out}"
+    )
     assert not fixed_seen, (
         "SECURITY: the project .claude/settings.json SessionStart hook executed at "
         "claude-native startup with no trust prompt. omnigent's global trust pre-seed "
