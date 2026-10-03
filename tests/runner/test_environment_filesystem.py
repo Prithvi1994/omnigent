@@ -15,7 +15,7 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
-from omnigent.entities.environment_filesystem import FilesystemPathNotFound
+from omnigent.entities.environment_filesystem import FilesystemPathNotFound, InvalidPath
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
 from omnigent.runner import create_runner_app
@@ -2073,6 +2073,322 @@ async def test_edit_and_delete_outside_workspace_round_trip(
     removed = await client.request("DELETE", url)
     assert removed.status_code == 200, removed.text
     assert not target.exists()
+
+
+def _absolute_delete_url(path: Path, *, recursive: bool = False) -> str:
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+    url = f"{base}/%2F{str(path).lstrip('/')}"
+    return f"{url}?recursive=true" if recursive else url
+
+
+@pytest.fixture(params=["outside", "workspace"])
+def absolute_delete_dir(request: pytest.FixtureRequest, tmp_path: Path, workspace: Path) -> Path:
+    """Directory an absolute-path delete test creates its entries in: outside
+    the workspace the delete runs in-process (admitted only because the
+    environment is unconfined); inside it a grant covers the path and the
+    delete runs in the sandboxed helper. Both routes must behave the same."""
+    return tmp_path if request.param == "outside" else workspace
+
+
+@pytest.mark.asyncio
+async def test_delete_absolute_path_through_symlinked_parent_is_refused(
+    client: httpx.AsyncClient,
+    absolute_delete_dir: Path,
+) -> None:
+    target = absolute_delete_dir / "target"
+    target.mkdir()
+    (target / "keep.txt").write_text("keep me\n")
+    link = absolute_delete_dir / "link"
+    link.symlink_to(target)
+
+    resp = await client.request("DELETE", _absolute_delete_url(link / "keep.txt"))
+
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_path"
+    assert (target / "keep.txt").exists()
+    assert link.is_symlink()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("populated", [True, False], ids=["non_empty_target", "empty_target"])
+async def test_delete_absolute_leaf_symlink_removes_only_the_link(
+    client: httpx.AsyncClient,
+    absolute_delete_dir: Path,
+    populated: bool,
+) -> None:
+    target = absolute_delete_dir / "target"
+    target.mkdir()
+    if populated:
+        (target / "keep.txt").write_text("keep me\n")
+    link = absolute_delete_dir / "link"
+    link.symlink_to(target)
+
+    resp = await client.request("DELETE", _absolute_delete_url(link))
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["type"] == "symlink"
+    assert not link.is_symlink() and not link.exists()
+    assert target.is_dir()
+    assert (target / "keep.txt").exists() is populated
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    getattr(os, "geteuid", lambda: 1)() == 0, reason="root can list a mode-0o311 directory"
+)
+async def test_delete_absolute_unreadable_nonempty_directory_is_refused_as_not_empty(
+    client: httpx.AsyncClient,
+    absolute_delete_dir: Path,
+) -> None:
+    locked = absolute_delete_dir / "locked"
+    locked.mkdir()
+    (locked / "secret.txt").write_text("secret\n")
+    locked.chmod(0o311)
+    try:
+        resp = await client.request("DELETE", _absolute_delete_url(locked))
+    finally:
+        locked.chmod(0o755)
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "directory_not_empty"
+    assert (locked / "secret.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_absolute_empty_directory(
+    client: httpx.AsyncClient,
+    absolute_delete_dir: Path,
+) -> None:
+    empty = absolute_delete_dir / "empty"
+    empty.mkdir()
+
+    resp = await client.request("DELETE", _absolute_delete_url(empty))
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["type"] == "directory"
+    assert resp.json()["bytes_deleted"] is None
+    assert not empty.exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_absolute_dangling_symlink_removes_the_link(
+    client: httpx.AsyncClient,
+    absolute_delete_dir: Path,
+) -> None:
+    link = absolute_delete_dir / "dangling"
+    link.symlink_to(absolute_delete_dir / "gone")
+
+    resp = await client.request("DELETE", _absolute_delete_url(link))
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["type"] == "symlink"
+    assert not link.is_symlink()
+
+
+@pytest.mark.asyncio
+async def test_delete_absolute_missing_path_is_not_found(
+    client: httpx.AsyncClient,
+    absolute_delete_dir: Path,
+) -> None:
+    resp = await client.request("DELETE", _absolute_delete_url(absolute_delete_dir / "nope.txt"))
+
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "path_not_found"
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    getattr(os, "geteuid", lambda: 1)() == 0, reason="root ignores directory write bits"
+)
+async def test_delete_absolute_in_unwritable_directory_is_permission_denied(
+    client: httpx.AsyncClient,
+    absolute_delete_dir: Path,
+) -> None:
+    sealed = absolute_delete_dir / "sealed"
+    sealed.mkdir()
+    victim = sealed / "victim.txt"
+    victim.write_text("still here\n")
+    sealed.chmod(0o555)
+    try:
+        resp = await client.request("DELETE", _absolute_delete_url(victim))
+    finally:
+        sealed.chmod(0o755)
+
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "permission_denied"
+    assert victim.exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_absolute_recursive_removes_the_tree_without_following_links(
+    client: httpx.AsyncClient,
+    absolute_delete_dir: Path,
+    tmp_path: Path,
+) -> None:
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "keep.txt").write_text("keep me\n")
+    tree = absolute_delete_dir / "tree"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "sub" / "file.txt").write_text("bye\n")
+    (tree / "escape").symlink_to(elsewhere)
+
+    resp = await client.request("DELETE", _absolute_delete_url(tree, recursive=True))
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["type"] == "directory"
+    assert not tree.exists()
+    assert (elsewhere / "keep.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_absolute_refuses_filesystem_and_environment_roots(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    for root in (Path("/"), workspace):
+        resp = await client.request("DELETE", _absolute_delete_url(root))
+        assert resp.status_code == 400, (root, resp.text)
+        assert resp.json()["error"]["code"] == "invalid_path"
+    assert (workspace / "hello.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_absolute_refuses_dot_dot_segments(
+    registry: SessionResourceRegistry,
+    tmp_path: Path,
+) -> None:
+    keep = tmp_path / "keep.txt"
+    keep.write_text("keep me\n")
+    fs = CallerProcessFilesystem(registry._primary_envs["conv_test"])
+
+    with pytest.raises(InvalidPath, match="traversal"):
+        await fs.delete(f"{tmp_path}/missing/../keep.txt")
+
+    assert keep.exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_absolute_routes_grant_covered_paths_through_the_helper(
+    client: httpx.AsyncClient,
+    registry: SessionResourceRegistry,
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A path a grant covers is deleted by the helper's own interpreter; a path
+    admitted only because the environment is unconfined is deleted in-process."""
+    os_env = registry._primary_envs["conv_test"]
+    commands: list[str] = []
+    real_shell = os_env.shell
+
+    async def recording_shell(command: str, **kwargs: object) -> dict[str, object]:
+        commands.append(command)
+        return await real_shell(command, **kwargs)
+
+    monkeypatch.setattr(os_env, "shell", recording_shell)
+    inside = workspace / "inside.txt"
+    inside.write_text("in\n")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("out\n")
+
+    assert (await client.request("DELETE", _absolute_delete_url(inside))).status_code == 200
+    assert len(commands) == 1 and "_delete_nofollow" in commands[0]
+    assert (await client.request("DELETE", _absolute_delete_url(outside))).status_code == 200
+    assert len(commands) == 1
+    assert not inside.exists() and not outside.exists()
+
+
+def test_delete_nofollow_without_dir_fd_support_still_refuses_symlinked_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner.environment_filesystem import _delete_nofollow
+
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "keep.txt").write_text("keep me\n")
+    (tmp_path / "link").symlink_to(target)
+    plain = tmp_path / "plain.txt"
+    plain.write_text("bye\n")
+    monkeypatch.setattr(os, "supports_dir_fd", set())
+
+    refused = _delete_nofollow(str(tmp_path / "link" / "keep.txt"), False)
+    removed = _delete_nofollow(str(plain), False)
+
+    assert refused["code"] == "invalid_path"
+    assert (target / "keep.txt").exists()
+    assert removed == {"deleted": True, "type": "file", "bytes_deleted": 4}
+    assert not plain.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sandbox_type", _SANDBOX_BACKENDS)
+async def test_delete_absolute_under_real_sandbox_runs_in_the_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_type: str,
+) -> None:
+    """A grant-covered absolute delete runs inside the confined helper with the
+    same no-follow rules, and a path no grant covers never reaches it."""
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    grant = tmp_path / "grant"
+    grant.mkdir()
+    (grant / "victim.txt").write_text("bye\n")
+    target = grant / "target"
+    target.mkdir()
+    (target / "keep.txt").write_text("keep me\n")
+    (grant / "link").symlink_to(target)
+    beyond = tmp_path / "beyond.txt"
+    beyond.write_text("out of reach\n")
+    # The helper imports omnigent from this checkout, which the sandbox
+    # must be allowed to read.
+    monkeypatch.setenv("PYTHONPATH", f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(ws),
+            sandbox=OSEnvSandboxSpec(
+                type=sandbox_type, read_paths=[str(_REPO_ROOT)], write_paths=[str(grant)]
+            ),
+        )
+    )
+    assert os_env is not None
+    reg = SessionResourceRegistry()
+    reg._primary_envs["conv_test"] = os_env
+    app = create_runner_app(
+        resource_registry=reg,
+        runner_workspace=ws,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            removed = await client.request("DELETE", _absolute_delete_url(grant / "victim.txt"))
+            assert removed.status_code == 200, removed.text
+            assert removed.json()["type"] == "file"
+            assert not (grant / "victim.txt").exists()
+
+            refused = await client.request(
+                "DELETE", _absolute_delete_url(grant / "link" / "keep.txt")
+            )
+            assert refused.status_code == 400, refused.text
+            assert (target / "keep.txt").exists()
+
+            unlinked = await client.request("DELETE", _absolute_delete_url(grant / "link"))
+            assert unlinked.status_code == 200, unlinked.text
+            assert unlinked.json()["type"] == "symlink"
+            assert not (grant / "link").is_symlink()
+            assert (target / "keep.txt").exists()
+
+            unreachable = await client.request("DELETE", _absolute_delete_url(beyond))
+            assert unreachable.status_code == 403, unreachable.text
+            assert unreachable.json()["error"]["code"] == "path_unreachable"
+            assert beyond.exists()
+    finally:
+        os_env.close()
 
 
 @pytest.mark.asyncio
