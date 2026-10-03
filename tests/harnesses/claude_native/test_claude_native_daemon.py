@@ -464,7 +464,7 @@ async def test_create_claude_session_labels_native_config_intent() -> None:
             use_claude_config=True,
         )
 
-    assert CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY.encode() in captured["body"]
+    assert f'"{CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY}": "1"'.encode() in captured["body"]
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="https://e.com"
@@ -555,3 +555,64 @@ async def test_prepare_daemon_terminal_resume_stamps_native_config_label(
     )
 
     assert patches == [{"labels": {CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY: "1"}}]
+
+    # New launch args and the flag resume together in a single PATCH with both fields.
+    patches.clear()
+    await claude_native._prepare_claude_terminal_via_daemon(
+        base_url="https://e.com",
+        headers={},
+        session_id="conv_resume",
+        session_bundle=None,
+        claude_args=("--dangerously-skip-permissions",),
+        use_claude_config=True,
+        host_id="host_resume",
+        workspace="/workspace",
+    )
+
+    assert patches == [
+        {
+            "terminal_launch_args": ["--dangerously-skip-permissions"],
+            "labels": {CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY: "1"},
+        }
+    ]
+
+
+async def test_prepare_daemon_terminal_resume_raises_on_rejected_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A rejected resume PATCH fails the launch loudly.
+
+    If the server rejects the label/args patch and the launch continued anyway,
+    the daemon-spawned runner would never see ``--use-native-config`` and would
+    route Claude at the configured gateway — the silent-ignore bug this prevents.
+    """
+    from contextlib import asynccontextmanager
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_resume":
+            return httpx.Response(500, json={"detail": "nope"})
+        return httpx.Response(404, json={})
+
+    @asynccontextmanager
+    async def fake_client(*args: object, **kwargs: object) -> Any:
+        del args, kwargs
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="https://e.com"
+        ) as client:
+            yield client
+
+    monkeypatch.setattr(claude_native, "open_daemon_client", fake_client)
+    monkeypatch.setattr(claude_native, "record_startup_event", lambda *a, **k: None)
+
+    with pytest.raises(click.ClickException, match="resume update failed"):
+        await claude_native._prepare_claude_terminal_via_daemon(
+            base_url="https://e.com",
+            headers={},
+            session_id="conv_resume",
+            session_bundle=None,
+            claude_args=(),
+            use_claude_config=True,
+            host_id="host_resume",
+            workspace="/workspace",
+        )

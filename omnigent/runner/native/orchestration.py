@@ -8460,10 +8460,9 @@ async def _auto_create_claude_terminal(
     inference_config = load_runtime_inference_config()
     claude_binding = binding_for_harness(inference_config, "claude-native")
     if launch_metadata.use_native_config:
-        # The session was launched with ``--use-native-config``: the user chose
-        # Claude Code's own ~/.claude config, so no provider/ucode config is
-        # derived and any configured binding is ignored — mirroring the
-        # CLI-launched path's ``use_claude_config``.
+        # --use-native-config: skip provider/ucode resolution and ignore any
+        # binding so Claude uses its own ~/.claude config (mirrors the CLI
+        # path's ``use_claude_config``).
         _logger.info(
             "native-claude: session=%s uses Claude Code's own native config "
             "(--use-native-config); skipping provider/ucode resolution",

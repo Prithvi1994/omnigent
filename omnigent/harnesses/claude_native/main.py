@@ -1665,11 +1665,9 @@ def run_claude_native(
                 startup_profiler=startup_profiler,
             )
         else:
-            # The daemon-spawned runner launches ``claude`` itself and
-            # derives the ucode config from the provider config, so the
-            # remote path takes neither ``command`` nor ``claude_config``.
-            # ``use_claude_config`` therefore rides on the session (as a
-            # label) so the runner knows to skip that derivation.
+            # The daemon-spawned runner launches ``claude`` itself, so the
+            # remote path takes neither ``command`` nor ``claude_config``;
+            # ``use_claude_config`` rides on the session as a label instead.
             _run_with_remote_server(
                 server.rstrip("/"),
                 spec_path,
@@ -4615,11 +4613,8 @@ async def _prepare_claude_terminal_via_daemon(
                 startup_progress=startup_progress,
             )
         elif persist_args or use_claude_config:
-            # Resume with new flags: replace the stored args
-            # (last-write-wins) and/or stamp the native-config label
-            # (labels upsert-merge, so other labels are untouched). No
-            # new flags → leave the stored state so the runner reuses it.
-            # The native-config label is set-only here: a resume without
+            # Resume with new flags: last-write-wins for args, and the
+            # native-config label is set-only — a resume without
             # --use-native-config never clears a previously stamped one.
             resume_patch: _JsonObject = {}
             if persist_args:
@@ -4632,17 +4627,23 @@ async def _prepare_claude_terminal_via_daemon(
                 resume_patch["labels"] = {CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY: "1"}
             _mark_startup_step(
                 startup_profiler,
-                "persisting resume launch args",
+                "persisting resume session patch",
                 startup_progress=startup_progress,
                 progress_message="Updating Claude session...",
             )
-            await client.patch(
+            resume_resp = await client.patch(
                 f"/v1/sessions/{url_component(session_id)}",
                 json=resume_patch,
             )
+            if resume_resp.status_code >= 400:
+                # Fail loudly — a dropped patch would silently lose the native-config intent.
+                raise click.ClickException(
+                    f"Claude session resume update failed "
+                    f"({resume_resp.status_code}): {error_text(resume_resp)}"
+                )
             _mark_startup_step(
                 startup_profiler,
-                "resume launch args persisted",
+                "resume session patch persisted",
                 startup_progress=startup_progress,
             )
             _mark_startup_step(

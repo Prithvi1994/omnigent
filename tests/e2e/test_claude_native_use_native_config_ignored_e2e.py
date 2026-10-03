@@ -37,6 +37,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.e2e._native_resume_helpers import omnigent_console_script
+
 pytestmark = pytest.mark.skipif(
     shutil.which("tmux") is None or sys.platform == "win32",
     reason="the native Claude wrapper launches Claude through the runner's tmux terminal",
@@ -56,10 +58,9 @@ _RECORD_NAME = "claude-launch.json"
 # diagnostic assertion fires instead of being killed by that outer timeout.
 _LAUNCH_DEADLINE_S = 150
 
-# The recording ``claude`` stub. It writes the launch argv + the routing-relevant
-# env the runner handed it (atomically, so the test never reads a partial file),
-# renders a Claude-Code-like composer so the runner's readiness poll is satisfied,
-# then idles like a live TUI until the pane is torn down.
+# The recording ``claude`` stub: atomically writes the launch argv + routing env
+# it was handed, renders a Claude-Code-like composer for the runner's readiness
+# poll, then idles like a live TUI until the pane is torn down.
 _RECORDING_CLAUDE = """\
 import json
 import os
@@ -88,17 +89,6 @@ sys.stdout.flush()
 while True:
     time.sleep(1)
 """
-
-
-def _omnigent_console_script() -> Path:
-    """Path to the ``omnigent`` console script beside the running interpreter."""
-    candidate = Path(sys.executable).parent / "omnigent"
-    if not candidate.is_file():
-        raise RuntimeError(
-            f"`omnigent` console script not found at {candidate}; the test venv "
-            "must have omnigent installed."
-        )
-    return candidate
 
 
 @pytest.fixture
@@ -178,7 +168,7 @@ def native_config_gateway_env() -> Iterator[dict[str, object]]:
                 ["server", "stop", "--force"],
             ):
                 subprocess.run(
-                    [str(_omnigent_console_script()), *stop_args],
+                    [str(omnigent_console_script()), *stop_args],
                     env=env,
                     stdout=devnull,
                     stderr=devnull,
@@ -207,7 +197,7 @@ def test_use_native_config_not_ignored_by_host_daemon(
 
     transcript = io.StringIO()
     child = pexpect.spawn(
-        str(_omnigent_console_script()),
+        str(omnigent_console_script()),
         ["claude", "--use-native-config"],
         cwd=str(workspace),
         env=env,
