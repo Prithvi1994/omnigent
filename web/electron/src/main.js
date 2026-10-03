@@ -2084,12 +2084,14 @@ function createWindow(targetUrl, opts = {}) {
     // Per-conversation embedded-browser view registry for this window.
     browserRegistry: createBrowserRegistryForWindow(win),
   });
-  // Native fullscreen removes macOS traffic lights; the renderer adjusts its
-  // clearance. Platform-neutral events also allow Linux desktop E2E coverage.
+  // Native fullscreen hides the macOS traffic lights, so the SPA drops the
+  // clearance it reserves for them. Only the pinned server page is told; a
+  // foreign page (SSO) loaded in this window learns nothing about it.
   const sendFullScreenState = () => {
-    if (!win.isDestroyed()) {
-      win.webContents.send("omnigent:full-screen-changed", win.isFullScreen());
-    }
+    if (win.isDestroyed()) return;
+    const pinned = pinnedOrigin(win);
+    if (!pinned || originOf(win.webContents.getURL()) !== pinned) return;
+    win.webContents.send("omnigent:full-screen-changed", win.isFullScreen());
   };
   win.on("enter-full-screen", sendFullScreenState);
   win.on("leave-full-screen", sendFullScreenState);
@@ -3291,10 +3293,14 @@ function pickWorkspaceForBridge(parent, workspaces, { signal } = {}) {
 
 function registerIpc() {
   registerWorkspacePickerIpc();
-  // Initial state complements transition events for renderers loaded fullscreen.
+  // Initial state for a renderer that loads while the window is already
+  // fullscreen; the transition events alone would leave it windowed.
   ipcMain.handle("omnigent:window-is-full-screen", (event) => {
-    const win = BrowserWindow.fromWebContents(event.sender);
-    return win ? win.isFullScreen() : false;
+    if (!isPinnedOriginSender(event)) {
+      console.warn("[omnigent] window-is-full-screen from untrusted sender dropped");
+      return false;
+    }
+    return BrowserWindow.fromWebContents(event.sender).isFullScreen();
   });
   ipcMain.handle("omnigent:cancel-server-connection", (event, requestId) => {
     if (!isSetupPageSender(event))
