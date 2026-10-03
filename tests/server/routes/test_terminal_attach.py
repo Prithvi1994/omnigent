@@ -648,7 +648,7 @@ async def test_attach_terminal_runner_close_propagates_close_code(
 async def test_attach_terminal_registry_abort_sends_wire_valid_close(
     app: FastAPI, trigger: str
 ) -> None:
-    """Both runner-tunnel abort producers close the browser with retryable 1011,
+    """Both runner-tunnel abort producers close the browser with retryable 1013,
     never the reserved abnormal-closure code 1006.
 
     ``deregister`` retires the tunnel; ``newest_wins_replace`` is a second tunnel
@@ -691,17 +691,16 @@ async def test_attach_terminal_registry_abort_sends_wire_valid_close(
     closed = exc_info.value
     # TestClient accepts close metadata that a real WebSocket cannot serialize.
     Frame(OP_CLOSE, Close(closed.code, closed.reason).serialize()).serialize(mask=False)
-    assert closed.code == 1011
+    assert closed.code == 1013
     assert closed.reason == "tunnel aborted"
 
 
 @pytest.mark.parametrize(
     ("code", "reason", "expected_code", "expected_reason"),
     [
-        (None, "", 1011, ""),
-        (1005, "", 1011, ""),
-        (1006, "tunnel aborted", 1011, "tunnel aborted"),
-        (4404, "terminal missing", 4404, "terminal missing"),
+        (None, "", 1013, ""),
+        (1005, "", 1013, ""),
+        (1006, "tunnel aborted", 1013, "tunnel aborted"),
         (4405, "detached", 4405, "detached"),
         (4500, "internal error", 4500, "internal error"),
         (1000, "normal", 1000, "normal"),

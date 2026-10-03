@@ -45,7 +45,7 @@ def test_normalize_ws_close_preserves_wire_codes() -> None:
 def test_normalize_ws_close_replaces_non_wire_codes() -> None:
     for code in [None, -1, 0, 999, 1004, 1005, 1006, 1015, 2000, 2999, 5000, 65536]:
         normalized = ws_common.normalize_ws_close(code, "tunnel aborted")
-        assert normalized == (1011, "tunnel aborted"), code
+        assert normalized == (1013, "tunnel aborted"), code
         Frame(OP_CLOSE, Close(*normalized).serialize()).serialize(mask=False)
 
 
@@ -53,7 +53,7 @@ def test_normalize_ws_close_makes_empty_close_retryable() -> None:
     received = Close.parse(b"")
     assert received.code == 1005
     normalized = ws_common.normalize_ws_close(received.code, received.reason)
-    assert normalized == (1011, "")
+    assert normalized == (1013, "")
     Frame(OP_CLOSE, Close(*normalized).serialize()).serialize(mask=False)
 
 

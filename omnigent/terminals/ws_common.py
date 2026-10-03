@@ -28,7 +28,10 @@ WS_CLOSE_TERMINAL_DETACHED: Final[int] = 4405
 WS_CLOSE_WRONG_REPLICA: Final[int] = 4400
 WS_CLOSE_INTERNAL_ERROR: Final[int] = 4500
 
-_WS_CLOSE_UNEXPECTED_CONDITION: Final[int] = 1011
+# Transport failures (dropped/replaced runner tunnel) close as "try again
+# later"; every browser bundle retries 1013, while older bundles dead-ended on
+# 1011 by treating it as a deliberate close.
+_WS_CLOSE_TRY_AGAIN_LATER: Final[int] = 1013
 _WS_CLOSE_APPLICATION_MIN: Final[int] = 3000
 _WS_CLOSE_APPLICATION_MAX: Final[int] = 4999
 _WS_CLOSE_REASON_MAX_BYTES: Final[int] = 123
@@ -48,7 +51,7 @@ def normalize_ws_close(code: int | None, reason: str | None) -> tuple[int, str]:
     :param code: Runner close code, or None when no close frame was received.
     :param reason: Optional runner close reason.
     :returns: A legal code and at most 123 complete UTF-8 reason bytes.
-        Missing or non-wire codes become retryable 1011.
+        Missing or non-wire codes become retryable 1013.
     """
     if code is not None and (
         code in _WS_CLOSE_WIRE_CODES
@@ -56,7 +59,7 @@ def normalize_ws_close(code: int | None, reason: str | None) -> tuple[int, str]:
     ):
         wire_code = code
     else:
-        wire_code = _WS_CLOSE_UNEXPECTED_CONDITION
+        wire_code = _WS_CLOSE_TRY_AGAIN_LATER
     wire_reason = (
         (reason or "")
         .encode("utf-8", errors="replace")[:_WS_CLOSE_REASON_MAX_BYTES]
