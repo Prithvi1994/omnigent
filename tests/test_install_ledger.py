@@ -223,9 +223,11 @@ def test_resolve_uninstall_ledger_drops_stale_third_party_launch_agents(
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(state))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
     launch_dir = home / "Library" / "LaunchAgents"
+    # Observed under a HOME that differs from the current one, as after a home move.
+    previous_launch_dir = tmp_path / "previous-home" / "Library" / "LaunchAgents"
     own = install_ledger.LaunchAgentEntry(
         kind="launchd",
-        path=str(launch_dir / f"{LAUNCHD_LABEL}.plist"),
+        path=str(previous_launch_dir / f"{LAUNCHD_LABEL}.plist"),
         label=LAUNCHD_LABEL,
         source="observed",
     )

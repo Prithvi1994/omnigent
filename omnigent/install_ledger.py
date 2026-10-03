@@ -518,14 +518,15 @@ def observed_launch_agents(*, deep: bool) -> list[LaunchAgentEntry]:
 def _drop_unknown_observed_launch_agents(ledger: InstallLedger) -> None:
     """Keep only Omnigent's own units among observed launch agents.
 
-    Ledgers written before exact matching may still list third-party units
-    observed by filename substring; recorded entries are kept untouched.
+    Ledgers written before exact matching may list third-party units observed
+    by filename substring. Matching by label (not path) keeps Omnigent's entry
+    even if HOME or XDG_CONFIG_HOME changed since the ledger was written.
     """
-    known = {(kind, str(path)) for kind, path, _label in _known_launch_agent_units()}
+    known = {(kind, label) for kind, _path, label in _known_launch_agent_units()}
     ledger.entries.launch_agents = [
         entry
         for entry in ledger.entries.launch_agents
-        if entry.source != "observed" or (entry.kind, entry.path) in known
+        if entry.source != "observed" or (entry.kind, entry.label) in known
     ]
 
 
