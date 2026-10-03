@@ -92,6 +92,18 @@ def _unresolvable_policy() -> FunctionPolicySpec:
     )
 
 
+def _unresolvable_tool_result_policy() -> FunctionPolicySpec:
+    """A tool_result-only policy whose function path cannot be imported."""
+    return FunctionPolicySpec(
+        name="unresolvable_tool_result",
+        on=[PhaseSelector(phase=Phase.TOOL_RESULT)],
+        function=FunctionRef(
+            path="omnigent.policies.builtins.does_not_exist",
+            arguments={},
+        ),
+    )
+
+
 # A leading DENY skips enforce_sandbox entirely; a trailing one discards the
 # transform enforce_sandbox already produced. Both must keep the sandbox.
 _POLICY_ORDERS = {
@@ -345,6 +357,22 @@ async def test_start_probe_fails_closed_on_unresolved_policy_sentinel() -> None:
     # The sentinel keeps denying real tool calls — fail-closed posture intact.
     denied = await gate.evaluate_tool_call("sys_session_send", {"agent": "child"})
     assert denied.action == "deny"
+
+
+@pytest.mark.asyncio
+async def test_start_probe_ignores_unresolved_tool_result_only_policy() -> None:
+    """A tool_result-only policy that fails to resolve must not block agent start."""
+    gate = RunnerToolPolicyGate.from_spec(_spec(_unresolvable_tool_result_policy()))
+
+    # It could never have transformed the launch, so the probe does not fail
+    # closed and yields no transform.
+    assert await gate.evaluate_agent_start(dict(_START_PROBE_ARGS)) is None
+
+    # Its load failure still fails tool dispatch closed on both phases.
+    denied_call = await gate.evaluate_tool_call("sys_session_send", {"agent": "child"})
+    assert denied_call.action == "deny"
+    denied_result = await gate.evaluate_tool_result("sys_session_send", "raw output")
+    assert "Denied by policy: unresolvable_tool_result" in denied_result
 
 
 @pytest.mark.asyncio

@@ -66,6 +66,11 @@ class _GatedPolicy:
     # could not be resolved. Its DENY is a load failure, not a real verdict, so
     # the start probe refuses to launch instead of silently dropping a transform.
     fail_closed: bool = False
+    # True when the policy declared TOOL_CALL (or self-selects via ``on=None``).
+    # Only such a policy can transform the start probe, so only its unresolved
+    # sentinel gates agent start; a tool_result-only policy still fails tool
+    # dispatch closed but must not block session init.
+    start_gated: bool = True
 
 
 @dataclass(frozen=True)
@@ -195,6 +200,10 @@ class RunnerToolPolicyGate:
                 phases = frozenset(s.phase for s in ps.on if _selector_covers_tools(s.phase))
             if not phases:
                 continue
+            # Capture start-probe participation from the declared phases before a
+            # resolution failure broadens them: only a TOOL_CALL (or on=None)
+            # policy can transform the launch and gate agent start.
+            start_gated = Phase.TOOL_CALL in phases
             try:
                 policy = resolve_function_policy(ps)
             except Exception as exc:  # noqa: BLE001 - all resolution failures deny
@@ -208,7 +217,13 @@ class RunnerToolPolicyGate:
             else:
                 fail_closed = False
             out.append(
-                _GatedPolicy(name=ps.name, policy=policy, phases=phases, fail_closed=fail_closed)
+                _GatedPolicy(
+                    name=ps.name,
+                    policy=policy,
+                    phases=phases,
+                    fail_closed=fail_closed,
+                    start_gated=start_gated,
+                )
             )
         return cls(out)
 
@@ -265,11 +280,14 @@ class RunnerToolPolicyGate:
         policies still contribute their ALLOW transforms.
 
         A policy the runner could not evaluate is treated differently from a
-        clean verdict. If a tool-phase policy raised, failed to resolve and was
+        clean verdict. If a start-capable policy (declared on ``tool_call`` or
+        self-selecting via ``on=None``) raised, failed to resolve and was
         replaced by the fail-closed sentinel, or returned a transform that does
         not preserve the probe's ``name``/``arguments`` shape, its intended
         effect is unknown, so the probe fails closed rather than launching with
-        a possibly-dropped sandbox restriction.
+        a possibly-dropped sandbox restriction. A ``tool_result``-only policy
+        that fails to resolve still denies tool dispatch but cannot have
+        transformed the launch, so it does not block session init.
 
         :param arguments: Probe arguments, e.g. ``{"agent_name": "...",
             "harness": "claude-sdk", "sandbox": {...}}``.
@@ -289,6 +307,11 @@ class RunnerToolPolicyGate:
             if Phase.TOOL_CALL not in gated.phases:
                 continue
             if gated.fail_closed:
+                if not gated.start_gated:
+                    # Declared on tool_result only, so it could never transform
+                    # the launch; its load failure fails tool dispatch closed but
+                    # must not block agent start.
+                    continue
                 # The configured policy never resolved, so its intended launch
                 # transform is unknown. Refuse to start rather than risk running
                 # the agent with a sandbox restriction silently dropped.
