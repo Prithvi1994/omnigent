@@ -5425,11 +5425,53 @@ def _wait_for_local_sessions_to_drain() -> None:
             last = count
 
 
+def _wait_for_daemon_sessions_to_drain(record: _HostDaemonRecord) -> None:
+    """Block until none of a remote-target daemon's sessions is running a turn.
+
+    The counterpart of :func:`_wait_for_local_sessions_to_drain` for a host
+    user service that connects to a remote server: lists the sessions owned
+    by the daemon's host id and waits only on ``status == "running"``, so
+    idle or approval-waiting sessions never hold the upgrade up. A server
+    that cannot be queried does not block the upgrade either.
+    """
+    last: int | None = None
+    while True:
+        result = _sessions_for_daemon(record, connected_only=True)
+        if result.error is not None:
+            click.echo(
+                f"{_host_display_url(record.target)}: cannot list sessions; "
+                f"skipping the drain wait: {result.error}",
+                err=True,
+            )
+            return
+        count = sum(1 for session in result.sessions if session.get("status") == "running")
+        if count == 0:
+            return
+        if last is None:
+            click.echo(
+                f"Waiting for {count} running session(s) on "
+                f"{_host_display_url(record.target)} to finish — press Ctrl-C to "
+                "abort, or re-run with --force to stop them now."
+            )
+        elif count != last:
+            click.echo(f"  {count} session(s) still running…")
+        last = count
+        time.sleep(_UPGRADE_DRAIN_POLL_S)
+
+
 def _capture_upgrade_host_service() -> tuple[HostService, str | None] | None:
     """Capture the installed host service before replacing the installation."""
-    from omnigent.host.service import installed_user_host_service
+    from omnigent.host.service import HostServiceError, installed_user_host_service
 
-    return installed_user_host_service()
+    try:
+        return installed_user_host_service()
+    except HostServiceError as exc:
+        # Nothing has been touched yet; refuse rather than upgrade underneath
+        # a service whose definition cannot be read back.
+        raise click.ClickException(
+            f"{exc} Repair it with `{cli_invocation(name='omni')} host disable` and "
+            f"`{cli_invocation(name='omni')} host enable`, then re-run the upgrade."
+        ) from exc
 
 
 def _finish_upgrade_host_service(
@@ -5459,6 +5501,11 @@ def _finish_upgrade_host_service(
             click.echo("Restored the host user service after the failed upgrade.")
     except HostServiceError as exc:
         action = "refresh" if succeeded else "restore"
+        if succeeded:
+            # Keep the host online on its previous definition instead of
+            # leaving it stopped; launchd already re-bootstraps it itself.
+            with contextlib.suppress(HostServiceError):
+                start_user_host_service(service)
         click.echo(
             f"Warning: could not {action} the host user service: {exc}. "
             "Run `omnigent host enable` after checking the service status.",
@@ -5478,7 +5525,7 @@ def _upgrade_host_service(
         if server_url is not None and not force:
             record = _find_daemon_record(_normalize_daemon_target(server_url))
             if record is not None:
-                _stop_daemon_sessions(record)
+                _wait_for_daemon_sessions_to_drain(record)
         from omnigent.host.service import HostServiceError, stop_user_host_service
 
         try:
@@ -5521,6 +5568,7 @@ def _upgrade_vcs_install(
     force: bool,
     pre: bool,
     extra_overrides: tuple[str, ...],
+    dry_run: bool,
 ) -> None:
     """Update a git/VCS ``omni`` install by re-pulling its tracked ref.
 
@@ -5538,6 +5586,7 @@ def _upgrade_vcs_install(
     :param force: Stop in-flight sessions immediately instead of draining.
     :param pre: Pass the installer's allow-pre-releases flag (no-op for git).
     :param extra_overrides: Extras supplied by ``omni upgrade --extra``.
+    :param dry_run: Print the command and exit without running it.
     """
     from omnigent.update_check import (
         _build_upgrade_suggestion,
@@ -5592,6 +5641,15 @@ def _upgrade_vcs_install(
         raise click.ClickException(
             f"No automatic upgrade command is known for this install. {suggestion.command}."
         )
+
+    if dry_run:
+        extras = sorted(set(extra_overrides or info.extras))
+        click.echo(
+            f"Detected installer: {info.detected_installer or info.installer}\n"
+            f"Detected extras: {', '.join(extras) if extras else '(none)'}\n"
+            f"Would run: {suggestion.command}"
+        )
+        return
 
     snapshot = _capture_upgrade_host_service()
     _drain_and_stop_local_server(force=force)
@@ -5836,6 +5894,9 @@ def upgrade(
     and stops the local background server and host daemon, then runs the
     matching upgrade command. The next ``omni`` invocation starts a fresh
     server on the new code automatically, so no explicit restart is needed.
+    An enabled host user service (``omni host enable``) is stopped before the
+    installer runs and re-installed afterwards so it restarts on the new code
+    with a refreshed environment; a failed upgrade restarts it unchanged.
 
     In-flight agent sessions are waited on by default; pass ``--force`` to
     stop them immediately. Pass ``--pre`` to consider pre-releases (rc /
@@ -5933,6 +5994,7 @@ def upgrade(
             force=force,
             pre=pre,
             extra_overrides=extra_overrides,
+            dry_run=dry_run,
         )
         return
 
