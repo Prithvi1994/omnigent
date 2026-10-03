@@ -84,6 +84,15 @@ _PERMISSION_PANE_WITH_MID_WORD_WRAP = _PERMISSION_PANE.replace(
 )
 
 
+# A working_dir metadata row long enough to wrap: the continuation line carries
+# no glyph, so it must not be folded back into the command title.
+_PERMISSION_PANE_WITH_WRAPPED_WORKDIR = _PERMISSION_PANE_WITH_WORKDIR.replace(
+    "    ╰ working_dir=/private/tmp/review\n",
+    "    ╰ working_dir=/private/tmp/omnigent-e2e-worktrees/fix-kiro-native-\n"
+    "verdict-really-long-worktree-path\n",
+)
+
+
 @pytest.fixture
 def secure_bridge_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Mirror the Kiro directory layout, with tmp_path as the trusted parent."""
@@ -394,6 +403,73 @@ def test_send_kiro_permission_verdict_refuses_suffix_inside_a_token(
         )
 
     assert [call[-1] for call in calls if "send-keys" in call] == []
+
+
+def test_send_kiro_permission_verdict_ignores_wrapped_working_dir_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A working_dir row that itself wraps must not corrupt the command title."""
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[
+            _PERMISSION_PANE_WITH_WRAPPED_WORKDIR,
+            _PERMISSION_PANE_WITH_WRAPPED_WORKDIR,
+            _READY_PANE,
+        ],
+    )
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    send_kiro_permission_verdict(
+        bridge_dir,
+        action="accept",
+        expected_title=(
+            "Running: cd /private/tmp/review && git status --short && git log -1 --oneline"
+        ),
+        timeout_s=0.1,
+    )
+
+    assert [call[-1] for call in calls if "send-keys" in call] == ["Enter"]
+
+
+def test_send_kiro_permission_verdict_rejects_a_failed_capture_as_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tmux capture that returns "" is a failure, not a vanished prompt.
+
+    An Enter dropped under load followed by a failed capture must not be read as
+    a confirmed delivery, and the blank pane must not trigger a blind retry.
+    """
+    monkeypatch.setattr(bridge, "_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0.0)
+    monkeypatch.setattr(bridge, "_PERMISSION_VERDICT_RETRY_INTERVAL_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    calls = _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE, _PERMISSION_PANE, ""])
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/tmux.sock"),
+        tmux_target="main",
+    )
+
+    with pytest.raises(RuntimeError, match="did not resolve after verdict delivery"):
+        send_kiro_permission_verdict(
+            bridge_dir,
+            action="accept",
+            expected_title="Running: pwd",
+            timeout_s=0.02,
+            verdict_recorded=lambda: False,
+        )
+
+    assert [call[-1] for call in calls if "send-keys" in call] == ["Enter"]
 
 
 def test_send_kiro_permission_verdict_stops_once_verdict_is_recorded(

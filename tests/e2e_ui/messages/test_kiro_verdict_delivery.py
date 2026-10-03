@@ -35,6 +35,7 @@ Enter on the approval picker; ``wrapped-title`` renders the real wrapped
 
 from __future__ import annotations
 
+import logging
 import secrets
 import shutil
 import subprocess
@@ -480,7 +481,11 @@ def _kiro_stack(server_tmp: Path, shim_source: str) -> Iterator[tuple[str, str, 
                         timeout=10.0,
                     )
             except Exception:
-                pass
+                # Teardown must not fail the test, but a swallowed error here can
+                # leak a tmux server or session, so surface it for the next run.
+                logging.getLogger(__name__).warning(
+                    "kiro verdict-delivery fixture teardown failed", exc_info=True
+                )
         for child in (runner_proc, proc):
             if child is None:
                 continue

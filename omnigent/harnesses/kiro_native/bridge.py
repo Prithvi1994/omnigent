@@ -485,7 +485,7 @@ def _kiro_active_permission_tool_line(pane: str) -> str:
     if approval_index < 0:
         return ""
     tool_index = -1
-    scan_floor = max(-1, approval_index - _PERMISSION_TOOL_BLOCK_SCAN_LINES)
+    scan_floor = max(-1, approval_index - _PERMISSION_TOOL_BLOCK_SCAN_LINES - 1)
     # Kiro may render metadata (e.g. working_dir) and a rule between the command
     # and the picker, so scan the nearby block for a tool-status glyph.
     for index in range(approval_index - 1, scan_floor, -1):
@@ -508,8 +508,13 @@ def _kiro_active_permission_tool_line(pane: str) -> str:
     command_lines: list[str] = []
     for line in lines[tool_index:approval_index]:
         stripped = line.strip()
-        if not stripped or _KIRO_SEPARATOR in stripped or stripped.startswith(("╰ ", "↳ ")):
+        if not stripped:
             continue
+        if _KIRO_SEPARATOR in stripped or stripped.startswith(("╰ ", "↳ ")):
+            # Metadata (working_dir, rule) follows the command block; a wrapped
+            # metadata line carries no glyph of its own, so stop collecting here
+            # instead of folding a wrapped working_dir into the command title.
+            break
         command_lines.append(stripped.lstrip("↓●○✓✗ ").strip())
     return " ".join(command_lines)
 
@@ -524,6 +529,10 @@ def _contains_at_token_boundaries(tool_line: str, needle: str, *, suffix_only: b
     Rejoined wrapped lines carry a space at each break, and a break can fall
     mid-token, so compare without whitespace; but the match must start and end
     where the pane had whitespace, so ``ls`` never matches ``installs``.
+
+    A real token boundary is indistinguishable from a mid-token wrap seam on the
+    rendered pane, so this correlation stays best-effort; the per-request ACP
+    recorder is the authoritative identity signal that gates verdict retries.
     """
     haystack: list[str] = []
     origins: list[int] = []
@@ -615,6 +624,12 @@ def _wait_for_kiro_permission_verdict_applied(
         if verdict_recorded is not None and verdict_recorded():
             return
         pane = _capture_pane(socket_path, tmux_target, join_wrapped=True)
+        if not pane:
+            # A tmux capture failure returns "": that is not a vanished prompt,
+            # so keep polling and let verdict_recorded (or the timeout) decide
+            # rather than reading a dropped Enter as a confirmed delivery.
+            time.sleep(_POLL_INTERVAL_S)
+            continue
         if not _kiro_permission_prompt_active(pane):
             return
         if not _kiro_permission_prompt_matches_title(pane, expected_title):

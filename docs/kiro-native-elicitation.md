@@ -78,5 +78,6 @@ For new records:
 
 - The runner sets `KIRO_ACP_RECORD_PATH` itself inside the allowlisted child environment. It does not inherit an arbitrary recorder path from the parent shell.
 - Kiro-derived prompt text is treated as untrusted UI input and truncated before it is sent as a card preview.
+- Correlating a web approval to a tmux prompt by its rendered title is best-effort, not a hard authorization boundary: a wrap seam on the pane is indistinguishable from a real whitespace boundary, and the file-based recorder gives no write-ordering guarantee against Kiro's own re-render. The per-request ACP recorder is the authoritative identity signal that stops a retry from answering a different queued request; a request-id correlation surfaced by Kiro itself would be needed to harden the title check further.
 - The web UI never exposes persistent trust for Kiro. Users who want persistent trust must use Kiro's own trust flags or TUI controls deliberately.
 - Kiro remains authenticated by Kiro's own CLI login and does not use Omnigent Databricks, OpenAI, or Anthropic provider credentials.
