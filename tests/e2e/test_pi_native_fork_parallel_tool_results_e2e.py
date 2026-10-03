@@ -918,6 +918,7 @@ def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
     base_url, runner_id, runner_log = pi_fork_rig
     session_id = _create_native_pi_session(base_url, runner_id)
     items: list[dict[str, Any]] = []
+    fork_id: str | None = None
     try:
         # --- Step 1: one turn whose response makes TWO parallel tool calls.
         _send_message(base_url, session_id, f"Read both seeded files. {_PARALLEL_MARKER}")
@@ -1032,7 +1033,7 @@ def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
             what="the forked session's turn to complete",
         )
     finally:
-        for sid in (locals().get("fork_id"), session_id):
+        for sid in (fork_id, session_id):
             if sid:
                 with contextlib.suppress(httpx.HTTPError):
                     _client.delete(f"{base_url}/v1/sessions/{sid}", timeout=10.0)

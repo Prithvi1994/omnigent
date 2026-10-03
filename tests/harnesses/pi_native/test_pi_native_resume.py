@@ -331,10 +331,9 @@ def test_full_tool_roundtrip_chains_correctly() -> None:
 
 
 def test_parallel_tool_calls_merge_into_one_assistant_message() -> None:
-    # One model response makes two parallel calls plus its text; both results
-    # follow. Anthropic replay requires the results to sit adjacent to the ONE
-    # assistant message holding both calls -- separate single-call messages
-    # orphan the results behind the response text.
+    # One response with two parallel calls plus text: Anthropic replay needs both
+    # results adjacent to the single assistant message holding the calls; separate
+    # single-call messages would orphan the results behind the response text.
     items = [
         _user_item("read both files", item_id="u1", response_id="pi-user-1"),
         _function_call_item(
