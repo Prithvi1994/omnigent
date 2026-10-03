@@ -459,7 +459,11 @@ def fast_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     Keeps the retry *count* (the budget length) intact while removing the
     real multi-second sleeps between attempts.
     """
-    monkeypatch.setattr(daemon_launch, "_LAUNCH_RETRY_DELAYS_S", (0.0,) * 8)
+    monkeypatch.setattr(
+        daemon_launch,
+        "_LAUNCH_RETRY_DELAYS_S",
+        (0.0,) * len(daemon_launch._LAUNCH_RETRY_DELAYS_S),
+    )
 
 
 async def _launch(client: httpx.AsyncClient, host_id: str = "host_1") -> str:

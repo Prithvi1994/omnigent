@@ -33,9 +33,8 @@ DAEMON_POLL_INITIAL_INTERVAL_S = 0.1
 DAEMON_POLL_BACKOFF_FACTOR = 1.5
 
 # Backoff between runner-launch retries while the host's tunnel/registration
-# is briefly unsettled (see `launch_or_reuse_daemon_runner`). ~16.5s budget:
-# long enough to ride out a reconnect or a registration lag, bounded so a
-# genuinely-missing host still fails reasonably fast.
+# is briefly unsettled (see `launch_or_reuse_daemon_runner`): a ~16.5s budget,
+# bounded so a genuinely-missing host still fails reasonably fast.
 _LAUNCH_RETRY_DELAYS_S = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.0, 3.0)
 
 
@@ -282,13 +281,9 @@ async def launch_or_reuse_daemon_runner(
             f"/v1/sessions/{url_component(session_id)}",
             json={"runner_id": ""},
         )
-    # The launch can fail transiently while the host's tunnel (re)connects and
-    # its registration settles — e.g. just after `omnigent host` restarts, or
-    # when many hosts register against one shared app at once. Two forms are
-    # transient and resolve on their own: a 409 "host is offline" (tunnel absent
-    # from this replica's registry) and a 404 "host not found" (registration not
-    # yet visible). Retry both across that window, bounded so a genuinely-
-    # missing host still fails reasonably fast.
+    # While the host's tunnel (re)connects and its registration settles, the
+    # launch can transiently 409 "host is offline" or 404 "host not found".
+    # Retry both across that window; a genuinely-missing host still fails fast.
     delays = _LAUNCH_RETRY_DELAYS_S
     for attempt in range(len(delays) + 1):
         if attempt:
@@ -300,14 +295,14 @@ async def launch_or_reuse_daemon_runner(
         )
         if resp.status_code < 400:
             break
-        error = error_text(resp).lower()
-        transient = (resp.status_code == 409 and "offline" in error) or (
-            resp.status_code == 404 and "host not found" in error
+        error = error_text(resp)
+        lowered = error.lower()
+        transient = (resp.status_code == 409 and "offline" in lowered) or (
+            resp.status_code == 404 and "host not found" in lowered
         )
         if not (transient and attempt < len(delays)):
             raise click.ClickException(
-                f"Failed to launch a runner on host {host_id!r} "
-                f"({resp.status_code}): {error_text(resp)}"
+                f"Failed to launch a runner on host {host_id!r} ({resp.status_code}): {error}"
             )
     runner_id = resp.json().get("runner_id")
     if not isinstance(runner_id, str) or not runner_id:
