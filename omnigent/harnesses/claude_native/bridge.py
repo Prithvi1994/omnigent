@@ -3999,9 +3999,12 @@ def inject_user_message(
     temp file) + ``paste-buffer -p`` so interior newlines ride as raw CR
     inside the paste markers and Claude Code's TUI keeps multi-line
     input as data rather than submitting on each newline
-    (anthropics/claude-code#52126). A trailing newline inside the paste
-    absorbs any trailing backslash — otherwise ``\`` + the submit
+    (anthropics/claude-code#52126). A message ending in ``\`` gets a
+    trailing newline inside the paste — otherwise ``\`` + the submit
     ``Enter`` reads as a line-continuation and the message sits unsent.
+    No other message gets one: Claude Code collapses a paste holding
+    three or more line breaks into a ``[Pasted text #N +X lines]``
+    placeholder, so an unconditional newline hid three-line messages.
     ``Enter`` is a separate tmux call. The file-based buffer
     path (not ``send-keys`` argv) matters: tmux caps a single
     client→server command at ~16KB, so a large message — e.g. a PR diff
@@ -4146,18 +4149,23 @@ def _paste_and_submit(
     # CSI-u sends Ctrl+A/Ctrl+K literally so Claude handles them as keys.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[97;5u")
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[107;5u")
-    # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
+    payload = _paste_payload_bytes(text)
+    if payload.endswith(b"\\"):
+        # A draft ending in "\" turns the submit Enter into a line continuation;
+        # a CR inside the paste absorbs it. No other message gets one: Claude Code
+        # collapses a paste holding three or more line breaks into a placeholder.
+        payload += b"\r"
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
     # "command too long" on large payloads (a PR diff in a sub-agent
     # dispatch). ``load-buffer`` streams the file without that cap, and
     # ``paste-buffer -p`` wraps it in the same bracketed-paste markers so
-    # interior newlines (mapped to CR below) stay data instead of becoming
+    # interior newlines (mapped to CR above) stay data instead of becoming
     # per-line submits. See anthropics/claude-code#52126.
     with tempfile.NamedTemporaryFile(
         dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
     ) as paste_file:
-        paste_file.write(_paste_payload_bytes(text + "\n"))
+        paste_file.write(payload)
         paste_path = paste_file.name
     try:
         _run_tmux(socket_path, "load-buffer", "-b", "omnigent-paste", paste_path)
