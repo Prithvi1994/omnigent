@@ -248,3 +248,34 @@ def test_reap_skips_pane_group_when_pid_reused(
     assert terminal_mod.reap_orphaned_terminals() == 1
     assert not directory.exists()
     assert killed == []
+
+
+def test_reap_skips_pane_group_when_start_time_missing_on_linux(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Linux a pane with no captured start time is left alone, not killed.
+
+    A missing /proc start time means the pid was already gone when snapshotted,
+    so force-killing its group could hit an unrelated process that reused it.
+    """
+    directory = tmp_path / "omnigent-terminal-nostart"
+    directory.mkdir()
+    socket = directory / "tmux.sock"
+    socket.touch()
+    owner_claim.write_owner_claim(directory)
+    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
+    monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    monkeypatch.setattr(terminal_mod, "_process_alive", lambda pid: False)
+    monkeypatch.setattr(terminal_mod, "IS_LINUX", True)
+    monkeypatch.setattr(terminal_mod, "_list_pane_pids", lambda socket_path: [4242])
+    monkeypatch.setattr(
+        terminal_mod.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+    )
+    monkeypatch.setattr(terminal_mod, "_pid_start_time", lambda pid: None)
+    killed: list[int] = []
+    monkeypatch.setattr(terminal_mod.os, "killpg", lambda pgid, sig: killed.append(pgid))
+    assert terminal_mod.reap_orphaned_terminals() == 1
+    assert not directory.exists()
+    assert killed == []

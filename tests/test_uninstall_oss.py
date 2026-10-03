@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -923,3 +924,19 @@ def test_uninstall_script_kills_sighup_ignoring_harness_child(tmp_path: Path) ->
         _kill_pane_group_best_effort(pane_pid)
         _kill_tmux_server(socket_path)
         shutil.rmtree(scratch_tmp, ignore_errors=True)
+
+
+def test_shell_target_gone_markers_match_python() -> None:
+    """The uninstall script's gone-server markers mirror terminal.py's.
+
+    The shell copy of ``_tmux_reports_target_gone`` is hand-maintained; if it
+    drifts from the Python tuple the sweep misclassifies a dead server as live
+    (socket kept forever) or vice versa, so pin the two copies together.
+    """
+    from omnigent.inner.terminal import _TMUX_TARGET_GONE_STDERR_MARKERS
+
+    body = SCRIPT.read_text().split("tmux_reports_target_gone() {", 1)[1].split("\n}", 1)[0]
+    shell_prefixes = set(re.findall(r'"([^"]*)"\*', body))
+    assert shell_prefixes == set(_TMUX_TARGET_GONE_STDERR_MARKERS) | {"error connecting to "}
+    # The error-connecting case mirrors the Python endswith guard.
+    assert "(no such file or directory)" in body

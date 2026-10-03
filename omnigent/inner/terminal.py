@@ -28,7 +28,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TypeAlias, cast
 
-from omnigent._platform import IS_WINDOWS
+from omnigent._platform import IS_LINUX, IS_WINDOWS
 from omnigent.cli_invocation import cli_invocation
 from omnigent.debug_logging import debug_event
 from omnigent.native import owner_claim
@@ -816,9 +816,10 @@ def _list_pane_pids(socket_path: Path) -> list[int] | None:
 
     :param socket_path: The terminal's control socket, e.g.
         ``Path("/tmp/omnigent-terminal-ab12/tmux.sock")``.
-    :returns: The live pane pids; ``[]`` when tmux reports none; ``None``
-        when the snapshot could not run, so the caller preserves the
-        instance dir for a later sweep instead of reaping it blind.
+    :returns: The live pane pids; ``[]`` when tmux reports the server/target
+        gone (no panes to reach); ``None`` when the snapshot could not run or
+        failed for an unexplained reason, so the caller preserves the instance
+        dir for a later sweep instead of reaping it blind.
     """
     try:
         result = subprocess.run(
@@ -830,7 +831,10 @@ def _list_pane_pids(socket_path: Path) -> list[int] | None:
     except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0:
-        return []
+        # A gone server has no panes to reach; any other failure leaves the
+        # pane set unknown, so preserve the dir rather than reap it blind.
+        detail = result.stderr.decode(errors="replace").strip()
+        return [] if _tmux_reports_target_gone(detail) else None
     pids: list[int] = []
     for token in result.stdout.decode(errors="replace").split():
         with contextlib.suppress(ValueError):
@@ -851,12 +855,12 @@ def _pid_start_time(pid: int) -> int | None:
     if pid <= 0 or IS_WINDOWS:
         return None
     try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
+        stat_text = Path(f"/proc/{pid}/stat").read_text()
     except OSError:
         return None
     # comm (field 2) is parenthesised and may contain spaces or ')'; split
     # after the final ')' so starttime sits at a fixed offset.
-    fields = stat.rpartition(")")[2].split()
+    fields = stat_text.rpartition(")")[2].split()
     try:
         return int(fields[19])
     except (IndexError, ValueError):
@@ -872,16 +876,23 @@ def _kill_pane_process_group(pid: int, start_time: int | None) -> None:
     server. The sweep force-kills the pane's whole group so its descendants
     die with it. *start_time* is the pid's start time captured before
     ``kill-server``: if it no longer matches, the pane process already died
-    and its pid was reused, so the group is left alone. A gone, reused, or
-    foreign (``PermissionError``) pid is a no-op, so where ``/proc`` can
-    confirm identity this never kills a live unrelated process group.
+    and its pid was reused, so the group is left alone. On Linux a missing
+    *start_time* means the pid was already gone when snapshotted, so the group
+    is left alone rather than risk a recycled pid; where ``/proc`` is
+    unavailable (non-Linux) the kill is best-effort. A gone, reused, or foreign
+    (``PermissionError``) pid is always a no-op.
 
     :param pid: A pane pid captured before ``kill-server``, e.g. ``48213``.
     :param start_time: ``_pid_start_time(pid)`` from that same snapshot.
     """
     if pid <= 0 or IS_WINDOWS:
         return
-    if start_time is not None and _pid_start_time(pid) != start_time:
+    if start_time is None:
+        # A live pane always has a captured start time on Linux; its absence
+        # means the pid was already gone, so don't risk killing a reused pid.
+        if IS_LINUX:
+            return
+    elif _pid_start_time(pid) != start_time:
         return
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
         os.killpg(os.getpgid(pid), signal.SIGKILL)

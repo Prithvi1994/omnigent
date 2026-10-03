@@ -119,7 +119,9 @@ class _ScratchInstall:
                 "PATH": f"{shim_bin}:{os.environ.get('PATH', '')}",
                 "OMNIGENT_CONFIG_HOME": str(config_home),
                 "CLAUDE_CONFIG_DIR": str(claude_dir),
-                "PYTHONPATH": str(_REPO_ROOT),
+                "PYTHONPATH": os.pathsep.join(
+                    p for p in (str(_REPO_ROOT), os.environ.get("PYTHONPATH", "")) if p
+                ),
                 "TERM": "xterm-256color",
                 "LINES": "40",
                 "COLUMNS": "160",
@@ -236,7 +238,8 @@ def scratch_install(isolated_mock_llm_server_url: str) -> Iterator[_ScratchInsta
         # Housekeeping for whatever the product left behind, so a leaked tmux
         # server or harness child never escapes into the shared CI box.
         for socket_path in install.terminal_sockets():
-            _tmux(socket_path, "kill-server")
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                _tmux(socket_path, "kill-server")
         for pid, _ in install.processes():
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.kill(pid, signal.SIGKILL)
