@@ -1,6 +1,13 @@
-// Real Electron fullscreen journey for the macOS sidebar header layout.
-// A Macintosh UA activates that layout on non-macOS hosts; fullscreen events
-// still come from Electron's main process.
+// Desktop-shell lane: the macOS title-bar cluster (sidebar toggle / Search /
+// Settings) sits 5.5rem in to clear the traffic lights. Native fullscreen hides
+// those lights, so the cluster must give that clearance up while fullscreen and
+// take it back afterwards. Fullscreen state comes from Electron's main process,
+// which is why this drives the real shell; a Macintosh user agent engages the
+// macOS layout on other hosts.
+//
+// Run from web/electron after building the SPA:
+//   OMNIGENT_PYTHON=../../.venv/bin/python OMNIGENT_PW_NO_SANDBOX=1 \
+//     xvfb-run -a node --test e2e/desktop_fullscreen_sidebar_controls.e2e.js
 
 "use strict";
 
@@ -18,61 +25,93 @@ const {
 } = require("./desktopHarness");
 
 const deps = desktopDepsAvailable();
-const RECORD_DIR = path.join(__dirname, "recordings", "desktop-fullscreen-sidebar-controls");
+const RECORD_DIR =
+  process.env.OMNIGENT_DESKTOP_RECORD_DIR ||
+  path.join(__dirname, "recordings", "desktop-fullscreen-sidebar-controls");
 
-// The windowed traffic-light clearance is 5.5rem.
+const CLUSTER = ".electron-sidebar-header-actions";
+// Windowed clearance is `left: 5.5rem`; anything inside the old gap counts as
+// realigned, so the threshold is deliberately loose.
 const TRAFFIC_LIGHT_CLEARANCE_PX = 88;
-// Distinguish left alignment from the old 88px gap.
 const FULLSCREEN_ALIGNED_MAX_X = 48;
+const SETTLE_MS = 10_000;
+const LINGER_MS = 1_500;
 
-/** The visible main window (firstWindow() can race to a hidden helper). */
-async function mainWindow(electronApp, firstWindow) {
-  for (let i = 0; i < 120; i++) {
-    const page = electronApp.windows().find((p) => p.url().startsWith("http"));
-    if (page) return page;
-    // oxlint-disable-next-line no-await-in-loop
-    await new Promise((resolve) => {
-      setTimeout(resolve, 500);
-    });
-  }
-  return firstWindow;
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
-/** Smallest x among visible header controls, or null if none is visible. */
-async function leftmostHeaderControlX(window) {
-  const candidates = [
-    window.locator(".electron-sidebar-header-actions"),
-    window.locator('[data-testid="sidebar-brand"]'),
-    window.locator('.conversations-sidebar [data-testid="sidebar-header-actions"]'),
-  ];
-  let min = null;
-  for (const locator of candidates) {
-    // oxlint-disable no-await-in-loop
-    if (!(await locator.isVisible().catch(() => false))) continue;
-    const box = await locator.boundingBox();
-    // oxlint-enable no-await-in-loop
-    if (box && (min === null || box.x < min)) min = box.x;
-  }
-  return min;
+async function clusterX(window) {
+  const box = await window.locator(CLUSTER).boundingBox();
+  return box ? box.x : null;
 }
 
-/** Poll until `predicate(await probe())` holds or `timeoutMs` passes. */
-async function waitForValue(probe, predicate, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  let value = await probe();
+async function waitForClusterX(window, predicate) {
+  const deadline = Date.now() + SETTLE_MS;
+  let x = await clusterX(window);
   /* oxlint-disable no-await-in-loop */
-  while (!predicate(value) && Date.now() < deadline) {
-    await new Promise((resolve) => {
-      setTimeout(resolve, 250);
-    });
-    value = await probe();
+  while (!predicate(x) && Date.now() < deadline) {
+    await sleep(250);
+    x = await clusterX(window);
   }
   /* oxlint-enable no-await-in-loop */
-  return value;
+  return x;
+}
+
+// isMacElectronShell() keys the macOS layout off navigator.userAgent containing
+// "Macintosh"; define it in the renderer so the stand-in engages that layout
+// without a real macOS host.
+async function useMacintoshUserAgent(window) {
+  await window.addInitScript(() => {
+    Object.defineProperty(navigator, "userAgent", {
+      value: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+      configurable: true,
+    });
+    Object.defineProperty(navigator, "platform", { value: "MacIntel", configurable: true });
+  });
+  await window.reload();
+}
+
+// Same window operation as the green traffic light / View > Toggle Full Screen.
+function setFullScreen(electronApp, fullScreen) {
+  return electronApp.evaluate(
+    ({ BrowserWindow }, wanted) =>
+      new Promise((resolve) => {
+        const win = BrowserWindow.getAllWindows().find((w) =>
+          w.webContents.getURL().startsWith("http"),
+        );
+        const event = wanted ? "enter-full-screen" : "leave-full-screen";
+        const timer = setTimeout(
+          () => resolve({ event: false, isFullScreen: win.isFullScreen() }),
+          10_000,
+        );
+        win.once(event, () => {
+          clearTimeout(timer);
+          resolve({ event: true, isFullScreen: win.isFullScreen() });
+        });
+        win.setFullScreen(wanted);
+      }),
+    fullScreen,
+  );
+}
+
+function layoutFacts(window) {
+  return window.evaluate(() => {
+    const shell = document.querySelector(".app-shell");
+    return {
+      userAgent: navigator.userAgent,
+      appShellData: shell ? { ...shell.dataset } : null,
+      displayModeFullscreen: window.matchMedia("(display-mode: fullscreen)").matches,
+      fullscreenElement: Boolean(document.fullscreenElement),
+      innerSize: [window.innerWidth, window.innerHeight],
+    };
+  });
 }
 
 describe(
-  "desktop shell — fullscreen sidebar header controls",
+  "desktop shell — sidebar header controls across native fullscreen",
   { skip: deps.ok ? false : `missing deps: ${deps.missing.join(", ")}` },
   () => {
     let tmpDir;
@@ -88,100 +127,77 @@ describe(
       if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
     });
 
-    it("realigns the sidebar header controls when the window goes fullscreen", async () => {
-      const {
-        electronApp,
-        window: firstWindow,
-        userDataDir,
-        stopDisplayCapture,
-      } = await launchDesktop({ recordDir: RECORD_DIR, serverUrl: server.serverUrl });
+    it("drops the traffic-light clearance while the window is fullscreen", async () => {
+      const { electronApp, window, userDataDir, stopDisplayCapture } = await launchDesktop({
+        recordDir: RECORD_DIR,
+        serverUrl: server.serverUrl,
+      });
+      const observations = {};
       let saved;
       try {
-        const window = await mainWindow(electronApp, firstWindow);
         const landed = window.getByText("What should we build?");
         await landed.waitFor({ state: "visible", timeout: 60_000 });
 
-        // Engage the macOS desktop layout (UA-keyed, see isMacElectronShell).
-        await window.addInitScript(() => {
-          Object.defineProperty(navigator, "userAgent", { value: "Mozilla/5.0 (Macintosh)" });
-          Object.defineProperty(navigator, "platform", { value: "MacIntel" });
-        });
-        await window.reload();
+        await useMacintoshUserAgent(window);
         await landed.waitFor({ state: "visible", timeout: 60_000 });
+        const facts = await layoutFacts(window);
+        assert.equal(
+          facts.appShellData?.electronMac,
+          "true",
+          `macOS desktop layout did not engage: ${JSON.stringify(facts)}`,
+        );
+        await window.locator(CLUSTER).waitFor({ state: "visible", timeout: 15_000 });
 
-        // Windowed: the cluster clears the traffic lights.
-        const cluster = window.locator(".electron-sidebar-header-actions");
-        await cluster.waitFor({ state: "visible", timeout: 15_000 });
-        const windowedBox = await cluster.boundingBox();
-        assert.ok(windowedBox, "title-bar cluster has no bounding box");
+        const windowedX = await clusterX(window);
+        observations.windowed = { clusterX: windowedX, ...facts };
+        await window.screenshot({ path: path.join(RECORD_DIR, "windowed.png") });
         assert.ok(
-          windowedBox.x >= TRAFFIC_LIGHT_CLEARANCE_PX - 8,
-          `windowed cluster should clear the traffic lights, got x=${windowedBox.x}`,
+          windowedX !== null && windowedX >= TRAFFIC_LIGHT_CLEARANCE_PX - 8,
+          `windowed cluster should clear the traffic lights, got x=${windowedX}`,
         );
+        await sleep(LINGER_MS);
 
-        // The user's action: enter fullscreen (green light / View > Toggle Full Screen).
-        const entered = await electronApp.evaluate(
-          ({ BrowserWindow }) =>
-            new Promise((resolve) => {
-              const win = BrowserWindow.getAllWindows().find(
-                (w) => w.isVisible() && w.webContents.getURL().startsWith("http"),
-              );
-              const timer = setTimeout(
-                () => resolve({ event: false, isFullScreen: win.isFullScreen() }),
-                10_000,
-              );
-              win.once("enter-full-screen", () => {
-                clearTimeout(timer);
-                resolve({ event: true, isFullScreen: win.isFullScreen() });
-              });
-              win.setFullScreen(true);
-            }),
-        );
+        const entered = await setFullScreen(electronApp, true);
         assert.ok(
           entered.event && entered.isFullScreen,
           `window did not enter fullscreen: ${JSON.stringify(entered)}`,
         );
-
-        // Fullscreen removes the lights and their 5.5rem gap.
-        const fullscreenX = await waitForValue(
-          () => leftmostHeaderControlX(window),
+        const fullscreenX = await waitForClusterX(
+          window,
           (x) => x !== null && x < FULLSCREEN_ALIGNED_MAX_X,
-          10_000,
         );
-        assert.ok(fullscreenX !== null, "no sidebar header control is visible in fullscreen");
+        observations.fullscreen = { clusterX: fullscreenX, ...(await layoutFacts(window)) };
+        await window.screenshot({ path: path.join(RECORD_DIR, "fullscreen.png") });
+        await sleep(LINGER_MS);
+        assert.ok(fullscreenX !== null, "sidebar header cluster is not visible in fullscreen");
         assert.ok(
           fullscreenX < FULLSCREEN_ALIGNED_MAX_X,
-          `sidebar header controls still reserve the traffic-light strip in fullscreen: ` +
-            `leftmost visible control at x=${fullscreenX} (expected < ${FULLSCREEN_ALIGNED_MAX_X})`,
+          "sidebar header controls still reserve the traffic-light strip in fullscreen: " +
+            `cluster at x=${fullscreenX} (expected < ${FULLSCREEN_ALIGNED_MAX_X})`,
         );
 
-        // Leaving fullscreen restores the clearance (the lights are back).
-        await electronApp.evaluate(
-          ({ BrowserWindow }) =>
-            new Promise((resolve) => {
-              const win = BrowserWindow.getAllWindows().find(
-                (w) => w.isVisible() && w.webContents.getURL().startsWith("http"),
-              );
-              const timer = setTimeout(resolve, 10_000);
-              win.once("leave-full-screen", () => {
-                clearTimeout(timer);
-                resolve();
-              });
-              win.setFullScreen(false);
-            }),
-        );
-        const restoredBox = await waitForValue(
-          () => cluster.boundingBox(),
-          (box) => box !== null && box.x >= TRAFFIC_LIGHT_CLEARANCE_PX - 8,
-          10_000,
-        );
-        assert.ok(restoredBox, "title-bar cluster disappeared after leaving fullscreen");
+        const left = await setFullScreen(electronApp, false);
         assert.ok(
-          restoredBox.x >= TRAFFIC_LIGHT_CLEARANCE_PX - 8,
-          `windowed traffic-light clearance not restored, got x=${restoredBox.x}`,
+          left.event && !left.isFullScreen,
+          `window did not leave fullscreen: ${JSON.stringify(left)}`,
         );
+        const restoredX = await waitForClusterX(
+          window,
+          (x) => x !== null && x >= TRAFFIC_LIGHT_CLEARANCE_PX - 8,
+        );
+        observations.restored = { clusterX: restoredX, ...(await layoutFacts(window)) };
+        await window.screenshot({ path: path.join(RECORD_DIR, "restored.png") });
+        assert.ok(
+          restoredX !== null && restoredX >= TRAFFIC_LIGHT_CLEARANCE_PX - 8,
+          `windowed traffic-light clearance not restored after leaving fullscreen, got x=${restoredX}`,
+        );
+        await sleep(LINGER_MS);
       } finally {
-        // Close first so failed runs still produce a recording.
+        fs.writeFileSync(
+          path.join(RECORD_DIR, "observations.json"),
+          JSON.stringify(observations, null, 2),
+        );
+        // Close first so a failing run still flushes and names its footage.
         await electronApp.close();
         await stopDisplayCapture();
         saved = saveRecording(RECORD_DIR, "fullscreen-sidebar-controls");
