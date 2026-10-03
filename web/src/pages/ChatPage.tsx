@@ -3002,6 +3002,14 @@ function ComposerImpl(
     if (conversationId) setSessionDraft(conversationId, { text: "", files: [] });
   }, [restoredSendDraft, conversationId, settledConversationId, replaceText]);
 
+  // Float local command output (/help, /context, bare /model) in the popover
+  // band and clear the submitted draft; error branches keep the draft to edit.
+  const showCommandOutput = (text: string) => {
+    dirtyRef.current = true;
+    setValue("");
+    setCommandError(text);
+  };
+
   /**
    * Execute a slash command by name + optional argument string.
    * Clears the input and error state on success (or sets an error on
@@ -3096,9 +3104,7 @@ function ComposerImpl(
           const current = sessionModelOverride
             ? `${sessionModelOverride} (override)`
             : (llmModel ?? "agent default");
-          dirtyRef.current = true;
-          setValue("");
-          setCommandError(
+          showCommandOutput(
             `Model: ${current}\nUsage: /model <name>${supportsModelReset ? " | default" : ""}`,
           );
           return true;
@@ -3152,16 +3158,12 @@ function ComposerImpl(
           lines.push("No usage data yet — send a message first.");
         }
         lines.push(`Items in context: ${blocks.length}`);
-        dirtyRef.current = true;
-        setValue("");
-        setCommandError(lines.join("\n"));
+        showCommandOutput(lines.join("\n"));
         return true;
       }
       case "/help": {
         const lines = Object.entries(slashCommands).map(([name, desc]) => `${name} — ${desc}`);
-        dirtyRef.current = true;
-        setValue("");
-        setCommandError(lines.join("\n"));
+        showCommandOutput(lines.join("\n"));
         return true;
       }
       default:
@@ -3538,6 +3540,13 @@ function ComposerImpl(
     if (e.key === "Escape" && btwSidechat) {
       e.preventDefault();
       dismissBtwSidechat();
+      return;
+    }
+    // Esc clears the floating command output (/help, /context, …) first, so
+    // dismissing it never falls through to stop an in-flight turn below.
+    if (e.key === "Escape" && commandError !== null) {
+      e.preventDefault();
+      setCommandError(null);
       return;
     }
     // Esc cancels an in-flight turn. When idle it's a no-op — clearing on

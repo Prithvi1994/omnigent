@@ -121,6 +121,7 @@ def _header_and_menu(page: Page, item_testid: str) -> dict:
           }
           return {
             header: header ? rect(header) : null,
+            headerZ: header ? getComputedStyle(header).zIndex : null,
             menu: menu ? rect(menu) : null,
             menuZ: menu ? getComputedStyle(menu).zIndex : null,
           };
@@ -161,8 +162,8 @@ def test_help_command_output_stays_below_header(
     assert geom["header"] is not None, "ChatHeader overlay not found"
     assert geom["card"] is not None, "composer card not found"
     assert geom["feedback"] is not None, "/help output did not render inside the composer card"
-    # The header overlay paints on top of anything beneath it.
-    assert geom["headerZ"] in {"30", "auto"} or int(geom["headerZ"]) >= 30
+    # The header overlay is the fixed z-30 band it must paint on top of.
+    assert geom["headerZ"] == "30", geom["headerZ"]
 
     assert geom["card"]["top"] >= geom["header"]["bottom"] - 1, (
         f"composer card top {geom['card']['top']} crosses under header bottom "
@@ -202,6 +203,8 @@ def test_slash_menu_stays_below_header_on_short_window(
     geom = _header_and_menu(page, "slash-menu-item-help")
     assert geom["header"] is not None, "ChatHeader overlay not found"
     assert geom["menu"] is not None, "slash-command menu container not found"
+    # The menu sits in the z-20 popover band, strictly beneath the z-30 header.
+    assert int(geom["menuZ"]) < int(geom["headerZ"]), (geom["menuZ"], geom["headerZ"])
 
     assert geom["menu"]["top"] >= geom["header"]["bottom"] - 1, (
         f"slash menu top {geom['menu']['top']} crosses under header bottom "
@@ -234,6 +237,7 @@ def test_mention_menu_stays_below_header_on_short_window(
     geom = _header_and_menu(page, "file-mention-item-0")
     assert geom["header"] is not None
     assert geom["menu"] is not None
+    assert int(geom["menuZ"]) < int(geom["headerZ"]), (geom["menuZ"], geom["headerZ"])
     assert geom["menu"]["top"] >= geom["header"]["bottom"] - 1, geom
     overflow = item.evaluate(
         "(el) => { const list = el.closest('[role=listbox]'); "

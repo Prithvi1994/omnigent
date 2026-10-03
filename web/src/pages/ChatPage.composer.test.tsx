@@ -1199,6 +1199,38 @@ describe("Composer slash-command submit routing", () => {
     expect(ta.value).toBe("");
   });
 
+  it("floats /context output in the popover band and clears the draft", () => {
+    render(<Composer {...composerProps({ onSendSlashCommand: vi.fn() })} />);
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/context" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    const output = screen.getByTestId("composer-command-output");
+    expect(output).toHaveTextContent("Items in context:");
+    expect(output).toHaveClass("absolute", COMPOSER_POPOVER_Z);
+    expect(ta.value).toBe("");
+  });
+
+  it("dismisses floating command output on Escape without stopping an in-flight turn", () => {
+    const onStop = vi.fn();
+    render(
+      <Composer {...composerProps({ onSendSlashCommand: vi.fn(), isWorking: true, onStop })} />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/help" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(screen.getByTestId("composer-command-output")).toBeInTheDocument();
+
+    // Escape dismisses the overlay and must not reach the turn-stop branch.
+    fireEvent.keyDown(ta, { key: "Escape" });
+    expect(screen.queryByTestId("composer-command-output")).not.toBeInTheDocument();
+    expect(onStop).not.toHaveBeenCalled();
+
+    // With the overlay gone, Escape resumes interrupting the running turn.
+    fireEvent.keyDown(ta, { key: "Escape" });
+    expect(onStop).toHaveBeenCalledTimes(1);
+  });
+
   it("treats /effort as plaintext when effort controls are hidden", () => {
     const onSend = vi.fn();
     const onSendSlashCommand = vi.fn();
