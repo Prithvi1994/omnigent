@@ -219,13 +219,15 @@ def _validate_timezone_or_400(timezone: str) -> None:
         ) from exc
 
 
-def _validate_name_or_400(name: str) -> None:
-    """Raise a 400 ``OmnigentError`` if *name* is blank or wider than its column."""
-    if not name.strip() or len(name) > SCHEDULED_TASK_NAME_MAX_LEN:
+def _validate_name_or_400(name: str) -> str:
+    """Return *name* trimmed, or raise a 400 ``OmnigentError`` if it is blank or too wide."""
+    name = name.strip()
+    if not name or len(name) > SCHEDULED_TASK_NAME_MAX_LEN:
         raise OmnigentError(
             f"name must be 1-{SCHEDULED_TASK_NAME_MAX_LEN} characters and not blank",
             code=ErrorCode.INVALID_INPUT,
         )
+    return name
 
 
 def create_scheduled_tasks_router(
@@ -371,7 +373,7 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Create a scheduled task and arm it on the live scheduler."""
         owner = _owner(request)
-        _validate_name_or_400(body.name)
+        name = _validate_name_or_400(body.name)
         _validate_rrule_or_400(body.rrule)
         _validate_timezone_or_400(body.timezone)
         permission_mode = validate_session_permission_mode(body.permission_mode)
@@ -388,7 +390,7 @@ def create_scheduled_tasks_router(
         )
         task = store.create(
             scheduled_task_id=uuid.uuid4().hex,
-            name=body.name,
+            name=name,
             prompt=body.prompt,
             rrule=body.rrule,
             user_id=None if owner == RESERVED_USER_LOCAL else owner,
@@ -556,13 +558,13 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         existing = _require_owned(scheduled_task_id, owner_id)
-        if body.name is not None:
-            _validate_name_or_400(body.name)
         if body.rrule is not None:
             _validate_rrule_or_400(body.rrule)
         if body.timezone is not None:
             _validate_timezone_or_400(body.timezone)
         fields = body.model_dump(exclude_unset=True)
+        if fields.get("name") is not None:
+            fields["name"] = _validate_name_or_400(fields["name"])
         target_agent_id = fields.get("agent_id") or existing.agent_id
         agent_changed = target_agent_id != existing.agent_id
         if agent_changed:
