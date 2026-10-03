@@ -1378,6 +1378,67 @@ def test_remote_run_preflights_local_claude_binary(
     assert called_remote is False
 
 
+def test_remote_resume_skips_managed_config_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A flag-less ``--server`` resume must not resolve managed config in the CLI.
+
+    On the remote path the daemon-spawned runner launches ``claude`` and
+    resolves its own provider config, so resolving here -- which can raise for
+    a Databricks profile with no Claude agent -- would abort the resume before
+    the runner ever reads the saved ``--use-native-config`` label.
+    """
+    reached_remote = False
+
+    def fake_which(command: str) -> str | None:
+        """
+        Report Claude and tmux as present so preflight passes.
+
+        :param command: Command name passed to ``shutil.which``.
+        :returns: Fake executable path.
+        """
+        if command == "tmux":
+            return "/usr/bin/tmux"
+        return f"/usr/bin/{command}"
+
+    def exploding_resolve(*args: object, **kwargs: object) -> object:
+        """
+        Fail if the CLI resolves managed config on the remote path.
+
+        :returns: Never returns.
+        :raises click.ClickException: Always, to flag the unwanted call.
+        """
+        del args, kwargs
+        raise click.ClickException("managed config must not resolve on the remote path")
+
+    def fake_remote(*args: object, **kwargs: object) -> None:
+        """
+        Record that the remote launch path was reached.
+
+        :returns: None.
+        """
+        nonlocal reached_remote
+        del args, kwargs
+        reached_remote = True
+
+    monkeypatch.setattr(claude_native.shutil, "which", fake_which)
+    monkeypatch.setattr(claude_native, "resolve_native_claude_config", exploding_resolve)
+    monkeypatch.setattr(claude_native, "_run_with_remote_server", fake_remote)
+
+    claude_native.run_claude_native(
+        server="https://example.com/",
+        session_id="conv_abc",
+        extra_args=(),
+        use_claude_config=False,
+    )
+
+    assert reached_remote is True, (
+        "run_claude_native did not reach the remote launch path; the managed "
+        "config resolver likely ran and aborted before _run_with_remote_server."
+    )
+
+
 def test_local_run_preflights_local_claude_binary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

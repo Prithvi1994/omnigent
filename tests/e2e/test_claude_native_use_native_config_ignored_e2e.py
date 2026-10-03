@@ -210,6 +210,14 @@ def test_use_native_config_not_ignored_by_host_daemon(
                 pass
             except pexpect.EOF:
                 break
+        # The launch is daemon-routed, so the runner can finish writing the
+        # record just after the foreground CLI child exits; re-poll briefly
+        # before failing to avoid racing that write.
+        if not record_path.exists():
+            for _ in range(10):
+                time.sleep(1)
+                if record_path.exists():
+                    break
         assert record_path.exists(), (
             "the daemon-spawned runner never launched the Claude terminal; "
             f"CLI output:\n{transcript.getvalue()}"
@@ -221,7 +229,12 @@ def test_use_native_config_not_ignored_by_host_daemon(
     argv = record["argv"]
     launch_env = record["env"]
     launched_base_url = launch_env.get("ANTHROPIC_BASE_URL")
-    launched_model = argv[argv.index("--model") + 1] if "--model" in argv else None
+    if "--model" in argv:
+        model_index = argv.index("--model")
+        assert model_index + 1 < len(argv), f"the runner passed --model with no value: {argv!r}"
+        launched_model = argv[model_index + 1]
+    else:
+        launched_model = None
 
     # Native config passes neither a managed gateway URL nor a catalog
     # ``--model`` — Claude resolves both from its own ``~/.claude`` config — so

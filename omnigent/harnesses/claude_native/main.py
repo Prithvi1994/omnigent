@@ -1638,22 +1638,20 @@ def run_claude_native(
     if prompt and prompt.strip():
         sanitized_args = (prompt, *sanitized_args)
     startup_profiler.mark("claude args normalized")
-    # Resolve the launch config across all offerings: a configured provider
-    # (configure harnesses), the Databricks ucode profile, or Claude's own
-    # login — so `omnigent claude` honors the provider selection just like
-    # the in-process claude-sdk harness. ``use_claude_config`` forces the
-    # CLI's own ~/.claude config (skips all of it).
-    startup_profiler.mark("resolving claude config")
-    claude_config = None if use_claude_config else resolve_native_claude_config(spec=None)
-    startup_profiler.mark(
-        "claude config resolved",
-        detail="native config" if claude_config is not None else "claude cli config",
-    )
 
     with TemporaryDirectory(prefix="omnigent-claude-native-") as tmpdir:
         spec_path = _materialize_claude_agent_spec(Path(tmpdir))
         startup_profiler.mark("agent spec materialized")
         if server is None:
+            # Resolve the launch config here, where it is used: a configured
+            # provider, the Databricks ucode profile, or Claude's own login.
+            # ``use_claude_config`` forces the CLI's own ~/.claude config.
+            startup_profiler.mark("resolving claude config")
+            claude_config = None if use_claude_config else resolve_native_claude_config(spec=None)
+            startup_profiler.mark(
+                "claude config resolved",
+                detail="native config" if claude_config is not None else "claude cli config",
+            )
             _run_with_local_server(
                 spec_path,
                 session_id=session_id,
@@ -1665,9 +1663,9 @@ def run_claude_native(
                 startup_profiler=startup_profiler,
             )
         else:
-            # The daemon-spawned runner launches ``claude`` itself, so the
-            # remote path takes neither ``command`` nor ``claude_config``;
-            # ``use_claude_config`` rides on the session as a label instead.
+            # The daemon-spawned runner launches ``claude`` and resolves its own
+            # provider config, so the remote path takes neither ``command`` nor
+            # ``claude_config``; ``use_claude_config`` rides on the session label.
             _run_with_remote_server(
                 server.rstrip("/"),
                 spec_path,
