@@ -180,7 +180,7 @@ def test_delete_secret_reports_disabled_keyring_as_unreachable() -> None:
         ),
         (
             secrets.SecretDeletion(removed=False, file_error="JSONDecodeError"),
-            "the file-backed secret store could not be read (JSONDecodeError)",
+            "the file-backed secret store could not be read or updated (JSONDecodeError)",
         ),
     ],
 )

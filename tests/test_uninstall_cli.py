@@ -252,6 +252,29 @@ def test_uninstall_cli_manifest_reports_undiscoverable_config_for_purge(
     assert len(keychain_rows[0]) == 2 and keychain_rows[0][1]
 
 
+def test_uninstall_cli_manifest_reports_unparseable_nesting_for_purge(
+    monkeypatch, tmp_path: Path
+) -> None:
+    rows, _ = _uninstall_manifest_rows(monkeypatch, tmp_path, "[" * 2000 + "]" * 2000)
+
+    assert [row[0] for row in _keychain_rows(rows)] == ["keychain_discovery_error"]
+
+
+def test_uninstall_cli_manifest_discovers_from_config_home_not_data_dir(
+    monkeypatch, tmp_path: Path
+) -> None:
+    data_dir = tmp_path / "data-dir"
+    data_dir.mkdir()
+    (data_dir / "config.yaml").write_text("cursor:\n  api_key_ref: keychain:statehome\n")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(data_dir))
+
+    rows, _ = _uninstall_manifest_rows(
+        monkeypatch, tmp_path, "cursor:\n  api_key_ref: keychain:confighome\n"
+    )
+
+    assert _keychain_rows(rows) == [["keychain_secret", "confighome", "confighome"]]
+
+
 def test_uninstall_cli_skips_keychain_discovery_without_purge(monkeypatch, tmp_path: Path) -> None:
     rows, _ = _uninstall_manifest_rows(
         monkeypatch, tmp_path, b"\xff\xfe not utf-8", "uninstall", "cli", "--dry-run"
@@ -340,7 +363,7 @@ def test_internal_delete_keychain_secret_treats_disabled_keyring_as_unreachable(
                 removed=False, keyring_error="KeyringLocked", file_error="JSONDecodeError"
             ),
             1,
-            "could not be read (JSONDecodeError)",
+            "could not be read or updated (JSONDecodeError)",
         ),
         (SecretDeletion(removed=False, survives=True), 1, "still holds secret 'anthropic'"),
         (

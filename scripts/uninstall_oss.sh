@@ -55,8 +55,9 @@ EOF
 }
 
 json_escape() {
-  # Escape tabs, then drop any other control character: JSON cannot carry them raw.
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g; s/[[:cntrl:]]//g'
+  # Fold line breaks, escape tabs, then drop any other control character: JSON
+  # strings cannot carry them raw.
+  printf '%s' "$1" | tr '\n\r' '  ' | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g; s/[[:cntrl:]]//g'
 }
 
 record_action() {
@@ -142,6 +143,11 @@ state_home() {
   else
     printf '%s/.omnigent\n' "$HOME"
   fi
+}
+
+config_file() {
+  # The same location rule as the CLI: the config may live apart from the state.
+  printf '%s/config.yaml\n' "${OMNIGENT_CONFIG_HOME:-$HOME/.omnigent}"
 }
 
 is_pid_alive() {
@@ -604,9 +610,9 @@ desktop_paths() {
 }
 
 collect_keychain_secret_names() {
-  # Each line is "<name for the helper><TAB><name for display>": the manifest
-  # carries percent-encoded names; a standalone run (no CLI manifest) scans
-  # config.yaml before purge_state deletes it and can only report them.
+  # Each line is "<name for the helper><TAB><name for display>". The CLI
+  # manifest carries percent-encoded names; without it, scan the effective
+  # config (the CLI's own location rule) before purge_state deletes it.
   if [ -n "${OMNIGENT_UNINSTALL_LEDGER_MANIFEST:-}" ] && [ -f "$OMNIGENT_UNINSTALL_LEDGER_MANIFEST" ]; then
     while IFS="$TAB" read -r artifact name display rest; do
       if [ "$artifact" = keychain_discovery_error ]; then
@@ -618,18 +624,31 @@ collect_keychain_secret_names() {
       [ -n "$name" ] || continue
       printf '%s\t%s\n' "$name" "${display:-$name}" >>"$SECRETS_FILE"
     done <"$OMNIGENT_UNINSTALL_LEDGER_MANIFEST"
-  elif [ -f "$(state_home)/config.yaml" ]; then
-    config="$(state_home)/config.yaml"
+  else
+    config="$(config_file)"
+    [ -e "$config" ] || return 0
     # HELPER_OUT is free until the helper runs; use it as the scan scratch file.
     if ! sed -E 's/(^|[[:space:]])#.*//' "$config" >"$HELPER_OUT" 2>/dev/null; then
       KEYCHAIN_UNRESOLVED=$((KEYCHAIN_UNRESOLVED + 1))
       record_action keychain_secret config.yaml discover failed "" "could not read $config to discover keychain secrets"
       return 0
     fi
+    # Quoted names carrying characters the text scan cannot extract are set
+    # aside (HELPER_ERR is also free until the helper runs) and reported below
+    # instead of being truncated into a different name.
+    bad_quoted="\"keychain:[^\"]*[][:space:]',{}[][^\"]*\"|'keychain:[^']*[][:space:]\",{}[][^']*'"
+    grep -vE "$bad_quoted" "$HELPER_OUT" >"$HELPER_ERR" || true
     # Only "%" needs encoding for the helper, which percent-decodes column one.
-    grep -oE "keychain:[^][:space:]\"',{}[]+" "$HELPER_OUT" | sed 's/^keychain://' | sort -u |
+    grep -oE "keychain:[^][:space:]\"',{}[]+" "$HELPER_ERR" | sed 's/^keychain://' | sort -u |
       sed 's/[[:cntrl:]]//g' |
       awk '{ raw = $0; enc = $0; gsub(/%/, "%25", enc); print enc "\t" raw }' >>"$SECRETS_FILE" || true
+    # Any reference the scan did not extract must not vanish silently.
+    mentioned="$(grep -o 'keychain:' "$HELPER_ERR" | wc -l | tr -d ' ')"
+    extracted="$(grep -oE "keychain:[^][:space:]\"',{}[]+" "$HELPER_ERR" | wc -l | tr -d ' ')"
+    if [ "$mentioned" != "$extracted" ] || grep -qE "$bad_quoted" "$HELPER_OUT"; then
+      KEYCHAIN_UNRESOLVED=$((KEYCHAIN_UNRESOLVED + 1))
+      record_action keychain_secret config.yaml discover failed "" "$config references keychain secrets the standalone scan could not parse; run the purge through the omnigent CLI"
+    fi
   fi
 }
 
@@ -658,11 +677,11 @@ purge_keychain_secrets() {
           ;;
         partial*)
           KEYCHAIN_UNRESOLVED=$((KEYCHAIN_UNRESOLVED + 1))
-          record_action keychain_secret "$display" remove reported "" "removed from the OS keychain (service omnigent); the file-backed store could not be read (${outcome#partial }), check it manually"
+          record_action keychain_secret "$display" remove reported "" "removed from the OS keychain (service omnigent); the file-backed store could not be read or updated (${outcome#partial }), check it manually"
           ;;
         unverified*)
           KEYCHAIN_UNRESOLVED=$((KEYCHAIN_UNRESOLVED + 1))
-          record_action keychain_secret "$display" remove reported "" "no entry in the OS keychain (service omnigent); the file-backed store could not be read (${outcome#unverified }), check it manually"
+          record_action keychain_secret "$display" remove reported "" "no entry in the OS keychain (service omnigent); the file-backed store could not be read or updated (${outcome#unverified }), check it manually"
           ;;
         *)
           KEYCHAIN_UNRESOLVED=$((KEYCHAIN_UNRESOLVED + 1))

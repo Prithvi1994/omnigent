@@ -4,7 +4,9 @@ Spawned CLI processes select it with
 ``PYTHON_KEYRING_BACKEND=tests.e2e._file_keyring_backend.FileKeyring`` (the repo
 root on ``PYTHONPATH``); ``OMNIGENT_TEST_KEYRING_FILE`` names the JSON store.
 Entries are keyed ``"<service>\\x00<username>"`` so the ``keyring`` CLI and
-``omnigent.onboarding.secrets`` share one store.
+``omnigent.onboarding.secrets`` share one store. The store serves one CLI
+process at a time: reads and writes are not locked, though each write replaces
+the file atomically.
 """
 
 from __future__ import annotations

@@ -19,6 +19,7 @@ def _run_uninstall(
     env = os.environ.copy()
     env["HOME"] = str(home)
     env["OMNIGENT_DATA_DIR"] = str(home / ".omnigent")
+    env["OMNIGENT_CONFIG_HOME"] = str(home / ".omnigent")
     env["PATH"] = path or env.get("PATH", "")
     if env_updates:
         env.update(env_updates)
@@ -62,6 +63,7 @@ def _path_without_zstd(tmp_path: Path) -> str:
         "sh",
         "sleep",
         "tar",
+        "tr",
         "uname",
     ):
         target = shutil.which(command)
@@ -841,17 +843,26 @@ def test_uninstall_script_purge_failed_keychain_delete_keeps_state(tmp_path: Pat
     assert not (state.parent / "omnigent").exists()
 
 
-def test_uninstall_script_purge_force_removes_state_after_failed_keychain_delete(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("helper_kwargs", "status"),
+    [
+        ({"exit_code": 1, "stderr": "Error: keyring exploded"}, "failed"),
+        ({"stdout": "file-only KeyringLocked"}, "reported"),
+    ],
+    ids=["failed", "unresolved"],
+)
+def test_uninstall_script_purge_force_removes_state_but_keeps_nonzero_exit(
+    tmp_path: Path, helper_kwargs: dict, status: str
 ) -> None:
-    helper, _ = _fake_secret_helper(tmp_path, exit_code=1, stderr="Error: keyring exploded")
+    helper, _ = _fake_secret_helper(tmp_path, **helper_kwargs)
     result, state = _purge_with_manifest(
         tmp_path, "keychain_secret\tanthropic\n", helper, "--yes", "--force"
     )
 
     assert result.returncode == 1
-    actions = _keychain_actions(json.loads(result.stdout))
-    assert [(name, status) for name, status, _ in actions] == [("anthropic", "failed")]
+    payload = json.loads(result.stdout)
+    assert [(name, s) for name, s, _ in _keychain_actions(payload)] == [("anthropic", status)]
+    assert payload["exit_code"] == 1
     assert not state.exists()
 
 
@@ -884,12 +895,12 @@ def test_uninstall_script_purge_skips_absent_keychain_secret(tmp_path: Path) -> 
         (
             "partial PermissionError",
             "removed from the OS keychain (service omnigent); "
-            "the file-backed store could not be read (PermissionError)",
+            "the file-backed store could not be read or updated (PermissionError)",
         ),
         (
             "unverified JSONDecodeError",
             "no entry in the OS keychain (service omnigent); "
-            "the file-backed store could not be read (JSONDecodeError)",
+            "the file-backed store could not be read or updated (JSONDecodeError)",
         ),
     ],
 )
@@ -906,19 +917,6 @@ def test_uninstall_script_purge_keeps_state_for_unresolved_helper_outcomes(
     assert fragment in actions[0][2]
     assert _state_actions(payload) == [("skipped", "--force")]
     assert state.exists()
-
-
-def test_uninstall_script_purge_force_removes_state_after_unresolved_outcome(
-    tmp_path: Path,
-) -> None:
-    helper, _ = _fake_secret_helper(tmp_path, stdout="file-only KeyringLocked")
-    result, state = _purge_with_manifest(
-        tmp_path, "keychain_secret\tanthropic\n", helper, "--yes", "--force"
-    )
-
-    assert result.returncode == 1
-    assert json.loads(result.stdout)["exit_code"] == 1
-    assert not state.exists()
 
 
 def test_uninstall_script_purge_dry_run_previews_keychain_secrets(tmp_path: Path) -> None:
@@ -1024,30 +1022,69 @@ def test_uninstall_script_standalone_purge_encodes_percent_for_helper(tmp_path: 
     assert not state.exists()
 
 
+def _standalone_purge(home: Path, **env: str) -> subprocess.CompletedProcess[str]:
+    return _run_uninstall(
+        home,
+        "state",
+        "--purge",
+        "--yes",
+        "--json",
+        env_updates={
+            "OMNIGENT_UNINSTALL_LEDGER_MANIFEST": "",
+            "OMNIGENT_UNINSTALL_PYTHON": "",
+            **env,
+        },
+    )
+
+
 def test_uninstall_script_standalone_purge_reports_unreadable_config(tmp_path: Path) -> None:
-    if os.geteuid() == 0:
-        pytest.skip("root can read a mode-000 file")
     home = tmp_path / "home"
     state = _state_with_install_signal(home)
-    config = state / "config.yaml"
-    config.write_text("cursor:\n  api_key_ref: keychain:cursor\n")
-    config.chmod(0o000)
-    try:
-        result = _run_uninstall(
-            home,
-            "state",
-            "--purge",
-            "--yes",
-            "--json",
-            env_updates={
-                "OMNIGENT_UNINSTALL_LEDGER_MANIFEST": "",
-                "OMNIGENT_UNINSTALL_PYTHON": "",
-            },
-        )
-    finally:
-        config.chmod(0o600)
+    # A directory in config.yaml's place fails every read, regardless of the user.
+    (state / "config.yaml").mkdir()
+
+    result = _standalone_purge(home)
 
     assert result.returncode == 1
     actions = _keychain_actions(json.loads(result.stdout))
     assert [(name, status) for name, status, _ in actions] == [("config.yaml", "failed")]
+    assert state.exists()
+
+
+def test_uninstall_script_standalone_purge_reads_the_effective_config_home(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    state = _state_with_install_signal(home)
+    (state / "config.yaml").write_text("cursor:\n  api_key_ref: keychain:statehome\n")
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text("cursor:\n  api_key_ref: keychain:confighome\n")
+
+    result = _standalone_purge(home, OMNIGENT_CONFIG_HOME=str(config_home))
+
+    assert result.returncode == 1
+    actions = _keychain_actions(json.loads(result.stdout))
+    assert [(name, status) for name, status, _ in actions] == [("confighome", "reported")]
+
+
+def test_uninstall_script_standalone_purge_flags_names_it_cannot_parse(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    state = _state_with_install_signal(home)
+    (state / "config.yaml").write_text(
+        "providers:\n"
+        "  anthropic:\n"
+        "    anthropic:\n"
+        "      api_key_ref: keychain:anthropic\n"
+        "odd:\n"
+        '  api_key_ref: "keychain:has space"\n'
+    )
+
+    result = _standalone_purge(home)
+
+    assert result.returncode == 1
+    actions = _keychain_actions(json.loads(result.stdout))
+    assert [(name, status) for name, status, _ in actions] == [
+        ("config.yaml", "failed"),
+        ("anthropic", "reported"),
+    ]
+    assert "could not parse" in actions[0][2]
     assert state.exists()

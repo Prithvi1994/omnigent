@@ -5051,9 +5051,12 @@ _KEYCHAIN_REF_RE = re.compile(r"keychain:([^\s\"',\[\]{}]+)")
 def _keychain_secret_names() -> list[str]:
     """Collect the secret names the global config references as ``keychain:<name>``.
 
-    Those secrets live in the OS keychain, outside the state dir, so purge must
-    delete or report them explicitly. A config the YAML parser rejects is
-    scanned as text with comments removed; that scan stops names at whitespace.
+    Those secrets live in the OS keychain, outside the state dir and its backup,
+    so purge must delete or report them explicitly. The effective config
+    (``OMNIGENT_CONFIG_HOME`` or ``~/.omnigent``) is the source of truth even
+    when ``OMNIGENT_DATA_DIR`` places the state elsewhere. A config the YAML
+    parser rejects is scanned as text with comments removed; that scan stops
+    names at whitespace.
 
     :returns: Sorted unique secret names, e.g. ``["anthropic", "cursor"]``.
     :raises OSError: If the config exists but cannot be read.
@@ -5144,7 +5147,7 @@ def _write_uninstall_manifest(ledger: InstallLedger, *, purge: bool = False) -> 
         if purge:
             try:
                 names = _keychain_secret_names()
-            except (OSError, UnicodeDecodeError) as exc:
+            except (OSError, UnicodeDecodeError, RecursionError) as exc:
                 reason = re.sub(r"\s+", " ", str(exc))
                 handle.write("\t".join(["keychain_discovery_error", reason]) + "\n")
                 names = []
@@ -5206,7 +5209,7 @@ def _internal_delete_keychain_secret(encoded_name: str) -> None:
         )
     if outcome.keyring_error is not None and not outcome.removed:
         fallback = (
-            f"the file-backed store could not be read ({outcome.file_error})"
+            f"the file-backed store could not be read or updated ({outcome.file_error})"
             if outcome.file_error
             else f"no file-backed secret {name!r} exists"
         )
@@ -5378,7 +5381,7 @@ def doctor(
 @click.option(
     "--purge",
     is_flag=True,
-    help="Remove state data and Omnigent's OS-keychain secrets after writing a backup.",
+    help="Remove state data and the OS-keychain secrets the config references (after a backup).",
 )
 @click.option("--purge-workspace", is_flag=True, help="Also remove ~/omnigent with --purge.")
 @click.option("--dry-run", is_flag=True, help="Print planned actions only.")

@@ -250,7 +250,7 @@ class SecretDeletion:
         if self.keyring_error is not None:
             return f"the OS keychain was not consulted or reachable ({self.keyring_error})"
         if self.file_error is not None:
-            return f"the file-backed secret store could not be read ({self.file_error})"
+            return f"the file-backed secret store could not be read or updated ({self.file_error})"
         return ""
 
 

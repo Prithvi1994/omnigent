@@ -44,10 +44,9 @@ KEYRING_BACKEND = "tests.e2e._file_keyring_backend.FileKeyring"
 
 _POINTER = "❯"
 _ANSI_RE = re.compile(rb"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]")
-# Ambient credentials would be auto-adopted by setup and change the menus.
-_AMBIENT_ENV_RE = re.compile(
-    r"API_KEY|TOKEN|^DATABRICKS_|^OMNIGENT_(CONFIG_HOME|DATA_DIR|DISABLE_KEYRING)$"
-)
+# Ambient credentials would be auto-adopted by setup and OMNIGENT_* knobs
+# would change the wizard's journey.
+_AMBIENT_ENV_RE = re.compile(r"API_KEY|TOKEN|^DATABRICKS_|^OMNIGENT_")
 
 
 def cli_env(home: Path) -> dict[str, str]:
@@ -57,7 +56,9 @@ def cli_env(home: Path) -> dict[str, str]:
     env.update(
         {
             "HOME": str(home),
-            "PYTHONPATH": str(_REPO_ROOT),
+            "PYTHONPATH": os.pathsep.join(
+                p for p in (str(_REPO_ROOT), env.get("PYTHONPATH", "")) if p
+            ),
             "PYTHON_KEYRING_BACKEND": KEYRING_BACKEND,
             "OMNIGENT_TEST_KEYRING_FILE": str(home / ".test-keychain.json"),
             "NO_COLOR": "1",
