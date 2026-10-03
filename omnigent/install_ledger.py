@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
-from omnigent.host.service import LAUNCHD_NAMESPACE, SYSTEMD_UNIT
+from omnigent.host.service import LAUNCHD_LABEL, SYSTEMD_UNIT
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 SCHEMA_VERSION = 1
@@ -486,39 +486,29 @@ def observed_external_configs(*, deep: bool) -> list[ExternalConfigEntry]:
 
 
 def observed_launch_agents(*, deep: bool) -> list[LaunchAgentEntry]:
-    """Backfill only units Omnigent itself installs.
+    """Back-fill only the units Omnigent itself installs.
 
     Uninstall unloads and deletes every ledger entry, so matching by name
     substring would destroy third-party units that merely contain "omnigent".
     """
     if not deep:
         return []
-    entries: list[LaunchAgentEntry] = []
-    launchd_dir = Path.home() / "Library" / "LaunchAgents"
-    if launchd_dir.is_dir():
-        for path in sorted(launchd_dir.glob(f"{LAUNCHD_NAMESPACE}*.plist")):
-            entries.append(
-                LaunchAgentEntry(
-                    kind="launchd",
-                    path=str(path),
-                    label=path.stem,
-                    source="observed",
-                    confidence="high",
-                )
-            )
     config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    systemd_unit = config_home / "systemd" / "user" / SYSTEMD_UNIT
-    if systemd_unit.is_file():
-        entries.append(
-            LaunchAgentEntry(
-                kind="systemd_user",
-                path=str(systemd_unit),
-                label=SYSTEMD_UNIT,
-                source="observed",
-                confidence="high",
-            )
+    known_units = (
+        (
+            "launchd",
+            Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist",
+            LAUNCHD_LABEL,
+        ),
+        ("systemd_user", config_home / "systemd" / "user" / SYSTEMD_UNIT, SYSTEMD_UNIT),
+    )
+    return [
+        LaunchAgentEntry(
+            kind=kind, path=str(path), label=label, source="observed", confidence="high"
         )
-    return entries
+        for kind, path, label in known_units
+        if path.is_file()
+    ]
 
 
 def new_ledger(*, source: str, strategy: str, deep: bool) -> InstallLedger:

@@ -17,9 +17,7 @@ from typing import Literal
 
 from omnigent.process_logging import data_dir
 
-# Reverse-DNS namespace owned by Omnigent; every launchd job it creates lives here.
-LAUNCHD_NAMESPACE = "ai.omnigent."
-LAUNCHD_LABEL = f"{LAUNCHD_NAMESPACE}host"
+LAUNCHD_LABEL = "ai.omnigent.host"
 SYSTEMD_UNIT = "omnigent-host.service"
 # launchctl bootout returns before the job is gone; poll for the unload to land.
 _LAUNCHD_UNLOAD_TIMEOUT = 10.0
