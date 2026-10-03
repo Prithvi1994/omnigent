@@ -2088,10 +2088,14 @@ function createWindow(targetUrl, opts = {}) {
   // clearance it reserves for them. Only the pinned server page is told; a
   // foreign page (SSO) loaded in this window learns nothing about it.
   const sendFullScreenState = () => {
-    if (win.isDestroyed()) return;
+    if (win.isDestroyed() || win.webContents.isDestroyed()) return;
     const pinned = pinnedOrigin(win);
     if (!pinned || originOf(win.webContents.getURL()) !== pinned) return;
-    win.webContents.send("omnigent:full-screen-changed", win.isFullScreen());
+    try {
+      win.webContents.send("omnigent:full-screen-changed", win.isFullScreen());
+    } catch {
+      // Window torn down between the check and the send; ignore.
+    }
   };
   win.on("enter-full-screen", sendFullScreenState);
   win.on("leave-full-screen", sendFullScreenState);

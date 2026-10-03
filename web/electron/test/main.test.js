@@ -203,6 +203,7 @@ function loadNavigationHarness({
   const appEvents = new Map();
   const webContents = {
     id: 1,
+    isDestroyed: () => false,
     send: (channel, data) => calls.progress.push({ channel, data }),
     stop() {},
     reload() {
@@ -3082,6 +3083,18 @@ describe("fullscreen state plumbing", () => {
     h.setUrl(server);
     h.emit("did-navigate", server, 200, "OK");
     assert.deepEqual(fullScreenEvents(h), [true]);
+  });
+
+  it("stays silent when the webContents is torn down mid-transition", (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, savedServerUrl: server });
+    t.after(h.cleanup);
+    h.api.createWindow();
+
+    h.webContents.isDestroyed = () => true;
+    h.setFullScreen(true);
+    h.emitWindow("enter-full-screen");
+
+    assert.deepEqual(fullScreenEvents(h), [], "a destroyed webContents must not be sent to");
   });
 
   it("answers the initial fullscreen query only for the pinned server page", async (t) => {

@@ -22,9 +22,12 @@ function loadPreload(respond = () => null) {
       return respond(channel, args) ?? null;
     },
     send: () => {},
-    on: (channel, listener) => listeners.set(channel, listener),
+    on: (channel, listener) =>
+      listeners.set(channel, [...(listeners.get(channel) ?? []), listener]),
     removeListener: (channel, listener) => {
-      if (listeners.get(channel) === listener) listeners.delete(channel);
+      const remaining = (listeners.get(channel) ?? []).filter((l) => l !== listener);
+      if (remaining.length === 0) listeners.delete(channel);
+      else listeners.set(channel, remaining);
     },
   };
   vm.runInNewContext(PRELOAD, {
@@ -39,7 +42,7 @@ function loadPreload(respond = () => null) {
   });
   return {
     desktop: exposed.get("omnigentDesktop"),
-    emit: (channel, payload) => listeners.get(channel)?.({}, payload),
+    emit: (channel, payload) => (listeners.get(channel) ?? []).forEach((l) => l({}, payload)),
     hasListener: (channel) => listeners.has(channel),
     invokes,
   };

@@ -61,14 +61,16 @@ def _cluster_x(page: Page) -> float:
     return box["x"]
 
 
-def _wait_for_cluster_x(page: Page, predicate: str, limit: float) -> None:
+def _wait_for_cluster_x(page: Page, *, below: bool, limit: float) -> None:
     """Wait briefly for the cluster to settle at a position; assert separately."""
     page.wait_for_function(
-        "([selector, limit]) => {"
+        "([selector, below, limit]) => {"
         "  const el = document.querySelector(selector);"
-        f" return el && el.getBoundingClientRect().x {predicate} limit;"
+        "  if (!el) return false;"
+        "  const x = el.getBoundingClientRect().x;"
+        "  return below ? x < limit : x >= limit;"
         "}",
-        arg=[_CLUSTER, limit],
+        arg=[_CLUSTER, below, limit],
         timeout=5_000,
     )
 
@@ -90,7 +92,7 @@ def test_fullscreen_realigns_sidebar_header_controls(page: Page, live_server: st
     # The cluster realigns when fullscreen hides the traffic lights.
     page.evaluate("window.__omniFullScreen.set(true)")
     with contextlib.suppress(PlaywrightTimeoutError):
-        _wait_for_cluster_x(page, "<", FULLSCREEN_ALIGNED_MAX_X)
+        _wait_for_cluster_x(page, below=True, limit=FULLSCREEN_ALIGNED_MAX_X)
     fullscreen_x = _cluster_x(page)
     assert fullscreen_x < FULLSCREEN_ALIGNED_MAX_X, (
         "sidebar header controls still reserve the traffic-light strip in "
@@ -101,7 +103,7 @@ def test_fullscreen_realigns_sidebar_header_controls(page: Page, live_server: st
     # Leaving fullscreen restores the clearance (the lights are back).
     page.evaluate("window.__omniFullScreen.set(false)")
     with contextlib.suppress(PlaywrightTimeoutError):
-        _wait_for_cluster_x(page, ">=", TRAFFIC_LIGHT_CLEARANCE_PX - 8)
+        _wait_for_cluster_x(page, below=False, limit=TRAFFIC_LIGHT_CLEARANCE_PX - 8)
     restored_x = _cluster_x(page)
     assert restored_x >= TRAFFIC_LIGHT_CLEARANCE_PX - 8, (
         f"windowed traffic-light clearance not restored, got x={restored_x}"
