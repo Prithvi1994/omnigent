@@ -220,6 +220,201 @@ async def test_scratch_delete_under_active_sandbox(
         env.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sandbox_type",
+    [
+        pytest.param(
+            "darwin_seatbelt",
+            marks=pytest.mark.skipif(
+                sys.platform != "darwin" or not shutil.which("sandbox-exec"),
+                reason="darwin_seatbelt requires macOS + sandbox-exec",
+            ),
+        ),
+        pytest.param(
+            "linux_bwrap",
+            marks=pytest.mark.skipif(
+                not sys.platform.startswith("linux") or not shutil.which("bwrap"),
+                reason="linux_bwrap requires Linux + bwrap",
+            ),
+        ),
+    ],
+)
+async def test_fork_delete_under_active_sandbox(
+    workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sandbox_type: str
+) -> None:
+    temporary = tmp_path / "temporary"
+    temporary.mkdir()
+    alias = tmp_path / "temporary-alias"
+    alias.symlink_to(temporary, target_is_directory=True)
+    monkeypatch.setattr(tempfile, "tempdir", str(alias))
+    env = create_os_environment(
+        OSEnvSpec(
+            cwd=str(workspace),
+            fork=True,
+            sandbox=OSEnvSandboxSpec(
+                type=sandbox_type,
+                read_paths=[str(Path(__file__).resolve().parents[2])],
+                write_paths=["."],
+            ),
+        )
+    )
+    assert isinstance(env, CallerProcessOSEnvironment)
+    fork_root = env.cwd
+    try:
+        assert (await env.shell("true"))["exit_code"] == 0
+        assert (fork_root / "victim").read_bytes() == b"workspace bytes"
+        assert (await CallerProcessFilesystem(env).delete("victim")).deleted is True
+        assert not (fork_root / "victim").exists()
+        assert (workspace / "victim").read_bytes() == b"workspace bytes"
+        assert fork_root == fork_root.resolve()
+    finally:
+        env.close()
+    assert not fork_root.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("helper_state", ["unstarted", "restarted"])
+@pytest.mark.parametrize(
+    "sandbox_type",
+    [
+        "none",
+        pytest.param(
+            "darwin_seatbelt",
+            marks=pytest.mark.skipif(
+                sys.platform != "darwin" or not shutil.which("sandbox-exec"),
+                reason="darwin_seatbelt requires macOS + sandbox-exec",
+            ),
+        ),
+        pytest.param(
+            "linux_bwrap",
+            marks=pytest.mark.skipif(
+                not sys.platform.startswith("linux") or not shutil.which("bwrap"),
+                reason="linux_bwrap requires Linux + bwrap",
+            ),
+        ),
+    ],
+)
+async def test_missing_cwd_creation_preserves_operations_but_refuses_delete(
+    tmp_path: Path, helper_state: str, sandbox_type: str
+) -> None:
+    cwd = tmp_path / "not-created-yet"
+    spec = OSEnvSpec(
+        cwd=str(cwd),
+        sandbox=OSEnvSandboxSpec(
+            type=sandbox_type,
+            read_paths=[str(Path(__file__).resolve().parents[2])],
+            write_paths=["."],
+        ),
+    )
+    env = create_os_environment(spec)
+    assert isinstance(env, CallerProcessOSEnvironment)
+    try:
+        cwd.mkdir()
+        assert (await env.shell("printf retained > victim"))["exit_code"] == 0
+        assert (await env.read("victim"))["content"] == "retained"
+        if helper_state == "restarted":
+            with env._helper._lock:
+                env._helper._stop_locked()
+        result = await env.delete("victim")
+        assert result["code"] == "workspace_root_changed"
+        assert "create a new environment" in result["error"]
+        assert (cwd / "victim").read_bytes() == b"retained"
+    finally:
+        env.close()
+    replacement = create_os_environment(spec)
+    assert isinstance(replacement, CallerProcessOSEnvironment)
+    try:
+        assert (await replacement.delete("victim"))["deleted"] is True
+        assert not (cwd / "victim").exists()
+    finally:
+        replacement.close()
+
+
+@pytest.mark.parametrize("failure", [PermissionError, RuntimeError])
+@pytest.mark.parametrize("owned_copy_on_write", [False, True])
+def test_failed_environment_initialization_cleans_owned_resources(
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: type[Exception],
+    owned_copy_on_write: bool,
+) -> None:
+    fork_dir = tmp_path / "fork"
+    fork_dir.mkdir()
+    policy = SandboxPolicy(
+        backend_type="none",
+        active=False,
+        read_roots=None,
+        write_roots=[],
+        write_files=[],
+        allow_network=True,
+    )
+    copy_on_write = Mock(spec=CopyOnWriteEnvironment)
+
+    def fail_helper(*args: object, **kwargs: object) -> None:
+        raise failure("initialization failed")
+
+    monkeypatch.setattr(os_env_module, "_HelperProcessClient", fail_helper)
+    env = CallerProcessOSEnvironment.__new__(CallerProcessOSEnvironment)
+    with pytest.raises(failure, match="initialization failed"):
+        env.__init__(
+            spec=OSEnvSpec(cwd=str(workspace)),
+            cwd=workspace,
+            sandbox=policy,
+            shell_path="/bin/sh",
+            _fork_dir=fork_dir,
+            _copy_on_write_environment=cast(CopyOnWriteEnvironment, copy_on_write),
+            _owns_copy_on_write=owned_copy_on_write,
+        )
+    assert not fork_dir.exists()
+    if owned_copy_on_write:
+        copy_on_write.close.assert_called_once()
+    else:
+        copy_on_write.close.assert_not_called()
+    env.close()
+    env.__del__()
+
+
+@pytest.mark.parametrize("stage", ["construction", "preparation"])
+def test_failed_owned_namespace_initialization_cleans_fork(
+    workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    fork_dir = tmp_path / "fork"
+    fork_dir.mkdir()
+    policy = SandboxPolicy(
+        backend_type="none",
+        active=False,
+        read_roots=None,
+        write_roots=[],
+        write_files=[],
+        allow_network=True,
+        copy_on_write_roots=[workspace],
+    )
+    copy_on_write = Mock(spec=CopyOnWriteEnvironment)
+    copy_on_write.prepare.side_effect = RuntimeError("namespace failed")
+    factory = Mock(return_value=copy_on_write)
+    if stage == "construction":
+        factory.side_effect = RuntimeError("namespace failed")
+    monkeypatch.setattr(os_env_module, "CopyOnWriteEnvironment", factory)
+    env = CallerProcessOSEnvironment.__new__(CallerProcessOSEnvironment)
+    with pytest.raises(RuntimeError, match="namespace failed"):
+        env.__init__(
+            spec=OSEnvSpec(cwd=str(workspace)),
+            cwd=workspace,
+            sandbox=policy,
+            shell_path="/bin/sh",
+            _fork_dir=fork_dir,
+        )
+    assert not fork_dir.exists()
+    if stage == "preparation":
+        copy_on_write.close.assert_called_once()
+    else:
+        copy_on_write.close.assert_not_called()
+    env.close()
+    env.__del__()
+
+
 def test_root_identity_uses_prepared_environment_view(
     workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

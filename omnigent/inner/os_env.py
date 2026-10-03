@@ -488,11 +488,14 @@ class _HelperProcessClient:
         self._root_identity = self._stat_root_identity(self.cwd)
         atexit.register(self.close)
 
-    def _stat_root_identity(self, root: Path) -> tuple[int, int]:
+    def _stat_root_identity(self, root: Path) -> tuple[int, int] | None:
         namespace = self.sandbox.copy_on_write_namespace
         if namespace is not None:
             root = Path(f"/proc/{namespace[0]}/root") / root.relative_to(root.anchor)
-        root_stat = root.stat()
+        try:
+            root_stat = root.stat()
+        except FileNotFoundError:
+            return None
         return root_stat.st_dev, root_stat.st_ino
 
     def request(self, payload: OpRequest) -> OpResult:
@@ -606,7 +609,9 @@ class _HelperProcessClient:
         expected_root_identity = (
             self._stat_root_identity(helper_cwd) if self.start_in_scratch else self._root_identity
         )
-        root_identity: list[JsonValue] = [expected_root_identity[0], expected_root_identity[1]]
+        root_identity: list[JsonValue] | None = None
+        if expected_root_identity is not None:
+            root_identity = [expected_root_identity[0], expected_root_identity[1]]
         config: dict[str, JsonValue] = {
             "cwd": str(helper_cwd),
             "shell_path": self.shell_path,
@@ -958,16 +963,16 @@ class CallerProcessOSEnvironment(OSEnvironment):
                 raise RuntimeError("Missing copy-on-write environment")
 
     def __post_init__(self) -> None:
-        if (
-            self.sandbox.copy_on_write_roots
-            and self._copy_on_write_environment is None
-            and self.sandbox.copy_on_write_namespace is None
-        ):
-            self._copy_on_write_environment = CopyOnWriteEnvironment(
-                self.sandbox.copy_on_write_roots
-            )
-            self._owns_copy_on_write = True
         try:
+            if (
+                self.sandbox.copy_on_write_roots
+                and self._copy_on_write_environment is None
+                and self.sandbox.copy_on_write_namespace is None
+            ):
+                self._copy_on_write_environment = CopyOnWriteEnvironment(
+                    self.sandbox.copy_on_write_roots
+                )
+                self._owns_copy_on_write = True
             self._helper = _HelperProcessClient(
                 cwd=self.cwd,
                 shell_path=self.shell_path,
@@ -977,10 +982,9 @@ class CallerProcessOSEnvironment(OSEnvironment):
                 egress_allow_private_destinations=self._egress_allow_private_destinations,
                 copy_on_write_environment=self._copy_on_write_environment,
             )
-        except OSError:
-            if self._owns_copy_on_write and self._copy_on_write_environment is not None:
-                self._copy_on_write_environment.close()
-            raise
+        finally:
+            if getattr(self, "_helper", None) is None:
+                self.close()
 
     async def read(
         self,
@@ -1065,7 +1069,9 @@ class CallerProcessOSEnvironment(OSEnvironment):
         return cast(OpResult, result)
 
     def close(self) -> None:
-        self._helper.close()
+        helper = getattr(self, "_helper", None)
+        if helper is not None:
+            helper.close()
         if self._owns_copy_on_write and self._copy_on_write_environment is not None:
             self._copy_on_write_environment.close()
         if self._fork_dir is not None:
@@ -1092,7 +1098,7 @@ def create_os_environment(
     cwd = Path(spec.cwd or os.getcwd()).resolve(strict=False)
     fork_dir: Path | None = None
     if spec.fork:
-        fork_dir = Path(tempfile.mkdtemp(prefix="omnigent-fork-"))
+        fork_dir = Path(tempfile.mkdtemp(prefix="omnigent-fork-")).resolve()
         effective_cwd = fork_dir / "root"
         _copy_tree(cwd, effective_cwd)
         cwd = effective_cwd
@@ -1920,17 +1926,19 @@ def _run_helper(config: JsonValue) -> int:
     if not isinstance(sandbox_value, dict):
         raise ValueError("Invalid os_env helper sandbox payload")
     root_identity_value = config.get("root_identity")
-    if not isinstance(root_identity_value, list) or len(root_identity_value) != 2:
-        raise ValueError("Invalid os_env helper root identity")
-    root_device, root_inode = root_identity_value
-    if (
-        not isinstance(root_device, int)
-        or isinstance(root_device, bool)
-        or not isinstance(root_inode, int)
-        or isinstance(root_inode, bool)
-    ):
-        raise ValueError("Invalid os_env helper root identity")
-    root_identity = (root_device, root_inode)
+    root_identity: tuple[int, int] | None = None
+    if root_identity_value is not None:
+        if not isinstance(root_identity_value, list) or len(root_identity_value) != 2:
+            raise ValueError("Invalid os_env helper root identity")
+        root_device, root_inode = root_identity_value
+        if (
+            not isinstance(root_device, int)
+            or isinstance(root_device, bool)
+            or not isinstance(root_inode, int)
+            or isinstance(root_inode, bool)
+        ):
+            raise ValueError("Invalid os_env helper root identity")
+        root_identity = (root_device, root_inode)
 
     # S4 (security): if the parent shipped a Proxy-Authorization
     # token via the config FD, splice it into HTTP_PROXY / HTTPS_PROXY
