@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from omnigent import install_ledger
 from omnigent.host.service import LAUNCHD_LABEL, SYSTEMD_UNIT
 
@@ -208,6 +210,52 @@ def test_deep_backfill_observes_external_config_and_launch_agents(
     ]
     assert cursor_config.exists()
     assert launch_agent.exists()
+
+
+@pytest.mark.parametrize("source", ["installer", "backfill"])
+def test_resolve_uninstall_ledger_drops_stale_third_party_launch_agents(
+    tmp_path: Path, monkeypatch, source: str
+) -> None:
+    home = tmp_path / "home"
+    state = home / ".omnigent"
+    state.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(state))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    launch_dir = home / "Library" / "LaunchAgents"
+    own = install_ledger.LaunchAgentEntry(
+        kind="launchd",
+        path=str(launch_dir / f"{LAUNCHD_LABEL}.plist"),
+        label=LAUNCHD_LABEL,
+        source="observed",
+    )
+    stale = install_ledger.LaunchAgentEntry(
+        kind="launchd",
+        path=str(launch_dir / "com.example.omnigent-handoff.plist"),
+        label="com.example.omnigent-handoff",
+        source="observed",
+    )
+    recorded = install_ledger.LaunchAgentEntry(
+        kind="systemd_user",
+        path=str(home / ".config" / "systemd" / "user" / SYSTEMD_UNIT),
+        label=SYSTEMD_UNIT,
+        source="recorded",
+        confidence="certain",
+    )
+    ledger = install_ledger.new_ledger(source=source, strategy="deep-backfill", deep=False)
+    ledger.entries.launch_agents = [own, stale, recorded]
+    path = (
+        install_ledger.ledger_path()
+        if source == "installer"
+        else install_ledger.backfill_ledger_path()
+    )
+    install_ledger.write_ledger(ledger, path=path)
+
+    resolved = install_ledger.resolve_uninstall_ledger()
+
+    assert resolved is not None
+    assert resolved.ledger_source == source
+    assert resolved.entries.launch_agents == [own, recorded]
 
 
 def test_record_and_remove_launch_agent_preserves_other_entries(

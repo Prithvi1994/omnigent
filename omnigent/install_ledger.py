@@ -490,6 +490,14 @@ def observed_external_configs(*, deep: bool) -> list[ExternalConfigEntry]:
     return entries
 
 
+def _known_launch_agent_units() -> tuple[tuple[str, Path, str], ...]:
+    """``(kind, path, label)`` of every unit ``omnigent host service enable`` installs."""
+    return (
+        ("launchd", launchd_plist_path(), LAUNCHD_LABEL),
+        ("systemd_user", systemd_unit_path(), SYSTEMD_UNIT),
+    )
+
+
 def observed_launch_agents(*, deep: bool) -> list[LaunchAgentEntry]:
     """Back-fill only the units Omnigent itself installs.
 
@@ -498,16 +506,26 @@ def observed_launch_agents(*, deep: bool) -> list[LaunchAgentEntry]:
     """
     if not deep:
         return []
-    known_units = (
-        ("launchd", launchd_plist_path(), LAUNCHD_LABEL),
-        ("systemd_user", systemd_unit_path(), SYSTEMD_UNIT),
-    )
     return [
         LaunchAgentEntry(
             kind=kind, path=str(path), label=label, source="observed", confidence="high"
         )
-        for kind, path, label in known_units
+        for kind, path, label in _known_launch_agent_units()
         if path.is_file()
+    ]
+
+
+def _drop_unknown_observed_launch_agents(ledger: InstallLedger) -> None:
+    """Keep only Omnigent's own units among observed launch agents.
+
+    Ledgers written before exact matching may still list third-party units
+    observed by filename substring; recorded entries are kept untouched.
+    """
+    known = {(kind, str(path)) for kind, path, _label in _known_launch_agent_units()}
+    ledger.entries.launch_agents = [
+        entry
+        for entry in ledger.entries.launch_agents
+        if entry.source != "observed" or (entry.kind, entry.path) in known
     ]
 
 
@@ -588,9 +606,11 @@ def backfill_install_ledger(*, deep: bool, apply: bool = True) -> InstallLedger 
 def resolve_uninstall_ledger() -> InstallLedger | None:
     real = load_ledger(ledger_path())
     if real and real.ledger_source == "installer":
+        _drop_unknown_observed_launch_agents(real)
         return real
     backfill = load_ledger(backfill_ledger_path())
     if backfill:
+        _drop_unknown_observed_launch_agents(backfill)
         return backfill
     return backfill_install_ledger(deep=True, apply=True)
 
