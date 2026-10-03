@@ -194,11 +194,8 @@ def _sample_arguments(tool: Tool) -> dict[str, object]:
 async def test_every_advertised_field_reaches_the_request(
     tool: Tool, verb: str, url: str, path_args: dict[str, str]
 ) -> None:
-    """Each field the tool schema advertises survives the dispatch allowlist.
-
-    An advertised field missing from the allowlist is dropped before the REST
-    call, so the agent's call reports success while the server never saw it.
-    """
+    """Every advertised field must survive the dispatch allowlist; one missing from
+    it is dropped silently while the call still reports success."""
     args = {**_sample_arguments(tool), **path_args}
     client = _RecordingClient()
     await _execute_scheduled_task_tool(tool.name(), json.dumps(args), server_client=client)
