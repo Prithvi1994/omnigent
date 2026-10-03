@@ -576,6 +576,34 @@ async def test_prepare_daemon_terminal_resume_stamps_native_config_label(
         }
     ]
 
+    # A plain resume (no flag, no new args) persists nothing.
+    patches.clear()
+    await claude_native._prepare_claude_terminal_via_daemon(
+        base_url="https://e.com",
+        headers={},
+        session_id="conv_resume",
+        session_bundle=None,
+        claude_args=(),
+        use_claude_config=False,
+        host_id="host_resume",
+        workspace="/workspace",
+    )
+    assert patches == []
+
+    # Args-only resume patches those and never stamps or clears the label.
+    patches.clear()
+    await claude_native._prepare_claude_terminal_via_daemon(
+        base_url="https://e.com",
+        headers={},
+        session_id="conv_resume",
+        session_bundle=None,
+        claude_args=("--dangerously-skip-permissions",),
+        use_claude_config=False,
+        host_id="host_resume",
+        workspace="/workspace",
+    )
+    assert patches == [{"terminal_launch_args": ["--dangerously-skip-permissions"]}]
+
 
 async def test_prepare_daemon_terminal_resume_raises_on_rejected_patch(
     monkeypatch: pytest.MonkeyPatch,

@@ -24,6 +24,7 @@ gateway base URL is an unroutable sentinel the stub only records, never dials.
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -37,7 +38,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.e2e._native_resume_helpers import omnigent_console_script
+from tests.e2e._native_resume_helpers import cli_env, omnigent_console_script
 
 pytestmark = pytest.mark.skipif(
     shutil.which("tmux") is None or sys.platform == "win32",
@@ -131,27 +132,14 @@ def native_config_gateway_env() -> Iterator[dict[str, object]]:
         encoding="utf-8",
     )
 
-    env = dict(os.environ)
-    # Strip vars that, leaked from an enclosing omnigent/Claude process, would
-    # mis-route the runner or shadow the config under test.
-    for stale in (
-        "OMNIGENT_CLAUDE_PATH",
-        "OMNIGENT_RUNNER_ID",
-        "OMNIGENT_RUNNER_WORKSPACE",
-        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN",
-        "RUNNER_SERVER_URL",
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_BASE_URL",
-        "CLAUDE_CODE_ENTRYPOINT",
-        "CLAUDECODE",
-        "TMUX",
-    ):
+    # cli_env() pins PYTHONPATH to this worktree so the CLI, daemon, and runner
+    # import the code under test, and strips runner/tmux/credential leaks. Also
+    # drop the gateway hints this test asserts the native path never uses.
+    env = cli_env()
+    for stale in ("OMNIGENT_CLAUDE_PATH", "ANTHROPIC_BASE_URL"):
         env.pop(stale, None)
     env["OMNIGENT_CONFIG_HOME"] = str(config_home)
     env["OMNIGENT_DATA_DIR"] = str(data_dir)
-    env["TERM"] = "xterm-256color"
-    env["OMNIGENT_NO_UPDATE_CHECK"] = "1"
-    env["OMNIGENT_SKIP_ONBOARD"] = "1"
 
     try:
         yield {
@@ -167,14 +155,16 @@ def native_config_gateway_env() -> Iterator[dict[str, object]]:
                 ["host", "stop", "--all", "--force"],
                 ["server", "stop", "--force"],
             ):
-                subprocess.run(
-                    [str(omnigent_console_script()), *stop_args],
-                    env=env,
-                    stdout=devnull,
-                    stderr=devnull,
-                    timeout=120,
-                    check=False,
-                )
+                # A hung stop must not skip the remaining cleanup below.
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    subprocess.run(
+                        [str(omnigent_console_script()), *stop_args],
+                        env=env,
+                        stdout=devnull,
+                        stderr=devnull,
+                        timeout=120,
+                        check=False,
+                    )
         shutil.rmtree(root, ignore_errors=True)
 
 
@@ -233,13 +223,16 @@ def test_use_native_config_not_ignored_by_host_daemon(
     launched_base_url = launch_env.get("ANTHROPIC_BASE_URL")
     launched_model = argv[argv.index("--model") + 1] if "--model" in argv else None
 
-    assert launched_base_url != _GATEWAY_BASE_URL, (
+    # Native config passes neither a managed gateway URL nor a catalog
+    # ``--model`` — Claude resolves both from its own ``~/.claude`` config — so
+    # assert absence, which also catches any other managed route.
+    assert launched_base_url is None, (
         "--use-native-config was ignored: the daemon-spawned runner routed Claude "
-        f"at the configured gateway (ANTHROPIC_BASE_URL={launched_base_url!r}) instead "
+        f"through a managed gateway (ANTHROPIC_BASE_URL={launched_base_url!r}) instead "
         "of Claude Code's own native config."
     )
-    assert launched_model != _GATEWAY_MODEL, (
-        "--use-native-config was ignored: the daemon-spawned runner launched Claude on "
-        f"the gateway model (--model {launched_model!r}) instead of Claude Code's own "
-        "native config."
+    assert launched_model is None, (
+        "--use-native-config was ignored: the daemon-spawned runner forced a catalog "
+        f"model (--model {launched_model!r}) instead of letting Claude Code pick from "
+        "its own native config."
     )
