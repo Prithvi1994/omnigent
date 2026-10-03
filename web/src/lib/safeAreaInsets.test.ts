@@ -32,16 +32,20 @@ describe("getSafeAreaCollisionBoundary", () => {
     expect(getSafeAreaCollisionBoundary().isConnected).toBe(true);
   });
 
-  it("lives in the embed root while one is registered", () => {
+  it("follows the embed root registered after the first menu rendered", () => {
+    const el = getSafeAreaCollisionBoundary();
+    expect(el.parentElement).toBe(document.body);
+
     const root = document.createElement("div");
     document.body.appendChild(root);
     setEmbedRoot(root);
-    getSafeAreaCollisionBoundary().remove();
-    expect(getSafeAreaCollisionBoundary().parentElement).toBe(root);
+    expect(getSafeAreaCollisionBoundary()).toBe(el);
+    expect(el.parentElement).toBe(root);
 
-    root.remove();
     setEmbedRoot(null);
-    expect(getSafeAreaCollisionBoundary().parentElement).toBe(document.body);
+    expect(getSafeAreaCollisionBoundary()).toBe(el);
+    expect(el.parentElement).toBe(document.body);
+    root.remove();
   });
 });
 

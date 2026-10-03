@@ -10,6 +10,8 @@ are emulated as in ``test_model_advanced_settings_safe_area``.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
@@ -47,8 +49,8 @@ def _scroll_list_to_end(page: Page, menu: Locator) -> int:
     :returns: The resulting scroll offset, which must be positive.
     """
     menu.hover()
-    page.mouse.wheel(0, 400)
     for _ in range(40):
+        page.mouse.wheel(0, 400)
         state = menu.evaluate(
             "el => ({top: el.scrollTop, max: el.scrollHeight - el.clientHeight})"
         )
@@ -102,7 +104,8 @@ def test_drill_in_page_opens_at_top_of_scrolled_list(
         menu_box = _settled_box(page, menu)
         back_box = _settled_box(page, back)
         # Hold the open page so the outcome is readable in a recording.
-        page.wait_for_timeout(1_000)
+        if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
+            page.wait_for_timeout(1_000)
 
         assert back_box["y"] >= menu_box["y"], (
             f"the {page_name} page opened scrolled: its Back row starts at "

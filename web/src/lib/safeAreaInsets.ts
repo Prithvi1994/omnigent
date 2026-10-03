@@ -1,11 +1,6 @@
-// Shared Radix collision boundary for popover primitives: an invisible fixed
-// element inset from the viewport by the OS safe-area insets (the
-// `--omnigent-safe-*` fold variables, index.css). Popovers positioned against
-// it clamp — and size their `--radix-*-available-height` cap — at the
-// safe-area line instead of the raw screen edge, and the CSS variables resolve
-// live at every position update (getComputedStyle cannot absolutize the custom
-// properties, so a rect-carrying element stands in for a numeric read). It
-// lives in the Radix portal container, so the embed's scoped variables apply.
+// Shared Radix collision boundary: an invisible fixed element inset by the
+// `--omnigent-safe-*` variables (index.css). An element, not a number, lets the
+// CSS values resolve live on every position update.
 
 import { getEmbedRoot } from "@/lib/host";
 
@@ -13,9 +8,14 @@ type CollisionBoundary = Element | null | (Element | null)[];
 
 let safeAreaBoundary: HTMLElement | null = null;
 
-/** The shared safe-area boundary element, created and attached on first use. */
+/** The shared safe-area boundary element, kept inside the Radix portal container. */
 export function getSafeAreaCollisionBoundary(): HTMLElement {
-  if (safeAreaBoundary?.isConnected) return safeAreaBoundary;
+  // The embed registers its root after the first closed menus render, and its
+  // scoped variables only resolve inside it, so follow the current container.
+  const container = getEmbedRoot() ?? document.body;
+  if (safeAreaBoundary?.isConnected && safeAreaBoundary.parentElement === container) {
+    return safeAreaBoundary;
+  }
   const el = safeAreaBoundary ?? document.createElement("div");
   el.style.position = "fixed";
   el.style.top = "var(--omnigent-safe-top, 0px)";
@@ -25,7 +25,7 @@ export function getSafeAreaCollisionBoundary(): HTMLElement {
   el.style.visibility = "hidden";
   el.style.pointerEvents = "none";
   el.setAttribute("aria-hidden", "true");
-  (getEmbedRoot() ?? document.body).appendChild(el);
+  container.appendChild(el);
   safeAreaBoundary = el;
   return el;
 }
