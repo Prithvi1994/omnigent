@@ -208,7 +208,11 @@ async def test_scratch_delete_under_active_sandbox(
     )
     assert isinstance(env, CallerProcessOSEnvironment)
     try:
-        result = await env.shell("printf scratch > victim")
+        # Spawn the helper from this thread: bwrap's --die-with-parent is
+        # thread-scoped and would kill it (and its scratch dir) with a worker.
+        result = env._helper.request(
+            {"op": "shell", "command": "printf scratch > victim", "timeout": 30}
+        )
         assert result["exit_code"] == 0, result
         scratch = Path(result["cwd"])
         assert scratch != workspace
