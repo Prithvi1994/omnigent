@@ -6,7 +6,8 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,12 +18,14 @@ from fastapi import FastAPI
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.entities.environment_filesystem import FilesystemPathNotFound
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.os_env import create_os_environment
+from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.runner import create_runner_app
 from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
 from tests.runner.helpers import NullServerClient
+
+OsEnvFactory = Callable[[OSEnvSpec], OSEnvironment]
 
 
 @pytest.fixture
@@ -40,8 +43,24 @@ def workspace(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def registry(workspace: Path) -> SessionResourceRegistry:
-    """Registry with a real CallerProcessOSEnvironment."""
+def make_os_env() -> Iterator[OsEnvFactory]:
+    """Create OS environments that are closed, helper subprocess included, at teardown."""
+    created: list[OSEnvironment] = []
+
+    def _create(spec: OSEnvSpec) -> OSEnvironment:
+        os_env = create_os_environment(spec)
+        assert os_env is not None
+        created.append(os_env)
+        return os_env
+
+    yield _create
+    for os_env in created:
+        os_env.close()
+
+
+@pytest.fixture
+def registry(workspace: Path) -> Iterator[SessionResourceRegistry]:
+    """Registry with a real CallerProcessOSEnvironment, closed at teardown."""
     os_env = create_os_environment(
         OSEnvSpec(
             type="caller_process",
@@ -52,7 +71,8 @@ def registry(workspace: Path) -> SessionResourceRegistry:
     assert os_env is not None
     reg = SessionResourceRegistry()
     reg._primary_envs["conv_test"] = os_env
-    return reg
+    yield reg
+    os_env.close()
 
 
 @pytest.fixture
@@ -95,6 +115,7 @@ async def test_list_environment_root(
 @pytest.mark.asyncio
 async def test_list_environment_root_with_broken_symlink(
     tmp_path: Path,
+    make_os_env: OsEnvFactory,
 ) -> None:
     """GET /filesystem succeeds even when the workspace contains a broken symlink.
 
@@ -110,10 +131,9 @@ async def test_list_environment_root_with_broken_symlink(
     # Create a symlink that points to a non-existent target.
     (ws / "broken_link").symlink_to(ws / "does_not_exist")
 
-    os_env = create_os_environment(
+    os_env = make_os_env(
         OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
     )
-    assert os_env is not None
     reg = SessionResourceRegistry()
     reg._primary_envs["conv_broken"] = os_env
     app = create_runner_app(
@@ -253,6 +273,7 @@ async def test_read_binary_file_content(
 @pytest.mark.asyncio
 async def test_read_text_byte_cap_truncates_on_utf8_boundary(
     workspace: Path,
+    make_os_env: OsEnvFactory,
 ) -> None:
     """A byte cap that lands mid-codepoint still yields decodable UTF-8.
 
@@ -265,10 +286,9 @@ async def test_read_text_byte_cap_truncates_on_utf8_boundary(
     # and lands mid-codepoint inside "é".
     (workspace / "accents.txt").write_text("aé")
 
-    os_env = create_os_environment(
+    os_env = make_os_env(
         OSEnvSpec(type="caller_process", cwd=str(workspace), sandbox=OSEnvSandboxSpec(type="none"))
     )
-    assert os_env is not None
     fs = CallerProcessFilesystem(os_env)
 
     content = await fs.read("accents.txt", max_bytes=2)
@@ -452,6 +472,7 @@ async def test_delete_real_file_with_command_substitution_name(
 @pytest.mark.asyncio
 async def test_stat_path_with_command_substitution_does_not_execute(
     workspace: Path,
+    make_os_env: OsEnvFactory,
 ) -> None:
     """``CallerProcessFilesystem.stat`` must not execute ``$(...)`` in the path.
 
@@ -462,14 +483,13 @@ async def test_stat_path_with_command_substitution_does_not_execute(
     """
     from omnigent.runner.environment_filesystem import CallerProcessFilesystem
 
-    os_env = create_os_environment(
+    os_env = make_os_env(
         OSEnvSpec(
             type="caller_process",
             cwd=str(workspace),
             sandbox=OSEnvSandboxSpec(type="none"),
         ),
     )
-    assert os_env is not None
     fs = CallerProcessFilesystem(os_env)
 
     marker = workspace / "PWNED_STAT"
@@ -487,6 +507,7 @@ async def test_stat_path_with_command_substitution_does_not_execute(
 @pytest.mark.asyncio
 async def test_stat_real_file_with_command_substitution_name(
     workspace: Path,
+    make_os_env: OsEnvFactory,
 ) -> None:
     """``CallerProcessFilesystem.stat`` returns correct metadata for a file whose
     name literally contains ``$(...)``.
@@ -497,14 +518,13 @@ async def test_stat_real_file_with_command_substitution_name(
     """
     from omnigent.runner.environment_filesystem import CallerProcessFilesystem
 
-    os_env = create_os_environment(
+    os_env = make_os_env(
         OSEnvSpec(
             type="caller_process",
             cwd=str(workspace),
             sandbox=OSEnvSandboxSpec(type="none"),
         ),
     )
-    assert os_env is not None
     fs = CallerProcessFilesystem(os_env)
 
     weird_name = "report$(id).txt"
@@ -1558,8 +1578,11 @@ async def glob_client(glob_workspace: Path) -> AsyncIterator[httpx.AsyncClient]:
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
-        yield c
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
+            yield c
+    finally:
+        os_env.close()
 
 
 @pytest.mark.asyncio
@@ -1703,6 +1726,7 @@ def _git_env() -> dict[str, str]:
 @pytest.mark.asyncio
 async def test_worktree_session_uses_session_workspace_for_changes(
     tmp_path: Path,
+    make_os_env: OsEnvFactory,
 ) -> None:
     """The /changes endpoint uses the session's workspace, not the runner's.
 
@@ -1746,14 +1770,13 @@ async def test_worktree_session_uses_session_workspace_for_changes(
 
     # Set up the OS environment for the session pointing at the
     # session workspace so _require_os_env passes.
-    os_env = create_os_environment(
+    os_env = make_os_env(
         OSEnvSpec(
             type="caller_process",
             cwd=str(session_ws),
             sandbox=OSEnvSandboxSpec(type="none"),
         ),
     )
-    assert os_env is not None
     reg = SessionResourceRegistry()
     reg._primary_envs[session_id] = os_env
 
@@ -1845,6 +1868,7 @@ async def test_search_scan_budget_bounds_a_no_match_walk(
     client: httpx.AsyncClient,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    make_os_env: OsEnvFactory,
 ) -> None:
     """A query matching nothing never fills the result cap, so the walk needs
     its own bound. With the scan budget lowered, a tree larger than the budget
@@ -1859,7 +1883,7 @@ async def test_search_scan_budget_bounds_a_no_match_walk(
         10,
     )
     fs = CallerProcessFilesystem(
-        create_os_environment(
+        make_os_env(
             OSEnvSpec(
                 type="caller_process",
                 cwd=str(tmp_path),
@@ -1877,6 +1901,7 @@ async def test_search_scan_budget_bounds_a_no_match_walk(
 async def test_search_tree_of_exactly_budget_size_is_not_truncated(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    make_os_env: OsEnvFactory,
 ) -> None:
     """A tree with exactly `budget` entries is fully enumerable, not truncated.
 
@@ -1892,7 +1917,7 @@ async def test_search_tree_of_exactly_budget_size_is_not_truncated(
 
     monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 4)
     fs = CallerProcessFilesystem(
-        create_os_environment(
+        make_os_env(
             OSEnvSpec(
                 type="caller_process",
                 cwd=str(tmp_path),
@@ -1911,6 +1936,7 @@ async def test_search_tree_of_exactly_budget_size_is_not_truncated(
 async def test_search_defers_deep_noise_subtree_to_reach_later_real_dir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    make_os_env: OsEnvFactory,
 ) -> None:
     """A deep dependency subtree must not starve a later-sorted real directory.
 
@@ -1940,7 +1966,7 @@ async def test_search_defers_deep_noise_subtree_to_reach_later_real_dir(
         20,
     )
     fs = CallerProcessFilesystem(
-        create_os_environment(
+        make_os_env(
             OSEnvSpec(
                 type="caller_process",
                 cwd=str(tmp_path),
@@ -1960,6 +1986,7 @@ async def test_search_defers_deep_noise_subtree_to_reach_later_real_dir(
 @pytest.mark.asyncio
 async def test_search_does_not_follow_symlinked_deprioritized_dir(
     tmp_path: Path,
+    make_os_env: OsEnvFactory,
 ) -> None:
     """A symlinked deprioritized dir must not let the walk escape the workspace.
 
@@ -1978,7 +2005,7 @@ async def test_search_does_not_follow_symlinked_deprioritized_dir(
     (ws / "node_modules").symlink_to(outside, target_is_directory=True)
 
     fs = CallerProcessFilesystem(
-        create_os_environment(
+        make_os_env(
             OSEnvSpec(
                 type="caller_process",
                 cwd=str(ws),
@@ -1996,7 +2023,9 @@ async def test_search_does_not_follow_symlinked_deprioritized_dir(
 
 
 @pytest.mark.asyncio
-async def test_scoped_search_reports_the_matched_files_own_size(tmp_path: Path) -> None:
+async def test_scoped_search_reports_the_matched_files_own_size(
+    tmp_path: Path, make_os_env: OsEnvFactory
+) -> None:
     """A scoped search must stat the file it actually matched.
 
     Result paths are relative to the search base, but the helper's cwd is the
@@ -2012,7 +2041,7 @@ async def test_scoped_search_reports_the_matched_files_own_size(tmp_path: Path) 
     (tmp_path / "collide.txt").write_text("y")
 
     fs = CallerProcessFilesystem(
-        create_os_environment(
+        make_os_env(
             OSEnvSpec(
                 type="caller_process",
                 cwd=str(tmp_path),
@@ -2098,15 +2127,18 @@ async def test_unwritable_target_reports_an_error_not_a_crash(
         locked.chmod(0o700)
 
 
-def _git_runner_client(
+@asynccontextmanager
+async def _git_runner_client(
     ws: Path, session_id: str, *, runner_workspace: Path | None = None
-) -> httpx.AsyncClient:
+) -> AsyncIterator[httpx.AsyncClient]:
     """Runner app serving *ws* as the session's environment, for the search tests.
+
+    The OS environment, and with it its helper subprocess, is closed on exit.
 
     :param ws: The session environment's working tree.
     :param session_id: Session to register the OS environment under.
     :param runner_workspace: The runner's own workspace; defaults to *ws*.
-    :returns: An httpx client bound to the runner app.
+    :yields: An httpx client bound to the runner app.
     """
     os_env = create_os_environment(
         OSEnvSpec(
@@ -2115,6 +2147,7 @@ def _git_runner_client(
             sandbox=OSEnvSandboxSpec(type="none"),
         )
     )
+    assert os_env is not None
     reg = SessionResourceRegistry()
     reg._primary_envs[session_id] = os_env
     app = create_runner_app(
@@ -2122,7 +2155,13 @@ def _git_runner_client(
         runner_workspace=runner_workspace if runner_workspace is not None else ws,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://runner")
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            yield client
+    finally:
+        os_env.close()
 
 
 @pytest.mark.asyncio
@@ -2174,7 +2213,9 @@ async def test_search_finds_tracked_files_past_the_scan_budget(
 
 
 @pytest.mark.asyncio
-async def test_search_walk_skips_git_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_search_walk_skips_git_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_os_env: OsEnvFactory
+) -> None:
     """``.git`` sorts first and in a clone holds more entries than the whole
     budget; the walk used to spend all of it there and miss every real file."""
     env = _git_env()
@@ -2182,7 +2223,7 @@ async def test_search_walk_skips_git_dir(tmp_path: Path, monkeypatch: pytest.Mon
     (tmp_path / "zz.txt").write_text("x")
     monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 10)
     fs = CallerProcessFilesystem(
-        create_os_environment(
+        make_os_env(
             OSEnvSpec(
                 type="caller_process",
                 cwd=str(tmp_path),
@@ -2225,14 +2266,14 @@ async def test_search_still_finds_gitignored_files_after_git_status(tmp_path: Pa
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX filesystem root")
 @pytest.mark.asyncio
 async def test_search_from_filesystem_root_keeps_paths_intact(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_os_env: OsEnvFactory
 ) -> None:
     """Browsing ``/`` is allowed for an unconfined environment. The walk builds
     result paths by slicing off the root, and a root of ``/`` already ends in
     the separator — slicing one more character used to turn ``etc`` into ``tc``."""
     monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 60)
     fs = CallerProcessFilesystem(
-        create_os_environment(
+        make_os_env(
             OSEnvSpec(
                 type="caller_process",
                 cwd=str(tmp_path),

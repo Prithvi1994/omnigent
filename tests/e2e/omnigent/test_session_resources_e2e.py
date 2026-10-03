@@ -92,6 +92,7 @@ def _omnigent_server(
     port: int,
     env: dict[str, str],
     cwd: Path,
+    workspace: Path,
     db_path: Path,
     runner_id: str,
     binding_token: str,
@@ -103,6 +104,10 @@ def _omnigent_server(
     :param port: Bind port.
     :param env: Subprocess environment (without runner-specific vars).
     :param cwd: Working directory.
+    :param workspace: Directory the runner roots session filesystems
+        and shells in. A throwaway directory keeps session writes out
+        of any workspace the invoking shell inherited from an Omnigent
+        runner.
     :param db_path: Path for the SQLite database.
     :param runner_id: Runner id derived from *binding_token*.
     :param binding_token: Tunnel binding token shared between server
@@ -131,15 +136,20 @@ def _omnigent_server(
     )
 
     # Spawn runner as sibling subprocess.
+    runner_env = {
+        **env,
+        "OMNIGENT_RUNNER_ID": runner_id,
+        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
+        "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
+        "OMNIGENT_RUNNER_WORKSPACE": str(workspace),
+        "RUNNER_SERVER_URL": base_url,
+    }
+    # ``workspace`` is the session root itself; an inherited isolation
+    # flag would nest a per-session directory under it instead.
+    runner_env.pop("OMNIGENT_RUNNER_ISOLATE_SESSION", None)
     runner_proc = subprocess.Popen(
         [str(python), "-m", "omnigent.runner._entry"],
-        env={
-            **env,
-            "OMNIGENT_RUNNER_ID": runner_id,
-            "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-            "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-            "RUNNER_SERVER_URL": base_url,
-        },
+        env=runner_env,
         cwd=str(cwd),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -266,8 +276,8 @@ def test_session_resources_e2e(
     :param mock_credentials_env: Mock credentials env from conftest.
     :param omnigent_python: Python interpreter fixture.
     :param omnigent_repo_root: Repo root fixture.
-    :param tmp_path: Pytest temp directory for the agent YAML
-        and SQLite database.
+    :param tmp_path: Pytest temp directory for the agent YAML,
+        SQLite database, and session workspace.
     """
     from omnigent.runner.identity import token_bound_runner_id
 
@@ -279,6 +289,8 @@ def test_session_resources_e2e(
     agent_dir.mkdir()
     yaml_path = agent_dir / "config.yaml"
     yaml_path.write_text(_AGENT_YAML)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     db_path = tmp_path / "test.db"
     binding_token = secrets.token_urlsafe(32)
     runner_id = token_bound_runner_id(binding_token)
@@ -290,6 +302,7 @@ def test_session_resources_e2e(
         port=port,
         env=env,
         cwd=repo_root,
+        workspace=workspace,
         db_path=db_path,
         runner_id=runner_id,
         binding_token=binding_token,
@@ -425,6 +438,9 @@ def test_session_resources_e2e(
             )
             assert resp.status_code == 200
             assert resp.json()["created"] is True
+            # The write lands in this test's own workspace, never in one
+            # inherited from the invoking shell.
+            assert (workspace / "_e2e_test.txt").read_text(encoding="utf-8") == "hello e2e"
 
             # Read
             resp = client.get(f"{fs}/_e2e_test.txt")
@@ -450,6 +466,7 @@ def test_session_resources_e2e(
             resp = client.delete(f"{fs}/_e2e_test.txt")
             assert resp.status_code == 200
             assert resp.json()["deleted"] is True
+            assert not (workspace / "_e2e_test.txt").exists()
 
             # Confirm gone
             resp = client.get(f"{fs}/_e2e_test.txt")
@@ -488,8 +505,8 @@ def test_direct_attach_e2e(
     :param mock_credentials_env: Mock credentials env from conftest.
     :param omnigent_python: Python interpreter fixture.
     :param omnigent_repo_root: Repo root fixture.
-    :param tmp_path: Pytest temp directory for the agent YAML
-        and SQLite database.
+    :param tmp_path: Pytest temp directory for the agent YAML,
+        SQLite database, and session workspace.
     """
     import asyncio
 
@@ -506,6 +523,8 @@ def test_direct_attach_e2e(
     agent_dir.mkdir()
     yaml_path = agent_dir / "config.yaml"
     yaml_path.write_text(_AGENT_YAML)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     db_path = tmp_path / "test.db"
     binding_token = secrets.token_urlsafe(32)
     runner_id = token_bound_runner_id(binding_token)
@@ -518,6 +537,7 @@ def test_direct_attach_e2e(
         port=port,
         env=env,
         cwd=repo_root,
+        workspace=workspace,
         db_path=db_path,
         runner_id=runner_id,
         binding_token=binding_token,
