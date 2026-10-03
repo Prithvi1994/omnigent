@@ -7,10 +7,15 @@ export function useDesktopFullscreen(): boolean {
   const [fullscreen, setFullscreen] = useState(false);
   useEffect(() => {
     let disposed = false;
-    void getDesktopFullScreen().then((value) => {
-      if (!disposed) setFullscreen(value);
+    let sawTransition = false;
+    const unsubscribe = onDesktopFullScreenChanged((value) => {
+      sawTransition = true;
+      setFullscreen(value);
     });
-    const unsubscribe = onDesktopFullScreenChanged(setFullscreen);
+    // A transition that lands during the IPC round trip is newer than the read.
+    void getDesktopFullScreen().then((value) => {
+      if (!disposed && !sawTransition) setFullscreen(value);
+    });
     return () => {
       disposed = true;
       unsubscribe();

@@ -53,4 +53,21 @@ describe("useDesktopFullscreen", () => {
     unmount();
     expect(unsubscribe).toHaveBeenCalledOnce();
   });
+
+  it("keeps a transition that arrives before the initial read resolves", async () => {
+    let resolve!: (fullScreen: boolean) => void;
+    getDesktopFullScreen.mockReturnValue(
+      new Promise<boolean>((r) => {
+        resolve = r;
+      }),
+    );
+    const { result } = renderHook(() => useDesktopFullscreen());
+    act(() => onChange?.(true));
+    expect(result.current).toBe(true);
+
+    await act(async () => {
+      resolve(false);
+    });
+    expect(result.current).toBe(true);
+  });
 });

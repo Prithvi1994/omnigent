@@ -1,11 +1,8 @@
-// Desktop-shell lane: the macOS title-bar cluster (sidebar toggle / Search /
-// Settings) sits 5.5rem in to clear the traffic lights. Native fullscreen hides
-// those lights, so the cluster must give that clearance up while fullscreen and
-// take it back afterwards. Fullscreen state comes from Electron's main process,
-// which is why this drives the real shell; a Macintosh user agent engages the
-// macOS layout on other hosts.
-//
-// Run from web/electron after building the SPA:
+// The macOS title-bar cluster (sidebar toggle / Search / Settings) sits 5.5rem
+// in to clear the traffic lights; native fullscreen hides those lights, so the
+// cluster must drop that clearance while fullscreen and restore it afterwards.
+
+// Run from web/electron after building the SPA (a Macintosh UA engages the layout):
 //   OMNIGENT_PYTHON=../../.venv/bin/python OMNIGENT_PW_NO_SANDBOX=1 \
 //     xvfb-run -a node --test e2e/desktop_fullscreen_sidebar_controls.e2e.js
 
@@ -82,6 +79,14 @@ function setFullScreen(electronApp, fullScreen) {
         const win = BrowserWindow.getAllWindows().find((w) =>
           w.webContents.getURL().startsWith("http"),
         );
+        if (!win) {
+          resolve({ event: false, isFullScreen: null, error: "no http window found" });
+          return;
+        }
+        if (win.isFullScreen() === wanted) {
+          resolve({ event: true, isFullScreen: wanted });
+          return;
+        }
         const event = wanted ? "enter-full-screen" : "leave-full-screen";
         const timer = setTimeout(
           () => resolve({ event: false, isFullScreen: win.isFullScreen() }),
@@ -198,7 +203,7 @@ describe(
           JSON.stringify(observations, null, 2),
         );
         // Close first so a failing run still flushes and names its footage.
-        await electronApp.close();
+        await electronApp.close().catch(() => {});
         await stopDisplayCapture();
         saved = saveRecording(RECORD_DIR, "fullscreen-sidebar-controls");
         fs.rmSync(userDataDir, { recursive: true, force: true });

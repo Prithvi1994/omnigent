@@ -3070,6 +3070,20 @@ describe("fullscreen state plumbing", () => {
     assert.deepEqual(fullScreenEvents(h), []);
   });
 
+  it("catches the pinned page up once a foreign page hands the window back", (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, savedServerUrl: server });
+    t.after(h.cleanup);
+    h.api.createWindow();
+    h.setUrl(foreign);
+    h.setFullScreen(true);
+    h.emitWindow("enter-full-screen");
+    assert.deepEqual(fullScreenEvents(h), [], "the foreign page must not be told");
+
+    h.setUrl(server);
+    h.emit("did-navigate", server, 200, "OK");
+    assert.deepEqual(fullScreenEvents(h), [true]);
+  });
+
   it("answers the initial fullscreen query only for the pinned server page", async (t) => {
     const h = loadNavigationHarness({ serverUrl: server });
     t.after(h.cleanup);

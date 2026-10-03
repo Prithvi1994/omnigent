@@ -2095,6 +2095,9 @@ function createWindow(targetUrl, opts = {}) {
   };
   win.on("enter-full-screen", sendFullScreenState);
   win.on("leave-full-screen", sendFullScreenState);
+  // A foreign page (SSO) ignores the live events above; re-send once the
+  // pinned server page is restored so it reflects the current state.
+  win.webContents.on("did-navigate", sendFullScreenState);
   registerWorkspaceRootBounce(win.webContents, () => pinnedOrigin(win));
   // Show the return banner when the window navigates away from its server
   // (e.g. SSO) and stays away. The watch's on-away URL is the last committed
@@ -3300,7 +3303,7 @@ function registerIpc() {
       console.warn("[omnigent] window-is-full-screen from untrusted sender dropped");
       return false;
     }
-    return BrowserWindow.fromWebContents(event.sender).isFullScreen();
+    return BrowserWindow.fromWebContents(event.sender)?.isFullScreen() ?? false;
   });
   ipcMain.handle("omnigent:cancel-server-connection", (event, requestId) => {
     if (!isSetupPageSender(event))

@@ -1012,7 +1012,7 @@ export function onDesktopFullScreenChanged(callback: (fullScreen: boolean) => vo
   const electron = electronApi();
   if (!electron?.onFullScreenChanged) return () => {};
   try {
-    return electron.onFullScreenChanged(callback);
+    return electron.onFullScreenChanged((fullScreen) => callback(fullScreen === true));
   } catch (err) {
     console.warn("[nativeBridge] electron onFullScreenChanged failed:", err);
     return () => {};

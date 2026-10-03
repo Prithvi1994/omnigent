@@ -637,13 +637,16 @@ describe("getDesktopFullScreen / onDesktopFullScreenChanged", () => {
     warn.mockRestore();
   });
 
-  it("forward transitions and hand back the shell's unsubscribe", () => {
+  it("forward transitions as booleans and hand back the shell's unsubscribe", () => {
     const unsubscribe = vi.fn();
     const onFullScreenChanged = vi.fn().mockReturnValue(unsubscribe);
     install({ onFullScreenChanged });
     const callback = vi.fn();
     const off = onDesktopFullScreenChanged(callback);
-    expect(onFullScreenChanged).toHaveBeenCalledWith(callback);
+    const listener = onFullScreenChanged.mock.calls[0][0] as (fullScreen: unknown) => void;
+    listener(true);
+    listener("junk");
+    expect(callback.mock.calls).toEqual([[true], [false]]);
     off();
     expect(unsubscribe).toHaveBeenCalledOnce();
   });
