@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
-import { COMPOSER_POPOVER_MAX_H } from "@/pages/chatLayout";
+import { COMPOSER_POPOVER_MAX_H, COMPOSER_POPOVER_Z } from "@/pages/chatLayout";
 
 // Drill-down "@"-mention browses one directory at a time, so the test stubs
 // both sources: the root listing (useWorkspaceAllFiles) and the per-directory
@@ -242,7 +242,7 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     expect(screen.getByTitle("Open src")).toBeInTheDocument();
     expect(screen.getByTitle("Attach readme.md")).toBeInTheDocument();
     expect(screen.getByRole("listbox").parentElement).toHaveClass(COMPOSER_POPOVER_MAX_H);
-    expect(screen.getByRole("listbox").closest(".bottom-full")).toHaveClass("z-20");
+    expect(screen.getByRole("listbox").closest(".bottom-full")).toHaveClass(COMPOSER_POPOVER_Z);
   });
 
   it("opens a folder to reveal nested files, then delivers the chosen file", () => {

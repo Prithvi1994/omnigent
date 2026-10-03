@@ -34,7 +34,7 @@ import {
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
-import { CHAT_COLUMN_WIDTH } from "./chatLayout";
+import { CHAT_COLUMN_WIDTH, COMPOSER_POPOVER_Z } from "./chatLayout";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
@@ -833,7 +833,7 @@ describe("Composer slash-command menu", () => {
     // Built-ins are inserted first, so "/compact" tops the list and is the
     // default highlight — the crux of the fix (was -1 / nothing selected).
     expect(activeRow()?.textContent).toContain("/compact");
-    expect(activeRow()?.closest(".absolute")).toHaveClass("z-20");
+    expect(activeRow()?.closest(".absolute")).toHaveClass(COMPOSER_POPOVER_Z);
   });
 
   it("Tab completes the highlighted skill into the textarea", () => {
@@ -1181,7 +1181,7 @@ describe("Composer slash-command submit routing", () => {
     const output = screen.getByTestId("composer-command-output");
     expect(output).toHaveTextContent("/help — Show available slash commands");
     expect(output).toHaveTextContent("/deslop — Remove AI slop");
-    expect(output).toHaveClass("absolute", "z-20", "overflow-y-auto");
+    expect(output).toHaveClass("absolute", COMPOSER_POPOVER_Z, "overflow-y-auto");
     expect(ta.value).toBe("");
     expect(output.parentElement).toHaveAttribute("data-composer-card");
   });
@@ -1195,7 +1195,7 @@ describe("Composer slash-command submit routing", () => {
 
     const output = screen.getByTestId("composer-command-output");
     expect(output).toHaveTextContent("Usage: /model <name> | default");
-    expect(output).toHaveClass("absolute", "z-20");
+    expect(output).toHaveClass("absolute", COMPOSER_POPOVER_Z);
     expect(ta.value).toBe("");
   });
 

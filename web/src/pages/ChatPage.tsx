@@ -3826,9 +3826,12 @@ function ComposerImpl(
                 />
               )}
               {commandError !== null && (
+                // Focusable so keyboard-only users can scroll output longer than the cap.
                 <div
                   data-testid="composer-command-output"
                   role="status"
+                  tabIndex={0}
+                  aria-label="Slash command output"
                   className={cn(
                     "absolute inset-x-0 bottom-full mb-2 overflow-y-auto overscroll-contain rounded-[12px] border border-border bg-popover px-3 py-2 shadow-menu",
                     COMPOSER_POPOVER_Z,
