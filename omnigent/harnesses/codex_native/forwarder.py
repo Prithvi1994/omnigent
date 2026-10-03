@@ -2815,7 +2815,7 @@ async def _post_resume_terminal_status(
     bridge_dir: Path,
     thread_id: str | None,
     turns: list[object],
-    replay_from_turn_id: str | None = None,
+    replay_from_turn_id: str | None,
 ) -> None:
     """
     Publish a missing terminal status edge from ``thread/resume`` data.

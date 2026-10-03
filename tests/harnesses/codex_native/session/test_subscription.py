@@ -598,7 +598,7 @@ class _FreshThreadRaceClient:
         self.connected = False
         self.closed = False
         self._resume_calls = 0
-        self.second_resume_issued = asyncio.Event()
+        self.resume_backfill_decided = asyncio.Event()
 
     async def connect(self) -> None:
         self.connected = True
@@ -611,7 +611,6 @@ class _FreshThreadRaceClient:
             raise RuntimeError(
                 "{'code': -32600, 'message': 'no rollout found for thread id thread_123'}"
             )
-        self.second_resume_issued.set()
         # Codex returns the just-started turn as terminal under
         # active_turn_present=false; the forwarder keys off turn status.
         return {
@@ -626,12 +625,10 @@ class _FreshThreadRaceClient:
 
     async def iter_events(self):
         yield _started_event("turn_abc")
-        # Let the resume-backfill terminal-status decision settle before the
-        # real turn end arrives (same cooperative-drain idiom as the parks
-        # test above), so ordering is deterministic without wall-clock waits.
-        await self.second_resume_issued.wait()
-        for _ in range(50):
-            await asyncio.sleep(0)
+        # Deliver the live turn end only after the resume terminal-status
+        # decision has actually run, so ordering is deterministic without a
+        # magic scheduler-pass count or wall-clock wait.
+        await self.resume_backfill_decided.wait()
         yield _agent_message_event("turn_abc", "item_agent", "the real worker answer")
         yield _completed_event("turn_abc", thread_id="thread_123")
 
@@ -646,20 +643,27 @@ class _FreshThreadRaceClient:
 def test_supervise_forwarder_resume_does_not_finish_a_just_started_turn(
     resume_turn_status: str,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A just-started, still-live turn must not be finished by resume state.
+    """Resume metadata must not finish a live turn before its real output.
 
-    Unlike the reconnect-after-completion case above, here the forwarder
-    observes the turn's live ``turn/started`` and its real ``turn/completed``
-    arrives afterward with output -- so the turn was in flight when the
-    fresh-thread retry ``thread/resume`` reported it terminal. Treating that
-    resume status as a terminal edge publishes a premature ``idle`` before any
-    assistant output, which the runner turns into a ``completed`` /
-    'produced no output' sub-agent while Codex keeps working and the real
-    result is dropped. The turn may only be reported finished at its real end.
+    The forwarder observes this turn's live start and real completion, so the
+    fresh-thread retry ``thread/resume`` reporting it terminal must not publish
+    a premature ``idle``; the real end delivers the result instead.
     """
     _write_forwarder_bridge(tmp_path, active_turn_id=None, thread_id="thread_123")
     client = _FreshThreadRaceClient(resume_turn_status)
+    # Release the live turn end once the resume terminal-status decision has
+    # actually run, so iter_events need not guess a scheduler-pass count.
+    original_post = codex_native_forwarder._post_resume_terminal_status
+
+    async def _tracked_post(*args: Any, **kwargs: Any) -> None:
+        try:
+            await original_post(*args, **kwargs)
+        finally:
+            client.resume_backfill_decided.set()
+
+    monkeypatch.setattr(codex_native_forwarder, "_post_resume_terminal_status", _tracked_post)
     posted: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -704,6 +708,14 @@ def test_supervise_forwarder_resume_does_not_finish_a_just_started_turn(
     assert not idle_before_output, (
         "forwarder reported the turn idle before it produced any output "
         f"(premature thread/resume terminal edge for a still-live turn); "
+        f"status edges={status_edges} first_output_index={first_output_index}"
+    )
+    idle_after_output = [
+        index for index, status in status_edges if status == "idle" and index > first_output_index
+    ]
+    assert idle_after_output, (
+        "forwarder never reported the turn idle after its real output "
+        "(the live turn/completed terminal edge must still finish the turn); "
         f"status edges={status_edges} first_output_index={first_output_index}"
     )
 
