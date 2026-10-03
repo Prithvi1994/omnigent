@@ -304,6 +304,9 @@ def register_resource_routes(
                 if os.path.isabs(home):
                     metadata["home"] = home
                 metadata["reachable"] = _environment_reach(root, agent_spec)
+                from omnigent.inner.os_env import workspace_delete_metadata
+
+                metadata["workspace_delete"] = workspace_delete_metadata()
                 content = {**content, "metadata": metadata}
         return JSONResponse(
             status_code=200,

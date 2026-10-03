@@ -8,7 +8,7 @@ import logging
 import threading
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import Mock
 
 import httpx
@@ -448,6 +448,7 @@ class _RoutedRunner:
     def __init__(self, client: _FakeRunnerClient) -> None:
         self.runner_id = "runner_one"
         self.client = client
+        self.capabilities = ("workspace_delete_nofollow_v1",)
 
 
 class _FakeRunnerRouter:
@@ -3883,6 +3884,188 @@ async def test_filesystem_delete_proxies_to_runner(
     )
     assert resp.status_code == 200
     assert resp.json()["deleted"] is True
+
+
+@pytest.mark.asyncio
+async def test_workspace_delete_gate_checks_the_executing_runner(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    from omnigent.runner.routing import RunnerRouter
+
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"keep until capable")
+
+    class DeletingClient(_FakeRunnerClient):
+        async def delete(self, url: str, *, timeout: float | None = None) -> httpx.Response:
+            victim.unlink()
+            return await super().delete(url, timeout=timeout)
+
+    class CapabilityRouter(_FakeRunnerRouter):
+        capabilities: tuple[str, ...] | None = None
+
+        def client_for_session_resources(
+            self,
+            session_id: str,
+            *,
+            conversation: Conversation | None = None,
+        ) -> _RoutedRunner:
+            routed = super().client_for_session_resources(session_id, conversation=conversation)
+            routed.capabilities = self.capabilities
+            return routed
+
+    runner = DeletingClient(payload=_fs_delete_payload())
+    router = CapabilityRouter(runner)
+    set_runner_router(cast(RunnerRouter, router))
+    for capabilities in (None, (), ("unrelated",)):
+        router.capabilities = capabilities
+        response = await client.delete(f"{_FS_BASE}/filesystem/victim")
+        assert victim.read_bytes() == b"keep until capable"
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "runner_upgrade_required"
+        assert not runner.calls
+    response = await client.delete(f"{_FS_BASE}/filesystem/{str(victim).lstrip('/')}?base=host")
+    assert response.status_code == 200
+    assert not victim.exists()
+    assert len(runner.calls) == 1
+    victim.write_bytes(b"keep until capable")
+    runner.calls.clear()
+    router.capabilities = ("workspace_delete_nofollow_v1",)
+    response = await client.delete(f"{_FS_BASE}/filesystem/victim?recursive=true")
+    assert response.status_code == 200
+    assert not victim.exists()
+    assert runner.calls == [("DELETE", f"{_FS_BASE}/filesystem/victim")]
+
+
+@pytest.mark.asyncio
+async def test_workspace_delete_unresolved_runner_is_refused(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    from omnigent.runner.routing import RunnerRouter
+
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"keep")
+    runner = _FakeRunnerClient(payload=_fs_delete_payload())
+
+    class MissingRunner(_FakeRunnerRouter):
+        def client_for_session_resources(
+            self,
+            session_id: str,
+            *,
+            conversation: Conversation | None = None,
+        ) -> _RoutedRunner:
+            raise LookupError("unknown runner")
+
+    set_runner_router(cast(RunnerRouter, MissingRunner(runner)))
+    response = await client.delete(f"{_FS_BASE}/filesystem/victim")
+    assert victim.read_bytes() == b"keep"
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "runner_upgrade_required"
+    assert not runner.calls
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_delete_does_not_publish_success(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner.routing import RunnerRouter
+
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"keep")
+    for payload in (
+        {"error": {"message": "timeout"}},
+        {},
+        {"deleted": False},
+        {"deleted": True},
+        [],
+    ):
+        runner = _FakeRunnerClient(payload=payload)
+        set_runner_router(cast(RunnerRouter, _FakeRunnerRouter(runner)))
+        from omnigent.server.routes.sessions import routes_resources
+
+        publish = Mock()
+        monkeypatch.setattr(routes_resources, "_publish_changed_files_invalidated", publish)
+        response = await client.delete(f"{_FS_BASE}/filesystem/victim")
+        assert victim.read_bytes() == b"keep"
+        assert response.status_code == 502
+        publish.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_environment_delete_metadata_treats_old_runner_as_unavailable(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    from omnigent.runner.routing import RunnerRouter
+
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"keep")
+    runner = _FakeRunnerClient(payload={"metadata": {"root": str(tmp_path)}})
+
+    class OldRunner(_FakeRunnerRouter):
+        def client_for_session_resources(
+            self,
+            session_id: str,
+            *,
+            conversation: Conversation | None = None,
+        ) -> _RoutedRunner:
+            routed = super().client_for_session_resources(session_id, conversation=conversation)
+            routed.capabilities = ()
+            return routed
+
+    set_runner_router(cast(RunnerRouter, OldRunner(runner)))
+    for advertised_metadata in ({}, {"available": False}, {"available": True}):
+        if advertised_metadata:
+            runner._payload = {"metadata": {"workspace_delete": advertised_metadata}}
+        response = await client.get(_FS_BASE)
+        availability = response.json()["metadata"]["workspace_delete"]
+        assert availability["available"] is False
+        assert availability["reason"]
+        assert victim.read_bytes() == b"keep"
+    set_runner_router(cast(RunnerRouter, _FakeRunnerRouter(runner)))
+    response = await client.get(_FS_BASE)
+    assert response.json()["metadata"]["workspace_delete"] == {"available": True}
+
+
+@pytest.mark.asyncio
+async def test_in_process_delete_uses_capable_helper(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    from omnigent.runner import create_runner_app
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from tests.runner.helpers import NullServerClient
+
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"delete me")
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import create_os_environment
+
+    registry = SessionResourceRegistry()
+    environment = create_os_environment(
+        OSEnvSpec(cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert environment is not None
+    registry._primary_envs["79b22ebd2309e48fdeb450c65611d51b"] = environment
+    app = create_runner_app(
+        resource_registry=registry,
+        runner_workspace=tmp_path,
+        server_client=NullServerClient(),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://runner",
+    ) as runner:
+        set_runner_client(runner)
+        response = await client.get(_FS_BASE)
+        assert response.json()["metadata"]["workspace_delete"] == {"available": True}
+        response = await client.delete(f"{_FS_BASE}/filesystem/victim")
+        assert response.status_code == 200
+        assert not victim.exists()
+    environment.close()
 
 
 @pytest.mark.asyncio
@@ -8460,7 +8643,7 @@ async def test_filesystem_mutations_are_not_gzipped(
         json={"content": "hi", "old_text": "a", "new_text": "b"},
     )
 
-    assert resp.status_code == 200
+    assert resp.status_code == (502 if method == "DELETE" else 200)
     assert "content-encoding" not in resp.headers
 
 

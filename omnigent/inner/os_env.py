@@ -6,15 +6,17 @@ import atexit
 import base64
 import codecs
 import contextlib
+import errno
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
@@ -77,6 +79,46 @@ OpRequest: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 # A single ``edit`` list entry — an {oldText, newText} pair of strings.
 EditEntry: TypeAlias = dict[str, str]
+
+CAP_WORKSPACE_DELETE = "workspace_delete_nofollow_v1"
+SAFE_WORKSPACE_DELETE_SUPPORTED = (
+    all(operation in os.supports_dir_fd for operation in (os.open, os.stat, os.unlink, os.rmdir))
+    and os.stat in os.supports_follow_symlinks
+    and hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "O_DIRECTORY")
+)
+
+
+def workspace_delete_metadata() -> dict[str, object]:
+    """Advertise whether this platform can safely delete workspace entries."""
+    if SAFE_WORKSPACE_DELETE_SUPPORTED:
+        return {"available": True}
+    return {
+        "available": False,
+        "reason": "No-follow workspace delete is unsupported on this platform",
+    }
+
+
+@contextlib.contextmanager
+def _open_parent_beneath(
+    root: Path, relative_path: str, *, nofollow_root: bool = False
+) -> Iterator[tuple[int, str]]:
+    """Keep a no-follow parent descriptor open through a leaf operation."""
+    parts = relative_path.split("/")
+    root_flags = os.O_RDONLY | os.O_DIRECTORY
+    if nofollow_root:
+        root_flags |= os.O_NOFOLLOW
+    descriptor = os.open(root, root_flags)
+    try:
+        for name in parts[:-1]:
+            next_descriptor = os.open(
+                name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=descriptor
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        yield descriptor, parts[-1]
+    finally:
+        os.close(descriptor)
 
 
 class _PopenKwargs(TypedDict, total=False):
@@ -349,6 +391,11 @@ class OSEnvironment(ABC):
     ) -> OpResult:
         raise NotImplementedError
 
+    async def delete(self, path: str, *, recursive: bool = False) -> OpResult:
+        """Refuse deletion unless the environment implements the helper operation."""
+        del path, recursive
+        return {"error": "This environment does not support safe delete", "code": "unsupported"}
+
     def prepare_sandbox(self, policy: SandboxPolicy) -> None:
         """Attach environment-owned resources before launching a consumer."""
         if policy.copy_on_write_roots:
@@ -422,7 +469,7 @@ class _HelperProcessClient:
 
     def request(self, payload: OpRequest) -> OpResult:
         with self._lock:
-            return self._request_locked(payload, allow_retry=True)
+            return self._request_locked(payload, allow_retry=payload.get("op") != "delete")
 
     def close(self) -> None:
         with self._lock:
@@ -971,6 +1018,13 @@ class CallerProcessOSEnvironment(OSEnvironment):
         result = await run_sync_on_thread(self._helper.request, request)
         return cast(OpResult, result)
 
+    async def delete(self, path: str, *, recursive: bool = False) -> OpResult:
+        """Delete through the sandboxed helper, without replaying a lost response."""
+        result = await run_sync_on_thread(
+            self._helper.request, {"op": "delete", "path": path, "recursive": recursive}
+        )
+        return cast(OpResult, result)
+
     def close(self) -> None:
         self._helper.close()
         if self._owns_copy_on_write and self._copy_on_write_environment is not None:
@@ -1054,6 +1108,13 @@ def _handle_helper_request(
     sandbox: SandboxPolicy,
 ) -> OpResult:
     op = request.get("op")
+    if op == "delete":
+        raw_path = request.get("path")
+        recursive = request.get("recursive", False)
+        if not isinstance(raw_path, str) or not isinstance(recursive, bool):
+            return {"error": "Invalid delete request", "code": "invalid_path"}
+        return _delete_impl(cwd, raw_path, sandbox, recursive=recursive)
+
     if op == "read":
         raw_path = request.get("path")
         if not isinstance(raw_path, str) or not raw_path.strip():
@@ -1140,6 +1201,65 @@ def _handle_helper_request(
         )
 
     return {"error": f"Unsupported os_env helper operation: {op!r}"}
+
+
+def _delete_impl(cwd: Path, raw_path: str, sandbox: SandboxPolicy, *, recursive: bool) -> OpResult:
+    """Delete a leaf inside the helper using its anchored parent descriptor."""
+    if "\x00" in raw_path:
+        return {"error": "Path contains NUL bytes", "code": "invalid_path"}
+    path = os.path.normpath(raw_path)
+    absolute = os.path.isabs(path)
+    if path == "." or path == str(cwd) or (not absolute and ".." in path.split(os.sep)):
+        return {
+            "error": "Cannot delete the environment root or traverse outside it",
+            "code": "invalid_path",
+        }
+    if not absolute and not SAFE_WORKSPACE_DELETE_SUPPORTED:
+        return {"error": "No-follow workspace delete is unsupported", "code": "unsupported"}
+    try:
+        if absolute:
+            target = Path(path)
+            if sandbox.active:
+                _assert_within_reach(cwd, sandbox, target, need_write=True)
+            _assert_write_allowed(sandbox, target)
+            return _delete_leaf(path, recursive=recursive)
+        _assert_write_allowed(sandbox, cwd / path)
+        with _open_parent_beneath(cwd, path, nofollow_root=True) as (parent_descriptor, name):
+            return _delete_leaf(name, recursive=recursive, parent_descriptor=parent_descriptor)
+    except OSError as exc:
+        code = "delete_failed"
+        if exc.errno == errno.ENOENT:
+            code = "not_found"
+        elif exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            code = "invalid_path"
+        elif exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+            code = "directory_not_empty"
+        return {"error": str(exc), "code": code}
+
+
+def _delete_leaf(path: str, *, recursive: bool, parent_descriptor: int | None = None) -> OpResult:
+    """Mutate the leaf without following it; rmdir checks emptiness atomically."""
+    leaf_stat = os.stat(path, dir_fd=parent_descriptor, follow_symlinks=False)
+    if stat.S_ISDIR(leaf_stat.st_mode):
+        if recursive:
+            if not shutil.rmtree.avoids_symlink_attacks:
+                return {
+                    "error": "Symlink-safe recursive delete is unsupported",
+                    "code": "unsupported",
+                }
+            shutil.rmtree(path, dir_fd=parent_descriptor)
+        else:
+            os.rmdir(path, dir_fd=parent_descriptor)
+        entry_type = "directory"
+    else:
+        os.unlink(path, dir_fd=parent_descriptor)
+        entry_type = "symlink" if stat.S_ISLNK(leaf_stat.st_mode) else "file"
+    return {
+        "deleted": True,
+        "exit_code": 0,
+        "type": entry_type,
+        "bytes_deleted": None if entry_type == "directory" else leaf_stat.st_size,
+    }
 
 
 def _resolve_path(cwd: Path, path: str) -> Path:
