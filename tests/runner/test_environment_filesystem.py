@@ -2096,6 +2096,21 @@ def absolute_delete_dir(request: pytest.FixtureRequest, tmp_path: Path, workspac
     return tmp_path if request.param == "outside" else workspace
 
 
+def _record_helper_deletes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record the targets ``CallerProcessFilesystem`` hands to the sandboxed helper."""
+    targets: list[str] = []
+    real = CallerProcessFilesystem._helper_delete_nofollow
+
+    async def recording(
+        self: CallerProcessFilesystem, target: str, *, recursive: bool
+    ) -> dict[str, object]:
+        targets.append(target)
+        return await real(self, target, recursive=recursive)
+
+    monkeypatch.setattr(CallerProcessFilesystem, "_helper_delete_nofollow", recording)
+    return targets
+
+
 @pytest.mark.asyncio
 async def test_delete_absolute_path_through_symlinked_parent_is_refused(
     client: httpx.AsyncClient,
@@ -2153,7 +2168,8 @@ async def test_delete_absolute_unreadable_nonempty_directory_is_refused_as_not_e
     try:
         resp = await client.request("DELETE", _absolute_delete_url(locked))
     finally:
-        locked.chmod(0o755)
+        if locked.exists():
+            locked.chmod(0o755)
 
     assert resp.status_code == 409, resp.text
     assert resp.json()["error"]["code"] == "directory_not_empty"
@@ -2248,11 +2264,11 @@ async def test_delete_absolute_recursive_removes_the_tree_without_following_link
 
 
 @pytest.mark.asyncio
-async def test_delete_absolute_refuses_filesystem_and_environment_roots(
+async def test_delete_absolute_refuses_filesystem_and_environment_roots_and_their_ancestors(
     client: httpx.AsyncClient,
     workspace: Path,
 ) -> None:
-    for root in ("/", "//", str(workspace), f"/{workspace}"):
+    for root in ("/", "//", str(workspace), f"/{workspace}", str(workspace.parent)):
         resp = await client.request("DELETE", _absolute_delete_url(root, recursive=True))
         assert resp.status_code == 400, (root, resp.text)
         assert resp.json()["error"]["code"] == "invalid_path"
@@ -2324,18 +2340,7 @@ async def test_delete_absolute_routes_grant_covered_paths_through_the_helper(
 ) -> None:
     """A path a grant covers is deleted by the sandboxed helper; a path admitted
     only because the environment is unconfined is deleted in-process."""
-    helper_targets: list[str] = []
-    real_helper_delete = CallerProcessFilesystem._helper_delete_nofollow
-
-    async def recording_helper_delete(
-        self: CallerProcessFilesystem, target: str, *, recursive: bool
-    ) -> dict[str, object]:
-        helper_targets.append(target)
-        return await real_helper_delete(self, target, recursive=recursive)
-
-    monkeypatch.setattr(
-        CallerProcessFilesystem, "_helper_delete_nofollow", recording_helper_delete
-    )
+    helper_targets = _record_helper_deletes(monkeypatch)
     inside = workspace / "inside.txt"
     inside.write_text("in\n")
     outside = tmp_path / "outside.txt"
@@ -2348,30 +2353,38 @@ async def test_delete_absolute_routes_grant_covered_paths_through_the_helper(
     assert not inside.exists() and not outside.exists()
 
 
-def test_delete_nofollow_without_dir_fd_support_still_refuses_symlinked_parent(
+def test_delete_nofollow_without_dir_fd_support_is_unsupported(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from omnigent.runner.environment_filesystem import _delete_nofollow
 
-    target = tmp_path / "target"
-    target.mkdir()
-    (target / "keep.txt").write_text("keep me\n")
-    (tmp_path / "link").symlink_to(target)
     plain = tmp_path / "plain.txt"
     plain.write_text("bye\n")
     monkeypatch.setattr(os, "supports_dir_fd", set())
 
-    refused = _delete_nofollow(str(tmp_path / "link" / "keep.txt"), False)
-    removed = _delete_nofollow(str(plain), False)
-    unsupported = _delete_nofollow(str(target), True)
+    result = _delete_nofollow(str(plain), False)
 
-    assert refused["code"] == "invalid_path"
-    assert (target / "keep.txt").exists()
-    assert removed == {"deleted": True, "type": "file", "bytes_deleted": 4}
-    assert not plain.exists()
-    assert unsupported["code"] == "unsupported"
-    assert (target / "keep.txt").exists()
+    assert result["code"] == "unsupported"
+    assert plain.exists()
+
+
+def test_delete_nofollow_recursive_needs_python_3_11_in_the_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner.environment_filesystem import _delete_nofollow
+
+    tree = tmp_path / "tree"
+    (tree / "sub").mkdir(parents=True)
+    monkeypatch.setattr(sys, "version_info", (3, 10, 0, "final", 0))
+
+    refused = _delete_nofollow(str(tree), True)
+    removed = _delete_nofollow(str(tree / "sub"), False)
+
+    assert refused["code"] == "unsupported"
+    assert removed == {"deleted": True, "type": "directory", "bytes_deleted": None}
+    assert tree.is_dir() and not (tree / "sub").exists()
 
 
 @pytest.mark.asyncio
@@ -2400,6 +2413,7 @@ async def test_delete_absolute_under_real_sandbox_runs_in_the_helper(
     intruder.symlink_to(grant)
     beyond = tmp_path / "beyond.txt"
     beyond.write_text("out of reach\n")
+    helper_targets = _record_helper_deletes(monkeypatch)
     # The helper imports omnigent from this checkout, which the sandbox
     # must be allowed to read.
     monkeypatch.setenv("PYTHONPATH", f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
@@ -2452,6 +2466,12 @@ async def test_delete_absolute_under_real_sandbox_runs_in_the_helper(
                 assert unreachable.json()["error"]["code"] == "path_unreachable"
             assert beyond.exists()
             assert intruder.is_symlink() and grant.is_dir()
+            assert helper_targets == [
+                str(grant / "victim.txt"),
+                str(grant / "link" / "keep.txt"),
+                str(grant / "link"),
+                str(grant / "escape"),
+            ]
     finally:
         os_env.close()
 

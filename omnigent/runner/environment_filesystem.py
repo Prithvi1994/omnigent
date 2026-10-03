@@ -240,10 +240,9 @@ def _delete_nofollow(path: str, recursive: bool) -> dict[str, object]:
     so a symlinked component is refused rather than traversed. The leaf is
     ``lstat``-ed through that descriptor and unlinked, or removed with
     ``rmdir`` (which fails atomically when non-empty) or, when *recursive*,
-    with :func:`shutil.rmtree` anchored on the parent descriptor. Without
-    ``dir_fd`` support (Windows), plain calls follow a realpath check of the
-    parent chain, as in :func:`_lstat_beneath`; that check-then-act gap is
-    why recursive deletes are refused there.
+    with :func:`shutil.rmtree` anchored on the parent descriptor. Platforms
+    without ``dir_fd`` support (Windows) get ``unsupported`` rather than a
+    path-based fallback, whose check-then-act gap would reintroduce the bug.
 
     Self-contained on purpose: the sandboxed helper runs this function's
     source in its own ``python3``, so it must not use module-level names.
@@ -259,50 +258,38 @@ def _delete_nofollow(path: str, recursive: bool) -> dict[str, object]:
     import stat
     import sys
 
-    beneath = (
+    if not (
         all(op in os.supports_dir_fd for op in (os.open, os.stat, os.unlink, os.rmdir))
         and hasattr(os, "O_NOFOLLOW")
         and hasattr(os, "O_DIRECTORY")
-    )
+    ):
+        return {
+            "error": "No-follow delete needs dir_fd support, which this platform lacks",
+            "code": "unsupported",
+        }
     parent, name = os.path.split(path)
     fd: int | None = None
     try:
-        if beneath:
-            fd = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY)
-            walked = os.sep
-            for part in parent.split(os.sep):
-                if not part:
-                    continue
-                walked = os.path.join(walked, part)
-                try:
-                    next_fd = os.open(
-                        part, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=fd
-                    )
-                except OSError as exc:
-                    if exc.errno == errno.ELOOP:
-                        return {
-                            "error": f"{walked!r} is a symbolic link; delete does not follow "
-                            "symlinks, so name the resolved path instead",
-                            "code": "invalid_path",
-                        }
-                    if exc.errno == errno.ENOTDIR:
-                        return {"error": f"{walked!r} is not a directory", "code": "invalid_path"}
-                    raise
-                os.close(fd)
-                fd = next_fd
-        else:
-            if os.path.realpath(parent) != parent:
-                return {
-                    "error": f"A component of {parent!r} is a symbolic link; delete does not "
-                    "follow symlinks, so name the resolved path instead",
-                    "code": "invalid_path",
-                }
-            if recursive:
-                return {
-                    "error": "Recursive delete needs dir_fd support on this platform",
-                    "code": "unsupported",
-                }
-            name = path
+        fd = os.open(os.sep, os.O_RDONLY | os.O_DIRECTORY)
+        walked = os.sep
+        for part in parent.split(os.sep):
+            if not part:
+                continue
+            walked = os.path.join(walked, part)
+            try:
+                next_fd = os.open(part, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=fd)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    return {
+                        "error": f"{walked!r} is a symbolic link; delete does not follow "
+                        "symlinks, so name the resolved path instead",
+                        "code": "invalid_path",
+                    }
+                if exc.errno == errno.ENOTDIR:
+                    return {"error": f"{walked!r} is not a directory", "code": "invalid_path"}
+                raise
+            os.close(fd)
+            fd = next_fd
         st = os.stat(name, dir_fd=fd, follow_symlinks=False)
         if stat.S_ISDIR(st.st_mode):
             if not recursive:
@@ -1676,7 +1663,8 @@ print(json.dumps({'r': results, 't': truncated}))
         :param recursive: Remove a directory together with its contents.
         :returns: Delete result.
         :raises InvalidPath: For a malformed path, a ``..`` segment, a
-            symlinked parent, or the filesystem or environment root.
+            symlinked parent, the filesystem root, or the environment root
+            or an ancestor of it.
         :raises PathUnreachable: When no grant covers the entry in a confined
             environment; checked before the walk, so a symlinked parent that
             leads outside every grant is refused this way rather than as
@@ -1693,8 +1681,9 @@ print(json.dumps({'r': results, 't': truncated}))
         target = os.sep + os.path.normpath(path).lstrip(os.sep)
         if target == os.sep:
             raise InvalidPath("Cannot delete the filesystem root")
-        if target == str(self._root):
-            raise InvalidPath("Cannot delete the environment root")
+        root = str(self._root)
+        if target == root or root.startswith(target + os.sep):
+            raise InvalidPath("Cannot delete the environment root or an ancestor of it")
         entry = resolve_browse_target(
             target, self._roots, unconfined=self._unconfined, need_write=True, follow_leaf=False
         )
