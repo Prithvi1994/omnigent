@@ -1475,6 +1475,29 @@ class _DaemonChatSession:
 
 _DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S = 30.0
 _DAEMON_CHAT_RUNNER_ONLINE_TIMEOUT_S = 60.0
+
+
+def _daemon_chat_host_online_timeout_s() -> float:
+    """Seconds to wait for the host to come online before launching a runner.
+
+    Defaults to :data:`_DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S`, overridable via
+    ``OMNIGENT_HOST_ONLINE_TIMEOUT_S``. When many ``omnigent run`` agents start
+    against one shared server at once, that server can take longer than the
+    default to register a newly connected host; the wait then expires before a
+    session exists. The dev launchers raise this ceiling for shared-``--server``
+    runs (see ``dev/repro.py`` / ``dev/resolve.py``). A missing, non-numeric, or
+    non-positive value keeps the default.
+    """
+    raw = os.environ.get("OMNIGENT_HOST_ONLINE_TIMEOUT_S")
+    if raw is None:
+        return _DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S
+    return value if value > 0 else _DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S
+
+
 _ACCOUNTS_SETUP_POLL_INTERVAL_S = 1.0
 _ACCOUNTS_SETUP_TIMEOUT_S = 600.0
 
@@ -1699,7 +1722,7 @@ async def _prepare_chat_session_via_daemon(
             (session_id, fresh_session), _ = await asyncio.gather(
                 resolve_session(),
                 wait_for_host_online(
-                    client, host_id, timeout_s=_DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S
+                    client, host_id, timeout_s=_daemon_chat_host_online_timeout_s()
                 ),
             )
             if progress is not None:

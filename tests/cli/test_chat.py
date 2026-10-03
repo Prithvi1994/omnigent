@@ -4671,3 +4671,42 @@ def test_cursor_native_resume_never_drives_an_omnigent_turn(
     )
 
     assert redirected["session_id"] == "conv_abc123"
+
+
+def test_daemon_chat_host_online_timeout_defaults_without_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no override, the host-online wait is the built-in default.
+
+    Cleared explicitly so an ambient ``OMNIGENT_HOST_ONLINE_TIMEOUT_S`` on the
+    runner cannot flip this to the override branch.
+    """
+    monkeypatch.delenv("OMNIGENT_HOST_ONLINE_TIMEOUT_S", raising=False)
+    assert (
+        chat_module._daemon_chat_host_online_timeout_s()
+        == chat_module._DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S
+    )
+
+
+def test_daemon_chat_host_online_timeout_honors_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A longer value lets a shared ``--server`` launch wait out slow registration."""
+    monkeypatch.setenv("OMNIGENT_HOST_ONLINE_TIMEOUT_S", "120")
+    assert chat_module._daemon_chat_host_online_timeout_s() == 120.0
+
+
+@pytest.mark.parametrize("bad", ["", "soon", "0", "-5", "nan"])
+def test_daemon_chat_host_online_timeout_ignores_unusable_env(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    """A non-numeric or non-positive override falls back to the default.
+
+    A 0 or negative wait would fail the launch instantly, and a non-number is
+    a typo — neither should silently break ``omnigent run``.
+    """
+    monkeypatch.setenv("OMNIGENT_HOST_ONLINE_TIMEOUT_S", bad)
+    assert (
+        chat_module._daemon_chat_host_online_timeout_s()
+        == chat_module._DAEMON_CHAT_HOST_ONLINE_TIMEOUT_S
+    )

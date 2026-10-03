@@ -32,6 +32,12 @@ DAEMON_POLL_INTERVAL_S = 0.5
 DAEMON_POLL_INITIAL_INTERVAL_S = 0.1
 DAEMON_POLL_BACKOFF_FACTOR = 1.5
 
+# Backoff between runner-launch retries while the host's tunnel/registration
+# is briefly unsettled (see `launch_or_reuse_daemon_runner`). ~16.5s budget:
+# long enough to ride out a reconnect or a registration lag, bounded so a
+# genuinely-missing host still fails reasonably fast.
+_LAUNCH_RETRY_DELAYS_S = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.0, 3.0)
+
 
 def daemon_poll_intervals() -> Iterator[float]:
     """
@@ -276,18 +282,17 @@ async def launch_or_reuse_daemon_runner(
             f"/v1/sessions/{url_component(session_id)}",
             json={"runner_id": ""},
         )
-    # The host tunnel can be briefly absent from the server's in-memory
-    # registry while it (re)connects — e.g. just after `omnigent host`
-    # restarts, after a server restart/redeploy, or under a flapping tunnel.
-    # During that window the launch 409s "host is offline" even though the
-    # host is online per the cross-replica DB, and the whole session start
-    # fails. Retry transient 409s across the reconnect window so
-    # high-latency / reconnecting setups start reliably. Bounded, so a
-    # genuinely-offline host still fails reasonably fast.
-    _RETRY_DELAYS_S = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.0, 3.0)  # ~16.5s budget
-    for attempt in range(len(_RETRY_DELAYS_S) + 1):
+    # The launch can fail transiently while the host's tunnel (re)connects and
+    # its registration settles — e.g. just after `omnigent host` restarts, or
+    # when many hosts register against one shared app at once. Two forms are
+    # transient and resolve on their own: a 409 "host is offline" (tunnel absent
+    # from this replica's registry) and a 404 "host not found" (registration not
+    # yet visible). Retry both across that window, bounded so a genuinely-
+    # missing host still fails reasonably fast.
+    delays = _LAUNCH_RETRY_DELAYS_S
+    for attempt in range(len(delays) + 1):
         if attempt:
-            await asyncio.sleep(_RETRY_DELAYS_S[attempt - 1])
+            await asyncio.sleep(delays[attempt - 1])
         resp = await client.post(
             f"/v1/hosts/{url_component(host_id)}/runners",
             json={"session_id": session_id, "workspace": workspace},
@@ -295,8 +300,11 @@ async def launch_or_reuse_daemon_runner(
         )
         if resp.status_code < 400:
             break
-        transient = resp.status_code == 409 and "offline" in error_text(resp).lower()
-        if not (transient and attempt < len(_RETRY_DELAYS_S)):
+        error = error_text(resp).lower()
+        transient = (resp.status_code == 409 and "offline" in error) or (
+            resp.status_code == 404 and "host not found" in error
+        )
+        if not (transient and attempt < len(delays)):
             raise click.ClickException(
                 f"Failed to launch a runner on host {host_id!r} "
                 f"({resp.status_code}): {error_text(resp)}"
