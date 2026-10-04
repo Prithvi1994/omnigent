@@ -127,8 +127,9 @@ Do all of this before Step 1:
    checkout is unreadable while `sys_session_get_info` reports the runner
    online — the runner is broken, not the report. Do not investigate on it:
    record the failing calls and exact errors, then stop with `needs_more_info`
-   and `failure_class: "infrastructure"` (see `resolve-handoff`) so the
-   workflow retries on a healthy runner instead of posting a verdict.
+   and `failure_class: "infrastructure"` (see `resolve-handoff`), which asks a
+   workflow that supports the signal to retry on a healthy runner instead of
+   posting a verdict.
 4. **Check the verdict is actionable.** You act only on a reproduction that showed
    a live bug. If the recovered overall `verdict` is `already_fixed` or
    `not_reproduced`, there is nothing to resolve — stop and say so (see Output). If

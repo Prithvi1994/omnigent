@@ -195,7 +195,7 @@ to the publisher. No new test-selection gate is introduced.
    (`reviewed_existing_pr` / `authored_fix`), `outcome` (`fixed` /
    `partially_fixed` / `not_fixed` / `nothing_to_fix` / `needs_more_info`),
    `failure_class` (`infrastructure` when a broken runner or tooling stopped the
-   run, so the workflow retries instead of posting a verdict), the
+   run; it requests a retry from workflows that support the signal), the
    plain-English `problem_summary` and `solution_summary` used for the Linear
    update, the per-facet fail→pass proof, the compact PR-facing `review_body` in
    review mode, the PR URL (opened or reviewed, or empty until the workflow-owned

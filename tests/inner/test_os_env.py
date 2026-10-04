@@ -522,17 +522,29 @@ def test_shell_command_does_not_see_omnigent_project_root(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX shebang behaviour")
+@pytest.mark.parametrize(
+    ("shim_exit", "exit_detail"),
+    [
+        ("exit 0", "exited with code 0"),
+        ("echo 'helper: boom' >&2\nexit 3", "exited with code 3: helper: boom"),
+    ],
+    ids=["silent-exit-0", "stderr-exit-3"],
+)
 def test_helper_exit_without_reply_logs_each_attempt_with_exit_detail(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    shim_exit: str,
+    exit_detail: str,
 ) -> None:
-    """A helper that exits cleanly without replying leaves a runner-log trail.
+    """A helper that exits without replying leaves a runner-log trail.
 
     The client restarts the helper and retries once, and only the retry's
     error reaches the agent; both attempts must be logged with the exit
     detail so a broken runner can be diagnosed from the runner log.
     """
     shim = tmp_path / "python-shim"
-    shim.write_text("#!/bin/sh\nread -r _request\nexit 0\n", encoding="utf-8")
+    shim.write_text(f"#!/bin/sh\nread -r _request\n{shim_exit}\n", encoding="utf-8")
     shim.chmod(0o755)
     monkeypatch.setattr(sys, "executable", str(shim))
     client = _HelperProcessClient(cwd=tmp_path, shell_path="/bin/sh", sandbox=_inactive_policy())
@@ -543,12 +555,14 @@ def test_helper_exit_without_reply_logs_each_attempt_with_exit_detail(
         finally:
             client.close()
 
-    assert result == {"error": "os_env helper failed: OS environment helper exited with code 0"}
-    messages = [record.getMessage() for record in caplog.records]
+    assert result == {"error": f"os_env helper failed: OS environment helper {exit_detail}"}
+    messages = [
+        record.getMessage() for record in caplog.records if record.name == "omnigent.inner.os_env"
+    ]
     assert len(messages) == 2
     for message in messages:
         assert "failed on op 'shell'" in message
-        assert "exited with code 0" in message
+        assert exit_detail in message
         assert "backend none" in message
     assert "retrying once" in messages[0]
     assert "retrying once" not in messages[1]

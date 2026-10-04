@@ -139,8 +139,10 @@ readiness; name pending publication/review steps in `remaining_work`.
   example every `sys_os_shell` / `sys_os_read` / `sys_os_write` call returns
   `os_env helper failed`, or the tracker answers 401/403. Keep `outcome` as
   `needs_more_info` so existing consumers still parse the handoff; the class
-  tells the workflow to retry the attempt on a healthy runner and keep earlier
-  checkpoints instead of posting a verdict to the ticket. Name the failing calls
+  requests an infrastructure retry. A workflow that supports the signal should
+  retry the attempt on a healthy runner and keep earlier checkpoints instead of
+  posting a verdict to the ticket; one that does not still receives the unchanged
+  outcome with the signal beside it. Name the failing calls
   and exact error text in `test_audit`, and list the unfinished steps in
   `remaining_work` so a retry can resume. Never set it for missing report
   information, unsafe evidence, conflicting bug identities, or an unresolved
