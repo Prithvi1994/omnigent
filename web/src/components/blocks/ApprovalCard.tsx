@@ -645,7 +645,10 @@ export function ApprovalCard({
               <>
                 <span>{message}</span>
                 {agyPermission?.actionDescription && (
-                  <span className="text-sm text-muted-foreground">
+                  <span
+                    className="text-sm text-muted-foreground"
+                    data-testid="agy-action-description"
+                  >
                     {agyPermission.actionDescription}
                   </span>
                 )}

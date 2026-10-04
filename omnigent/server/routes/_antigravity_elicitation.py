@@ -460,12 +460,18 @@ def to_tui_selection_keys(
             if persist == "always":
                 return [_AGY_TUI_PERMISSION_PERSIST_ALLOW_OPTION, _AGY_TUI_CONFIRM_KEY]
         if persist in ("session", "always"):
-            _logger.info(
-                "agy persist accept downgraded to one-time approve: delivered "
-                "pattern %r does not match consented pattern %r",
-                delivered_pattern,
-                consented_pattern,
-            )
+            if delivered_pattern is None:
+                _logger.info(
+                    "agy persist accept downgraded to one-time approve: the "
+                    "delivered gate advertises no always-allow entry"
+                )
+            else:
+                _logger.info(
+                    "agy persist accept downgraded to one-time approve: delivered "
+                    "pattern %r does not match consented pattern %r",
+                    delivered_pattern,
+                    consented_pattern,
+                )
         return [_AGY_TUI_PERMISSION_APPROVE_OPTION, _AGY_TUI_CONFIRM_KEY]
     if kind == "ask_question":
         return _agy_ask_question_tui_keys(result, spec)

@@ -181,6 +181,7 @@ def _reject_and_join(
         message="agy permission elicitation did not clear after Reject",
     )
     hook_thread.join(timeout=30)
+    assert not hook_thread.is_alive(), "agy elicitation hook POST did not settle"
     _require_no_hook_error(result_holder)
 
 
@@ -203,16 +204,17 @@ def test_agy_permission_card_offers_always_allow_choice(
 
     card = _open_pending_agy_card(page, base_url, session_id, result_holder)
 
-    # Sanity: the card names the gated command and still offers the binary pair.
-    expect(card).to_contain_text("pwd")
-    expect(card.get_by_role("button", name="Approve", exact=True)).to_be_visible()
-    expect(card.get_by_role("button", name="Reject", exact=True)).to_be_visible()
+    try:
+        # Sanity: the card names the gated command and still offers the binary pair.
+        expect(card).to_contain_text("pwd")
+        expect(card.get_by_role("button", name="Approve", exact=True)).to_be_visible()
+        expect(card.get_by_role("button", name="Reject", exact=True)).to_be_visible()
 
-    # The card must surface agy's advertised always-allow choice.
-    always_allow = card.get_by_role("button", name=_ALWAYS_ALLOW_PATTERN)
-    expect(always_allow.first).to_be_visible(timeout=_AFFORDANCE_TIMEOUT_MS)
-
-    _reject_and_join(card, base_url, session_id, hook_thread, result_holder)
+        # The card must surface agy's advertised always-allow choice.
+        always_allow = card.get_by_role("button", name=_ALWAYS_ALLOW_PATTERN)
+        expect(always_allow.first).to_be_visible(timeout=_AFFORDANCE_TIMEOUT_MS)
+    finally:
+        _reject_and_join(card, base_url, session_id, hook_thread, result_holder)
 
 
 @pytest.mark.timeout(120)
@@ -232,10 +234,11 @@ def test_agy_permission_card_shows_action_description(
 
     card = _open_pending_agy_card(page, base_url, session_id, result_holder)
 
-    # Sanity: the card names the gated command.
-    expect(card).to_contain_text("pwd")
+    try:
+        # Sanity: the card names the gated command.
+        expect(card).to_contain_text("pwd")
 
-    # The card must surface agy's action description.
-    expect(card).to_contain_text("Running pwd command", timeout=_AFFORDANCE_TIMEOUT_MS)
-
-    _reject_and_join(card, base_url, session_id, hook_thread, result_holder)
+        # The card must surface agy's action description.
+        expect(card).to_contain_text("Running pwd command", timeout=_AFFORDANCE_TIMEOUT_MS)
+    finally:
+        _reject_and_join(card, base_url, session_id, hook_thread, result_holder)

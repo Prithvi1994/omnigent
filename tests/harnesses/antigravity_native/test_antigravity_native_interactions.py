@@ -331,12 +331,14 @@ async def test_happy_path_delivers_selected_option_to_fresh_step() -> None:
 
 @pytest.mark.asyncio
 async def test_fallback_question_types_keys_against_the_surfaced_spec() -> None:
-    """ask_question keys follow the surfaced spec the RPC payload was built from.
+    """Typed ask_question digits stay consistent with the delivered RPC payload.
 
-    The surfaced question timed out and the verdict falls back to a different
-    same-kind gate whose options reuse the ids differently ("Second" is id "1"
-    there, not "2"). The typed digit must match the option id delivered over RPC
-    (both resolved against the surfaced spec), never the fallback gate's own id.
+    agy's real fallback re-asks the same gate, so the surfaced and delivered
+    specs normally share one option set. This uses a synthetic divergent
+    fallback ("Second" is id "1" there, not "2") only to expose a regression:
+    the typed digit must equal the option id the RPC payload carries -- both
+    resolved against the surfaced spec the user answered -- so the pane and
+    backend can never disagree.
     """
     pending = _pending_question(step_index=3)
     fallback = _question_step(

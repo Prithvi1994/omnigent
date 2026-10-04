@@ -448,8 +448,7 @@ async def bridge_interaction(
                     "permission", result, fresh["spec"], consented_spec=current["spec"]
                 )
             else:
-                # Map an answer against the surfaced spec the RPC payload used, so
-                # the typed digit and the delivered option id cannot disagree.
+                # Typed digits must match the option ids the RPC payload used.
                 keys = to_tui_selection_keys(fresh["kind"], result, current["spec"])
             if keys:
                 try:
