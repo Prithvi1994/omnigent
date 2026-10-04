@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FileContentResponse } from "@/hooks/useFileContent";
 import type * as UseFileContentModule from "@/hooks/useFileContent";
@@ -266,11 +266,6 @@ function makeData(overrides: Partial<FileContentResponse> = {}): FileContentResp
   };
 }
 
-// Animation frames run as cancellable zero-delay timers, so the pre-parse paint
-// yield resolves and teardown's cancelAnimationFrame stops the render loop.
-const frameTimers = new Map<number, ReturnType<typeof setTimeout>>();
-let nextFrameId = 0;
-
 beforeEach(() => {
   behavior.mode = "valid";
   behavior.orbitThrows = false;
@@ -282,21 +277,11 @@ beforeEach(() => {
   lastRenderer = null;
   lastMaterial = null;
   themeState.resolvedTheme = "light";
-  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
-    const id = ++nextFrameId;
-    frameTimers.set(
-      id,
-      setTimeout(() => {
-        frameTimers.delete(id);
-        callback(performance.now());
-      }, 0),
-    );
-    return id;
-  });
-  vi.stubGlobal("cancelAnimationFrame", (id: number) => {
-    clearTimeout(frameTimers.get(id));
-    frameTimers.delete(id);
-  });
+  vi.stubGlobal(
+    "requestAnimationFrame",
+    vi.fn(() => 1),
+  );
+  vi.stubGlobal("cancelAnimationFrame", vi.fn());
   vi.stubGlobal(
     "ResizeObserver",
     class {
@@ -309,8 +294,6 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
-  for (const timer of frameTimers.values()) clearTimeout(timer);
-  frameTimers.clear();
   vi.unstubAllGlobals();
 });
 
@@ -440,17 +423,6 @@ describe("ModelViewer teardown", () => {
 });
 
 describe("ModelViewer loading state", () => {
-  // Queues animation frames instead of running them, so the pre-parse paint
-  // yield stays pending until the test flushes it.
-  function holdFrames() {
-    const frames: FrameRequestCallback[] = [];
-    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
-      frames.push(callback);
-      return frames.length;
-    });
-    return frames;
-  }
-
   it("surfaces a loading status while the model is decoded, parsed and built", () => {
     // Hold the read pending so the viewer stays mid-load: the preview host is
     // mounted but the scene (canvas) is not built yet and nothing has errored.
@@ -470,22 +442,6 @@ describe("ModelViewer loading state", () => {
     await waitFor(() => expect(lastRenderer).not.toBeNull());
     await waitFor(() => expect(screen.queryByRole("status")).toBeNull());
     expect(screen.getByLabelText("3D preview of part.stl").querySelector("canvas")).not.toBeNull();
-  });
-
-  it("yields a frame after the bytes arrive and before the synchronous parse", async () => {
-    const frames = holdFrames();
-    render(<ModelViewer data={makeData()} path="part.stl" />);
-
-    // The bytes have been read but the parse waits on the paint yield.
-    await waitFor(() => expect(frames).toHaveLength(1));
-    expect(parseCalls).toEqual([]);
-    expect(screen.getByRole("status")).toHaveTextContent("Preparing model…");
-
-    await act(async () => {
-      frames.splice(0).forEach((frame) => frame(performance.now()));
-    });
-    await waitFor(() => expect(parseCalls).toEqual(["stl"]));
-    await waitFor(() => expect(screen.queryByRole("status")).toBeNull());
   });
 
   it("replaces the status with the error overlay when the load fails", async () => {

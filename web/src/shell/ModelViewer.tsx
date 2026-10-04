@@ -36,16 +36,10 @@ interface ParsedModel {
   stlMaterial: THREE.MeshStandardMaterial | null;
 }
 
-// Resolves after the next paint, so the loading overlay is on screen before a
-// long synchronous parse blocks the main thread.
-function afterNextPaint(): Promise<void> {
-  return new Promise((resolve) => {
-    requestAnimationFrame(() => setTimeout(resolve, 0));
-  });
-}
-
 // Shown over the empty canvas host from mount until the first frame renders or
 // the load fails. Decoding, parsing and building a large model can take seconds.
+// `loading` starts true, so React paints this before the effect's synchronous
+// parse ever blocks the main thread.
 function ModelLoadingOverlay() {
   return (
     <div
@@ -324,10 +318,7 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
     // so guard every step against the effect having been cleaned up.
     fileContentToBlob(data)
       .arrayBuffer()
-      .then(async (buffer) => {
-        if (disposed) return;
-        // Let the loading overlay paint before the parse freezes the page.
-        await afterNextPaint();
+      .then((buffer) => {
         if (disposed) return;
 
         const { object, stlMaterial } = parseModel(format, buffer, theme);
