@@ -274,7 +274,8 @@ async def test_reconnecting_trees_share_store_budget_without_waiting_for_initial
     app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import omnigent.server.app as server_app
-    from omnigent.server import child_session_recovery
+    from omnigent.server import child_session_recovery, runner_session_init
+    from omnigent.server.routes._sessions import helpers, orchestration
 
     agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
     roots = [_create_session(app, agent.id) for _ in range(12)]
@@ -285,6 +286,7 @@ async def test_reconnecting_trees_share_store_budget_without_waiting_for_initial
     hung_ids = {child.id for child in children[:-1]}
     expected = {row.id for row in roots + children}
     requested: set[str] = set()
+    attachment_sessions: set[str] = set()
     all_requested = asyncio.Event()
     pending_reads = peak_reads = 0
 
@@ -292,12 +294,20 @@ async def test_reconnecting_trees_share_store_budget_without_waiting_for_initial
         nonlocal pending_reads, peak_reads
         pending_reads += 1
         peak_reads = max(peak_reads, pending_reads)
+        if call.__name__ == "_filesystem_attachment_in_history":
+            attachment_sessions.add(args[0])
         try:
             return await asyncio.to_thread(call, *args, **kwargs)
         finally:
             pending_reads -= 1
 
-    for module in (server_app, child_session_recovery):
+    for module in (
+        server_app,
+        child_session_recovery,
+        runner_session_init,
+        helpers,
+        orchestration,
+    ):
         monkeypatch.setattr(
             module,
             "asyncio",
@@ -316,8 +326,44 @@ async def test_reconnecting_trees_share_store_budget_without_waiting_for_initial
     async with _recover(app, monkeypatch, respond) as (relays, finished):
         await asyncio.wait_for(all_requested.wait(), budget(5))
         assert requested == expected
+        assert attachment_sessions == expected
         assert expected <= set(relays)
         assert 1 < peak_reads <= 8
+        assert not finished.is_set()
+
+
+async def test_hosted_child_recovers_independently_while_parent_is_stalled(
+    app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
+    parent = _create_session(app, agent.id)
+    hostless, hosted = [
+        _create_session(app, agent.id, kind="sub_agent", parent_conversation_id=parent.id)
+        for _ in range(2)
+    ]
+    store = app.state.runner_router._conversation_store
+    store.set_host_id(hosted.id, "a" * 32, workspace="/tmp")
+    requested: set[str] = set()
+    parent_entered = asyncio.Event()
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        sid = json.loads(request.content)["session_id"]
+        requested.add(sid)
+        if sid == parent.id:
+            parent_entered.set()
+            await asyncio.Event().wait()
+        return httpx.Response(201)
+
+    async def hosted_recovers() -> None:
+        while sessions._session_status_cache.get(hosted.id) != "idle":
+            await asyncio.sleep(0)
+
+    async with _recover(app, monkeypatch, respond) as (relays, finished):
+        await asyncio.wait_for(asyncio.gather(parent_entered.wait(), hosted_recovers()), budget(5))
+        assert requested == {parent.id, hosted.id}
+        assert {parent.id, hostless.id, hosted.id} <= set(relays)
+        assert sessions._session_status_cache[parent.id] == "failed"
+        assert sessions._session_status_cache[hostless.id] == "failed"
         assert not finished.is_set()
 
 

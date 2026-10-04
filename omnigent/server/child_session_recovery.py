@@ -254,6 +254,7 @@ async def restore_active_children(
                         suppress_recovery_turn=not _interrupted(child),
                         resume_interrupted_turn=_interrupted(child),
                         generation=generation,
+                        store_slots=store_slots,
                     )
                     response.raise_for_status()
                 initializer.require_generation(runner_id, client, generation)

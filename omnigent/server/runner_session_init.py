@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -78,6 +79,7 @@ class RunnerSessionInitializer:
         suppress_recovery_turn: bool = False,
         resume_interrupted_turn: bool = False,
         generation: int | None = None,
+        store_slots: asyncio.Semaphore | None = None,
     ) -> httpx.Response:
         """Initialize once for the current connection and persisted snapshot."""
         runner_id = conversation.runner_id
@@ -117,12 +119,13 @@ class RunnerSessionInitializer:
                         require_filesystem_attachment_runtime,
                     )
 
-                    attachment = await asyncio.to_thread(
-                        _filesystem_attachment_in_history,
-                        conversation.id,
-                        self._conversation_store,
-                        self._file_store,
-                    )
+                    async with store_slots or nullcontext():
+                        attachment = await asyncio.to_thread(
+                            _filesystem_attachment_in_history,
+                            conversation.id,
+                            self._conversation_store,
+                            self._file_store,
+                        )
                     if attachment is not None:
                         require_filesystem_attachment_runtime(
                             host_id=None,

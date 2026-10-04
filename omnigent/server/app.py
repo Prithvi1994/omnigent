@@ -3410,6 +3410,8 @@ def create_app(
         reconnect re-initialization still happens.
 
         :param runner_id: The disconnected runner's id.
+        :param connection: The closed tunnel whose generation scopes
+            initialization cleanup.
         """
         cancelled = runner_session_initializer.invalidate_runner(
             runner_id, generation=connection.generation
@@ -3568,7 +3570,7 @@ def create_app(
                         if tunnel_registry.get(runner_id) is not connection:
                             return
                     routed = runner_router.client_for_session_resources(conv.id, conversation=conv)
-                except Exception:
+                except OmnigentError:
                     _logger.exception(
                         "Failed to resolve runner client for session %s on reconnect", conv.id
                     )
@@ -3603,15 +3605,20 @@ def create_app(
                     # Sessions without an agent have no runner runtime to initialize.
                     if conv.agent_id:
                         response = await runner_session_initializer.initialize(
-                            conv, client, timeout=10.0, generation=connection.generation
+                            conv,
+                            client,
+                            timeout=10.0,
+                            generation=connection.generation,
+                            store_slots=store_slots,
                         )
                         response.raise_for_status()
                     prefetch_session_routing_catalogs(conv.id, conv, client)
                     # Clear only a root's disconnect failure, after successful init.
                     # Children retain interruption evidence until continuation runs.
-                    await _publish_runner_recovered_status(
-                        conv.id, conversation_store, require_disconnect_code=True
-                    )
+                    async with store_slots:
+                        await _publish_runner_recovered_status(
+                            conv.id, conversation_store, require_disconnect_code=True
+                        )
                     if conv.agent_id:
                         await restore_active_children(
                             conv,
