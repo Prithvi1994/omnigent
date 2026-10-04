@@ -17,6 +17,7 @@ import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { ThreeMFLoader } from "three/examples/jsm/loaders/3MFLoader.js";
 import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import { Spinner } from "@/components/ui/spinner";
 import { type FileContentResponse, fileContentToBlob } from "@/hooks/useFileContent";
 import {
   type ModelFormat,
@@ -33,6 +34,29 @@ import { TruncatedBanner } from "./TruncatedBanner";
 interface ParsedModel {
   object: THREE.Object3D;
   stlMaterial: THREE.MeshStandardMaterial | null;
+}
+
+// Resolves after the next paint, so the loading overlay is on screen before a
+// long synchronous parse blocks the main thread.
+function afterNextPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    requestAnimationFrame(() => setTimeout(resolve, 0));
+  });
+}
+
+// Shown over the empty canvas host from mount until the first frame renders or
+// the load fails. Decoding, parsing and building a large model can take seconds.
+function ModelLoadingOverlay() {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-background/80 p-8 text-center text-muted-foreground text-ui"
+    >
+      <Spinner className="size-5" aria-hidden="true" />
+      <span>Preparing model…</span>
+    </div>
+  );
 }
 
 /**
@@ -223,6 +247,7 @@ function teardownScene(res: SceneResources): void {
 export function ModelViewer({ data, path }: { data: FileContentResponse; path: string }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [errored, setErrored] = useState(false);
+  const [loading, setLoading] = useState(true);
 
   // Theme comes from the app's shared next-themes source (same hook Monaco and
   // the terminal use). `mode` is a stable "light"|"dark" string, so the theme
@@ -265,6 +290,7 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
     }
 
     setErrored(false);
+    setLoading(true);
 
     let disposed = false;
     const res: SceneResources = {
@@ -298,7 +324,10 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
     // so guard every step against the effect having been cleaned up.
     fileContentToBlob(data)
       .arrayBuffer()
-      .then((buffer) => {
+      .then(async (buffer) => {
+        if (disposed) return;
+        // Let the loading overlay paint before the parse freezes the page.
+        await afterNextPaint();
         if (disposed) return;
 
         const { object, stlMaterial } = parseModel(format, buffer, theme);
@@ -358,6 +387,7 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
         };
         res.resizeObserver = new ResizeObserver(onResize);
         res.resizeObserver.observe(container);
+        setLoading(false);
       })
       .catch(() => {
         fail();
@@ -386,6 +416,7 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
         aria-label={`3D preview of ${filename}`}
         className="absolute inset-0 cursor-grab active:cursor-grabbing"
       />
+      {loading && !errored && !data.truncated && <ModelLoadingOverlay />}
       {errored && (
         <div className="absolute inset-0 flex items-center justify-center bg-background/80 p-8 text-center text-muted-foreground text-ui">
           {errorMessage}

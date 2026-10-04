@@ -1,6 +1,7 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FileContentResponse } from "@/hooks/useFileContent";
+import type * as UseFileContentModule from "@/hooks/useFileContent";
 
 // ── Mocks ───────────────────────────────────────────────────────────────────
 //
@@ -26,6 +27,10 @@ const behavior: LoaderBehavior = {
   orbitThrows: false,
   texturedMaterial: false,
 };
+
+// Hold the model-bytes read pending so the component sits in its loading state
+// (preview host mounted, scene not yet built) for the loading-state tests.
+const blobBehavior = { pending: false };
 
 // Textures the textured-material mesh references; disposed flags are asserted
 // by the teardown test to prove the material's textures are freed, not leaked.
@@ -227,6 +232,22 @@ vi.mock("three", () => {
 const themeState: { resolvedTheme: string } = { resolvedTheme: "light" };
 vi.mock("next-themes", () => ({ useTheme: () => themeState }));
 
+// Keep the real module but drive the one call ModelViewer makes,
+// fileContentToBlob(...).arrayBuffer(): it resolves immediately (the stubbed
+// loaders ignore the buffer) unless `pending` holds the read open mid-load.
+vi.mock("@/hooks/useFileContent", async (importOriginal) => {
+  const actual = await importOriginal<typeof UseFileContentModule>();
+  return {
+    ...actual,
+    fileContentToBlob: () => ({
+      arrayBuffer: () =>
+        blobBehavior.pending
+          ? new Promise<ArrayBuffer>(() => {})
+          : Promise.resolve(new ArrayBuffer(0)),
+    }),
+  };
+});
+
 import { modelViewerTheme } from "./codeViewerHelpers";
 import { ModelViewer } from "./ModelViewer";
 
@@ -245,23 +266,37 @@ function makeData(overrides: Partial<FileContentResponse> = {}): FileContentResp
   };
 }
 
-// Deterministic RAF: return an id and DON'T recurse, so the render loop runs
-// its body exactly once instead of spinning.
+// Animation frames run as cancellable zero-delay timers, so the pre-parse paint
+// yield resolves and teardown's cancelAnimationFrame stops the render loop.
+const frameTimers = new Map<number, ReturnType<typeof setTimeout>>();
+let nextFrameId = 0;
+
 beforeEach(() => {
   behavior.mode = "valid";
   behavior.orbitThrows = false;
   behavior.texturedMaterial = false;
+  blobBehavior.pending = false;
   materialTextures.map = makeTextureRecord();
   materialTextures.normalMap = makeTextureRecord();
   parseCalls.length = 0;
   lastRenderer = null;
   lastMaterial = null;
   themeState.resolvedTheme = "light";
-  vi.stubGlobal(
-    "requestAnimationFrame",
-    vi.fn(() => 1),
-  );
-  vi.stubGlobal("cancelAnimationFrame", vi.fn());
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+    const id = ++nextFrameId;
+    frameTimers.set(
+      id,
+      setTimeout(() => {
+        frameTimers.delete(id);
+        callback(performance.now());
+      }, 0),
+    );
+    return id;
+  });
+  vi.stubGlobal("cancelAnimationFrame", (id: number) => {
+    clearTimeout(frameTimers.get(id));
+    frameTimers.delete(id);
+  });
   vi.stubGlobal(
     "ResizeObserver",
     class {
@@ -274,6 +309,8 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  for (const timer of frameTimers.values()) clearTimeout(timer);
+  frameTimers.clear();
   vi.unstubAllGlobals();
 });
 
@@ -341,6 +378,7 @@ describe("ModelViewer error states", () => {
     render(<ModelViewer data={makeData({ truncated: true })} path="part.stl" />);
     expect(await screen.findByText(/too large to preview/)).toBeDefined();
     expect(parseCalls).toHaveLength(0);
+    expect(screen.queryByRole("status")).toBeNull();
   });
 });
 
@@ -358,6 +396,7 @@ describe("ModelViewer error recovery (container stays mounted)", () => {
     await waitFor(() => expect(parseCalls).toContain("stl"));
     await waitFor(() => expect(screen.queryByText(/Unable to render 3D model/)).toBeNull());
     expect(lastRenderer).not.toBeNull();
+    await waitFor(() => expect(screen.queryByRole("status")).toBeNull());
   });
 });
 
@@ -397,6 +436,65 @@ describe("ModelViewer teardown", () => {
     unmount();
     expect(materialTextures.map.disposed).toBe(true);
     expect(materialTextures.normalMap.disposed).toBe(true);
+  });
+});
+
+describe("ModelViewer loading state", () => {
+  // Queues animation frames instead of running them, so the pre-parse paint
+  // yield stays pending until the test flushes it.
+  function holdFrames() {
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    return frames;
+  }
+
+  it("surfaces a loading status while the model is decoded, parsed and built", () => {
+    // Hold the read pending so the viewer stays mid-load: the preview host is
+    // mounted but the scene (canvas) is not built yet and nothing has errored.
+    blobBehavior.pending = true;
+    render(<ModelViewer data={makeData({ path: "big.stl" })} path="big.stl" />);
+
+    const host = screen.getByLabelText("3D preview of big.stl");
+    expect(host.querySelector("canvas")).toBeNull();
+    expect(screen.queryByText(/Unable to render 3D model|too large to preview/)).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent("Preparing model…");
+  });
+
+  it("clears the status once the model renders", async () => {
+    render(<ModelViewer data={makeData()} path="part.stl" />);
+    expect(screen.getByRole("status")).toHaveTextContent("Preparing model…");
+
+    await waitFor(() => expect(lastRenderer).not.toBeNull());
+    await waitFor(() => expect(screen.queryByRole("status")).toBeNull());
+    expect(screen.getByLabelText("3D preview of part.stl").querySelector("canvas")).not.toBeNull();
+  });
+
+  it("yields a frame after the bytes arrive and before the synchronous parse", async () => {
+    const frames = holdFrames();
+    render(<ModelViewer data={makeData()} path="part.stl" />);
+
+    // The bytes have been read but the parse waits on the paint yield.
+    await waitFor(() => expect(frames).toHaveLength(1));
+    expect(parseCalls).toEqual([]);
+    expect(screen.getByRole("status")).toHaveTextContent("Preparing model…");
+
+    await act(async () => {
+      frames.splice(0).forEach((frame) => frame(performance.now()));
+    });
+    await waitFor(() => expect(parseCalls).toEqual(["stl"]));
+    await waitFor(() => expect(screen.queryByRole("status")).toBeNull());
+  });
+
+  it("replaces the status with the error overlay when the load fails", async () => {
+    behavior.mode = "throw";
+    render(<ModelViewer data={makeData()} path="part.stl" />);
+    expect(screen.getByRole("status")).toHaveTextContent("Preparing model…");
+
+    expect(await screen.findByText(/Unable to render 3D model/)).toBeDefined();
+    expect(screen.queryByRole("status")).toBeNull();
   });
 });
 
