@@ -1215,7 +1215,9 @@ async def test_cancelled_old_relay_preserves_replacement_runner_stop() -> None:
     assert new_handle is not None
     sessions_module._intentional_stop_sessions[session_id] = "runner-new"
     try:
-        await asyncio.gather(old_handle.task, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.gather(old_handle.task, return_exceptions=True), timeout=_TASK_TIMEOUT_S
+        )
         assert sessions_module._intentional_stop_sessions.get(session_id) == "runner-new"
         new_gate.set()
         await asyncio.wait_for(new_handle.task, timeout=_TASK_TIMEOUT_S)
