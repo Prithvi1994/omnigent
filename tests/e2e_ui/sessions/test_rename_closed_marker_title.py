@@ -1,11 +1,4 @@
-"""E2E: a user title containing ``:closed:`` must not close the session.
-
-``sys_session_close`` tombstones a closed child's title as ``:closed:<child id>``
-and the server reads that suffix back as closed state. A sidebar rename
-round-trips the user's title verbatim through ``PATCH /v1/sessions/{id}``, so a
-title that merely *contains* ``:closed:`` must stay user text: no truncation, no
-synthesized ``omnigent.closed=true`` label, and no ``409 Session is closed``.
-"""
+"""Sidebar titles containing ``:closed:`` remain verbatim and writable."""
 
 from __future__ import annotations
 
@@ -14,40 +7,27 @@ from urllib.parse import urlparse
 import httpx
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui.sessions.test_sidebar_lifecycle import _rename_from_row
+
 _TITLE = "notes about a :closed: door"
 _CLOSED_LABEL = "omnigent.closed"
 _FOLLOWUP = "still here after the rename"
 
 
 def _rename_via_sidebar(page: Page, base_url: str, session_id: str, title: str) -> None:
-    """Rename *session_id* to *title* through the sidebar row kebab.
+    """Rename *session_id* to *title* from its sidebar row and wait for the PATCH to land.
 
-    Waits for the rename ``PATCH`` to round-trip and requires it to have
-    been accepted, so the assertions that follow observe persisted
-    server state rather than an optimistic cache paint.
-
-    :param page: Playwright page fixture (fresh context per test).
-    :param base_url: Live server base URL.
-    :param session_id: Session to rename.
-    :param title: Exact title to commit.
+    Requiring the accepted ``PATCH`` means the assertions that follow observe
+    persisted server state rather than an optimistic cache paint.
     """
     page.goto(f"{base_url}/c/{session_id}")
-    row = page.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
-    expect(row).to_be_visible()
-
-    # Hover first so the desktop hover-revealed kebab trigger is interactable.
-    row.hover()
-    row.get_by_test_id("conversation-actions").click()
-    page.get_by_test_id("rename-conversation").click()
-    edit = page.get_by_test_id("rename-conversation-input")
-    expect(edit).to_be_visible()
-    edit.fill(title)
+    expect(page.locator(f'a[href="/c/{session_id}"]')).to_be_visible()
     with page.expect_response(
         lambda r: (
             r.request.method == "PATCH" and urlparse(r.url).path == f"/v1/sessions/{session_id}"
         )
     ) as patch_info:
-        edit.press("Enter")
+        _rename_from_row(page, session_id, title)
     assert patch_info.value.status == 200, (
         f"rename PATCH should be accepted, got {patch_info.value.status}"
     )

@@ -1078,12 +1078,14 @@ async def test_open_child_title_containing_closed_text_is_shown_verbatim(
 
 async def test_a_user_title_containing_closed_does_not_close_the_session(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     A user title containing ``:closed:`` reads back verbatim, carries no closed
     label and keeps accepting messages.
 
     :param client: The test HTTP client.
+    :param monkeypatch: Routes the accepted message to a fake runner.
     """
     agent = await create_test_agent(client)
     created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
@@ -1097,17 +1099,30 @@ async def test_a_user_title_containing_closed_does_not_close_the_session(
     assert renamed.json()["title"] == "release:closed:beta"
     assert CLOSED_LABEL_KEY not in renamed.json()["labels"]
 
-    message_resp = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={
-            "type": "message",
-            "data": {
-                "role": "user",
-                "content": [{"type": "input_text", "text": "still usable"}],
-            },
-        },
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
     )
-    assert message_resp.status_code != 409, message_resp.text
+
+    async def _fake_get_runner_client(session_id: str, runner_router: object) -> httpx.AsyncClient:
+        del session_id, runner_router
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    try:
+        message_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "still usable"}],
+                },
+            },
+        )
+        assert message_resp.status_code == 202, message_resp.text
+    finally:
+        await fake_runner.aclose()
 
 
 # ── Per-child attribution across a 5-10 fan-out ───────────
