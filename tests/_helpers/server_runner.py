@@ -135,7 +135,7 @@ class ServerRunner:
         deadline = time.monotonic() + self._health_timeout
         last = "not polled"
         while time.monotonic() < deadline:
-            for proc in (self.server, self.runner):
+            for proc in (self.server, self.runner, self.host):
                 assert proc is None or proc.poll() is None, (
                     f"Process exited with code {proc.returncode} before {url} was ready.\n"
                     f"{self.log_tail()}"

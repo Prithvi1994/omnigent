@@ -266,3 +266,67 @@ async def test_old_runner_sweep_preserves_rebound_session(
     finally:
         gate.set()
         await task
+
+
+@pytest.mark.parametrize("first_cancelled", [False, True])
+@pytest.mark.parametrize("same_runner", [False, True])
+async def test_overlapping_stop_failure_preserves_successful_stop(
+    family: tuple[SqlAlchemyConversationStore, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    first_cancelled: bool,
+    same_runner: bool,
+) -> None:
+    store, ids = family
+    first_entered, release_first = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def teardown(*_args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_entered.set()
+            await release_first.wait()
+            return False
+        return True
+
+    monkeypatch.setattr(sessions, "_stop_session_host_runner", teardown)
+    first = asyncio.create_task(
+        orchestration._stop_host_runner_intentionally(ids["parent"], "host", _RUNNER, None, store)
+    )
+    await asyncio.wait_for(first_entered.wait(), timeout=10)
+    second_id = ids["parent"] if same_runner else ids["elsewhere"]
+    second_runner = _RUNNER if same_runner else "runner-other"
+    second = asyncio.create_task(
+        orchestration._stop_host_runner_intentionally(
+            second_id, "host", second_runner, None, store
+        )
+    )
+    try:
+        # Let an independent stop finish while the first delivery is held open.
+        await asyncio.wait({second}, timeout=1)
+        if not same_runner:
+            assert second.done(), "Stopping another runner must not wait for the first runner"
+        if first_cancelled:
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+        else:
+            release_first.set()
+            assert not await first
+        assert await asyncio.wait_for(second, timeout=10)
+        error = ErrorDetail(
+            code="runner_disconnected", message="Runner disconnected unexpectedly."
+        )
+        await sessions._mark_runner_sessions_offline(
+            store.list_conversations_by_runner_id(second_runner), error, store
+        )
+        child_id = ids["active"] if same_runner else ids["elsewhere"]
+        assert sessions._session_status_cache[child_id] == "idle"
+        assert (
+            sessions._last_task_error_from_labels(store.get_conversation(child_id).labels) is None
+        )
+    finally:
+        release_first.set()
+        first.cancel()
+        second.cancel()
+        await asyncio.gather(first, second, return_exceptions=True)

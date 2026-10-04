@@ -187,6 +187,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _TERMINAL_RESPONSE_EVENT_TYPES,
     _TURN_ACTOR_LABEL,
     _deferred_elicitation_clear_tasks,
+    _intentional_runner_stop_locks,
     _intentional_stop_sessions,
     _interrupt_fenced_sessions,
     _llm_response_denied_turns,
@@ -756,57 +757,60 @@ async def _stop_host_runner_intentionally(
     """
     from omnigent.server.routes import sessions as _facade
 
-    statuses: dict[str, str | None] = {}
-    after: str | None = None
-    try:
-        while True:
-            batch = await asyncio.to_thread(
-                conversation_store.list_runner_session_statuses,
+    # An unsuccessful concurrent stop must not roll back a delivered stop's intent.
+    lock = _intentional_runner_stop_locks.setdefault(runner_id, asyncio.Lock())
+    async with lock:
+        statuses: dict[str, str | None] = {}
+        after: str | None = None
+        try:
+            while True:
+                batch = await asyncio.to_thread(
+                    conversation_store.list_runner_session_statuses,
+                    runner_id,
+                    after=after,
+                    limit=_RUNNER_STOP_STATUS_BATCH_SIZE,
+                )
+                statuses.update(batch)
+                if len(batch) < _RUNNER_STOP_STATUS_BATCH_SIZE:
+                    break
+                after = batch[-1][0]
+        except Exception:  # noqa: BLE001
+            # Keep Stop available during a store outage; only known sessions can
+            # inherit intent, so unseen cold sessions keep normal disconnect handling.
+            _logger.warning(
+                "Cannot load sessions for intentionally stopped runner %s; using live relays",
                 runner_id,
-                after=after,
-                limit=_RUNNER_STOP_STATUS_BATCH_SIZE,
+                exc_info=True,
+                extra={"session_id": session_id},
             )
-            statuses.update(batch)
-            if len(batch) < _RUNNER_STOP_STATUS_BATCH_SIZE:
-                break
-            after = batch[-1][0]
-    except Exception:  # noqa: BLE001
-        # Keep Stop available during a store outage; only known sessions can
-        # inherit intent, so unseen cold sessions keep normal disconnect handling.
-        _logger.warning(
-            "Cannot load sessions for intentionally stopped runner %s; using live relays",
-            runner_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
-    for related_id, handle in _runner_relay_tasks.items():
-        if handle.runner_id == runner_id and not handle.task.done():
-            statuses.setdefault(related_id, None)
-    statuses.setdefault(session_id, None)
-    marked: set[str] = set()
-    for related_id, persisted_status in statuses.items():
-        handle = _runner_relay_tasks.get(related_id)
-        if handle is not None and handle.runner_id != runner_id:
-            continue
-        live_status = _session_status_cache.get(related_id, persisted_status)
-        # Completed work and earlier task failures keep their existing outcome.
-        if related_id != session_id and live_status not in (*_MID_TURN_STATUSES, None):
-            continue
-        if _intentional_stop_sessions.get(related_id) != runner_id:
-            marked.add(related_id)
-            _intentional_stop_sessions[related_id] = runner_id
+        for related_id, handle in _runner_relay_tasks.items():
+            if handle.runner_id == runner_id and not handle.task.done():
+                statuses.setdefault(related_id, None)
+        statuses.setdefault(session_id, None)
+        marked: set[str] = set()
+        for related_id, persisted_status in statuses.items():
+            handle = _runner_relay_tasks.get(related_id)
+            if handle is not None and handle.runner_id != runner_id:
+                continue
+            live_status = _session_status_cache.get(related_id, persisted_status)
+            # Completed work and earlier task failures keep their existing outcome.
+            if related_id != session_id and live_status not in (*_MID_TURN_STATUSES, None):
+                continue
+            if _intentional_stop_sessions.get(related_id) != runner_id:
+                marked.add(related_id)
+                _intentional_stop_sessions[related_id] = runner_id
 
-    delivered = False
-    try:
-        delivered = await _facade._stop_session_host_runner(
-            session_id, host_id, runner_id, host_registry
-        )
-    finally:
-        if not delivered:
-            for related_id in marked:
-                if _intentional_stop_sessions.get(related_id) == runner_id:
-                    _intentional_stop_sessions.pop(related_id, None)
-    return delivered
+        delivered = False
+        try:
+            delivered = await _facade._stop_session_host_runner(
+                session_id, host_id, runner_id, host_registry
+            )
+        finally:
+            if not delivered:
+                for related_id in marked:
+                    if _intentional_stop_sessions.get(related_id) == runner_id:
+                        _intentional_stop_sessions.pop(related_id, None)
+        return delivered
 
 
 async def _archive_stop(

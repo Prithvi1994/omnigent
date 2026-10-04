@@ -641,6 +641,11 @@ _intentional_stop_sessions: WorkspaceScopedCache[str, str] = WorkspaceScopedCach
 )
 
 
+_intentional_runner_stop_locks: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScopedCache(
+    weakref.WeakValueDictionary
+)
+
+
 _TERMINAL_RESPONSE_EVENT_TYPES: frozenset[str] = frozenset(
     {
         "response.completed",
@@ -1173,6 +1178,7 @@ __all__ = [
     "_browser_action_registry",
     "_catalog_prefetch_tasks",
     "_deferred_elicitation_clear_tasks",
+    "_intentional_runner_stop_locks",
     "_intentional_stop_sessions",
     "_interrupt_fenced_sessions",
     "_llm_response_denied_turns",

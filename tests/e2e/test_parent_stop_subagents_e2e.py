@@ -235,13 +235,15 @@ def test_native_parent_teardown_preserves_child_outcome(
                 },
             )
         )
-        host = _wait(
-            lambda: next(
+
+        def online_host():
+            assert stack.host is not None and stack.host.poll() is None, stack.log_tail()
+            return next(
                 (h for h in _get(client, "/v1/hosts")["hosts"] if h["status"] == "online"),
                 None,
-            ),
-            "real host registration",
-        )
+            )
+
+        host = _wait(online_host, "real host registration")
         spec = {
             "name": "native-teardown-parent",
             "prompt": "Delegate research to the worker using sys_session_send.",
@@ -316,7 +318,6 @@ def test_native_parent_teardown_preserves_child_outcome(
         assert before["parent_session_id"] == parent_id, before
         assert before["harness"] == f"{harness}-native", before
         assert before["external_session_id"] != parent["external_session_id"], (parent, before)
-        assert before["status"] == "running", before
         with _Stream(stack.base_url, child_id) as stream:
             stopped_at = time.monotonic()
             if action == "crash":

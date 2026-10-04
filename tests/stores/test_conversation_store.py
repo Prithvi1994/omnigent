@@ -3227,7 +3227,9 @@ def test_runner_session_status_page_uses_runner_index(
         plan = conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
     description = str(plan)
     assert "ix_conversation_metadata_runner_id" in description, description
-    assert "id>?" in description, description
+    # SQLite's textual plan must show a cursor seek, not only use the index:
+    # scanning earlier pages through that index would still do unbounded work.
+    assert "id>?" in "".join(description.split()), description
     assert "TEMP B-TREE" not in description, description
 
 
