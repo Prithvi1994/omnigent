@@ -34,6 +34,8 @@ implements them separately, so a fix for one harness does not reach the others.
   configured argument count, read-only. Argument and environment values stay
   on the host. Workspace config can override these host defaults. Behind
   `harness_settings_ui`; other harnesses keep their credential card only.
+- `mcp-tools`: expand a configured or plugin MCP server to probe its tools,
+  with connected/auth/timeout/unreachable/unsupported and mixed-version states.
 
 ## How to get to it (user POV)
 
@@ -43,6 +45,10 @@ view appear in the session.
 
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
+
+**MCP tools:** Settings → Harnesses → configured harness card (or gear),
+then MCP servers → expand a server, or Plugins → plugin → MCPs → expand.
+Probes run only on expansion; requires `harness_settings_ui`.
 
 **Interrupted session:** observe startup before the first message, a running
 turn, and Stop separately. For an offline host use the reconnect paths in
@@ -106,6 +112,18 @@ Cross-harness journeys:
 - **`resume`, bare picker scoped to this host:**
   `tests/e2e/test_native_resume_picker_cross_host_e2e.py::test_bare_resume_picker_excludes_other_hosts_sessions`
 - **`chat-render`, `steer`, per harness:** use the matrix.
+- **`mcp-tools`:** run `tests/host/test_mcp_tools.py`,
+  `tests/server/routes/test_mcp_tools.py`, and the real-host test
+  `tests/e2e/test_host_mcp_tools_e2e.py::test_host_mcp_tools` with plain pytest.
+  Web coverage is in `web/src/pages/settings/SettingsHarnessesSection.test.tsx`.
+  From both card and gear entry points, expand a standalone and a plugin server;
+  verify the left chevron, immediate expansion, names, count and status dot.
+  Collapsed rows must not send probes or start processes. Reopen within five
+  minutes to reuse results. Test an HTTP 401, a hanging stdio process and a
+  missing executable; expect auth, timeout and unreachable states.
+  A 501 shows an update hint; inject a 404 from the tools route to retain plain
+  rows without expansion. Confirm no raw config, schemas or synthetic secrets
+  appear in responses/logs and no probe processes survive cancellation/timeout.
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.

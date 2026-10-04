@@ -42,6 +42,7 @@ from omnigent.host.frames import (
     CAP_CODEX_SIDE_CHAT,
     HostHelloFrame,
     HostMcpServersResultFrame,
+    HostMcpToolsResultFrame,
     HostSkillsResultFrame,
 )
 from omnigent.host.harness_startup import HarnessStartup
@@ -114,6 +115,14 @@ def _fail_pending_imports(conn: HostConnection) -> None:
                 },
             )
         )
+
+
+def _fail_pending_mcp_tools(conn: HostConnection) -> None:
+    """Settle probes immediately when their host connection disappears."""
+    while conn.pending_mcp_tools:
+        _request_id, future = conn.pending_mcp_tools.popitem()
+        if not future.done():
+            future.set_exception(ConnectionError("host disconnected"))
 
 
 # How long a runner exit report stays answerable, and how many are kept.
@@ -317,6 +326,7 @@ class HostConnection:
         model catalogs resolved by the selected host.
     :param pending_skills: Per-``request_id`` futures for sessionless skill discovery.
     :param pending_mcp_servers: Per-``request_id`` futures for MCP inventory requests.
+    :param pending_mcp_tools: Per-request futures for lazy MCP discovery.
     """
 
     workspace_id: int
@@ -383,6 +393,9 @@ class HostConnection:
         default_factory=dict,
     )
     pending_harness_startup: dict[str, asyncio.Future[HarnessStartup | None]] = field(
+        default_factory=dict
+    )
+    pending_mcp_tools: dict[str, asyncio.Future[HostMcpToolsResultFrame]] = field(
         default_factory=dict
     )
     pending_mcp_servers: dict[str, asyncio.Future[HostMcpServersResultFrame]] = field(
@@ -486,6 +499,7 @@ class HostRegistry:
                 old.outbound_queue.put_nowait(None)
                 _fail_pending_imports(old)
                 _fail_pending_harness_startup(old)
+                _fail_pending_mcp_tools(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
                 self._interactive_shells[host_id] = normalize_interactive_shells(
@@ -529,6 +543,7 @@ class HostRegistry:
         removed.outbound_queue.put_nowait(None)
         _fail_pending_imports(removed)
         _fail_pending_harness_startup(removed)
+        _fail_pending_mcp_tools(removed)
         return True
 
     def mark_frame_seen(self, conn: HostConnection) -> bool:
