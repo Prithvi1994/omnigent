@@ -27,6 +27,7 @@ def test_defaults_to_the_harness_binary(config: dict[str, object]) -> None:
         "env_var": "OMNIGENT_CLAUDE_PATH",
         "resolved_path": "/found/claude",
         "args": None,
+        "env_vars": None,
     }
 
 
@@ -65,6 +66,31 @@ def test_resolves_a_real_executable(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(harness_startup, "load_global_config", dict)
     monkeypatch.setenv("OMNIGENT_CLAUDE_PATH", str(binary))
     assert describe_harness_startup("claude-native")["resolved_path"] == str(binary)
+
+
+def test_unwraps_an_env_wrapper_naming_but_not_showing_its_variables(
+    config: dict[str, object],
+) -> None:
+    config["harness"] = {
+        "claude-native": {
+            "command": "/usr/bin/env",
+            "args": ["-i", "-u", "HOME", "TOKEN=s3cret", "MODE=1", "isaac", "--"],
+        }
+    }
+    startup = describe_harness_startup("claude-native")
+    assert (startup["command"], startup["resolved_path"]) == ("isaac", "/found/isaac")
+    assert (startup["args"], startup["env_vars"]) == ("--", ["TOKEN", "MODE"])
+    assert "s3cret" not in str(startup)
+
+
+def test_shows_an_env_wrapper_it_cannot_parse_as_is(config: dict[str, object]) -> None:
+    config["harness"] = {"claude-native": {"command": "env", "args": ["-S", "isaac --"]}}
+    startup = describe_harness_startup("claude-native")
+    assert (startup["command"], startup["args"], startup["env_vars"]) == (
+        "env",
+        "-S 'isaac --'",
+        None,
+    )
 
 
 def test_harness_without_a_cli(config: dict[str, object]) -> None:

@@ -2675,6 +2675,21 @@
             "title": "Env Var",
             "type": "string"
           },
+          "env_vars": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Names an `env` wrapper sets before *command*, e.g. `[\"FOO\"]` for `env FOO=1 claude`; `None` when there's no wrapper.",
+            "title": "Env Vars"
+          },
           "harness": {
             "description": "Canonical harness id, e.g. `\"claude-native\"`.",
             "title": "Harness",

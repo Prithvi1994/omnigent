@@ -38,6 +38,8 @@ class HarnessStartupResponse(BaseModel):
         ``"/opt/homebrew/bin/claude"``; ``None`` when it isn't found.
     :param args: Base launch args from the host's config, with secret-looking
         values masked, e.g. ``"--model opus"``; ``None`` when none are set.
+    :param env_vars: Names an ``env`` wrapper sets before *command*, e.g.
+        ``["FOO"]`` for ``env FOO=1 claude``; ``None`` when there's no wrapper.
     """
 
     harness: str
@@ -46,6 +48,7 @@ class HarnessStartupResponse(BaseModel):
     env_var: str
     resolved_path: str | None = None
     args: str | None = None
+    env_vars: list[str] | None = None
 
 
 def create_harness_startup_router(

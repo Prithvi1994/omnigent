@@ -108,6 +108,18 @@ def _fail_pending_imports(conn: HostConnection) -> None:
         )
 
 
+def _fail_pending_harness_startup(conn: HostConnection) -> None:
+    """Fail the connection's in-flight harness startup lookups immediately.
+
+    A dead tunnel can never deliver the result, so the route reports the lost
+    connection (502) now instead of waiting out its timeout (504).
+    """
+    while conn.pending_harness_startup:
+        _request_id, future = conn.pending_harness_startup.popitem()
+        if not future.done():
+            future.set_exception(ConnectionError(f"host '{conn.host_id}' disconnected"))
+
+
 # How long a runner exit report stays answerable, and how many are kept.
 # Reports only matter while a client is still waiting for the runner to
 # come online (a 60s window today); 10 minutes covers slow retries with
@@ -478,6 +490,7 @@ class HostRegistry:
                 )
                 old.outbound_queue.put_nowait(None)
                 _fail_pending_imports(old)
+                _fail_pending_harness_startup(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
                 self._interactive_shells[host_id] = normalize_interactive_shells(
@@ -520,6 +533,7 @@ class HostRegistry:
         # keeps the host row online, even though the host is now unreachable.
         removed.outbound_queue.put_nowait(None)
         _fail_pending_imports(removed)
+        _fail_pending_harness_startup(removed)
         return True
 
     def mark_frame_seen(self, conn: HostConnection) -> bool:

@@ -2280,6 +2280,7 @@ _STARTUP = {
     "env_var": "OMNIGENT_CLAUDE_PATH",
     "resolved_path": "/usr/local/bin/claude",
     "args": "--model opus",
+    "env_vars": ["FOO"],
 }
 
 

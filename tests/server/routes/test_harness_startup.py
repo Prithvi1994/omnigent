@@ -34,6 +34,7 @@ _STARTUP = {
     "env_var": "OMNIGENT_CLAUDE_PATH",
     "resolved_path": "/usr/local/bin/claude",
     "args": None,
+    "env_vars": None,
 }
 
 
@@ -150,4 +151,19 @@ async def test_proxy_cleans_up_unanswered_requests(
             host_registry=registry, host_conn=conn, harness="claude-native"
         )
     assert exc_info.value.status_code == status
+    assert conn.pending_harness_startup == {}
+
+
+async def test_disconnect_after_sending_fails_fast() -> None:
+    """A host dropping mid-request is a lost connection (502) now, not a 504 later."""
+    registry = HostRegistry()
+    conn = _register(registry, CAP_HARNESS_STARTUP)
+    task = asyncio.create_task(
+        request_host_harness_startup(host_registry=registry, host_conn=conn, harness="claude")
+    )
+    await asyncio.wait_for(conn.outbound_queue.get(), 2)  # the request went out
+    registry.deregister(conn.host_id)
+    with pytest.raises(HTTPException) as exc_info:
+        await asyncio.wait_for(task, 2)  # well under the 15s timeout
+    assert exc_info.value.status_code == 502
     assert conn.pending_harness_startup == {}

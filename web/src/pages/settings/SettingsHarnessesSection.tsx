@@ -482,6 +482,8 @@ function StartupSettings({ host, harness }: { host: Host; harness: string }) {
   if (isPending) {
     return <p className="text-ui text-muted-foreground">Loading launch settings…</p>;
   }
+  // An older server has no startup endpoint: the feature is unavailable, not failing.
+  if (error instanceof ApiError && error.status === 404) return null;
   if (!data) {
     return (
       <p className="text-ui text-muted-foreground" data-testid="harness-startup-error">
@@ -519,7 +521,14 @@ function commandHint(startup: HarnessStartup): string {
       : startup.command_source === "config"
         ? `From harness.${startup.harness}.command in ~/.omnigent/config.yaml.`
         : `Default command "${startup.command}"; set ${startup.env_var} to override.`;
-  return startup.resolved_path ? source : `${source} Not found on this machine.`;
+  const wrapper =
+    startup.env_vars === null
+      ? ""
+      : startup.env_vars.length > 0
+        ? ` Runs through env, setting ${startup.env_vars.join(", ")}.`
+        : " Runs through env.";
+  const missing = startup.resolved_path ? "" : " Not found on this machine.";
+  return `${source}${wrapper}${missing}`;
 }
 
 function SettingsField({

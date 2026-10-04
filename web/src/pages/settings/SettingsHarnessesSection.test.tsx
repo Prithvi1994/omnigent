@@ -21,6 +21,7 @@ const STARTUP: HarnessStartup = {
   env_var: "OMNIGENT_CLAUDE_PATH",
   resolved_path: "/opt/claude",
   args: "--model opus",
+  env_vars: null,
 };
 let startup: { data?: HarnessStartup; error?: unknown; isPending: boolean } = {
   data: STARTUP,
@@ -258,6 +259,35 @@ describe("Harness details", () => {
     expect(screen.getByText("/opt/claude")).toBeTruthy();
     expect(screen.getByText(/From harness\.claude-native\.command/)).toBeTruthy();
     expect(screen.getByText("--model opus")).toBeTruthy();
+  });
+
+  it("names the variables an env wrapper sets, not their values", () => {
+    hosts = [ONLINE];
+    startup = {
+      data: {
+        ...STARTUP,
+        command: "isaac",
+        resolved_path: "/usr/local/bin/isaac",
+        env_vars: ["A", "B"],
+      },
+      isPending: false,
+    };
+    renderHarnesses("claude-native");
+
+    selectTab("Settings");
+    expect(screen.getByText("/usr/local/bin/isaac")).toBeTruthy();
+    expect(screen.getByText(/Runs through env, setting A, B\./)).toBeTruthy();
+  });
+
+  it("hides launch settings, keeping the credential, on a server without the endpoint", () => {
+    hosts = [ONLINE];
+    startup = { error: new ApiError("404", 404, null), isPending: false };
+    renderHarnesses("claude-native");
+
+    selectTab("Settings");
+    expect(screen.getByText("Credential")).toBeTruthy();
+    expect(screen.queryByText("Path to binary")).toBeNull();
+    expect(screen.queryByTestId("harness-startup-error")).toBeNull();
   });
 
   it("asks to update a host too old to report launch settings", () => {

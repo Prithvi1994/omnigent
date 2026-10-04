@@ -363,6 +363,8 @@ export interface HarnessStartup {
   resolved_path: string | null;
   /** Base launch args from the host's config, secrets masked; `null` when none. */
   args: string | null;
+  /** Names an `env` wrapper sets before the command; `null` without a wrapper. */
+  env_vars: string[] | null;
 }
 
 /** The binary and base args *harness* launches with on a host. Read-only. */
