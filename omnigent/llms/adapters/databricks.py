@@ -18,6 +18,7 @@ from typing import Any
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms.adapters.openai import OpenAICompatibleAdapter
 from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+from omnigent.runtime.credentials.databricks_sdk import sdk_config
 
 
 class DatabricksAdapter(OpenAICompatibleAdapter):
@@ -51,10 +52,8 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
         """Return a cached ``Config`` for *profile*, creating it if needed."""
         if profile not in self._sdk_configs:
             try:
-                from databricks.sdk.config import Config
-
                 sdk_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
-                self._sdk_configs[profile] = Config(profile=sdk_profile)
+                self._sdk_configs[profile] = sdk_config(profile=sdk_profile)
             except Exception:
                 self._sdk_configs[profile] = None
         return self._sdk_configs[profile]

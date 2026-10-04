@@ -53,6 +53,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from omnigent.runtime.credentials.databricks_sdk import sdk_config
+
 _logger = logging.getLogger(__name__)
 
 # Default location of the Databricks CLI config file when
@@ -296,7 +298,7 @@ def _call_sdk_authenticate(profile: str | None) -> WorkspaceCreds | None:
         config invalid, non-Bearer auth scheme).
     """
     try:
-        from databricks.sdk.config import Config
+        import databricks.sdk.config  # noqa: F401 — the `databricks` extra
     except ImportError as exc:
         # Pinned dep missing = real env bug, not routine auth failure.
         _logger.warning(
@@ -309,7 +311,7 @@ def _call_sdk_authenticate(profile: str | None) -> WorkspaceCreds | None:
     # ``None`` means "let the SDK decide" (env var / DEFAULT section).
     sdk_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
     try:
-        cfg = Config(profile=sdk_profile)
+        cfg = sdk_config(profile=sdk_profile)
         headers = cfg.authenticate()
     except ValueError as exc:
         # INFO (not WARNING): expired tokens raise here. WARNING would

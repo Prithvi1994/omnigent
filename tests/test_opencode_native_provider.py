@@ -152,6 +152,7 @@ def test_resolve_gateway_none_without_profile() -> None:
 def test_resolve_gateway_none_when_sdk_absent(monkeypatch: pytest.MonkeyPatch) -> None:
     # Simulate databricks-sdk not installed: the import inside the function raises.
     monkeypatch.setitem(sys.modules, "databricks.sdk.core", None)
+    monkeypatch.setitem(sys.modules, "databricks.sdk.config", None)
     assert resolve_databricks_gateway("oss") is None
 
 
@@ -165,7 +166,7 @@ def _install_fake_sdk(
     fake = types.ModuleType("databricks.sdk.core")
 
     class _Config:
-        def __init__(self, *, profile: str) -> None:
+        def __init__(self, *, profile: str, **_kwargs: object) -> None:
             self.profile = profile
             self.host = host
 
@@ -173,6 +174,8 @@ def _install_fake_sdk(
             return {"Authorization": f"Bearer {token}"} if token else {}
 
     fake.Config = _Config  # type: ignore[attr-defined]
+    fake_config = types.ModuleType("databricks.sdk.config")
+    fake_config.Config = _Config  # type: ignore[attr-defined]
     sdk = types.ModuleType("databricks.sdk")
     # Only expose WorkspaceClient (used for serving-endpoint discovery) when the
     # test supplies endpoints; otherwise the import fails and discovery no-ops.
@@ -192,6 +195,7 @@ def _install_fake_sdk(
     monkeypatch.setitem(sys.modules, "databricks", types.ModuleType("databricks"))
     monkeypatch.setitem(sys.modules, "databricks.sdk", sdk)
     monkeypatch.setitem(sys.modules, "databricks.sdk.core", fake)
+    monkeypatch.setitem(sys.modules, "databricks.sdk.config", fake_config)
 
 
 def test_resolve_gateway_success(monkeypatch: pytest.MonkeyPatch) -> None:

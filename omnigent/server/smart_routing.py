@@ -1761,9 +1761,9 @@ class ExternalRoutingClient:
         """Mint a bearer from the configured Databricks CLI profile."""
         if self._sdk_config is None:
             try:
-                from databricks.sdk.config import Config
+                from omnigent.runtime.credentials.databricks_sdk import sdk_config
 
-                self._sdk_config = Config(profile=self._databricks_profile)
+                self._sdk_config = sdk_config(profile=self._databricks_profile)
             except Exception:  # noqa: BLE001 — auth failure degrades to unauthenticated
                 _logger.warning(
                     "ExternalRoutingClient: could not resolve auth for profile %r",

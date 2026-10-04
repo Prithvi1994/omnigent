@@ -359,7 +359,7 @@ def test_resolves_via_sdk_when_sdk_returns_creds(
     # works for ``auth_type = databricks-cli`` profiles whose cfg
     # sections have NO static ``token`` field).
     class _FakeConfig:
-        def __init__(self, *, profile: str | None) -> None:
+        def __init__(self, *, profile: str | None, **_kwargs: object) -> None:
             self.host = "https://sdk.example.com/"  # trailing slash on purpose
 
         def authenticate(self) -> dict[str, str]:
@@ -402,7 +402,7 @@ def test_sdk_non_bearer_auth_falls_through(
     # through to the cfg-file path rather than returning a malformed
     # token.
     class _NonBearerConfig:
-        def __init__(self, *, profile: str | None) -> None:
+        def __init__(self, *, profile: str | None, **_kwargs: object) -> None:
             self.host = "https://sdk.example.com"
 
         def authenticate(self) -> dict[str, str]:

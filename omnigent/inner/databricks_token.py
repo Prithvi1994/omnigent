@@ -78,6 +78,8 @@ def _sdk_bearer(profile: str | None, host: str | None) -> tuple[str, str] | None
     """
     from databricks.sdk.config import Config
 
+    from omnigent.runtime.credentials.databricks_sdk import sdk_config
+
     # Bound network so a slow/unreachable OIDC or token endpoint can't stall this
     # auth command; restore the prior default so the bound never leaks out.
     previous_timeout = socket.getdefaulttimeout()
@@ -89,7 +91,7 @@ def _sdk_bearer(profile: str | None, host: str | None) -> tuple[str, str] | None
             # mirroring the CLI mint's ``env -u``.
             for name in _ambient_credential_env_vars():
                 os.environ.pop(name, None)
-            cfg = Config(profile=profile)
+            cfg = sdk_config(profile=profile)
         else:
             # Unprofiled: mirror ``databricks auth token --host`` — drop any
             # ambient profile and pin the SDK to this workspace so env / OIDC

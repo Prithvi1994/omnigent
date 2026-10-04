@@ -316,9 +316,9 @@ def build_opencode_omnigent_mcp_server(
 def _databricks_bearer_token(profile: str) -> str | None:
     """Resolve a bearer token for a ``~/.databrickscfg`` profile (best-effort)."""
     try:
-        from databricks.sdk.core import Config
+        from omnigent.runtime.credentials.databricks_sdk import sdk_config
 
-        headers = Config(profile=profile).authenticate() or {}
+        headers = sdk_config(profile=profile).authenticate() or {}
         authz = headers.get("Authorization", "")
         return authz.split(" ", 1)[1] if authz.lower().startswith("bearer ") else None
     except Exception as exc:  # noqa: BLE001 - SDK absent / bad profile / auth failure.
@@ -349,9 +349,9 @@ def resolve_databricks_gateway(
     if not profile:
         return None
     try:
-        from databricks.sdk.core import Config
+        from omnigent.runtime.credentials.databricks_sdk import sdk_config
 
-        config = Config(profile=profile)
+        config = sdk_config(profile=profile)
         host = (config.host or "").rstrip("/")
         if not host:
             return None

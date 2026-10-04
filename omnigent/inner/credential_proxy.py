@@ -519,7 +519,7 @@ def _databricks_config(profile: str) -> object:
         the profile cannot be loaded.
     """
     try:
-        from databricks.sdk.config import Config
+        import databricks.sdk.config  # noqa: F401 — the `databricks` extra
     except ImportError as exc:
         raise OmnigentError(
             "os_env.sandbox.credential_proxy type 'databricks_cli' requires the "
@@ -527,8 +527,10 @@ def _databricks_config(profile: str) -> object:
             "`pip install omnigent[databricks]`).",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+    from omnigent.runtime.credentials.databricks_sdk import sdk_config
+
     try:
-        return Config(profile=profile)
+        return sdk_config(profile=profile)
     except Exception as exc:
         raise OmnigentError(
             f"Failed to load Databricks profile {profile!r}: {exc}",

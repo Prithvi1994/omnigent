@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 import httpx
 
 from omnigent.models import model_catalog
+from omnigent.runtime.credentials.databricks_sdk import sdk_config
 
 if TYPE_CHECKING:
     import configparser
@@ -145,7 +146,7 @@ def _read_databrickscfg(profile: str | None = None) -> DatabricksCredentials | N
     # ``None`` means "let the SDK decide" (env var / DEFAULT section).
     sdk_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
     try:
-        cfg = Config(profile=sdk_profile)
+        cfg = sdk_config(profile=sdk_profile)
         headers = cfg.authenticate()
     except ValueError as profile_exc:
         # ValueError is what Config raises for every user-facing resolution
@@ -706,7 +707,7 @@ def _resolve_databricks_auth(
     cfg = None
 
     try:
-        cfg = Config(profile=sdk_profile)
+        cfg = sdk_config(profile=sdk_profile)
         cfg.authenticate()
     except ValueError:
         if profile is None and sdk_profile is not None:
@@ -772,14 +773,11 @@ def _sdk_config(**kwargs: str) -> Any:  # type: ignore[explicit-any]  # SDK Conf
 
     :param kwargs: ``Config`` keyword arguments, e.g.
         ``profile="my-ws"`` or ``host=..., auth_type="databricks-cli"``.
-    :returns: The constructed ``databricks.sdk.config.Config``.
+    :returns: The constructed ``databricks.sdk.config.Config``; a named
+        profile mints by ``--profile`` on every supported SDK (see
+        :func:`omnigent.runtime.credentials.databricks_sdk.sdk_config`).
     """
-    from databricks.sdk.config import Config
-
-    # The SDK types ``Config.__init__`` as taking a CredentialsStrategy
-    # positionally; keyword config attributes are dynamically declared,
-    # so the kwargs expansion is untypeable here.
-    return Config(**kwargs)  # type: ignore[arg-type]
+    return sdk_config(**kwargs)
 
 
 def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth, str]:
