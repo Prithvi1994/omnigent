@@ -516,6 +516,69 @@ async def test_fallback_gate_without_persist_advertisement_types_plain_approve()
 
 
 @pytest.mark.asyncio
+async def test_fallback_gate_with_different_pattern_types_plain_approve() -> None:
+    """A persist accept never always-allows a gate the user did not consent to.
+
+    The surfaced gate advertised persist for ``ls`` but timed out; the fallback
+    same-kind gate advertises persist for a DIFFERENT command (``rm``). Both
+    offer a persist menu, so without binding consent to the surfaced pattern a
+    stale accept would durably always-allow ``rm``. The bridge must downgrade to
+    the plain "Yes", granting only the one-time run.
+    """
+    pending = _pending_permission(step_index=2, persist_pattern="ls")
+    fallback = _permission_step(step_index=3, persist_pattern="rm")
+    result = ElicitationResult.model_validate({"action": "accept", "_meta": {"persist": "always"}})
+    request, _ = _elicitation_returner(result)
+    deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder()
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([fallback]),
+        request_elicitation=request,
+        deliver=deliver,
+        inject_tui=inject_tui,
+    )
+
+    assert deliver.calls[0]["step_index"] == 3
+    assert inject_tui.calls == [["1", "Enter"]]
+
+
+@pytest.mark.asyncio
+async def test_fallback_gate_with_matching_pattern_still_types_persist_entry() -> None:
+    """agy's own same-gate timeout-retry still honors the persist choice.
+
+    The surfaced gate timed out and agy re-asked the SAME command with the SAME
+    persist pattern at a new index. The on-screen menu offers the pattern the
+    user consented to, so a persist accept must still type the always-allow
+    entry rather than being needlessly downgraded.
+    """
+    pending = _pending_permission(step_index=2, persist_pattern="ls")
+    fallback = _permission_step(step_index=3, persist_pattern="ls")
+    result = ElicitationResult.model_validate(
+        {"action": "accept", "_meta": {"persist": "session"}}
+    )
+    request, _ = _elicitation_returner(result)
+    deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder()
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([fallback]),
+        request_elicitation=request,
+        deliver=deliver,
+        inject_tui=inject_tui,
+    )
+
+    assert deliver.calls[0]["step_index"] == 3
+    assert inject_tui.calls == [["2", "Enter"]]
+
+
+@pytest.mark.asyncio
 async def test_tui_dismissal_failure_does_not_undo_delivered_verdict() -> None:
     """A TUI send-keys failure is best-effort: the RPC verdict still stands.
 

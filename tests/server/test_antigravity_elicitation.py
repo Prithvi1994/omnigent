@@ -527,6 +527,45 @@ class TestToTuiSelectionKeysPermission:
         keys = to_tui_selection_keys("permission", result, self._persistable_spec())
         assert keys == ["4", "Enter"]
 
+    def _persistable_spec_for_pattern(self, pattern: str) -> dict[str, object]:
+        return {
+            "resource": {"action": "command", "target": f"{pattern} -la"},
+            "persistSuggestionType": "PERSIST_SUGGESTION_TYPE_SUGGESTED",
+            "suggestedPersistPattern": pattern,
+        }
+
+    @pytest.mark.parametrize("persist", ["session", "always"])
+    def test_mismatched_consented_pattern_falls_back_to_plain_approve(self, persist: str) -> None:
+        """Persist consent is bound to the pattern the user saw.
+
+        When the verdict lands on a fallback gate advertising a different
+        pattern, a persist accept must type the plain "Yes" rather than durably
+        always-allowing a command the user never consented to.
+        """
+        result = ElicitationResult.model_validate(
+            {"action": "accept", "_meta": {"persist": persist}}
+        )
+        keys = to_tui_selection_keys(
+            "permission",
+            result,
+            self._persistable_spec_for_pattern("rm"),
+            consented_spec=self._persistable_spec_for_pattern("ls"),
+        )
+        assert keys == ["1", "Enter"]
+
+    def test_matching_consented_pattern_still_types_persist_entry(self) -> None:
+        """A same-pattern fallback gate still honors the persist choice."""
+        result = ElicitationResult.model_validate(
+            {"action": "accept", "_meta": {"persist": "session"}}
+        )
+        keys = to_tui_selection_keys(
+            "permission",
+            result,
+            self._persistable_spec_for_pattern("ls"),
+            consented_spec=self._persistable_spec_for_pattern("ls"),
+        )
+        assert keys == ["2", "Enter"]
+
 
 class TestToTuiSelectionKeysAskQuestion:
     """Tests for ask_question verdict → agy TUI numbered-prompt keystrokes."""

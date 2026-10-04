@@ -444,9 +444,12 @@ async def bridge_interaction(
             # the next typed turn does not land in the stale prompt's buffer. The
             # backend is already answered, so a TUI-typing failure is logged, not
             # raised — never undo a delivered verdict over a flaky pane.
-            # Map keys against the DELIVERED gate's spec: a stale captured spec
-            # must not select a persist entry the on-screen menu does not have.
-            keys = to_tui_selection_keys(fresh["kind"], result, fresh["spec"])
+            # Map keys against the DELIVERED gate's spec, but bind persist consent
+            # to what the user saw: a stale accept only always-allows when the
+            # delivered gate advertises the same pattern the surfaced one did.
+            keys = to_tui_selection_keys(
+                fresh["kind"], result, fresh["spec"], consented_spec=current["spec"]
+            )
             if keys:
                 try:
                     await inject_tui(keys)

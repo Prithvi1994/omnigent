@@ -398,6 +398,8 @@ def to_tui_selection_keys(
     kind: str,
     result: ElicitationResult,
     spec: dict[str, Any],
+    *,
+    consented_spec: dict[str, Any] | None = None,
 ) -> list[str]:
     """
     Map an elicitation result to the tmux keys that answer agy's TUI prompt.
@@ -429,6 +431,9 @@ def to_tui_selection_keys(
     :param result: The web-submitted elicitation verdict.
     :param spec: The original ``askQuestion`` / ``permission`` block (used to map
         an ask_question answer's option labels back to ids).
+    :param consented_spec: The permission block the user actually saw. When
+        given, a persist accept is honored only if ``spec`` advertises the same
+        pattern the user consented to; defaults to ``spec`` (no fallback gate).
     :returns: Ordered tmux key arguments to send into the agy pane (possibly
         empty when no keystroke is warranted, e.g. an unsupported kind).
     :raises ValueError: When ``kind`` is not ``"ask_question"`` or ``"permission"``.
@@ -437,9 +442,16 @@ def to_tui_selection_keys(
         if result.action != "accept":
             return [_AGY_TUI_PERMISSION_REJECT_OPTION, _AGY_TUI_CONFIRM_KEY]
         persist = result.meta.get("persist") if result.meta is not None else None
-        # Always-allow entries exist only when the spec advertised a persist
-        # pattern; otherwise fall back to plain approve, never a missing entry.
-        if _suggested_persist_pattern(spec) is not None:
+        delivered_pattern = _suggested_persist_pattern(spec)
+        # Persist consent is bound to the pattern the user saw: when the verdict
+        # lands on a fallback gate, only always-allow if it advertises that same
+        # pattern, so a stale accept can never durably grant another command.
+        consented_pattern = (
+            _suggested_persist_pattern(consented_spec)
+            if consented_spec is not None
+            else delivered_pattern
+        )
+        if delivered_pattern is not None and delivered_pattern == consented_pattern:
             if persist == "session":
                 return [_AGY_TUI_PERMISSION_SESSION_ALLOW_OPTION, _AGY_TUI_CONFIRM_KEY]
             if persist == "always":
