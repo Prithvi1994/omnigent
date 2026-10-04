@@ -1126,13 +1126,26 @@ def test_routed_model_switch_checks_inherited_effort(
             ],
         }
     ]
-    client = _install_fake_client(monkeypatch, _FakeAppServerClient(catalog))
+
+    class LiveSettingsClient(_FakeAppServerClient):
+        native_effort = "max"
+
+        async def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+            if method == "thread/settings/update" and isinstance(params.get("effort"), str):
+                self.native_effort = str(params["effort"])
+            return await super().request(method, params)
+
+    client = LiveSettingsClient(catalog)
+    _install_fake_client(monkeypatch, client)
 
     assert codex_native_hook._apply_thread_model(bridge_dir, "databricks-gpt-5-4") is None
 
-    update: dict[str, object] = {"threadId": "thread_abc", "model": "gpt-5.4"}
-    if inherited != expected:
-        update["effort"] = expected
+    assert client.native_effort == expected
+    update: dict[str, object] = {
+        "threadId": "thread_abc",
+        "model": "gpt-5.4",
+        "effort": expected,
+    }
     assert client.requests[-1] == ("thread/settings/update", update)
     assert read_codex_config_effort(bridge_dir) == expected
 

@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, Mock
 import httpx
 import pytest
 
-from omnigent.harnesses.codex_native import app_server, bridge
+from omnigent.harnesses.codex_native import app_server, bridge, forwarder
 from omnigent.runner import app as runner_app
 from omnigent.runner.native_controls import NativeControls, build_native_controls
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -55,15 +55,18 @@ class _CodexClient:
                 "result": {
                     "data": [
                         {
-                            "id": "gpt-5.4",
+                            "id": model,
                             "defaultReasoningEffort": (
-                                None if self.failure == "missing_default" else "medium"
+                                None if self.failure == "missing_default" else default
                             ),
                             "supportedReasoningEfforts": [
-                                {"reasoningEffort": effort}
-                                for effort in ("low", "medium", "high", "xhigh")
+                                {"reasoningEffort": effort} for effort in levels
                             ],
                         }
+                        for model, default, levels in [
+                            ("gpt-5.4", "medium", ("low", "medium", "high", "xhigh")),
+                            ("gpt-6-sol", "low", ("low", "medium", "high", "xhigh", "max")),
+                        ]
                     ],
                     "nextCursor": None,
                 }
@@ -173,6 +176,90 @@ async def test_successful_update_mirrors_unchanged_native_effort_without_notific
     )
 
 
+@pytest.mark.parametrize("legacy_runner", [False, True])
+@pytest.mark.parametrize(("requested", "expected"), [("default", "low"), ("max", "max")])
+async def test_combined_model_and_effort_uses_target_model_capabilities(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_runner: bool,
+    requested: str,
+    expected: str,
+) -> None:
+    session = native_session
+    session.codex.failure = None
+    original_post = session.runner.post
+    forwarded: list[dict[str, Any]] = []
+
+    async def forward(url: str, **kwargs: Any) -> httpx.Response:
+        body = dict(kwargs["json"])
+        forwarded.append(body)
+        if legacy_runner and body.get("type") == "model_change":
+            # Older runners ignore an effort included in a model-change event.
+            body.pop("effort", None)
+        return await original_post(url, **{**kwargs, "json": body})
+
+    monkeypatch.setattr(session.runner, "post", forward)
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}",
+        json={"model_override": "gpt-6-sol", "reasoning_effort": requested},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["model_override"] == "gpt-6-sol"
+    assert response.json()["reasoning_effort"] == expected
+    assert bridge.read_codex_config_model(session.bridge_dir) == "gpt-6-sol"
+    assert bridge.read_codex_config_effort(session.bridge_dir) == expected
+    assert session.remembered_efforts[session.session_id] == expected
+    updates = [
+        params for method, params in session.codex.requests if method == "thread/settings/update"
+    ]
+    if legacy_runner:
+        assert [event["type"] for event in forwarded] == ["model_change", "effort_change"]
+        assert updates[-1] == {"threadId": "thread_codex", "effort": expected}
+    else:
+        assert len(forwarded) == 1
+        assert updates == [{"threadId": "thread_codex", "model": "gpt-6-sol", "effort": expected}]
+
+
+@pytest.mark.parametrize("reset_failure", ["refused", "disconnected"])
+async def test_legacy_combined_reset_failure_preserves_the_applied_model(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    reset_failure: str,
+) -> None:
+    session = native_session
+    session.codex.failure = None
+    original_post = session.runner.post
+
+    async def forward(url: str, **kwargs: Any) -> httpx.Response:
+        body = dict(kwargs["json"])
+        if body.get("type") == "model_change":
+            body.pop("effort", None)
+            response = await original_post(url, **{**kwargs, "json": body})
+            session.codex.failure = "missing_default"
+            app_server._effort_catalog_cache.clear()
+            return response
+        assert body.get("type") == "effort_change"
+        if reset_failure == "disconnected":
+            raise httpx.ConnectError("Runner disconnected after applying the model")
+        return await original_post(url, **kwargs)
+
+    monkeypatch.setattr(session.runner, "post", forward)
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}",
+        json={"model_override": "gpt-6-sol", "reasoning_effort": "default"},
+    )
+
+    assert response.status_code == 503, response.text
+    snapshot = await client.get(f"/v1/sessions/{session.session_id}")
+    assert snapshot.json()["model_override"] == "gpt-6-sol"
+    assert snapshot.json()["reasoning_effort"] == "xhigh"
+    assert bridge.read_codex_config_model(session.bridge_dir) == "gpt-6-sol"
+    assert bridge.read_codex_config_effort(session.bridge_dir) == "xhigh"
+
+
 async def test_reset_without_current_model_rejected_before_codex_connection(
     native_session: _NativeSession,
     monkeypatch: pytest.MonkeyPatch,
@@ -194,6 +281,51 @@ async def test_reset_without_current_model_rejected_before_codex_connection(
     factory.assert_not_called()
     assert session.remembered_efforts[session.session_id] == "xhigh"
     assert bridge.read_codex_config_effort(session.bridge_dir) == "xhigh"
+
+
+@pytest.mark.parametrize("initial_effort", ["xhigh", "low"])
+async def test_forwarder_recovers_a_failed_immediate_effort_mirror(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_effort: str,
+) -> None:
+    session = native_session
+    session.codex.failure = None
+    session.store.update_conversation(session.session_id, reasoning_effort=initial_effort)
+    assert bridge.write_codex_config_effort(session.bridge_dir, initial_effort)
+    state = forwarder._CodexForwarderState(effort=initial_effort)
+    forwarder._refresh_effort_from_config(session.bridge_dir, state)
+    state.posted_effort = initial_effort
+    state.posted_effort_known = True
+    original_post = client.post
+    attempts = 0
+
+    async def post(url: str, **kwargs: Any) -> httpx.Response:
+        nonlocal attempts
+        if kwargs.get("json", {}).get("type") == "external_reasoning_effort_change":
+            attempts += 1
+            if attempts == 1:
+                return httpx.Response(503, json={"error": "temporarily unavailable"})
+        return await original_post(url, **kwargs)
+
+    monkeypatch.setattr(client, "post", post)
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"reasoning_effort": "minimal"}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["reasoning_effort"] == "minimal"
+    assert bridge.read_codex_config_effort(session.bridge_dir) == "low"
+    assert session.remembered_efforts[session.session_id] == "low"
+
+    forwarder._refresh_effort_from_config(session.bridge_dir, state)
+    await forwarder._sync_reasoning_effort_change(
+        client, session_id=session.session_id, forwarder_state=state
+    )
+
+    snapshot = await client.get(f"/v1/sessions/{session.session_id}")
+    assert snapshot.json()["reasoning_effort"] == "low"
+    assert attempts == 2
 
 
 @pytest.mark.parametrize("failure", ["missing_default", "timeout"])

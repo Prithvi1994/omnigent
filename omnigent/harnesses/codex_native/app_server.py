@@ -763,7 +763,14 @@ def clamp_codex_effort_for_model(
         return effort
     target = EFFORT_ORDER.index(effort)
     resolved = min(supported, key=lambda value: abs(EFFORT_ORDER.index(value) - target))
-    _logger.info("Adjusted Codex reasoning effort for model %s: %s -> %s", model, effort, resolved)
+    log_once(
+        _logger,
+        logging.INFO,
+        "Adjusted Codex reasoning effort for model %s: %s -> %s",
+        model,
+        effort,
+        resolved,
+    )
     return resolved
 
 
@@ -792,6 +799,7 @@ async def resolve_codex_effort_for_model(
                 list_codex_model_options(client, include_hidden=True),
                 timeout=_EFFORT_CATALOG_TIMEOUT_SECONDS,
             )
+            # Empty startup catalogs can recover; retry instead of hiding later metadata.
             if transport is not None and catalog:
                 _effort_catalog_cache[transport] = catalog
         except Exception:  # noqa: BLE001 — discovery must not prevent a turn
@@ -800,11 +808,9 @@ async def resolve_codex_effort_for_model(
             )
     if effort is None:
         entry = _codex_model_catalog_entry(catalog, model) if model else None
-        default = (
-            entry.get("defaultReasoningEffort", entry.get("default_reasoning_level"))
-            if entry is not None
-            else None
-        )
+        if entry is None:
+            raise ValueError(f"Codex model capabilities unavailable for {model!r}")
+        default = entry.get("defaultReasoningEffort", entry.get("default_reasoning_level"))
         if not isinstance(default, str) or not default:
             raise ValueError("Codex model catalog did not provide a default reasoning effort")
         effort = default

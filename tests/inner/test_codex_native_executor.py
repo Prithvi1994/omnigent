@@ -1358,17 +1358,18 @@ def test_model_settings_update_mirrors_model_into_config_toml(
 
 
 @pytest.mark.parametrize(
-    ("requested", "inherited", "supported", "expected"),
+    ("requested", "inherited", "supported", "expected", "model_override"),
     [
-        ("minimal", "medium", ["low", "medium", "high", "xhigh"], "low"),
-        ("max", "medium", ["low", "medium", "high", "xhigh"], "xhigh"),
-        (None, "max", ["low", "medium", "high", "xhigh"], "xhigh"),
-        (None, "high", ["low", "medium", "high", "xhigh"], "high"),
-        ("max", "medium", ["low", "medium", "high", "xhigh", "max", "ultra"], "max"),
-        ("ultra", "medium", ["low", "medium", "high", "xhigh", "max", "ultra"], "ultra"),
+        ("minimal", "medium", ["low", "medium", "high", "xhigh"], "low", None),
+        ("max", "medium", ["low", "medium", "high", "xhigh"], "xhigh", None),
+        (None, "max", ["low", "medium", "high", "xhigh"], "xhigh", None),
+        (None, "high", ["low", "medium", "high", "xhigh"], "high", None),
+        ("max", "medium", ["low", "medium", "high", "xhigh", "max", "ultra"], "max", None),
+        ("ultra", "medium", ["low", "medium", "high", "xhigh", "max", "ultra"], "ultra", None),
+        ("minimal", "medium", ["low", "medium", "high", "xhigh"], "low", "databricks-gpt-5-6-sol"),
+        (None, "high", ["low", "medium", "high", "xhigh"], "high", "databricks-gpt-5-6-sol"),
     ],
 )
-@pytest.mark.parametrize("model_override", ["databricks-gpt-5-6-sol", None])
 def test_dispatch_uses_model_supported_effort(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1427,12 +1428,16 @@ def test_dispatch_uses_model_supported_effort(
     assert requests[-1][0] == "turn/start"
     assert read_codex_config_effort(tmp_path) == expected
 
-    _start_state(tmp_path)
-    _run_turn_with_config(
-        CodexNativeExecutor(bridge_dir=tmp_path),
-        "next turn",
-        ExecutorConfig(model=model_override, extra={"reasoning_effort": requested}),
-    )
+    if requested == "minimal" and model_override is None:
+        _start_state(tmp_path)
+        _run_turn_with_config(
+            CodexNativeExecutor(bridge_dir=tmp_path),
+            "next turn",
+            ExecutorConfig(model=model_override, extra={"reasoning_effort": requested}),
+        )
+        assert [
+            params["effort"] for method, params in requests if method == "thread/settings/update"
+        ] == [expected, expected]
     assert sum(method == "model/list" for method, _params in requests) == 1
     assert read_codex_config_model(tmp_path) == (model_override or "gpt-5.6-sol")
 

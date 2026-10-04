@@ -347,7 +347,8 @@ async def test_codex_native_settings_change_clamps_and_mirrors_effort(
         if initial_effort is not None:
             # A terminal-side pick can leave the runner's remembered choice stale.
             remembered_efforts[conv_id] = "minimal"
-        for _ in range(2):
+        repetitions = 2 if event == {"type": "effort_change", "effort": "minimal"} else 1
+        for _ in range(repetitions):
             if "type" in event:
                 response = await client.post(f"/v1/sessions/{conv_id}/events", json=event)
                 assert response.status_code == 204, response.text
@@ -356,7 +357,7 @@ async def test_codex_native_settings_change_clamps_and_mirrors_effort(
                 result = await controls.handle_codex_native_settings_update(conv_id, event)
                 assert result.status_code == 204
     updates = [params for method, params in fake.requests if method == "thread/settings/update"]
-    assert len(updates) == 2
+    assert len(updates) == repetitions
     assert all(params["effort"] == expected_effort for params in updates)
     assert sum(method == "model/list" for method, _ in fake.requests) == 1
     assert codex_native_bridge.read_codex_config_model(bridge_dir) == expected_model

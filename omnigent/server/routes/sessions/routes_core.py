@@ -2707,22 +2707,66 @@ def register_core_routes(
         # The runner applies native settings live. Silent startup metadata
         # writes skip both recovery and forwarding to avoid recursive launches.
         live_forward = not body.silent
+        combined_model_forward = False
+        _model_forward = None
         if live_forward and (effort is not None or clear_effort):
+            effort_event = {"type": "effort_change", "effort": updated.reasoning_effort}
+            combined_model_forward = bool(
+                live_model_change
+                and updated.model_override
+                and updated.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+                == _CODEX_NATIVE_WRAPPER_LABEL_VALUE
+            )
+            event = (
+                {
+                    "type": "model_change",
+                    "model": updated.model_override,
+                    "effort": updated.reasoning_effort,
+                }
+                if combined_model_forward
+                else effort_event
+            )
             effort_forward = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
-                {"type": "effort_change", "effort": updated.reasoning_effort},
+                event,
                 # Same TUI injection budget as the model change below: the
                 # ``/effort`` confirm dialog can render seconds after the
                 # command.
                 timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
+            model_applied = bool(
+                combined_model_forward
+                and effort_forward is not None
+                and 200 <= effort_forward.status_code < 300
+            )
+            if combined_model_forward:
+                _model_forward = effort_forward
+            if model_applied:
+                assert effort_forward is not None
+                combined_applied = False
+                with contextlib.suppress(ValueError):
+                    result = json.loads(effort_forward.body)
+                    combined_applied = (
+                        isinstance(result, dict) and result.get("codex_settings_applied") is True
+                    )
+                if not combined_applied:
+                    # Older runners apply only the model; reset against that
+                    # model after its update has completed.
+                    effort_forward = await _forward_session_change_to_runner(
+                        session_id,
+                        runner_router,
+                        effort_event,
+                        timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                    )
             if (
                 updated.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
                 == _CODEX_NATIVE_WRAPPER_LABEL_VALUE
                 and conv is not None
-                and effort_forward is not None
-                and not 200 <= effort_forward.status_code < 300
+                and (
+                    (effort_forward is None and model_applied)
+                    or (effort_forward is not None and not 200 <= effort_forward.status_code < 300)
+                )
             ):
                 # A live refusal must not leave the picker claiming unapplied
                 # settings. No runner response still permits saving for resume.
@@ -2731,21 +2775,21 @@ def register_core_routes(
                     session_id,
                     previous=conv,
                     attempted=updated,
-                    restore_model=live_model_change,
+                    restore_model=live_model_change and not model_applied,
                 )
                 raise OmnigentError(
                     "The terminal did not apply the reasoning effort change. Please try again.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
         if live_model_change:
-            _model_forward = await _forward_session_change_to_runner(
-                session_id,
-                runner_router,
-                {"type": "model_change", "model": updated.model_override},
-                # The runner answers this by typing ``/model`` into the pane and
-                # confirming the dialog, which outlasts the default budget.
-                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
-            )
+            if not combined_model_forward:
+                _model_forward = await _forward_session_change_to_runner(
+                    session_id,
+                    runner_router,
+                    {"type": "model_change", "model": updated.model_override},
+                    # The runner can answer by confirming a TUI model dialog.
+                    timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
+                )
             # Append a durable [System: model changed to X] note for sessions
             # whose history Omnigent writes. Gate on the wrapper label (NOT
             # omnigent.ui, which chat-first SDK terminal-view sessions like

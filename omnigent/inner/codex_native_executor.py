@@ -147,6 +147,8 @@ async def _start_codex_turn(
         )
         if resolved_effort != effort:
             settings_overrides["effort"] = resolved_effort
+    elif isinstance(settings_overrides.get("effort"), str):
+        _logger.warning("Codex effort change without a known model skips capability validation")
     if settings_overrides:
         await client.request(
             "thread/settings/update",

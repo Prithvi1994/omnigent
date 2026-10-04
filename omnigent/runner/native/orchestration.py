@@ -5383,18 +5383,6 @@ async def _auto_create_codex_terminal(
     # ``_AUTO_CODEX_APP_SERVERS`` entry, or the failure leaks the app-server.
     try:
         if launch_config.external_session_id is not None:
-            write_bridge_state(
-                bridge_dir,
-                CodexNativeBridgeState(
-                    session_id=session_id,
-                    socket_path=codex_ws_url,
-                    thread_id=launch_config.external_session_id,
-                    codex_home=str(codex_home),
-                    # The session workspace: without it the executor falls back
-                    # to the runner process's own cwd when starting turns.
-                    cwd=workspace,
-                ),
-            )
             if launch_config.reasoning_effort:
                 # A resumed thread runs the rollout's effort, not the config pin.
                 try:
@@ -5415,6 +5403,19 @@ async def _auto_create_codex_terminal(
                         exc_info=True,
                         extra={"session_id": session_id},
                     )
+            # Publish after resume repair so live settings cannot interleave it.
+            write_bridge_state(
+                bridge_dir,
+                CodexNativeBridgeState(
+                    session_id=session_id,
+                    socket_path=codex_ws_url,
+                    thread_id=launch_config.external_session_id,
+                    codex_home=str(codex_home),
+                    # The session workspace: without it the executor falls back
+                    # to the runner process's own cwd when starting turns.
+                    cwd=workspace,
+                ),
+            )
         launched = await _launch_codex_native_tui(
             session_id,
             resource_registry,

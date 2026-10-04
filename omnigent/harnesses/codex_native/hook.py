@@ -506,11 +506,11 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> str | None:
                 effort_for_model_switch(inherited_effort, slug), slug, rows
             )
             settings: dict[str, object] = {"threadId": state.thread_id, "model": slug}
-            if effort is not None and effort != inherited_effort:
+            if effort is not None:
                 settings["effort"] = effort
             await client.request("thread/settings/update", settings)
             applied = slug
-            applied_effort = effort if "effort" in settings else None
+            applied_effort = effort
         finally:
             await client.close()
 

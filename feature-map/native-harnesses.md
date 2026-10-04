@@ -89,6 +89,7 @@ Cross-harness journeys:
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_clamps_unsupported_effort`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_preserves_supported_effort`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_model_switch_clamps_inherited_effort`,
+  `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_combined_model_and_reset_uses_target_default`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_effort_reset_survives_next_turn`.
   These own their environment: run with plain `uv run pytest`. They drive a
   real Codex TUI and REST session settings, checking the outgoing Responses
@@ -104,11 +105,21 @@ Cross-harness journeys:
   `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_reset_preserves_concurrent_selection_and_sibling_settings`,
   `tests/server/integration/test_codex_effort_forward_failure.py::test_reset_without_current_model_rejected_before_codex_connection`,
   `tests/server/integration/test_codex_effort_forward_failure.py::test_successful_update_mirrors_unchanged_native_effort_without_notification`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_combined_model_and_effort_uses_target_model_capabilities`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_legacy_combined_reset_failure_preserves_the_applied_model`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_forwarder_recovers_a_failed_immediate_effort_mirror`,
   `tests/server/integration/test_codex_effort_forward_failure.py::test_offline_or_silent_effort_change_is_saved_for_resume`.
   Run with plain `uv run pytest`. Both HTTP apps and persistence are real;
   Codex RPC failures inject missing defaults and discovery timeouts. A refused
   reset returns an error and preserves applied settings and concurrent edits;
   offline and silent changes remain available for resume.
+  A combined model/effort PATCH uses the target model's capabilities. Older
+  runners apply the model first and then the effort; if that second step
+  fails, the error preserves the model already applied. A failed immediate
+  mirror is retried when the forwarder next reads the private config.
+  While a connected runner is still starting Codex and has no loaded bridge,
+  live settings return a retryable 503 and retain the previous selection.
+  Retry once the terminal is ready; fully offline and silent saves remain deferred.
 - **`approvals`:**
   `tests/e2e_ui/approvals/test_native_edit_tools_approval_card.py::test_native_file_edit_tools_require_approval_card`
 - **`resume`, bare picker scoped to this host:**

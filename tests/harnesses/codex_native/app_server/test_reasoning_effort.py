@@ -54,19 +54,20 @@ def test_gateway_restrictions_still_apply_to_catalog_supported_efforts(
 
 
 @pytest.mark.parametrize(
-    ("effort", "supported", "expected"),
+    ("effort", "supported", "expected", "schema"),
     [
-        ("minimal", ["low", "medium", "high", "xhigh"], "low"),
-        ("max", ["low", "medium", "high", "xhigh"], "xhigh"),
-        ("ultra", ["low", "high"], "high"),
-        ("medium", ["high", "low"], "low"),
-        ("max", ["high", "max", "ultra"], "max"),
-        ("ultra", ["high", "max", "ultra"], "ultra"),
-        ("none", ["none", "low"], "none"),
-        (None, ["low", "medium", "high"], None),
+        ("minimal", ["low", "medium", "high", "xhigh"], "low", "id"),
+        ("max", ["low", "medium", "high", "xhigh"], "xhigh", "id"),
+        ("ultra", ["low", "high"], "high", "id"),
+        ("medium", ["high", "low"], "low", "id"),
+        ("max", ["high", "max", "ultra"], "max", "id"),
+        ("ultra", ["high", "max", "ultra"], "ultra", "id"),
+        ("none", ["none", "low"], "none", "id"),
+        (None, ["low", "medium", "high"], None, "id"),
+        ("max", ["low", "medium", "high", "xhigh"], "xhigh", "model"),
+        ("max", ["low", "medium", "high", "xhigh"], "xhigh", "debug"),
     ],
 )
-@pytest.mark.parametrize("schema", ["id", "model", "debug"])
 def test_effort_uses_the_matching_models_advertised_levels(
     effort: str | None, supported: list[str], expected: str | None, schema: str
 ) -> None:

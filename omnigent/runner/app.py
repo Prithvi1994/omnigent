@@ -6571,10 +6571,24 @@ def create_runner_app(
                 if harness == "codex-native":
                     if model is None or not model.strip():
                         return Response(status_code=204)
-                    return await _handle_codex_native_settings_update(
-                        conversation_id,
-                        {"model": model.strip()},
+                    settings: _JsonObject = {"model": model.strip()}
+                    if "effort" in body:
+                        effort = body["effort"]
+                        if effort is not None and not isinstance(effort, str):
+                            return JSONResponse(
+                                status_code=400,
+                                content={
+                                    "error": "invalid_input",
+                                    "detail": "Body 'effort' must be a string or null",
+                                },
+                            )
+                        settings["effort"] = effort
+                    response = await _handle_codex_native_settings_update(
+                        conversation_id, settings
                     )
+                    if "effort" in settings and 200 <= response.status_code < 300:
+                        return JSONResponse({"codex_settings_applied": True})
+                    return response
                 if harness == "cursor-native":
                     return await _handle_cursor_native_model_change(
                         conversation_id,

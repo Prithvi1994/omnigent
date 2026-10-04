@@ -421,6 +421,27 @@ def test_codex_effort_reset_survives_next_turn(codex_effort_rig: _Rig) -> None:
         _assert_turn(rig, session, "gpt-5.4", default)
 
 
+def test_codex_combined_model_and_reset_uses_target_default(codex_effort_rig: _Rig) -> None:
+    """A combined public update selects the new model's real advertised default."""
+    rig = codex_effort_rig
+    supported = rig.capabilities("gpt-5.6-sol")
+    with _session(rig, "gpt-5.4", "xhigh") as session:
+        _assert_turn(rig, session, "gpt-5.4", "xhigh")
+        previous = asyncio.run(_native_settings(session, "gpt-5.4"))["model"]
+        target = asyncio.run(_native_settings(session, "gpt-5.6-sol"))["model"]
+        default = target["defaultReasoningEffort"]
+        assert previous["defaultReasoningEffort"] != default
+        assert previous["defaultReasoningEffort"] in supported
+        _json(
+            rig.api.patch(
+                f"/v1/sessions/{session.id}",
+                json={"model_override": "gpt-5.6-sol", "reasoning_effort": "default"},
+            )
+        )
+        _assert_turn(rig, session, "gpt-5.6-sol", default, terminal=True)
+        _assert_turn(rig, session, "gpt-5.6-sol", default)
+
+
 def test_codex_resume_clamps_persisted_effort(codex_effort_rig: _Rig) -> None:
     """Restart the real runner, resume the same Codex thread, and send from its TUI."""
     rig = codex_effort_rig
