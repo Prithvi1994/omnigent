@@ -390,14 +390,16 @@ def test_resolve_provider_antigravity_sdk_keeps_provider_resolution(
 
     The in-process Antigravity SDK harness consumes an Omnigent-resolved
     credential (spec api-key / ``antigravity:`` block / ambient key), so
-    its spellings must keep provider-config resolution instead of
-    claiming an agy CLI login the SDK never uses.
+    its spellings must keep provider-config resolution: ``none`` without a
+    credential and the supplied key with one, never an agy CLI login the
+    SDK does not use.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir.
     :param harness: The SDK antigravity harness spelling under test.
     """
     _isolate_config(monkeypatch, tmp_path, "")
+    assert resolve_model_provider(_worker_spec(harness), harness).kind == "none"
     spec = _worker_spec(harness, auth=ApiKeyAuth(api_key="gemini-test-key"))
     provider = resolve_model_provider(spec, harness)
     assert provider.kind == "key"
