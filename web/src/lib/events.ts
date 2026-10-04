@@ -69,6 +69,8 @@ export interface ResponseCompleted {
 export interface ResponseFailed {
   type: "response_failed";
   response: Response;
+  /** Where the failure originated, when supplied by the server. */
+  source?: string;
 }
 
 /** `response.incomplete` — stopped early. */
@@ -655,8 +657,8 @@ export interface SessionCodexApprovalModeEvent {
 }
 
 /**
- * `session.agent_changed` — the session's bound agent was switched in
- * place (switch-agent route).
+ * `session.agent_changed`: the session's bound agent changed (e.g. its
+ * MCP servers were edited).
  *
  * The harness may have changed family (e.g. claude-sdk → claude-native),
  * which flips the session's message lifecycle: native sessions defer

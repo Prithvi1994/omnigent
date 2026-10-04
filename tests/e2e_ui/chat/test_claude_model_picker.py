@@ -29,7 +29,9 @@ _EXPECTED_ROWS = [
 def _finish_snapshot_routes(page: Page) -> Iterator[None]:
     """Drain snapshot response handlers before Playwright disposes the page."""
     yield
-    page.unroute_all(behavior="wait")
+    # A recording run closes the page when the test body ends.
+    if not page.is_closed():
+        page.unroute_all(behavior="wait")
 
 
 _MODEL_OPTIONS = [
@@ -815,7 +817,7 @@ def test_claude_model_label_never_claims_a_version_the_catalog_didnt_give(
     # The catalog lands: its display name supersedes the fallback.
     catalog_state["ready"] = True
     _announce_catalog(page, session_id)
-    expect(label).to_contain_text("Sonnet 5 (1M context)", timeout=10_000)
+    expect(label).to_contain_text("Sonnet 5 1M", timeout=10_000)
 
     log = page.evaluate("window.__modelLabelLog")
     labels = [entry["text"] for entry in log if entry["text"]]
