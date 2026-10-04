@@ -155,6 +155,12 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
     # models: map from the resolved entry (see acp_curated_models).
     "acp": "acp",
     "qwen": "qwen",
+    # The native agy TUI bridge resolves its provider via the SDK sibling,
+    # mirroring the claude-native -> claude-sdk rule above.
+    "antigravity-native": "antigravity",
+    "native-antigravity": "antigravity",
+    "agy-native": "antigravity",
+    "native-agy": "antigravity",
 }
 
 # cursor-agent always routes through its own stored login — there is no
@@ -614,10 +620,6 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
         )
     if (harness or "") in _DEVIN_HARNESSES:
         return ResolvedModelProvider(kind=SUBSCRIPTION_KIND, cli="devin", detail="devin CLI login")
-    # The native agy TUI owns its auth (~/.gemini OAuth or GEMINI_API_KEY) and the
-    # launch seeds no Omnigent credential, so it reads as a CLI login like cursor/devin.
-    if canonical_harness == "antigravity-native":
-        return ResolvedModelProvider(kind=SUBSCRIPTION_KIND, cli="agy", detail="agy CLI login")
 
     harness_type = _PROVIDER_RESOLUTION_HARNESS.get(canonical_harness or "")
     if harness_type is None:
@@ -634,9 +636,16 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
             agent_spec, harness_type=harness_type, actual_harness=harness
         )
     )
-    if entry is not None:
-        return _provider_from_entry(entry, harness_type)
-    return _provider_from_legacy_auth(agent_spec, harness_type)
+    provider = (
+        _provider_from_entry(entry, harness_type)
+        if entry is not None
+        else _provider_from_legacy_auth(agent_spec, harness_type)
+    )
+    if provider.kind == NONE_KIND and canonical_harness == "antigravity-native":
+        # The native agy TUI runs on its own login (~/.gemini OAuth or GEMINI_API_KEY)
+        # when Omnigent resolves no credential, so it is a CLI login, not a dead worker.
+        return ResolvedModelProvider(kind=SUBSCRIPTION_KIND, cli="agy", detail="agy CLI login")
+    return provider
 
 
 def _provider_from_legacy_auth(
