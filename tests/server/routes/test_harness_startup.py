@@ -33,7 +33,8 @@ _STARTUP = {
     "command_source": "default",
     "env_var": "OMNIGENT_CLAUDE_PATH",
     "resolved_path": "/usr/local/bin/claude",
-    "args": None,
+    "arg_names": None,
+    "arg_count": 0,
     "env_vars": None,
     "reads_config": True,
 }
@@ -135,7 +136,7 @@ async def test_older_host_fails_fast_without_a_frame(startup_app) -> None:
     assert conn.outbound_queue.empty()
 
 
-@pytest.mark.parametrize("outcome,status", [("timeout", 504), ("replaced", 502)])
+@pytest.mark.parametrize("outcome,status", [("timeout", 504), ("stale", 502)])
 async def test_proxy_cleans_up_unanswered_requests(
     monkeypatch: pytest.MonkeyPatch, outcome: str, status: int
 ) -> None:
@@ -152,6 +153,21 @@ async def test_proxy_cleans_up_unanswered_requests(
             host_registry=registry, host_conn=conn, harness="claude-native"
         )
     assert exc_info.value.status_code == status
+    assert conn.pending_harness_startup == {}
+
+
+async def test_replacing_the_connection_after_sending_fails_fast() -> None:
+    """A host reconnecting mid-request fails the old request (502) at once."""
+    registry = HostRegistry()
+    conn = _register(registry, CAP_HARNESS_STARTUP)
+    task = asyncio.create_task(
+        request_host_harness_startup(host_registry=registry, host_conn=conn, harness="claude")
+    )
+    await asyncio.wait_for(conn.outbound_queue.get(), 2)  # the request went out
+    _register(registry, CAP_HARNESS_STARTUP)  # the same host reconnects
+    with pytest.raises(HTTPException) as exc_info:
+        await asyncio.wait_for(task, 2)
+    assert exc_info.value.status_code == 502
     assert conn.pending_harness_startup == {}
 
 

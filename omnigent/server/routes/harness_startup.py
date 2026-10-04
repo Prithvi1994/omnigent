@@ -25,7 +25,7 @@ _HARNESS_STARTUP_TIMEOUT_S = 15.0
 
 
 class HarnessStartupResponse(BaseModel):
-    """The command and base args a harness launch uses on a host.
+    """The command, and the names of the base args, a harness launch uses on a host.
 
     :param harness: Canonical harness id, e.g. ``"claude-native"``.
     :param command: Command a launch runs, e.g. ``"claude"`` or
@@ -36,8 +36,10 @@ class HarnessStartupResponse(BaseModel):
         ``"OMNIGENT_CLAUDE_PATH"``.
     :param resolved_path: Executable *command* resolves to on the host, e.g.
         ``"/opt/homebrew/bin/claude"``; ``None`` when it isn't found.
-    :param args: Base launch args from the host's config, with secret-looking
-        values masked, e.g. ``"--model opus"``; ``None`` when none are set.
+    :param arg_names: Option names among the base launch args from the
+        host's config, e.g. ``["--model"]``; values never leave the host.
+        ``None`` when no args are set.
+    :param arg_count: How many base launch args the host's config sets.
     :param env_vars: Names an ``env`` wrapper sets before *command*, e.g.
         ``["FOO"]`` for ``env FOO=1 claude``; ``None`` when there's no wrapper.
     :param reads_config: Whether the harness's launch reads
@@ -49,7 +51,8 @@ class HarnessStartupResponse(BaseModel):
     command_source: Literal["env", "config", "default"] | None = None
     env_var: str
     resolved_path: str | None = None
-    args: str | None = None
+    arg_names: list[str] | None = None
+    arg_count: int = 0
     env_vars: list[str] | None = None
     reads_config: bool = False
 
@@ -67,10 +70,9 @@ def create_harness_startup_router(
     async def get_harness_startup(
         request: Request, host_id: str, harness: str
     ) -> HarnessStartupResponse:
-        """Describe the binary and base args *harness* launches with on a host.
+        """Describe the binary *harness* launches with on a host, and its arg names.
 
-        Read-only; secret-looking args are masked on the host. The caller must
-        own the host.
+        Read-only; arg values stay on the host. The caller must own the host.
         """
         user_id = require_user(request, auth_provider)
         host = await asyncio.to_thread(

@@ -2627,19 +2627,29 @@
         "type": "object"
       },
       "HarnessStartupResponse": {
-        "description": "The command and base args a harness launch uses on a host.",
+        "description": "The command, and the names of the base args, a harness launch uses on a host.",
         "properties": {
-          "args": {
+          "arg_count": {
+            "default": 0,
+            "description": "How many base launch args the host's config sets.",
+            "format": "int64",
+            "title": "Arg Count",
+            "type": "integer"
+          },
+          "arg_names": {
             "anyOf": [
               {
-                "type": "string"
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
               },
               {
                 "type": "null"
               }
             ],
-            "description": "Base launch args from the host's config, with secret-looking values masked, e.g. `\"--model opus\"`; `None` when none are set.",
-            "title": "Args"
+            "description": "Option names among the base launch args from the host's config, e.g. `[\"--model\"]`; values never leave the host. `None` when no args are set.",
+            "title": "Arg Names"
           },
           "command": {
             "anyOf": [
@@ -10182,7 +10192,7 @@
     },
     "/v1/hosts/{host_id}/harnesses/{harness}/startup": {
       "get": {
-        "description": "Describe the binary and base args *harness* launches with on a host.\n\nRead-only; secret-looking args are masked on the host. The caller must\nown the host.",
+        "description": "Describe the binary *harness* launches with on a host, and its arg names.\n\nRead-only; arg values stay on the host. The caller must own the host.",
         "operationId": "get_harness_startup_v1_hosts__host_id__harnesses__harness__startup_get",
         "parameters": [
           {

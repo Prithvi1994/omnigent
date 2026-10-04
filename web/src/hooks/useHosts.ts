@@ -361,8 +361,10 @@ export interface HarnessStartup {
   env_var: string;
   /** Executable the command resolves to on the host; `null` when not found. */
   resolved_path: string | null;
-  /** Base launch args from the host's config, secrets masked; `null` when none. */
-  args: string | null;
+  /** Option names among the base launch args, e.g. `["--model"]`; `null` when none. */
+  arg_names: string[] | null;
+  /** How many base launch args the host's config sets; their values stay on the host. */
+  arg_count: number;
   /** Names an `env` wrapper sets before the command; `null` without a wrapper. */
   env_vars: string[] | null;
   /** Whether the launch reads `harness.<name>.command` / `args` from config at all. */

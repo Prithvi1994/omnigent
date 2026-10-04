@@ -357,7 +357,7 @@ async def test_host_answers_harness_startup_over_the_tunnel(
 
 
 async def test_host_reports_harness_startup_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fail(harness: str) -> dict[str, str | list[str] | None]:
+    def fail(harness: str) -> dict[str, str | list[str] | int | bool | None]:
         raise RuntimeError("boom")
 
     monkeypatch.setattr("omnigent.host.harness_startup.describe_harness_startup", fail)

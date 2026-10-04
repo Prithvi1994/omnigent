@@ -1045,11 +1045,11 @@ class HostHarnessStartupFrame:
 
 @dataclass
 class HostHarnessStartupResultFrame:
-    """Host → server: a harness's launch command, its source, and masked args."""
+    """Host → server: a harness's launch command, its source, and its arg names."""
 
     request_id: str
     status: str
-    startup: dict[str, str | list[str] | bool | None] | None = None
+    startup: dict[str, str | list[str] | int | bool | None] | None = None
     error: str | None = None
 
 
@@ -2663,7 +2663,6 @@ _HARNESS_STARTUP_FIELDS = (
     "command_source",
     "env_var",
     "resolved_path",
-    "args",
 )
 
 
@@ -2672,11 +2671,14 @@ def _decode_harness_startup_result(msg: _JsonObject) -> HostHarnessStartupResult
     raw = msg.get("startup")
     if raw is not None and not isinstance(raw, dict):
         raise ValueError("frame field must be a harness startup object: 'startup'")
-    startup: dict[str, str | list[str] | bool | None] | None = None
+    startup: dict[str, str | list[str] | int | bool | None] | None = None
     if raw is not None:
         startup = {key: _optional_nullable_str(raw, key) for key in _HARNESS_STARTUP_FIELDS}
-        startup["env_vars"] = (
-            _optional_str_list(raw, "env_vars") if raw.get("env_vars") is not None else None
+        for key in ("arg_names", "env_vars"):
+            startup[key] = _optional_str_list(raw, key) if raw.get(key) is not None else None
+        arg_count = raw.get("arg_count")
+        startup["arg_count"] = (
+            arg_count if isinstance(arg_count, int) and not isinstance(arg_count, bool) else 0
         )
         startup["reads_config"] = raw.get("reads_config") is True
     return HostHarnessStartupResultFrame(
