@@ -1,10 +1,5 @@
-"""E2E: a hardware keyboard's Cmd/Ctrl+Enter sends on a touch-primary device.
-
-Touch devices keep the on-screen keyboard's Enter a newline, but an attached
-keyboard must still send with Cmd+Enter (iOS) or Ctrl+Enter (Android) in both
-send-shortcut modes. Desktop Chromium at a phone profile stands in for the
-native WebView, with synthesized key events.
-"""
+"""E2E: a hardware keyboard's Cmd/Ctrl+Enter sends on a touch device, while plain
+Enter stays a newline (desktop Chromium at a phone profile stands in)."""
 
 from __future__ import annotations
 
