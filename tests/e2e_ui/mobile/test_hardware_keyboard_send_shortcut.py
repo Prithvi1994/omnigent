@@ -28,11 +28,11 @@ _TOGGLE = "composer-submit-with-mod-enter-toggle"
 _SEND_TIMEOUT_MS = 10_000
 _TURN_TIMEOUT_MS = 30_000
 
-# Keep both routing tokens the same length: the mock routes to the longest match
-# token in the resent transcript and breaks ties by the newest turn, so
-# equal-length tokens keep each turn routed to its own reply.
+# Equal-length routing tokens: on the resent transcript the mock picks the longest
+# match, then the rightmost (newest turn), so each turn gets its own reply.
 _META_TOKEN = "hardware-meta-enter"
 _CTRL_TOKEN = "hardware-ctrl-enter"
+assert len(_META_TOKEN) == len(_CTRL_TOKEN)
 _META_PROMPT = f"{_META_TOKEN} summarize the deploy status"
 _META_REPLY = "deploy-status-summary-reply"
 _CTRL_PROMPT = f"{_CTRL_TOKEN} list the open incidents"
