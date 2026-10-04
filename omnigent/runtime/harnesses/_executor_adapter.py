@@ -1377,19 +1377,31 @@ def _stringify_tool_payload(value: Any) -> str:
 
 
 def _render_acp_tool_call_content(block: Any) -> str:
-    """Render one ACP ``ToolCallContent`` entry; shapes without text keep a JSON fallback."""
+    """Render one ACP ``ToolCallContent`` entry.
+
+    Non-text ``content`` blocks are named rather than dumped; unknown shapes keep a JSON fallback.
+    """
     if isinstance(block, dict):
         block_type = block.get("type")
         if block_type == "content":
             inner = block.get("content")
-            inner_blocks = inner if isinstance(inner, list) else [inner]
-            texts = [
-                b["text"]
-                for b in inner_blocks
-                if isinstance(b, dict) and isinstance(b.get("text"), str)
+            inner_blocks = [
+                b for b in (inner if isinstance(inner, list) else [inner]) if isinstance(b, dict)
             ]
-            if texts:
-                return "".join(texts)
+            texts = [b["text"] for b in inner_blocks if isinstance(b.get("text"), str)]
+            # Image, audio and resource blocks can carry large base64 payloads; name them instead.
+            kinds = sorted(
+                {
+                    str(b.get("type", "unknown"))
+                    for b in inner_blocks
+                    if not isinstance(b.get("text"), str)
+                }
+            )
+            parts = ["".join(texts)] if texts else []
+            if kinds:
+                parts.append(f"[content: {', '.join(kinds)}]")
+            if parts:
+                return "\n".join(parts)
         elif block_type == "diff":
             path = block.get("path")
             new_text = block.get("newText")
@@ -1400,7 +1412,7 @@ def _render_acp_tool_call_content(block: Any) -> str:
         elif block_type == "terminal":
             terminal_id = block.get("terminalId")
             return f"[terminal {terminal_id}]" if terminal_id else "[terminal]"
-        # A flat text block mixed into an ACP list keeps its text, as the legacy join did.
+        # Preserve the text of flat text blocks mixed into an ACP list.
         block_text = block.get("text")
         if isinstance(block_text, str):
             return block_text

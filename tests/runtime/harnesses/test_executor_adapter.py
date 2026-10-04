@@ -2761,6 +2761,14 @@ def test_stringify_tool_payload_unwraps_acp_content_union() -> None:
     ]
     assert _stringify_tool_payload(inner_array) == "first second"
 
+    mixed_inner = [
+        {
+            "type": "content",
+            "content": [{"type": "text", "text": "ok"}, {"type": "image", "data": "..."}],
+        }
+    ]
+    assert _stringify_tool_payload(mixed_inner) == "ok\n[content: image]"
+
 
 def test_stringify_tool_payload_renders_diff_and_terminal_variants() -> None:
     """ACP ``diff`` / ``terminal`` results render as readable summaries,
@@ -2815,12 +2823,12 @@ def test_stringify_tool_payload_preserves_flat_blocks_and_fallbacks() -> None:
 
     assert _stringify_tool_payload([]) == "[]"
 
-    # Entries an ACP list cannot render stay visible through a per-entry JSON fallback.
+    # Unrenderable entries stay visible: non-text content by kind, unknown blocks as JSON.
     terminal = {"type": "terminal", "terminalId": "term-1"}
     image_content = {"type": "content", "content": {"type": "image", "data": "..."}}
     assert _stringify_tool_payload([{"type": "content"}]) == json.dumps({"type": "content"})
-    assert _stringify_tool_payload([image_content, terminal]) == (
-        f"{json.dumps(image_content)}\n[terminal term-1]"
+    assert (
+        _stringify_tool_payload([image_content, terminal]) == "[content: image]\n[terminal term-1]"
     )
     assert _stringify_tool_payload([foreign_block, terminal]) == (
         f"{json.dumps(foreign_block)}\n[terminal term-1]"
