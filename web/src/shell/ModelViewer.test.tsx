@@ -57,6 +57,7 @@ interface RendererRecord {
   disposed: boolean;
   contextLost: boolean;
   clearColor?: number;
+  statusAtFirstRender?: boolean;
 }
 let lastRenderer: RendererRecord | null = null;
 
@@ -169,7 +170,12 @@ vi.mock("three", () => {
     setClearColor(color: number) {
       this.record.clearColor = color;
     }
-    render() {}
+    render() {
+      // Whether the loading status was still in the DOM when the first frame drew.
+      if (this.record.statusAtFirstRender === undefined) {
+        this.record.statusAtFirstRender = document.querySelector('[role="status"]') !== null;
+      }
+    }
     dispose() {
       this.record.disposed = true;
     }
@@ -435,11 +441,12 @@ describe("ModelViewer loading state", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Preparing model…");
   });
 
-  it("clears the status once the model renders", async () => {
+  it("clears the status only after the first frame renders", async () => {
     render(<ModelViewer data={makeData()} path="part.stl" />);
     expect(screen.getByRole("status")).toHaveTextContent("Preparing model…");
 
-    await waitFor(() => expect(lastRenderer).not.toBeNull());
+    // The overlay is still up when the first frame is drawn, then goes away.
+    await waitFor(() => expect(lastRenderer?.statusAtFirstRender).toBe(true));
     await waitFor(() => expect(screen.queryByRole("status")).toBeNull());
     expect(screen.getByLabelText("3D preview of part.stl").querySelector("canvas")).not.toBeNull();
   });
