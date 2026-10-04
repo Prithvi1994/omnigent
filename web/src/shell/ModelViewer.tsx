@@ -37,9 +37,7 @@ interface ParsedModel {
 }
 
 // Shown over the empty canvas host from mount until the first frame renders or
-// the load fails. Decoding, parsing and building a large model can take seconds.
-// `loading` starts true, so React paints this before the effect's synchronous
-// parse ever blocks the main thread.
+// the load fails; decoding, parsing and building a large model can take seconds.
 function ModelLoadingOverlay() {
   return (
     <div
