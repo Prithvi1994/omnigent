@@ -200,6 +200,33 @@ async def test_stop_uses_live_relay_binding_when_row_lookup_fails(
         await task
 
 
+async def test_stop_burst_does_not_evict_other_pending_stops(
+    family: tuple[SqlAlchemyConversationStore, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pending stop intent must survive a burst beyond the former cache capacity."""
+    store, ids = family
+    pending = {f"pending-stop-{i}": "runner-previous-stop" for i in range(16384)}
+    sessions._intentional_stop_sessions.update(pending)
+    expected = pending | {
+        ids[name]: _RUNNER for name in ("parent", "active", "cold", "grandchild")
+    }
+
+    async def teardown(*_args):
+        assert dict(sessions._intentional_stop_sessions.items()) == expected
+        return True
+
+    monkeypatch.setattr(sessions, "_stop_session_host_runner", teardown)
+    try:
+        assert await orchestration._stop_host_runner_intentionally(
+            ids["parent"], "host", _RUNNER, None, store
+        )
+        assert dict(sessions._intentional_stop_sessions.items()) == expected
+    finally:
+        for session_id in pending:
+            sessions._intentional_stop_sessions.pop(session_id, None)
+
+
 async def test_unconsumed_stop_expires_before_a_later_disconnect(
     family: tuple[SqlAlchemyConversationStore, dict[str, str]],
     monkeypatch: pytest.MonkeyPatch,

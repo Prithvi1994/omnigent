@@ -7459,20 +7459,15 @@ async def _relay_runner_stream(
                 ),
             )
             if decision == "intentional_stop":
-                # User clicked Stop: the Stop handler brought this runner's
-                # tunnel down on purpose (see _stop_session_host_runner), so
-                # the drop is expected — not a failure. Publish a quiet idle
-                # and clear any error label so the chat and sidebar settle
-                # to a stopped state instead of rendering
-                # "Error · runner_disconnected". The one-shot marker was
-                # already consumed by the relay teardown, so a genuine later
-                # disconnect surfaces normally.
+                # An expected drop must not erase a real failure reported during
+                # teardown: preserve its labels when the sticky status stays failed.
                 _publish_status(session_id, "idle")
-                await _persist_session_status_error_labels(
-                    session_id,
-                    None,
-                    conversation_store,
-                )
+                if _session_status_cache.get(session_id) != "failed":
+                    await _persist_session_status_error_labels(
+                        session_id,
+                        None,
+                        conversation_store,
+                    )
             elif decision == "server_shutdown":
                 # This server closed the tunnel on its way down; the runner is
                 # reachable, just not by a process that stopped listening. The

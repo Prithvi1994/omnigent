@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 import time
 import weakref
@@ -632,11 +633,11 @@ _read_explicit_unread: WorkspaceScopedCache[str, set[str]] = WorkspaceScopedCach
 _interrupt_fenced_sessions: WorkspaceScopedSet[str] = WorkspaceScopedSet()
 
 
-# A marker covers only the stopped runner. Orphaned replica-local markers expire
-# after the host teardown and a full disconnect grace have had time to finish.
+# Markers belong to one runner and expire after teardown plus disconnect grace.
+# Do not evict live markers under load: each one suppresses an expected drop.
 _intentional_stop_sessions: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
     lambda: cachetools.TTLCache(
-        maxsize=16384, ttl=2 * RUNNER_LIVENESS_TTL_S, timer=lambda: time.monotonic()
+        maxsize=math.inf, ttl=2 * RUNNER_LIVENESS_TTL_S, timer=lambda: time.monotonic()
     )
 )
 

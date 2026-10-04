@@ -112,17 +112,21 @@ class _Stream:
                             event = json.loads(line[5:].strip())
                             self.events.append(event)
                             self.ready.set()
-        except httpx.ReadTimeout:
+        except httpx.ReadTimeout as exc:
             if not self.done.is_set():
-                self.error = AssertionError("session stream timed out before teardown")
+                self.error = exc
         except Exception as exc:
             self.error = exc
+
+    def check_error(self) -> None:
+        if self.error is not None:
+            raise AssertionError("Session SSE reader failed") from self.error
 
     def __enter__(self):
         self.thread.start()
         if not self.ready.wait(20):
             self.__exit__(None, None, None)
-            raise AssertionError(f"Stream never became ready: {self.error}")
+            raise AssertionError("Stream never became ready")
         return self
 
     def __exit__(self, exc_type, *_args):
@@ -130,7 +134,7 @@ class _Stream:
         self.thread.join(timeout=35)
         assert not self.thread.is_alive(), "SSE reader did not exit within its read timeout"
         if exc_type is None:
-            assert self.error is None, self.error
+            self.check_error()
 
 
 @pytest.mark.parametrize("harness", ["claude", "codex"])
@@ -341,12 +345,17 @@ def test_native_parent_teardown_preserves_child_outcome(
                 timeout=40,
             )
             disconnected_at = time.monotonic()
+            decisions = tuple(
+                f"Relay: runner transport lost for session={child_id} ({decision})"
+                for decision in ("intentional_stop", "failed_mid_turn", "idle_no_failure")
+            )
+
+            def disconnect_decided():
+                server_log = stack.log_path("server").read_text()
+                return any(decision in server_log for decision in decisions)
+
             _wait(
-                lambda: any(
-                    f"Relay: runner transport lost for session={child_id} ({decision})"
-                    in stack.log_path("server").read_text()
-                    for decision in ("intentional_stop", "failed_mid_turn", "idle_no_failure")
-                ),
+                disconnect_decided,
                 "child's disconnect decision after the production reconnect grace",
                 timeout=RUNNER_DISCONNECT_GRACE_S + 20,
             )
@@ -374,7 +383,7 @@ def test_native_parent_teardown_preserves_child_outcome(
                 "offline_elapsed_s": time.monotonic() - disconnected_at,
             }
             (tmp_path / "evidence.json").write_text(json.dumps(evidence, indent=2))
-            assert stream.error is None, stream.error
+            stream.check_error()
             failures = [
                 e
                 for e in stream.events

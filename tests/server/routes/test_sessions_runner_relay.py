@@ -1088,6 +1088,66 @@ class _ScriptedThenDropRunnerClient:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("intentional", [False, True])
+async def test_relay_preserves_failure_reported_during_intentional_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+    intentional: bool,
+) -> None:
+    """A failure arriving after stop intent keeps its status and durable details."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S", 0.0
+    )
+    session_id = "aa251103f45c42da8b471d1f6b12b54a"
+    runner_id = "runner-failing-during-stop"
+    error = {"code": "native_turn_error", "message": "Harness failed before teardown."}
+    event = {"type": "session.status", "status": "failed", "error": error}
+    gate = asyncio.Event()
+    runner = _ScriptedThenDropRunnerClient([f"data: {json.dumps(event)}\n\n"], gate)
+    store = _RecordingLabelStore(live_status="running")
+    sessions_module._session_status_cache[session_id] = "running"
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            runner_id,
+            runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+        if intentional:
+            sessions_module._intentional_stop_sessions[session_id] = runner_id
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        status = await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S)
+        assert status["type"] == "session.status"
+        assert status["status"] == "failed"
+        assert status["error"]["code"] == error["code"]
+        assert sessions_module._session_status_cache.get(session_id) == "failed"
+        persisted = sessions_module._last_task_error_from_labels(store.labels[session_id])
+        assert persisted is not None
+        assert persisted["code"] == error["code"]
+        assert persisted["message"] == error["message"]
+        assert session_id not in sessions_module._intentional_stop_sessions
+    finally:
+        gate.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.pop(session_id, None)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._intentional_stop_sessions.pop(session_id, None)
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mark_before_rebind", [True, False])
 async def test_relay_ignores_stop_intent_for_a_different_runner(
     monkeypatch: pytest.MonkeyPatch, mark_before_rebind: bool
