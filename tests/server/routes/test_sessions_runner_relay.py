@@ -1827,6 +1827,10 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
                 "code": "runner_disconnected",
                 "message": "Runner disconnected unexpectedly.",
             }
+        elif intentional_stop and (cached or live_status) in {"running", "waiting"}:
+            assert status == "idle"
+            assert sessions_module._last_task_error_from_labels(persisted) is None
+            assert session_id not in sessions_module._intentional_stop_sessions
         else:
             assert status == cached
             assert persisted is None
