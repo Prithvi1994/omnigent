@@ -352,11 +352,11 @@ async def test_old_runner_sweep_preserves_rebound_session(
         await task
 
 
-@pytest.mark.parametrize("rebind", [False, True])
+@pytest.mark.parametrize("handoff", ["unchanged", "rebind", "relay"])
 async def test_stop_settlement_is_ordered_and_checks_the_current_binding(
     family: tuple[SqlAlchemyConversationStore, dict[str, str]],
     monkeypatch: pytest.MonkeyPatch,
-    rebind: bool,
+    handoff: str,
 ) -> None:
     store, ids = family
     child_id = ids["active"]
@@ -374,6 +374,8 @@ async def test_stop_settlement_is_ordered_and_checks_the_current_binding(
     sessions._intentional_stop_sessions[child_id] = _RUNNER
     session_live_state.persist_live_status(child_id, "running")
     sweep = None
+    relay = None
+    relay_gate = asyncio.Event()
     try:
         assert await asyncio.to_thread(entered.wait, 10)
         error = ErrorDetail(code="runner_disconnected", message="Runner disappeared.")
@@ -382,15 +384,26 @@ async def test_stop_settlement_is_ordered_and_checks_the_current_binding(
         )
         await asyncio.wait({sweep}, timeout=0.1)
         assert not sweep.done(), "Settlement must follow the pending status write"
-        if rebind:
+        if handoff == "rebind":
             store.replace_runner_id(child_id, "runner-replacement")
             store.set_labels(child_id, {"omnigent.last_task_error_code": "replacement_error"})
+        elif handoff == "relay":
+            relay = asyncio.create_task(relay_gate.wait())
+            sessions._runner_relay_tasks[child_id] = sessions._RelayHandle(
+                _RUNNER, relay, relay_gate
+            )
         release.set()
         await asyncio.wait_for(sweep, timeout=10)
+        if relay is not None:
+            assert sessions._session_status_cache[child_id] == "running"
+            assert sessions._intentional_stop_sessions.get(child_id) == _RUNNER
+            relay_gate.set()
+            await asyncio.wait_for(relay, timeout=10)
+            await sessions._mark_runner_sessions_offline([old_row], error, store)
         after = store.get_conversation(child_id)
-        assert after.live_status == ("running" if rebind else "idle")
+        assert after.live_status == ("running" if handoff == "rebind" else "idle")
         assert sessions._session_status_cache[child_id] == after.live_status
-        if rebind:
+        if handoff == "rebind":
             assert after.labels["omnigent.last_task_error_code"] == "replacement_error"
         else:
             # Settlement must not deduplicate away the next real running edge.
@@ -402,6 +415,9 @@ async def test_stop_settlement_is_ordered_and_checks_the_current_binding(
             assert store.get_conversation(child_id).live_status == "running"
     finally:
         release.set()
+        relay_gate.set()
+        if relay is not None:
+            await asyncio.wait_for(relay, timeout=10)
         if sweep is not None:
             await asyncio.wait_for(asyncio.gather(sweep, return_exceptions=True), timeout=10)
         await asyncio.wait_for(
@@ -409,6 +425,48 @@ async def test_stop_settlement_is_ordered_and_checks_the_current_binding(
             timeout=10,
         )
         session_live_state.configure(None)
+
+
+@pytest.mark.parametrize("recovery", ["idle", "failed", "rebound"])
+async def test_failed_stop_settlement_preserves_intent_for_safe_reconciliation(
+    family: tuple[SqlAlchemyConversationStore, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    recovery: str,
+) -> None:
+    store, ids = family
+    child_id = ids["active"]
+    old_row = store.get_conversation(child_id)
+    settle = store.settle_intentionally_stopped_session
+    sessions._intentional_stop_sessions[child_id] = _RUNNER
+
+    def unavailable(*_args):
+        raise RuntimeError("metadata write temporarily unavailable")
+
+    monkeypatch.setattr(store, "settle_intentionally_stopped_session", unavailable)
+    error = ErrorDetail(code="runner_disconnected", message="Runner disappeared.")
+    await sessions._mark_runner_sessions_offline([old_row], error, store)
+    assert sessions._intentional_stop_sessions.get(child_id) == _RUNNER
+    assert sessions._session_status_cache[child_id] == "running"
+    assert store.get_conversation(child_id).live_status == "running"
+
+    monkeypatch.setattr(store, "settle_intentionally_stopped_session", settle)
+    if recovery == "failed":
+        store.set_session_live_status(child_id, "failed")
+        sessions._session_status_cache[child_id] = "failed"
+    elif recovery == "rebound":
+        store.replace_runner_id(child_id, "runner-replacement")
+    if recovery != "idle":
+        store.set_labels(child_id, {"omnigent.last_task_error_code": "preserved"})
+
+    await sessions._mark_runner_sessions_offline([old_row], error, store)
+    after = store.get_conversation(child_id)
+    assert after.live_status == ("running" if recovery == "rebound" else recovery)
+    assert sessions._session_status_cache[child_id] == after.live_status
+    assert child_id not in sessions._intentional_stop_sessions
+    if recovery != "idle":
+        assert after.labels["omnigent.last_task_error_code"] == "preserved"
+    if recovery == "rebound":
+        assert after.runner_id == "runner-replacement"
 
 
 @pytest.mark.parametrize("first_cancelled", [False, True])

@@ -3625,6 +3625,12 @@ async def _mark_runner_sessions_offline_impl(
                     if settled is None:
                         continue
                     current_handle = _runner_relay_tasks.get(conv.id)
+                    if (
+                        current_handle is not None
+                        and current_handle.runner_id == stopped_runner_id
+                        and not current_handle.task.done()
+                    ):
+                        continue
                     if settled and (
                         current_handle is None or current_handle.runner_id == stopped_runner_id
                     ):
