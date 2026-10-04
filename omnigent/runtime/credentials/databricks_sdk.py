@@ -62,7 +62,12 @@ def _sdk_version() -> tuple[int, ...]:
 def _sdk_mints_by_host() -> bool:
     """Whether the installed SDK's ``databricks-cli`` mint ignores ``Config.profile``."""
     version = _sdk_version()
-    return not version or version < _PROFILE_AWARE_SDK
+    if not version:
+        # Unknown release: trust its own credential chain instead of reaching
+        # into private internals that an unrecognized SDK may have reshaped.
+        return False
+    padded = version + (0,) * (3 - len(version))
+    return padded < _PROFILE_AWARE_SDK
 
 
 def profile_pinned_credentials() -> Any | None:  # type: ignore[explicit-any]  # SDK CredentialsStrategy
@@ -124,10 +129,11 @@ def _profile_pinned_databricks_cli(sdk_credentials: Any) -> Any:  # type: ignore
         try:
             token_source.token()
         except OSError as exc:
-            if "databricks OAuth is not" in str(exc):
-                _logger.debug("OAuth not configured or not available: %s", exc)
-                return None
-            raise
+            # A failed CLI mint should let the chain fall through to the next
+            # provider, not crash callers that handle only ValueError. CLI error
+            # wording varies by release, so skip on any mint failure here.
+            _logger.debug("databricks-cli mint failed; skipping provider: %s", exc)
+            return None
 
         def headers() -> dict[str, str]:
             token = token_source.token()
@@ -148,7 +154,7 @@ def pin_cli_command_to_profile(cmd: list[str], profile: str | None) -> list[str]
     :returns: *cmd* with ``--host <host>`` replaced by ``--profile <profile>``;
         unchanged when there is no profile or the command already names one.
     """
-    if not profile or "--profile" in cmd or "--host" not in cmd:
+    if not profile or "--profile" in cmd or "-p" in cmd or "--host" not in cmd:
         return list(cmd)
     index = cmd.index("--host")
     return [*cmd[:index], "--profile", profile, *cmd[index + 2 :]]

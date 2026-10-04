@@ -169,7 +169,7 @@ def test_stand_in_cli_matches_real_host_lookup(signed_in_cli: _SignedInCli) -> N
     assert json.loads(version.stdout)["Major"] == 1
 
 
-def test_executor_auth_uses_the_named_profile(signed_in_cli: _SignedInCli) -> None:
+def test_executor_auth_uses_the_named_profile(host_minting_sdk: _SignedInCli) -> None:
     from omnigent.inner.databricks_executor import _resolve_databricks_auth
 
     auth, host = _resolve_databricks_auth(_PROFILE)
@@ -178,7 +178,7 @@ def test_executor_auth_uses_the_named_profile(signed_in_cli: _SignedInCli) -> No
     assert auth.current_token() == f"tok-{_PROFILE}"
 
 
-def test_workspace_credentials_use_the_named_profile(signed_in_cli: _SignedInCli) -> None:
+def test_workspace_credentials_use_the_named_profile(host_minting_sdk: _SignedInCli) -> None:
     from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
     creds = resolve_databricks_workspace(_PROFILE)
@@ -186,7 +186,7 @@ def test_workspace_credentials_use_the_named_profile(signed_in_cli: _SignedInCli
     assert (creds.host, creds.token) == (_WORKSPACE, f"tok-{_PROFILE}")
 
 
-def test_credential_proxy_uses_the_named_profile(signed_in_cli: _SignedInCli) -> None:
+def test_credential_proxy_uses_the_named_profile(host_minting_sdk: _SignedInCli) -> None:
     from omnigent.inner.credential_proxy import DatabricksProfileTokenProvider
 
     provider = DatabricksProfileTokenProvider(_PROFILE)
@@ -195,13 +195,13 @@ def test_credential_proxy_uses_the_named_profile(signed_in_cli: _SignedInCli) ->
     assert provider.resolve() == f"tok-{_PROFILE}"
 
 
-def test_token_entrypoint_uses_the_named_profile(signed_in_cli: _SignedInCli) -> None:
+def test_token_entrypoint_uses_the_named_profile(host_minting_sdk: _SignedInCli) -> None:
     from omnigent.inner.databricks_token import _sdk_bearer
 
     assert _sdk_bearer(_PROFILE, _WORKSPACE) == (_WORKSPACE, f"tok-{_PROFILE}")
 
 
-def test_smart_routing_profile_auth_uses_the_named_profile(signed_in_cli: _SignedInCli) -> None:
+def test_smart_routing_profile_auth_uses_the_named_profile(host_minting_sdk: _SignedInCli) -> None:
     from omnigent.server.smart_routing import ExternalRoutingClient
 
     client = ExternalRoutingClient(
@@ -217,7 +217,7 @@ def test_smart_routing_profile_auth_uses_the_named_profile(signed_in_cli: _Signe
     assert next(auth.auth_flow(request)).headers["Authorization"] == f"Bearer tok-{_PROFILE}"
 
 
-def test_llm_adapter_uses_the_named_profile(signed_in_cli: _SignedInCli) -> None:
+def test_llm_adapter_uses_the_named_profile(host_minting_sdk: _SignedInCli) -> None:
     from omnigent.llms.adapters.databricks import DatabricksAdapter
 
     assert DatabricksAdapter()._resolve_via_sdk(_PROFILE) == {
@@ -227,7 +227,7 @@ def test_llm_adapter_uses_the_named_profile(signed_in_cli: _SignedInCli) -> None
 
 
 def test_opencode_gateway_uses_the_named_profile(
-    signed_in_cli: _SignedInCli, monkeypatch: pytest.MonkeyPatch
+    host_minting_sdk: _SignedInCli, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from omnigent.harnesses.opencode_native import provider
 
@@ -263,12 +263,17 @@ def test_opencode_gateway_uses_the_named_profile(
             ["databricks", "auth", "token", "--profile", _PROFILE],
         ),
         (
+            ["databricks", "auth", "token", "-p", _PROFILE],
+            _PROFILE,
+            ["databricks", "auth", "token", "-p", _PROFILE],
+        ),
+        (
             ["databricks", "auth", "token", "--host", _WORKSPACE],
             None,
             ["databricks", "auth", "token", "--host", _WORKSPACE],
         ),
     ],
-    ids=["host-to-profile", "keeps-account-id", "already-profile", "no-profile"],
+    ids=["host-to-profile", "keeps-account-id", "already-profile", "short-profile", "no-profile"],
 )
 def test_pin_cli_command_to_profile(
     cmd: list[str], profile: str | None, expected: list[str]
@@ -291,11 +296,16 @@ def test_sdk_config_pins_only_sdks_that_mint_by_host(monkeypatch: pytest.MonkeyP
     databricks_sdk.sdk_config(profile=_PROFILE)
     monkeypatch.setattr(databricks_sdk, "_sdk_version", lambda: (0, 94, 0))
     databricks_sdk.sdk_config(profile=_PROFILE)
+    monkeypatch.setattr(databricks_sdk, "_sdk_version", lambda: ())
+    databricks_sdk.sdk_config(profile=_PROFILE)
 
-    pinned, stock = constructed
+    pinned, stock, unknown = constructed
     assert pinned["profile"] == _PROFILE
+    assert "credentials_strategy" in pinned, "pin was silently skipped: SDK chain not customizable"
     assert pinned["credentials_strategy"].auth_type() == "default"
+    # A newer release and an unknown release both keep the SDK's own chain.
     assert stock == {"profile": _PROFILE}
+    assert unknown == {"profile": _PROFILE}
 
 
 def _force_host_minting(monkeypatch: pytest.MonkeyPatch, cli_path: Path) -> None:
@@ -313,6 +323,21 @@ def _force_host_minting(monkeypatch: pytest.MonkeyPatch, cli_path: Path) -> None
         self._cmd = [str(cli_path), "auth", "token", "--host", cfg.host]
 
     monkeypatch.setattr(sdk_credentials.DatabricksCliTokenSource, "__init__", forced_init)
+
+
+@pytest.fixture
+def host_minting_sdk(signed_in_cli: _SignedInCli, monkeypatch: pytest.MonkeyPatch) -> _SignedInCli:
+    """A signed-in CLI whose SDK is pinned to the pre-0.94 host-keyed mint.
+
+    A modern installed SDK already mints by ``--profile``, so a boundary test
+    would pass even if its caller stopped routing through ``sdk_config`` and
+    built the ``Config`` directly. Forcing the host-keyed command and an old
+    reported version makes the same-host ambiguity reappear unless the pin runs,
+    so these tests fail if a consumer bypasses the shared helper.
+    """
+    _force_host_minting(monkeypatch, signed_in_cli.path)
+    monkeypatch.setattr(databricks_sdk, "_sdk_version", lambda: (0, 67, 0))
+    return signed_in_cli
 
 
 def test_profile_pinned_chain_mints_by_profile(
