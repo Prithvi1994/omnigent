@@ -196,6 +196,12 @@ describe("ChatComposer", () => {
       shouldPreferSendOverCompletion: true,
       shouldSteerAllFromKeyboard: false,
     });
+    fireEvent.keyDown(input, { key: "Enter", ctrlKey: true, shiftKey: true });
+    expect(onKeyDown).toHaveBeenLastCalledWith(expect.anything(), {
+      shouldSubmitFromKeyboard: false,
+      shouldPreferSendOverCompletion: false,
+      shouldSteerAllFromKeyboard: true,
+    });
     onKeyDown.mockClear();
     rerender(
       <ChatComposer
