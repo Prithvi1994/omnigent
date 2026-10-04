@@ -508,13 +508,9 @@ function StartupSettings({ host, harness }: { host: Host; harness: string }) {
   );
 }
 
-/** The option names of the launch args, e.g. "--model --settings (2 values hidden)". */
+/** How many launch args are set, e.g. "4 arguments"; the args stay on the host. */
 function argsSummary(startup: HarnessStartup): string {
-  if (startup.arg_count === 0) return "None";
-  const names = startup.arg_names ?? [];
-  const hidden = startup.arg_count - names.length;
-  if (names.length === 0) return `${plural(startup.arg_count, "argument")} (values hidden)`;
-  return hidden > 0 ? `${names.join(" ")} (${plural(hidden, "value")} hidden)` : names.join(" ");
+  return startup.arg_count === 0 ? "None" : plural(startup.arg_count, "argument");
 }
 
 function plural(count: number, word: string): string {
@@ -528,7 +524,7 @@ function argsHint(startup: HarnessStartup): string {
   if (startup.arg_count === 0) {
     return `Set harness.${startup.harness}.args in ~/.omnigent/config.yaml to pass arguments on launch.`;
   }
-  return `Passed to the harness binary on launch. Values stay on the host; see harness.${startup.harness}.args in ~/.omnigent/config.yaml.`;
+  return `Set in harness.${startup.harness}.args in ~/.omnigent/config.yaml and passed on launch. They stay on the host, since they can hold credentials.`;
 }
 
 /** Where the launch command comes from, and whether the host found it. */

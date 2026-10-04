@@ -31,8 +31,9 @@ implements them separately, so a fix for one harness does not reach the others.
 - `launch-settings`: the harness's Settings tab shows, read-only, the binary a
   web launch on the selected host runs (its source: `OMNIGENT_<NAME>_PATH` when
   runners receive it, `harness.<name>.command`, or the default; an `env`
-  wrapper is unwrapped) and the option names of its startup arguments, never
-  their values. A workspace's `.omnigent/config.yaml` can still override them.
+  wrapper is unwrapped) and how many startup arguments it passes; the arguments
+  never leave the host. A workspace's `.omnigent/config.yaml` can still override
+  them.
   An older host asks to be updated; an older server hides the fields.
 
 ## How to get to it (user POV)
@@ -104,13 +105,13 @@ Cross-harness journeys:
 - **`launch-settings`:** no browser test yet (the page is behind the
   `harness_settings_ui` release feature). Run with plain `uv run pytest`:
   `tests/host/test_harness_startup.py::test_codex_prefers_config_then_a_resolvable_env_var`,
-  `tests/host/test_harness_startup.py::test_reports_option_names_never_arg_values`,
+  `tests/host/test_harness_startup.py::test_never_reports_args_only_their_count`,
   `tests/server/routes/test_harness_startup.py::test_older_host_fails_fast_without_a_frame`;
   the page itself is covered by `web/src/pages/settings/SettingsHarnessesSection.test.tsx`.
   To drive it: enable `harness_settings_ui`, set `harness.claude-native.args` in
   the host's `~/.omnigent/config.yaml` (include a fake `--api-key x`), restart the
   host, then open Settings → Harnesses → Claude Code's gear. Expect the resolved
-  binary with its source, and `--api-key (1 value hidden)` with no value shown.
+  binary with its source, and the argument count with no argument shown.
   The page reads only the user-level config, so a workspace's
   `.omnigent/config.yaml` can differ. A host without
   the `harness_startup` capability shows "Update <host>…"; a server without

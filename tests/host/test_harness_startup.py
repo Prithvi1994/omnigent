@@ -1,4 +1,4 @@
-"""A harness's launch command and arg names, as the Settings page shows them."""
+"""A harness's launch command and arg count, as the Settings page shows them."""
 
 from __future__ import annotations
 
@@ -40,7 +40,6 @@ def test_defaults_to_the_harness_binary(config: dict[str, object]) -> None:
         "command_source": "default",
         "env_var": "OMNIGENT_CLAUDE_PATH",
         "resolved_path": "/found/claude",
-        "arg_names": None,
         "arg_count": 0,
         "env_vars": None,
         "reads_config": True,
@@ -48,40 +47,26 @@ def test_defaults_to_the_harness_binary(config: dict[str, object]) -> None:
 
 
 @pytest.mark.parametrize(
-    "secret_arg",
+    "args",
     [
-        "--api-key=synthetic-key",
-        '{"apiKey": "synthetic-key"}',
-        '{"proxy":"https://fake-user:fake-pass@example.invalid/?sig=fake-signature"}',
-        "claude --api-key synthetic-key --",
-        "-psynthetic-key",
+        ["--api-key=SYNTHETIC_SECRET"],
+        ["--settings", '{"apiKey": "SYNTHETIC_SECRET"}'],
+        ["--settings", '{"proxy":"https://u:SYNTHETIC_SECRET@example.invalid/?sig=x"}'],
+        # An option-shaped value of a value-taking option, and one after ``--``.
+        ["--system-prompt", "--SYNTHETIC_SECRET"],
+        ["-p", "--", "--SYNTHETIC_SECRET"],
+        ["-pSYNTHETIC_SECRET"],
     ],
 )
-def test_reports_option_names_never_arg_values(config: dict[str, object], secret_arg: str) -> None:
+def test_never_reports_args_only_their_count(config: dict[str, object], args: list[str]) -> None:
     config["harness"] = {
-        "claude-native": {"args": ["--model", "opus", "--settings", secret_arg]},
-        "codex-native": {"args": ["-c", secret_arg]},
+        "claude-native": {"args": args},
+        "codex-native": {"args": ["-c", *args]},
     }
     claude = describe_harness_startup("claude-native")
     codex = describe_harness_startup("codex-native")
-    assert claude["arg_count"] == 4 and codex["arg_count"] == 2
-    payload = json.dumps([claude, codex])
-    for fragment in ("synthetic-key", "fake-pass", "fake-signature", "opus"):
-        assert fragment not in payload
-    assert claude["arg_names"] is not None and claude["arg_names"][:2] == ["--model", "--settings"]
-
-
-def test_option_names_drop_attached_values() -> None:
-    names = harness_startup._option_names(
-        ["--model=opus", "--api-key", "k", "-pSECRET", "-c", "--", "codex", "-"]
-    )
-    assert names == ["--model", "--api-key", "-p", "-c"]
-
-
-def test_config_command_for_claude(config: dict[str, object]) -> None:
-    config["harness"] = {"claude-native": {"command": "/opt/claude"}}
-    startup = describe_harness_startup("claude-native")
-    assert (startup["command"], startup["command_source"]) == ("/opt/claude", "config")
+    assert (claude["arg_count"], codex["arg_count"]) == (len(args), len(args) + 1)
+    assert "SYNTHETIC_SECRET" not in json.dumps([claude, codex])
 
 
 def test_env_var_counts_only_when_runners_receive_it(
@@ -134,10 +119,10 @@ def test_codex_prefers_config_then_a_resolvable_env_var(
     monkeypatch.setenv("OMNIGENT_CODEX_PATH", str(binary))
     config["harness"] = {"codex-native": {"command": "/cfg/codex", "args": ["--profile", "x"]}}
     startup = describe_harness_startup("codex-native")
-    assert (startup["command"], startup["command_source"], startup["arg_names"]) == (
+    assert (startup["command"], startup["command_source"], startup["arg_count"]) == (
         "/cfg/codex",
         "config",
-        ["--profile"],
+        2,
     )
 
 
@@ -147,11 +132,7 @@ def test_pi_ignores_global_config_its_web_launch_does_not_read(
     config["harness"] = {"pi-native": {"command": "/cfg/pi", "args": ["--model", "x"]}}
     startup = describe_harness_startup("pi-native")
     assert (startup["command"], startup["command_source"]) == ("pi", "default")
-    assert (startup["arg_names"], startup["arg_count"], startup["reads_config"]) == (
-        None,
-        0,
-        False,
-    )
+    assert (startup["arg_count"], startup["reads_config"]) == (0, False)
 
 
 def test_unwraps_an_env_wrapper_naming_but_not_showing_its_variables(
@@ -165,7 +146,7 @@ def test_unwraps_an_env_wrapper_naming_but_not_showing_its_variables(
     }
     startup = describe_harness_startup("claude-native")
     assert (startup["command"], startup["resolved_path"]) == ("isaac", "/found/isaac")
-    assert (startup["arg_names"], startup["arg_count"]) == (["--model"], 2)
+    assert startup["arg_count"] == 2
     assert startup["env_vars"] == ["TOKEN", "MODE"]
     assert "s3cret" not in str(startup)
 
@@ -190,7 +171,7 @@ def test_shows_an_env_wrapper_it_cannot_parse_as_is(config: dict[str, object]) -
         "claude-native": {"command": "env", "args": ["-S", "claude --api-key synthetic-key --"]}
     }
     startup = describe_harness_startup("claude-native")
-    assert (startup["command"], startup["arg_names"], startup["arg_count"]) == ("env", ["-S"], 2)
+    assert (startup["command"], startup["arg_count"]) == ("env", 2)
     assert "synthetic-key" not in str(startup)
 
 

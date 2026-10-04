@@ -33,7 +33,6 @@ _STARTUP = {
     "command_source": "default",
     "env_var": "OMNIGENT_CLAUDE_PATH",
     "resolved_path": "/usr/local/bin/claude",
-    "arg_names": None,
     "arg_count": 0,
     "env_vars": None,
     "reads_config": True,
@@ -85,6 +84,13 @@ def _client(app: FastAPI) -> httpx.AsyncClient:
     [
         (HostHarnessStartupResultFrame("", "ok", startup=_STARTUP), 200),
         (HostHarnessStartupResultFrame("", "failed", error="lookup failed"), 502),
+        # A malformed reply (no ``env_var``, unknown source) is a host failure.
+        (
+            HostHarnessStartupResultFrame(
+                "", "ok", startup={**_STARTUP, "env_var": None, "command_source": "bogus"}
+            ),
+            502,
+        ),
     ],
 )
 async def test_owner_gets_harness_startup(

@@ -1045,7 +1045,7 @@ class HostHarnessStartupFrame:
 
 @dataclass
 class HostHarnessStartupResultFrame:
-    """Host → server: a harness's launch command, its source, and its arg names."""
+    """Host → server: a harness's launch command, its source, and its arg count."""
 
     request_id: str
     status: str
@@ -2674,8 +2674,9 @@ def _decode_harness_startup_result(msg: _JsonObject) -> HostHarnessStartupResult
     startup: dict[str, str | list[str] | int | bool | None] | None = None
     if raw is not None:
         startup = {key: _optional_nullable_str(raw, key) for key in _HARNESS_STARTUP_FIELDS}
-        for key in ("arg_names", "env_vars"):
-            startup[key] = _optional_str_list(raw, key) if raw.get(key) is not None else None
+        startup["env_vars"] = (
+            _optional_str_list(raw, "env_vars") if raw.get("env_vars") is not None else None
+        )
         arg_count = raw.get("arg_count")
         startup["arg_count"] = (
             arg_count if isinstance(arg_count, int) and not isinstance(arg_count, bool) else 0

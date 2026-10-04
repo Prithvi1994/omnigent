@@ -1,10 +1,12 @@
-"""What a harness launch on this host runs: its binary and the names of its args.
+"""What a harness launch on this host runs: its binary and how many args it passes.
 
 Read-only and display-oriented. Mirrors each native harness's web launcher,
 against the environment a runner actually gets (``_build_runner_env``) and the
 user-level ``~/.omnigent/config.yaml``; a workspace's ``.omnigent/config.yaml``
-can still override these. Only option *names* leave the host: arg values, like
-the values an ``env`` wrapper sets, may hold credentials and stay here.
+can still override these. No arg leaves the host, only their count: any arg
+may hold a credential or a private prompt, and no rule tells an option name
+from a value for every CLI. Likewise only the names an ``env`` wrapper sets
+leave, never their values.
 """
 
 from __future__ import annotations
@@ -28,9 +30,6 @@ from omnigent.onboarding.harness_install import required_cli_for_harness
 HarnessStartup = dict[str, str | list[str] | int | bool | None]
 
 _ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
-# A long option name (``--model``) or a short one (``-c``); anything else is a value.
-_LONG_OPTION = re.compile(r"--[A-Za-z0-9][A-Za-z0-9_.-]*")
-_SHORT_OPTION = re.compile(r"-[A-Za-z0-9]")
 _CODEX_NATIVE = "codex-native"
 # Native harnesses whose web launch reads ``harness.<name>.command`` / ``args``
 # (the runner's ``_auto_create_claude_terminal`` / ``_launch_codex_native_tui``).
@@ -38,7 +37,7 @@ _CONFIG_LAUNCHED = frozenset({"claude-native", _CODEX_NATIVE})
 
 
 def describe_harness_startup(harness: str) -> HarnessStartup:
-    """Describe the command and arg names a web launch of *harness* uses here.
+    """Describe the command a web launch of *harness* uses here, and its arg count.
 
     Mirrors each launcher. ``claude-native``: the ``OMNIGENT_<NAME>_PATH`` env
     var, then config ``harness.<name>.command``, then the built-in binary.
@@ -54,9 +53,8 @@ def describe_harness_startup(harness: str) -> HarnessStartup:
         without a CLI; ``env_var``, the env var that overrides the command (the
         deprecated ``HARNESS_*`` name when that one supplied it);
         ``resolved_path``, the executable the command resolves to, or ``None``
-        when not found; ``arg_names``, the option names among the config args,
-        e.g. ``["--model"]``, or ``None`` when none are set; ``arg_count``, how
-        many config args there are; ``env_vars``, the names an ``env`` wrapper
+        when not found; ``arg_count``, how many config args the launch passes
+        (after any ``env`` wrapper's own); ``env_vars``, the names an ``env`` wrapper
         sets, or ``None`` without one; and ``reads_config``, whether the launch
         reads ``harness.<name>.command`` / ``args`` at all.
     """
@@ -87,7 +85,6 @@ def describe_harness_startup(harness: str) -> HarnessStartup:
         "command_source": source,
         "env_var": env_var,
         "resolved_path": resolved,
-        "arg_names": _option_names(args) if args else None,
         "arg_count": len(args),
         "env_vars": env_vars,
         "reads_config": reads_config,
@@ -141,21 +138,6 @@ def _is_executable(command: str, path: str | None) -> bool:
     return bool(shutil.which(command, path=path)) or (
         os.path.isfile(command) and os.access(command, os.X_OK)
     )
-
-
-def _option_names(args: list[str]) -> list[str]:
-    """The option names in *args*, never their values.
-
-    E.g. ``["--model=opus", "--api-key", "k", "-c"]`` → ``["--model", "--api-key", "-c"]``.
-    """
-    names: list[str] = []
-    for arg in args:
-        if arg.startswith("--"):
-            if match := _LONG_OPTION.fullmatch(arg.split("=", 1)[0]):
-                names.append(match.group())
-        elif match := _SHORT_OPTION.match(arg):
-            names.append(match.group())  # ``-pVALUE`` → ``-p``
-    return names
 
 
 def _unwrap_env(

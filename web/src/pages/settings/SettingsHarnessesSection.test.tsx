@@ -20,7 +20,6 @@ const STARTUP: HarnessStartup = {
   command_source: "config",
   env_var: "OMNIGENT_CLAUDE_PATH",
   resolved_path: "/opt/claude",
-  arg_names: ["--model", "--api-key"],
   arg_count: 4,
   env_vars: null,
   reads_config: true,
@@ -270,8 +269,8 @@ describe("Harness details", () => {
     expect(screen.getByText("AI Gateway")).toBeTruthy();
     expect(screen.getByText("/opt/claude")).toBeTruthy();
     expect(screen.getByText(/From harness\.claude-native\.command/)).toBeTruthy();
-    // Option names only; their values never reach the browser.
-    expect(screen.getByText("--model --api-key (2 values hidden)")).toBeTruthy();
+    // Only the count; the args themselves never reach the browser.
+    expect(screen.getByText("4 arguments")).toBeTruthy();
     expect(screen.getByText(/can override these/)).toBeTruthy();
   });
 
@@ -325,7 +324,6 @@ describe("Harness details", () => {
         command: "pi",
         command_source: "default",
         env_var: "OMNIGENT_PI_PATH",
-        arg_names: null,
         arg_count: 0,
         reads_config: false,
       },

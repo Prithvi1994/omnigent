@@ -2627,29 +2627,14 @@
         "type": "object"
       },
       "HarnessStartupResponse": {
-        "description": "The command, and the names of the base args, a harness launch uses on a host.",
+        "description": "The command a harness launch uses on a host, and how many base args it passes.",
         "properties": {
           "arg_count": {
             "default": 0,
-            "description": "How many base launch args the host's config sets.",
+            "description": "How many base launch args the host's config sets; the args themselves never leave the host.",
             "format": "int64",
             "title": "Arg Count",
             "type": "integer"
-          },
-          "arg_names": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Option names among the base launch args from the host's config, e.g. `[\"--model\"]`; values never leave the host. `None` when no args are set.",
-            "title": "Arg Names"
           },
           "command": {
             "anyOf": [
@@ -10192,7 +10177,7 @@
     },
     "/v1/hosts/{host_id}/harnesses/{harness}/startup": {
       "get": {
-        "description": "Describe the binary *harness* launches with on a host, and its arg names.\n\nRead-only; arg values stay on the host. The caller must own the host.",
+        "description": "Describe the binary *harness* launches with on a host, and its arg count.\n\nRead-only; the args themselves stay on the host. The caller must own the host.",
         "operationId": "get_harness_startup_v1_hosts__host_id__harnesses__harness__startup_get",
         "parameters": [
           {

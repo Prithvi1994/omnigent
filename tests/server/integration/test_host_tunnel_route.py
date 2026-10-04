@@ -15,6 +15,7 @@ from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
     HostConnectionErrorFrame,
     HostHarnessReadinessFrame,
+    HostHarnessStartupResultFrame,
     HostHelloFrame,
     HostImportedLocalSession,
     HostImportLocalDoneFrame,
@@ -581,6 +582,35 @@ async def test_host_tunnel_routes_launch_result_to_future(
     assert result["status"] == "launched"
     assert result["runner_id"] == "runner_token_xyz"
     assert result["error"] is None
+
+
+async def test_host_tunnel_routes_harness_startup_result_to_future(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """A harness_startup_result resolves only its own pending request, and drops it."""
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+
+    loop = asyncio.get_event_loop()
+    mine: asyncio.Future[HostHarnessStartupResultFrame] = loop.create_future()
+    other: asyncio.Future[HostHarnessStartupResultFrame] = loop.create_future()
+    conn.pending_harness_startup["req_mine"] = mine
+    conn.pending_harness_startup["req_other"] = other
+
+    startup = {"harness": "claude-native", "env_var": "OMNIGENT_CLAUDE_PATH", "arg_count": 0}
+    result = HostHarnessStartupResultFrame(request_id="req_mine", status="ok", startup=startup)
+    await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(result)})
+
+    resolved = await asyncio.wait_for(mine, timeout=budget(2.0))
+    assert (resolved.status, resolved.startup and resolved.startup["harness"]) == (
+        "ok",
+        "claude-native",
+    )
+    assert not other.done()
+    assert list(conn.pending_harness_startup) == ["req_other"]
 
 
 async def test_host_tunnel_reassembles_chunked_import_session(
