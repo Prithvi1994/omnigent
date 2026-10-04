@@ -55,6 +55,42 @@ def _get(client: httpx.Client, path: str) -> dict:
     return response.json()
 
 
+def _send_message(client: httpx.Client, session_id: str, text: str) -> None:
+    response = client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+        },
+    )
+    assert response.status_code == 202, response.text
+
+
+def _wait_for_native_tools(
+    client: httpx.Client, session_id: str, mock_url: str, tool_name: str
+) -> None:
+    # Native CLIs may accept input before their MCP connection finishes discovery.
+    probe = "NATIVE_TOOL_READY_PROBE: acknowledge readiness."
+    _send_message(client, session_id, probe)
+    seen_requests = 0
+
+    def ready():
+        nonlocal seen_requests
+        snapshot = _get(client, f"/v1/sessions/{session_id}")
+        assert not snapshot.get("last_task_error"), snapshot["last_task_error"]
+        if snapshot["status"] != "idle" or snapshot.get("pending_inputs"):
+            return False
+        requests = [r for r in get_mock_requests(mock_url) if probe in json.dumps(r)]
+        if any(t.get("name") == tool_name for r in requests for t in r.get("tools", [])):
+            return True
+        if len(requests) > seen_requests:
+            seen_requests = len(requests)
+            _send_message(client, session_id, probe)
+        return False
+
+    _wait(ready, "native CLI to advertise its real MCP tools")
+
+
 class _Stream:
     def __init__(self, base_url: str, session_id: str) -> None:
         self.events: list[dict] = []
@@ -131,11 +167,12 @@ def test_native_parent_teardown_preserves_child_outcome(
     }
     dispatch_prompt = "PARENT_TEARDOWN_PROBE: delegate the research to the worker."
     child_prompt = "CHILD_TEARDOWN_PROBE: research the requested topic."
-    tool_guard = "Bash" if harness == "claude" else "exec_command"
+    tool_guard = "Bash" if harness == "claude" else "mcp__omnigent"
+    dispatch_guard = "mcp__omnigent__sys_session_send" if harness == "claude" else tool_guard
     httpx.post(
         f"{mock_url}/mock/configure",
         json={
-            "required_tools": [tool_guard],
+            "required_tools": [dispatch_guard],
             "key": "parent",
             "match": dispatch_prompt,
             "responses": [
@@ -238,17 +275,8 @@ def test_native_parent_teardown_preserves_child_outcome(
         )
         response.raise_for_status()
         parent_id = response.json()["session_id"]
-        response = client.post(
-            f"/v1/sessions/{parent_id}/events",
-            json={
-                "type": "message",
-                "data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": dispatch_prompt}],
-                },
-            },
-        )
-        assert response.status_code == 202, response.text
+        _wait_for_native_tools(client, parent_id, mock_url, dispatch_guard)
+        _send_message(client, parent_id, dispatch_prompt)
 
         def dispatched_child():
             snapshot = _get(client, f"/v1/sessions/{parent_id}")
