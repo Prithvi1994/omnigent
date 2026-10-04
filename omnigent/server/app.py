@@ -3545,6 +3545,7 @@ def create_app(
         convs.sort(key=lambda conv: conv.parent_conversation_id in bound_ids)
         _logger.info("_on_runner_connect: runner=%s, %d bound session(s)", runner_id, len(convs))
         roots: list[tuple[Conversation, httpx.AsyncClient]] = []
+        store_slots = asyncio.Semaphore(8)
         for conv in convs:
             # Even the relay-only tail must yield so a large tree remains cancellable.
             await asyncio.sleep(0)
@@ -3552,18 +3553,27 @@ def create_app(
                 return
             with runner_log_scope(conv.id, runner_id):
                 _logger.info("_on_runner_connect: matched %s (agent=%s)", conv.id, conv.agent_id)
+                independent = not (
+                    is_parent_owned_subagent(conv)
+                    or (conv.parent_conversation_id in bound_ids and conv.host_id is None)
+                )
                 try:
+                    if independent:
+                        fresh = await asyncio.to_thread(
+                            conversation_store.get_conversation, conv.id
+                        )
+                        if fresh is None or fresh.runner_id != runner_id:
+                            continue
+                        conv = fresh
+                        if tunnel_registry.get(runner_id) is not connection:
+                            return
                     routed = runner_router.client_for_session_resources(conv.id, conversation=conv)
-                except OmnigentError:
+                except Exception:
                     _logger.exception(
                         "Failed to resolve runner client for session %s on reconnect", conv.id
                     )
                     continue
                 _ensure_runner_relay(conv.id, runner_id, routed.client, conversation_store)
-                independent = not (
-                    is_parent_owned_subagent(conv)
-                    or (conv.parent_conversation_id in bound_ids and conv.host_id is None)
-                )
                 if independent:
                     roots.append((conv, routed.client))
                 else:
@@ -3580,6 +3590,13 @@ def create_app(
         async def recover_root(conv: Conversation, client: httpx.AsyncClient) -> None:
             with runner_log_scope(conv.id, runner_id):
                 try:
+                    async with store_slots:
+                        fresh = await asyncio.to_thread(
+                            conversation_store.get_conversation, conv.id
+                        )
+                    if fresh is None or fresh.runner_id != runner_id:
+                        return
+                    conv = fresh
                     runner_session_initializer.require_generation(
                         runner_id, client, connection.generation
                     )
@@ -3602,8 +3619,9 @@ def create_app(
                             conversation_store,
                             runner_session_initializer,
                             generation=connection.generation,
+                            store_slots=store_slots,
                         )
-                except ConnectionError:
+                except (ConnectionError, httpx.HTTPError):
                     if tunnel_registry.get(runner_id) is connection:
                         _logger.exception("Failed to re-assign session %s on reconnect", conv.id)
                     else:

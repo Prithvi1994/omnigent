@@ -184,11 +184,13 @@ class RunnerSessionInitializer:
             self._tasks.pop(key, None)
         return response
 
-    def invalidate_session(self, session_id: str) -> list[asyncio.Task[httpx.Response]]:
-        """Forget session readiness and return cancelled work for the caller to join."""
+    def invalidate_session(
+        self, session_id: str, *, runner_id: str | None = None
+    ) -> list[asyncio.Task[httpx.Response]]:
+        """Retire session readiness, optionally only for its former runner binding."""
         cancelled = []
         for key in list(self._tasks.keys() | self._recovery_ids.keys()):
-            if key[2] == session_id:
+            if key[2] == session_id and (runner_id is None or key[0] == runner_id):
                 task = self._tasks.pop(key, None)
                 if task is not None and not task.done():
                     task.cancel()

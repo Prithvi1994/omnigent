@@ -536,21 +536,46 @@ async def test_hung_child_does_not_block_sibling_or_its_descendants(recovery_tre
 
 
 @pytest.mark.asyncio
-async def test_same_runner_mirror_tree_needs_no_per_child_reads_or_initialization(
-    recovery_tree: Any, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("child_owner", ["owner", "other", None])
+async def test_same_runner_mirrors_check_ownership_without_conversation_reads_or_initialization(
+    recovery_tree: Any,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    child_owner: str | None,
 ) -> None:
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
     store, parent, child, relay, recovered, initializer = recovery_tree
     mirror = child()
     nested = child(owner=mirror)
     for row in (mirror, nested):
         store.replace_runner_id(row.id, "new")
         store.set_labels(row.id, {"omnigent.wrapper": "codex-native-ui-subagent"})
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    for user in ("owner", "other"):
+        permissions.ensure_user(user)
+    permissions.grant("owner", parent.id, LEVEL_OWNER)
+    if child_owner is not None:
+        permissions.grant(child_owner, mirror.id, LEVEL_OWNER)
+    monkeypatch.setattr(
+        "omnigent.runtime.get_runner_router",
+        lambda: Mock(runner_owner=lambda _: "owner"),
+    )
     monkeypatch.setattr(store, "get_conversation", lambda *_: pytest.fail("per-child read"))
+    initialized: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        initialized.append(json.loads(request.content)["session_id"])
+        return httpx.Response(201)
+
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda _: pytest.fail("mirror initialized"))
+        transport=httpx.MockTransport(respond), base_url="http://runner"
     ) as client:
         await restore_active_children(parent, client, store, initializer)
-    assert [call.args[0] for call in relay.call_args_list] == [mirror.id, nested.id]
+    expected = [] if child_owner == "other" else [mirror.id, nested.id]
+    assert [call.args[0] for call in relay.call_args_list] == expected
+    assert initialized == []
     recovered.assert_not_awaited()
 
 
@@ -683,16 +708,41 @@ async def test_current_tunnel_store_connection_failure_remains_visible(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("destination_inflight", [False, True])
 async def test_rebinding_joins_old_initialization_without_blocking_siblings(
     recovery_tree: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    destination_inflight: bool,
 ) -> None:
+    from omnigent.server import child_session_recovery as recovery_module
+
     store, parent, child, relay, _, initializer = recovery_tree
     row, sibling = child(), child()
     entered, retiring, release, retired = (asyncio.Event() for _ in range(4))
     sibling_restored = asyncio.Event()
     requested: set[str] = set()
     initialized_after_retirement: list[bool] = []
+    destination_entered, destination_release = asyncio.Event(), asyncio.Event()
+    destination: asyncio.Task[httpx.Response] | None = None
     relay.side_effect = lambda sid, *_: sibling_restored.set() if sid == sibling.id else None
+
+    async def start_destination_after_rebind(call: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal destination
+        result = await asyncio.to_thread(call, *args, **kwargs)
+        if destination_inflight and call == store.replace_runner_id and args[0] == row.id:
+            destination = asyncio.create_task(
+                initializer.initialize(
+                    result, new_client, timeout=10, resume_interrupted_turn=True
+                )
+            )
+            await destination_entered.wait()
+        return result
+
+    monkeypatch.setattr(
+        recovery_module,
+        "asyncio",
+        SimpleNamespace(**(vars(asyncio) | {"to_thread": start_destination_after_rebind})),
+    )
 
     async def old_response(_: httpx.Request) -> httpx.Response:
         entered.set()
@@ -704,11 +754,14 @@ async def test_rebinding_joins_old_initialization_without_blocking_siblings(
             retired.set()
         return httpx.Response(201)
 
-    def new_response(request: httpx.Request) -> httpx.Response:
+    async def new_response(request: httpx.Request) -> httpx.Response:
         sid = json.loads(request.content)["session_id"]
         requested.add(sid)
         if sid == row.id:
             initialized_after_retirement.append(retired.is_set())
+            if destination_inflight:
+                destination_entered.set()
+                await destination_release.wait()
         return httpx.Response(201)
 
     async with (
@@ -726,17 +779,25 @@ async def test_rebinding_joins_old_initialization_without_blocking_siblings(
         )
         try:
             await asyncio.wait_for(asyncio.gather(retiring.wait(), sibling_restored.wait()), 5)
-            assert row.id not in requested
+            if destination_inflight:
+                assert destination is not None
+                assert not destination.done()
+            else:
+                assert row.id not in requested
             assert not recovery.done()
             release.set()
+            destination_release.set()
+            if destination is not None:
+                assert (await asyncio.wait_for(asyncio.shield(destination), 5)).status_code == 201
             await asyncio.wait_for(recovery, 5)
             with pytest.raises(ConnectionError):
                 await old
             assert requested == {row.id, sibling.id}
-            assert initialized_after_retirement == [True]
+            assert initialized_after_retirement == [not destination_inflight]
             assert {call.args[0] for call in relay.call_args_list} == requested
         finally:
             release.set()
+            destination_release.set()
             recovery.cancel()
             await asyncio.gather(recovery, return_exceptions=True)
             await asyncio.gather(
@@ -745,3 +806,5 @@ async def test_rebinding_joins_old_initialization_without_blocking_siblings(
                 return_exceptions=True,
             )
             await asyncio.gather(old, return_exceptions=True)
+            if destination is not None:
+                await asyncio.gather(destination, return_exceptions=True)

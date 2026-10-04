@@ -113,6 +113,7 @@ async def restore_active_children(
     initializer: RunnerSessionInitializer,
     *,
     generation: int | None = None,
+    store_slots: asyncio.Semaphore | None = None,
 ) -> None:
     """Rebind and initialize interrupted descendants on their recovered parent's runner."""
     from omnigent.runtime import get_runner_router
@@ -129,8 +130,9 @@ async def restore_active_children(
     router = get_runner_router()
     runner_owner = router.runner_owner(parent.runner_id) if router is not None else None
 
-    # Bound each tree's database fan-out without holding slots during initialization.
-    store_slots = asyncio.Semaphore(8)
+    # A reconnect can share this database budget across its independent trees.
+    if store_slots is None:
+        store_slots = asyncio.Semaphore(8)
 
     async def store_call(fn: Callable[_P, _T], /, *args: _P.args, **kwargs: _P.kwargs) -> _T:
         async with store_slots:
@@ -149,8 +151,8 @@ async def restore_active_children(
     tree: dict[str, Conversation] = {parent.id: parent}
     frontier = [parent.id]
     while frontier:
-        children = await asyncio.to_thread(store.list_child_conversation_ids_by_parent, frontier)
-        rows = await asyncio.to_thread(
+        children = await store_call(store.list_child_conversation_ids_by_parent, frontier)
+        rows = await store_call(
             store.get_conversations, [child for ids in children.values() for child in ids]
         )
         frontier = []
@@ -180,8 +182,8 @@ async def restore_active_children(
         if row.id in needed and row.parent_conversation_id in tree:
             needed.add(row.parent_conversation_id)
 
-    # A same-runner mirror subtree only needs relays. Keep fresh reads and owner
-    # checks on every ancestor of a session that needs a rebind or continuation.
+    # Same-runner mirror subtrees need relays and ownership checks, without
+    # reloading each conversation or initializing an independent terminal.
     protocol_needed = {
         row.id
         for row in tree.values()
@@ -199,8 +201,9 @@ async def restore_active_children(
             return False
         initializer.require_generation(runner_id, client, generation)
         if snapshot.id not in protocol_needed:
-            if not _restorable(snapshot):
+            if not await ownership_allows(snapshot) or not _restorable(snapshot):
                 return False
+            initializer.require_generation(runner_id, client, generation)
             _ensure_runner_relay(snapshot.id, runner_id, client, store)
             return True
         # Re-read and initialize under one lock so competing restores share readiness.
@@ -229,16 +232,18 @@ async def restore_active_children(
                 if child.runner_id != parent.runner_id:
                     if router is not None and router.runner_is_online(child.runner_id):
                         return False
+                    previous_runner_id = child.runner_id
                     child = await store_call(
                         store.replace_runner_id,
                         child.id,
                         parent.runner_id,
-                        expected_runner_id=child.runner_id,
+                        expected_runner_id=previous_runner_id,
                     )
                     if child.runner_id != parent.runner_id:
                         return False
                     await asyncio.gather(
-                        *initializer.invalidate_session(child.id), return_exceptions=True
+                        *initializer.invalidate_session(child.id, runner_id=previous_runner_id),
+                        return_exceptions=True,
                     )
                 mirrored = is_parent_owned_subagent(child)
                 if not mirrored:

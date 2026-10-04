@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -212,3 +214,140 @@ async def test_failed_root_init_keeps_failure_but_does_not_block_other_tree(
         assert sessions._session_status_cache[failed.id] == "failed"
         assert sessions._session_status_cache[healthy.id] == "idle"
         assert set(requested) == {failed.id, healthy.id}
+
+
+@pytest.mark.parametrize("phase", ["listing", "attachment"])
+async def test_reconnect_skips_root_rebound_before_initialization(
+    app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    import omnigent.server.app as server_app
+
+    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
+    moved, healthy = [_create_session(app, agent.id) for _ in range(2)]
+    store = app.state.runner_router._conversation_store
+    requested: list[str] = []
+
+    async def rebind_after_listing(call: Any, *args: Any, **kwargs: Any) -> Any:
+        result = await asyncio.to_thread(call, *args, **kwargs)
+        if (
+            phase == "listing"
+            and call == store.list_conversations_by_runner_id
+            and any(row.id == moved.id for row in result)
+        ):
+            await asyncio.to_thread(store.replace_runner_id, moved.id, "destination-runner")
+        return result
+
+    monkeypatch.setattr(
+        server_app,
+        "asyncio",
+        SimpleNamespace(**(vars(asyncio) | {"to_thread": rebind_after_listing})),
+    )
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        requested.append(json.loads(request.content)["session_id"])
+        return httpx.Response(201)
+
+    try:
+        async with _recover(app, monkeypatch, respond) as (relays, finished):
+            if phase == "attachment":
+                original_relay = sessions._ensure_runner_relay
+
+                def attach_then_rebind(sid: str, *args: Any) -> None:
+                    original_relay(sid, *args)
+                    if sid == moved.id:
+                        store.replace_runner_id(moved.id, "destination-runner")
+
+                monkeypatch.setattr(sessions, "_ensure_runner_relay", attach_then_rebind)
+            await asyncio.wait_for(finished.wait(), budget(5))
+            assert requested == [healthy.id]
+            assert (moved.id in relays) == (phase == "attachment")
+            assert sessions._session_status_cache[moved.id] == "failed"
+            current = store.get_conversation(moved.id)
+            assert current is not None
+            assert current.runner_id == "destination-runner"
+            assert current.labels["omnigent.last_task_error_code"] == "runner_disconnected"
+    finally:
+        sessions._session_status_cache.pop(moved.id, None)
+
+
+async def test_reconnecting_trees_share_store_budget_without_waiting_for_initialization(
+    app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import omnigent.server.app as server_app
+    from omnigent.server import child_session_recovery
+
+    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
+    roots = [_create_session(app, agent.id) for _ in range(12)]
+    children = [
+        _create_session(app, agent.id, kind="sub_agent", parent_conversation_id=root.id)
+        for root in roots
+    ]
+    hung_ids = {child.id for child in children[:-1]}
+    expected = {row.id for row in roots + children}
+    requested: set[str] = set()
+    all_requested = asyncio.Event()
+    pending_reads = peak_reads = 0
+
+    async def tracked_store_call(call: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal pending_reads, peak_reads
+        pending_reads += 1
+        peak_reads = max(peak_reads, pending_reads)
+        try:
+            return await asyncio.to_thread(call, *args, **kwargs)
+        finally:
+            pending_reads -= 1
+
+    for module in (server_app, child_session_recovery):
+        monkeypatch.setattr(
+            module,
+            "asyncio",
+            SimpleNamespace(**(vars(asyncio) | {"to_thread": tracked_store_call})),
+        )
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        sid = json.loads(request.content)["session_id"]
+        requested.add(sid)
+        if requested == expected:
+            all_requested.set()
+        if sid in hung_ids:
+            await asyncio.Event().wait()
+        return httpx.Response(201)
+
+    async with _recover(app, monkeypatch, respond) as (relays, finished):
+        await asyncio.wait_for(all_requested.wait(), budget(5))
+        assert requested == expected
+        assert expected <= set(relays)
+        assert 1 < peak_reads <= 8
+        assert not finished.is_set()
+
+
+@pytest.mark.parametrize("superseded", [False, True])
+async def test_root_transport_failure_is_quiet_only_after_tunnel_replacement(
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    superseded: bool,
+) -> None:
+    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
+    root = _create_session(app, agent.id)
+    caplog.set_level(logging.INFO, logger="omnigent.server.app")
+
+    async def respond(_: httpx.Request) -> httpx.Response:
+        if superseded:
+            monkeypatch.setattr(app.state.tunnel_registry, "get", lambda _: None)
+        raise httpx.ConnectError("runner tunnel closed during initialization")
+
+    async with _recover(app, monkeypatch, respond) as (_, finished):
+        await asyncio.wait_for(finished.wait(), budget(5))
+        assert sessions._session_status_cache[root.id] == "failed"
+        errors = [
+            record
+            for record in caplog.records
+            if record.name == "omnigent.server.app" and record.levelno >= logging.ERROR
+        ]
+        assert bool(errors) is not superseded
+        if superseded:
+            assert any(
+                "Stopped recovering session" in record.getMessage() for record in caplog.records
+            )
