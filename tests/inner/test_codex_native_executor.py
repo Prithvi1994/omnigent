@@ -1383,6 +1383,10 @@ def test_dispatch_uses_model_supported_effort(
     requests: list[tuple[str, dict[str, Any]]] = []
 
     class CatalogClient(_FakeCodexNativeClient):
+        requests = []
+        created = []
+        next_turn = 1
+
         async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
             requests.append((method, params))
             if method == "model/list":

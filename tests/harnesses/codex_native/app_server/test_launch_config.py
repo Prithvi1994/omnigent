@@ -462,6 +462,7 @@ async def test_start_without_catalog_snapshot_checks_the_live_models(
                     ]
                 }
             }
+        assert method == "config/batchWrite"
         if write_failure == "rejected":
             raise app_server.CodexAppServerResponseError(
                 {"code": -32601, "message": "unavailable"}
@@ -470,7 +471,6 @@ async def test_start_without_catalog_snapshot_checks_the_live_models(
             raise ConnectionError("control socket disconnected")
         if write_failure == "timeout":
             await asyncio.Event().wait()
-        assert method == "config/batchWrite"
         # Perform the write so an unmaterialized symlink would change the source.
         config_path = Path(params["filePath"])
         document = tomlkit.parse(config_path.read_text())
