@@ -255,7 +255,7 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
             "xhigh",
             {"model": "glm-5-2", "effort": None},
             "glm-5-2",
-            "medium",
+            "high",
             id="model_change_and_effort_reset",
         ),
     ],
@@ -301,7 +301,7 @@ async def test_codex_native_settings_change_clamps_and_mirrors_effort(
                 "data": [
                     {
                         "id": model,
-                        "defaultReasoningEffort": "medium",
+                        "defaultReasoningEffort": "high" if model == "glm-5-2" else "medium",
                         "supportedReasoningEfforts": [
                             {"reasoningEffort": value} for value in levels
                         ],
