@@ -18,8 +18,6 @@ def config(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     for var in (
         "OMNIGENT_CLAUDE_PATH",
         "OMNIGENT_CODEX_PATH",
-        "OMNIGENT_PI_PATH",
-        "HARNESS_PI_PATH",
         "OMNIGENT_RUNNER_ENV_PASSTHROUGH",
     ):
         monkeypatch.delenv(var, raising=False)
@@ -42,7 +40,6 @@ def test_defaults_to_the_harness_binary(config: dict[str, object]) -> None:
         "resolved_path": "/found/claude",
         "arg_count": 0,
         "env_vars": None,
-        "reads_config": True,
     }
 
 
@@ -82,19 +79,6 @@ def test_env_var_counts_only_when_runners_receive_it(
     assert (startup["command"], startup["command_source"]) == ("/env/claude", "env")
 
 
-def test_reports_the_legacy_env_var_that_set_the_command(
-    config: dict[str, object], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("HARNESS_PI_PATH", "/legacy/pi")
-    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "HARNESS_PI_PATH")
-    startup = describe_harness_startup("pi-native")
-    assert (startup["command"], startup["command_source"], startup["env_var"]) == (
-        "/legacy/pi",
-        "env",
-        "HARNESS_PI_PATH",
-    )
-
-
 def test_resolves_a_real_executable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     binary = _executable(tmp_path / "claude")
     monkeypatch.setattr(harness_startup, "load_global_config", dict)
@@ -124,15 +108,6 @@ def test_codex_prefers_config_then_a_resolvable_env_var(
         "config",
         2,
     )
-
-
-def test_pi_ignores_global_config_its_web_launch_does_not_read(
-    config: dict[str, object],
-) -> None:
-    config["harness"] = {"pi-native": {"command": "/cfg/pi", "args": ["--model", "x"]}}
-    startup = describe_harness_startup("pi-native")
-    assert (startup["command"], startup["command_source"]) == ("pi", "default")
-    assert (startup["arg_count"], startup["reads_config"]) == (0, False)
 
 
 def test_unwraps_an_env_wrapper_naming_but_not_showing_its_variables(
@@ -175,10 +150,9 @@ def test_shows_an_env_wrapper_it_cannot_parse_as_is(config: dict[str, object]) -
     assert "synthetic-key" not in str(startup)
 
 
-def test_harness_without_a_cli(config: dict[str, object]) -> None:
-    startup = describe_harness_startup("not-a-harness")
-    assert (startup["command"], startup["command_source"], startup["resolved_path"]) == (
-        None,
-        None,
-        None,
-    )
+@pytest.mark.parametrize(
+    "harness", ["pi-native", "antigravity-native", "opencode-native", "not-a-harness"]
+)
+def test_rejects_unsupported_harnesses(config: dict[str, object], harness: str) -> None:
+    with pytest.raises(ValueError, match="launch settings aren't reported"):
+        describe_harness_startup(harness)

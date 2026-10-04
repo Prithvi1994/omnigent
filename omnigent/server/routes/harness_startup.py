@@ -7,8 +7,9 @@ import secrets
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
+from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import (
     CAP_HARNESS_STARTUP,
     HostHarnessStartupFrame,
@@ -40,8 +41,6 @@ class HarnessStartupResponse(BaseModel):
         args themselves never leave the host.
     :param env_vars: Names an ``env`` wrapper sets before *command*, e.g.
         ``["FOO"]`` for ``env FOO=1 claude``; ``None`` when there's no wrapper.
-    :param reads_config: Whether the harness's launch reads
-        ``harness.<name>.command`` / ``args`` from config at all.
     """
 
     harness: str
@@ -49,9 +48,8 @@ class HarnessStartupResponse(BaseModel):
     command_source: Literal["env", "config", "default"] | None = None
     env_var: str
     resolved_path: str | None = None
-    arg_count: int = 0
+    arg_count: int = Field(default=0, ge=0)
     env_vars: list[str] | None = None
-    reads_config: bool = False
 
 
 def create_harness_startup_router(
@@ -75,6 +73,11 @@ def create_harness_startup_router(
         host = await asyncio.to_thread(
             resolve_host_owner, user_id=user_id, host_id=host_id, host_store=host_store
         )
+        harness = canonicalize_harness(harness) or harness
+        if harness not in {"claude-native", "codex-native"}:
+            raise HTTPException(
+                status_code=404, detail="launch settings aren't reported for this harness"
+            )
         conn = host_registry.get(host_id)
         if conn is None:
             raise host_absent_error(host)

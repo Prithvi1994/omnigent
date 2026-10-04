@@ -1049,7 +1049,7 @@ class HostHarnessStartupResultFrame:
 
     request_id: str
     status: str
-    startup: dict[str, str | list[str] | int | bool | None] | None = None
+    startup: dict[str, str | list[str] | int | None] | None = None
     error: str | None = None
 
 
@@ -2668,26 +2668,31 @@ _HARNESS_STARTUP_FIELDS = (
 
 def _decode_harness_startup_result(msg: _JsonObject) -> HostHarnessStartupResultFrame:
     """Decode a harness startup description, keeping only the allow-listed fields."""
-    raw = msg.get("startup")
-    if raw is not None and not isinstance(raw, dict):
-        raise ValueError("frame field must be a harness startup object: 'startup'")
-    startup: dict[str, str | list[str] | int | bool | None] | None = None
-    if raw is not None:
-        startup = {key: _optional_nullable_str(raw, key) for key in _HARNESS_STARTUP_FIELDS}
-        startup["env_vars"] = (
-            _optional_str_list(raw, "env_vars") if raw.get("env_vars") is not None else None
+    request_id = _required_str(msg, "request_id")
+    try:
+        raw = msg.get("startup")
+        if raw is not None and not isinstance(raw, dict):
+            raise ValueError("frame field must be a harness startup object: 'startup'")
+        startup: dict[str, str | list[str] | int | None] | None = None
+        if raw is not None:
+            startup = {key: _optional_nullable_str(raw, key) for key in _HARNESS_STARTUP_FIELDS}
+            startup["env_vars"] = (
+                _optional_str_list(raw, "env_vars") if raw.get("env_vars") is not None else None
+            )
+            arg_count = _required_int(raw, "arg_count")
+            if arg_count < 0:
+                raise ValueError("arg_count must be non-negative")
+            startup["arg_count"] = arg_count
+        return HostHarnessStartupResultFrame(
+            request_id=request_id,
+            status=_required_str(msg, "status"),
+            startup=startup,
+            error=_optional_nullable_str(msg, "error"),
         )
-        arg_count = raw.get("arg_count")
-        startup["arg_count"] = (
-            arg_count if isinstance(arg_count, int) and not isinstance(arg_count, bool) else 0
+    except ValueError:
+        return HostHarnessStartupResultFrame(
+            request_id=request_id, status="failed", error="malformed harness startup reply"
         )
-        startup["reads_config"] = raw.get("reads_config") is True
-    return HostHarnessStartupResultFrame(
-        request_id=_required_str(msg, "request_id"),
-        status=_required_str(msg, "status"),
-        startup=startup,
-        error=_optional_nullable_str(msg, "error"),
-    )
 
 
 def _decode_import_local(msg: _JsonObject) -> HostImportLocalFrame:

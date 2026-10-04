@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
+import httpx
 import pytest
 from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI
@@ -13,8 +15,10 @@ from sqlalchemy.orm import Session
 from omnigent.db.db_models import SqlHost
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
+    CAP_HARNESS_STARTUP,
     HostConnectionErrorFrame,
     HostHarnessReadinessFrame,
+    HostHarnessStartupFrame,
     HostHarnessStartupResultFrame,
     HostHelloFrame,
     HostImportedLocalSession,
@@ -27,6 +31,7 @@ from omnigent.host.frames import (
 )
 from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostRegistry
+from omnigent.server.routes.harness_startup import create_harness_startup_router
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.stores.host_store import HostStore
 from tests.budgets import budget
@@ -611,6 +616,53 @@ async def test_host_tunnel_routes_harness_startup_result_to_future(
     )
     assert not other.done()
     assert list(conn.pending_harness_startup) == ["req_other"]
+
+
+@pytest.mark.parametrize(
+    "invalid", [{"arg_count": "4"}, {"arg_count": -3}, {"arg_count": True}, {"command": 5}]
+)
+async def test_malformed_harness_startup_reply_returns_502(
+    host_app: tuple[FastAPI, HostRegistry, HostStore], invalid: dict[str, object]
+) -> None:
+    app, registry, store = host_app
+    app.include_router(create_harness_startup_router(registry, store), prefix="/v1")
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    conn.hello.capabilities.append(CAP_HARNESS_STARTUP)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        task = asyncio.create_task(
+            client.get(f"/v1/hosts/{_HOST_ID}/harnesses/claude-native/startup")
+        )
+        sent = await comm.receive_output(timeout=budget(2.0))
+        request = decode_host_frame(sent["text"])
+        assert isinstance(request, HostHarnessStartupFrame)
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": json.dumps(
+                    {
+                        "kind": "host.harness_startup_result",
+                        "request_id": request.request_id,
+                        "status": "ok",
+                        "startup": {
+                            "harness": "claude-native",
+                            "env_var": "OMNIGENT_CLAUDE_PATH",
+                            "arg_count": 0,
+                            **invalid,
+                        },
+                    }
+                ),
+            }
+        )
+        response = await asyncio.wait_for(task, timeout=budget(2.0))
+    assert response.status_code == 502
+    assert response.json() == {"detail": "malformed harness startup reply"}
+    assert not conn.pending_harness_startup
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
 
 
 async def test_host_tunnel_reassembles_chunked_import_session(

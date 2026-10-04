@@ -2281,7 +2281,6 @@ _STARTUP = {
     "resolved_path": "/usr/local/bin/claude",
     "arg_count": 2,
     "env_vars": ["FOO"],
-    "reads_config": True,
 }
 
 
@@ -2312,3 +2311,30 @@ def test_harness_startup_result_keeps_only_allow_listed_fields() -> None:
     )
     assert isinstance(frame, HostHarnessStartupResultFrame)
     assert frame.startup == _STARTUP
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"arg_count": "4"},
+        {"arg_count": -3},
+        {"arg_count": True},
+        {"arg_count": None},
+        {"command": 5},
+        {"env_vars": [5]},
+    ],
+)
+def test_malformed_harness_startup_keeps_request_id(invalid: dict[str, object]) -> None:
+    frame = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.harness_startup_result",
+                "request_id": "req_malformed",
+                "status": "ok",
+                "startup": {**_STARTUP, **invalid},
+            }
+        )
+    )
+    assert frame == HostHarnessStartupResultFrame(
+        request_id="req_malformed", status="failed", error="malformed harness startup reply"
+    )

@@ -338,7 +338,12 @@ async def test_host_reports_mcp_inventory_failure(monkeypatch: pytest.MonkeyPatc
 async def test_host_answers_harness_startup_over_the_tunnel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    startup = {"harness": "claude-native", "command": "claude", "env_var": "OMNIGENT_CLAUDE_PATH"}
+    startup = {
+        "harness": "claude-native",
+        "command": "claude",
+        "env_var": "OMNIGENT_CLAUDE_PATH",
+        "arg_count": 0,
+    }
     monkeypatch.setattr(
         "omnigent.host.harness_startup.describe_harness_startup",
         lambda harness: {**startup, "harness": harness},

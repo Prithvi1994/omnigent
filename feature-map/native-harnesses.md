@@ -28,13 +28,14 @@ implements them separately, so a fix for one harness does not reach the others.
 - `disconnect`: startup waits and active operations settle when their native
   connection ends; reconnect can receive fresh events. Distinguish a native
   CLI disconnect, a runner going offline, and a browser stream reconnect.
-- `launch-settings`: the harness's Settings tab shows, read-only, the binary a
+- `launch-settings`: Claude and Codex's Settings tabs show, read-only, the binary a
   web launch on the selected host runs (its source: `OMNIGENT_<NAME>_PATH` when
   runners receive it, `harness.<name>.command`, or the default; an `env`
   wrapper is unwrapped) and how many startup arguments it passes; the arguments
   never leave the host. A workspace's `.omnigent/config.yaml` can still override
   them.
-  An older host asks to be updated; an older server hides the fields.
+  An older host asks to be updated; an older server hides the fields. Other
+  harnesses keep their credential card without launch settings.
 
 ## How to get to it (user POV)
 
@@ -106,12 +107,16 @@ Cross-harness journeys:
   `harness_settings_ui` release feature). Run with plain `uv run pytest`:
   `tests/host/test_harness_startup.py::test_codex_prefers_config_then_a_resolvable_env_var`,
   `tests/host/test_harness_startup.py::test_never_reports_args_only_their_count`,
+  `tests/server/routes/test_harness_startup.py::test_unsupported_harness_does_not_reach_the_host`,
+  `tests/server/integration/test_host_tunnel_route.py::test_malformed_harness_startup_reply_returns_502`,
   `tests/server/routes/test_harness_startup.py::test_older_host_fails_fast_without_a_frame`;
   the page itself is covered by `web/src/pages/settings/SettingsHarnessesSection.test.tsx`.
   To drive it: enable `harness_settings_ui`, set `harness.claude-native.args` in
   the host's `~/.omnigent/config.yaml` (include a fake `--api-key x`), restart the
   host, then open Settings → Harnesses → Claude Code's gear. Expect the resolved
   binary with its source, and the argument count with no argument shown.
+  Repeat for Codex with `harness.codex-native.args`. Open Cursor's Settings tab
+  and confirm the credential remains while both launch fields are hidden.
   The page reads only the user-level config, so a workspace's
   `.omnigent/config.yaml` can differ. A host without
   the `harness_startup` capability shows "Update <host>…"; a server without

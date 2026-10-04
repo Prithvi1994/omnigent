@@ -1,6 +1,6 @@
 """What a harness launch on this host runs: its binary and how many args it passes.
 
-Read-only and display-oriented. Mirrors each native harness's web launcher,
+Read-only and display-oriented. Mirrors Claude and Codex's native web launchers,
 against the environment a runner actually gets (``_build_runner_env``) and the
 user-level ``~/.omnigent/config.yaml``; a workspace's ``.omnigent/config.yaml``
 can still override these. No arg leaves the host, only their count: any arg
@@ -21,13 +21,12 @@ from omnigent._platform import resolve_cli_binary
 from omnigent.config import load_global_config
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_startup_config import (
-    _LEGACY_PATH_VARS,
     _harness_path_env_var,
     resolve_harness_config,
 )
 from omnigent.onboarding.harness_install import required_cli_for_harness
 
-HarnessStartup = dict[str, str | list[str] | int | bool | None]
+HarnessStartup = dict[str, str | list[str] | int | None]
 
 _ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _CODEX_NATIVE = "codex-native"
@@ -42,27 +41,24 @@ def describe_harness_startup(harness: str) -> HarnessStartup:
     Mirrors each launcher. ``claude-native``: the ``OMNIGENT_<NAME>_PATH`` env
     var, then config ``harness.<name>.command``, then the built-in binary.
     ``codex-native``: config, then the env var when it resolves, then the
-    built-in binary. Other native harnesses: the env var, then the built-in
-    binary; they read neither command nor args from config. Env vars count only
+    built-in binary. Only these two harnesses are supported. Env vars count only
     when a runner receives them. A launch wrapped in ``env NAME=value … cmd``
     reports ``cmd`` and the args after it, plus the names ``env`` sets.
 
     :param harness: A harness id, e.g. ``"claude-native"``.
     :returns: ``harness`` (canonical id); ``command`` and ``command_source``
-        (``"env"`` / ``"config"`` / ``"default"``), both ``None`` for a harness
-        without a CLI; ``env_var``, the env var that overrides the command (the
-        deprecated ``HARNESS_*`` name when that one supplied it);
+        (``"env"`` / ``"config"`` / ``"default"``); ``env_var``, the env var
+        that overrides the command;
         ``resolved_path``, the executable the command resolves to, or ``None``
         when not found; ``arg_count``, how many config args the launch passes
         (after any ``env`` wrapper's own); ``env_vars``, the names an ``env`` wrapper
-        sets, or ``None`` without one; and ``reads_config``, whether the launch
-        reads ``harness.<name>.command`` / ``args`` at all.
+        sets, or ``None`` without one.
+    :raises ValueError: If the harness's launch settings aren't supported.
     """
     canonical = canonicalize_harness(harness) or harness
-    reads_config = canonical in _CONFIG_LAUNCHED
-    override = (
-        resolve_harness_config(load_global_config())[1].get(canonical, {}) if reads_config else {}
-    )
+    if canonical not in _CONFIG_LAUNCHED:
+        raise ValueError("launch settings aren't reported for this harness")
+    override = resolve_harness_config(load_global_config())[1].get(canonical, {})
     spec = required_cli_for_harness(canonical)
     runner_env = _runner_env(canonical)
     command, source, env_var = _launch_command(
@@ -87,7 +83,6 @@ def describe_harness_startup(harness: str) -> HarnessStartup:
         "resolved_path": resolved,
         "arg_count": len(args),
         "env_vars": env_vars,
-        "reads_config": reads_config,
     }
 
 
@@ -122,10 +117,8 @@ def _launch_command(
         if env_command and _is_executable(env_command, env.get("PATH")):
             return env_command, "env", env_var
     else:
-        legacy_var = "HARNESS_" + env_var.removeprefix("OMNIGENT_")
-        for var in (env_var, legacy_var if legacy_var in _LEGACY_PATH_VARS else None):
-            if var and (env_command := env.get(var, "").strip()):
-                return env_command, "env", var
+        if env_command := env.get(env_var, "").strip():
+            return env_command, "env", env_var
         if config_command:
             return config_command, "config", env_var
     if default:

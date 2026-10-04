@@ -2633,6 +2633,7 @@
             "default": 0,
             "description": "How many base launch args the host's config sets; the args themselves never leave the host.",
             "format": "int64",
+            "minimum": 0.0,
             "title": "Arg Count",
             "type": "integer"
           },
@@ -2689,12 +2690,6 @@
             "description": "Canonical harness id, e.g. `\"claude-native\"`.",
             "title": "Harness",
             "type": "string"
-          },
-          "reads_config": {
-            "default": false,
-            "description": "Whether the harness's launch reads `harness.<name>.command` / `args` from config at all.",
-            "title": "Reads Config",
-            "type": "boolean"
           },
           "resolved_path": {
             "anyOf": [

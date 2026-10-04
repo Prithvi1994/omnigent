@@ -35,7 +35,6 @@ _STARTUP = {
     "resolved_path": "/usr/local/bin/claude",
     "arg_count": 0,
     "env_vars": None,
-    "reads_config": True,
 }
 
 
@@ -121,6 +120,18 @@ async def test_non_owner_does_not_reach_the_host(
     async with _client(app) as client:
         response = await client.get(_URL, headers={"x-test-user": user} if user else {})
     assert response.status_code == status
+    assert conn.outbound_queue.empty()
+
+
+@pytest.mark.parametrize("harness", ["pi-native", "antigravity-native", "opencode-native"])
+async def test_unsupported_harness_does_not_reach_the_host(startup_app, harness: str) -> None:
+    app, registry, _ = startup_app
+    conn = _register(registry, CAP_HARNESS_STARTUP)
+    async with _client(app) as client:
+        response = await client.get(
+            f"/v1/hosts/{_HOST_ID}/harnesses/{harness}/startup", headers={"x-test-user": "owner"}
+        )
+    assert response.status_code == 404
     assert conn.outbound_queue.empty()
 
 

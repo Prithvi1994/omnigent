@@ -482,7 +482,7 @@ function StartupSettings({ host, harness }: { host: Host; harness: string }) {
   if (isPending) {
     return <p className="text-ui text-muted-foreground">Loading launch settings…</p>;
   }
-  // An older server has no startup endpoint: the feature is unavailable, not failing.
+  // Unsupported harnesses and older servers have no launch settings.
   if (error instanceof ApiError && error.status === 404) return null;
   if (!data) {
     return (
@@ -518,9 +518,6 @@ function plural(count: number, word: string): string {
 }
 
 function argsHint(startup: HarnessStartup): string {
-  if (!startup.reads_config) {
-    return "This harness doesn't take startup arguments from ~/.omnigent/config.yaml.";
-  }
   if (startup.arg_count === 0) {
     return `Set harness.${startup.harness}.args in ~/.omnigent/config.yaml to pass arguments on launch.`;
   }
@@ -535,11 +532,7 @@ function commandHint(startup: HarnessStartup): string {
       ? `From ${startup.env_var}.`
       : startup.command_source === "config"
         ? `From harness.${startup.harness}.command in ~/.omnigent/config.yaml.`
-        : `Default command "${startup.command}"; set ${
-            startup.reads_config
-              ? `harness.${startup.harness}.command in ~/.omnigent/config.yaml`
-              : startup.env_var
-          } to override.`;
+        : `Default command "${startup.command}"; set harness.${startup.harness}.command in ~/.omnigent/config.yaml to override.`;
   const wrapper =
     startup.env_vars === null
       ? ""

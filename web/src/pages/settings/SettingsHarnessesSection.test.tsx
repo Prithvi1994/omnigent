@@ -22,7 +22,6 @@ const STARTUP: HarnessStartup = {
   resolved_path: "/opt/claude",
   arg_count: 4,
   env_vars: null,
-  reads_config: true,
 };
 interface StartupQuery {
   data?: HarnessStartup;
@@ -292,16 +291,20 @@ describe("Harness details", () => {
     expect(screen.getByText(/Runs through env, setting A, B\./)).toBeTruthy();
   });
 
-  it("hides launch settings, keeping the credential, on a server without the endpoint", () => {
-    hosts = [ONLINE];
-    startup = { error: new ApiError("404", 404, null), isPending: false };
-    renderHarnesses("claude-native");
+  it.each(["claude-native", "cursor-native"])(
+    "keeps the credential on 404 for an older server or unsupported harness (%s)",
+    (harness) => {
+      hosts = [{ ...ONLINE, configured_harnesses: { [harness]: true } }];
+      startup = { error: new ApiError("404", 404, null), isPending: false };
+      renderHarnesses(harness);
 
-    selectTab("Settings");
-    expect(screen.getByText("Credential")).toBeTruthy();
-    expect(screen.queryByText("Path to binary")).toBeNull();
-    expect(screen.queryByTestId("harness-startup-error")).toBeNull();
-  });
+      selectTab("Settings");
+      expect(screen.getByText("Credential")).toBeTruthy();
+      expect(screen.queryByText("Path to binary")).toBeNull();
+      expect(screen.queryByText("Startup arguments")).toBeNull();
+      expect(screen.queryByTestId("harness-startup-error")).toBeNull();
+    },
+  );
 
   it("reads launch settings from the host picked on the grid", () => {
     hosts = [ONLINE, { ...ONLINE, host_id: "h2", name: "build-box" }];
@@ -314,26 +317,6 @@ describe("Harness details", () => {
 
     expect(lastStartupLookup).toEqual(["h2", "claude-native"]);
     expect(screen.getByText("/h2/claude")).toBeTruthy();
-  });
-
-  it("says when a harness's launch reads neither command nor args from config", () => {
-    hosts = [ONLINE];
-    startup = {
-      data: {
-        ...STARTUP,
-        command: "pi",
-        command_source: "default",
-        env_var: "OMNIGENT_PI_PATH",
-        arg_count: 0,
-        reads_config: false,
-      },
-      isPending: false,
-    };
-    renderHarnesses("claude-native");
-
-    selectTab("Settings");
-    expect(screen.getByText(/set OMNIGENT_PI_PATH to override/)).toBeTruthy();
-    expect(screen.getByText(/doesn't take startup arguments from/)).toBeTruthy();
   });
 
   it("asks to update a host too old to report launch settings", () => {
