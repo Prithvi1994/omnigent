@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -413,10 +414,14 @@ async def test_start_clamps_effort_to_catalog(
         await server.close()
 
 
+@pytest.mark.parametrize("write_failure", [None, "rejected", "disconnected", "timeout"])
 async def test_start_without_catalog_snapshot_checks_the_live_models(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    write_failure: str | None,
 ) -> None:
-    """Standalone CLI startup repairs an unsupported effort before terminal attach."""
+    """Startup attempts the repair and still trusts hooks if the write fails."""
     from unittest.mock import AsyncMock, call
 
     from omnigent.harnesses.codex_native import app_server
@@ -428,19 +433,36 @@ async def test_start_without_catalog_snapshot_checks_the_live_models(
     monkeypatch.setenv("CODEX_HOME", str(source_home))
     _disable_codex_startup_rpc(monkeypatch)
     client = AsyncMock(spec=app_server.CodexAppServerClient)
-    client.request.side_effect = [
-        {
-            "result": {
-                "data": [
-                    {"id": "gpt-5.4", "supportedReasoningEfforts": [{"reasoningEffort": "xhigh"}]}
-                ]
+
+    async def request(method: str, _params: object) -> dict[str, object]:
+        if method == "model/list":
+            return {
+                "result": {
+                    "data": [
+                        {
+                            "id": "gpt-5.4",
+                            "supportedReasoningEfforts": [{"reasoningEffort": "xhigh"}],
+                        }
+                    ]
+                }
             }
-        },
-        {"result": {}},
-    ]
+        if write_failure == "rejected":
+            raise app_server.CodexAppServerResponseError(
+                {"code": -32601, "message": "unavailable"}
+            )
+        if write_failure == "disconnected":
+            raise ConnectionError("control socket disconnected")
+        if write_failure == "timeout":
+            await asyncio.Event().wait()
+        return {"result": {}}
+
+    client.request.side_effect = request
+    monkeypatch.setattr(app_server, "_EFFORT_CATALOG_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(
         app_server.CodexNativeAppServer, "_wait_until_ready", AsyncMock(return_value=client)
     )
+    trust = AsyncMock()
+    monkeypatch.setattr(app_server.CodexNativeAppServer, "_trust_policy_hooks", trust)
     server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", tmp_path)
 
     try:
@@ -462,7 +484,10 @@ async def test_start_without_catalog_snapshot_checks_the_live_models(
             ),
         ]
         assert (source_home / "config.toml").read_text() == original
+        trust.assert_awaited_once_with(client=client)
         client.close.assert_awaited_once()
+        if write_failure:
+            assert "Could not persist supported Codex reasoning effort at startup" in caplog.text
     finally:
         await server.close()
 
@@ -692,54 +717,3 @@ async def test_codex_native_launch_config_reads_reasoning_effort(
         config = await _codex_native_launch_config(session_id="conv_abc", server_client=client)
 
     assert config.reasoning_effort == expected
-
-
-@pytest.mark.parametrize(
-    ("model", "expected_effort"),
-    [("gpt-5.6-sol", "ultra"), (None, "ultra"), ("glm-5-2", "medium")],
-    ids=["sol", "no-model", "clamped"],
-)
-async def test_apply_codex_thread_effort_updates_the_loaded_thread(
-    monkeypatch: pytest.MonkeyPatch, model: str | None, expected_effort: str
-) -> None:
-    """
-    The persisted effort reaches a resumed thread via ``thread/settings/update``.
-
-    A resumed thread runs the rollout's recorded effort — none after a runner
-    restart rebuilt the rollout, the source's on a forked clone — so the launch
-    re-applies the session's effort (clamped to the model's ladder) once the
-    thread has started, instead of leaving the TUI at ``default`` until a web
-    turn happens to send one.
-    """
-    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
-
-    requests: list[tuple[str, dict[str, object]]] = []
-
-    class _FakeClient:
-        def __init__(self, *, ws_url: str, client_name: str) -> None:
-            assert ws_url == "ws://127.0.0.1:9876"
-            assert client_name == "omnigent-codex-native-effort"
-
-        async def connect(self) -> None:
-            return None
-
-        async def close(self) -> None:
-            return None
-
-        async def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
-            requests.append((method, params))
-            if method == "model/list":
-                return {"result": {"data": [], "nextCursor": None}}
-            return {"result": {}}
-
-    monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _FakeClient)
-    await codex_native_app_server.apply_codex_thread_effort(
-        "ws://127.0.0.1:9876", "thread_abc", "ultra", model=model
-    )
-    expected_requests: list[tuple[str, dict[str, object]]] = []
-    if model:
-        expected_requests.append(("model/list", {"includeHidden": True}))
-    expected_requests.append(
-        ("thread/settings/update", {"threadId": "thread_abc", "effort": expected_effort})
-    )
-    assert requests == expected_requests

@@ -142,7 +142,9 @@ async def _start_codex_turn(
     model = settings_overrides.get("model") or read_codex_config_model(bridge_dir)
     effort = settings_overrides.get("effort") or read_codex_config_effort(bridge_dir)
     if isinstance(model, str) and isinstance(effort, str):
-        resolved_effort = await resolve_codex_effort_for_model(client, effort, model)
+        resolved_effort = await resolve_codex_effort_for_model(
+            client, effort, model, transport=state.socket_path
+        )
         if resolved_effort != effort:
             settings_overrides["effort"] = resolved_effort
     if settings_overrides:

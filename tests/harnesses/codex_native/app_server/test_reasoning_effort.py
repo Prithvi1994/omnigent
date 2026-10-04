@@ -4,12 +4,39 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
 import pytest
+from cachetools import TTLCache
 
 from omnigent.harnesses.codex_native import app_server
 from omnigent.harnesses.codex_native.bridge import read_codex_config_effort
+from omnigent.server.smart_routing import RoutingSettings, parse_routing_tables
+
+
+def test_gateway_restrictions_still_apply_to_catalog_supported_efforts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CLI's built-in catalog does not override restrictions of the serving gateway."""
+    settings = RoutingSettings(
+        **parse_routing_tables(
+            {"effort_caps": {"gpt-5.6-sol": {"fallback": "medium", "unsupported": ["ultra"]}}}
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime._globals._caps", SimpleNamespace(routing_settings=settings)
+    )
+    catalog = [
+        {
+            "id": "gpt-5.6-sol",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": value} for value in ("low", "medium", "high", "max", "ultra")
+            ],
+        }
+    ]
+    assert app_server.clamp_codex_effort_for_model("ultra", "gpt-5.6-sol", catalog) == "medium"
+    assert app_server.clamp_codex_effort_for_model("max", "gpt-5.6-sol", catalog) == "max"
 
 
 @pytest.mark.parametrize(
@@ -104,9 +131,54 @@ async def test_live_effort_validation_reads_hidden_models_and_later_pages() -> N
     ]
 
 
+@pytest.mark.parametrize("boundary", ["same-server", "new-server", "expired"])
+async def test_successful_catalog_discovery_is_shared_between_turn_clients(
+    monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    now = 0.0
+    monkeypatch.setattr(
+        app_server, "_effort_catalog_cache", TTLCache(maxsize=2, ttl=60, timer=lambda: now)
+    )
+    first = AsyncMock(spec=app_server.CodexAppServerClient)
+    second = AsyncMock(spec=app_server.CodexAppServerClient)
+    for client, supported in ((first, ["low", "xhigh"]), (second, ["medium"])):
+        client.request.return_value = {
+            "result": {
+                "data": [
+                    {
+                        "id": "gpt-5.4",
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": value} for value in supported
+                        ],
+                    }
+                ]
+            }
+        }
+    transport = "ws://127.0.0.1:12345"
+    assert (
+        await app_server.resolve_codex_effort_for_model(
+            first, "max", "gpt-5.4", transport=transport
+        )
+        == "xhigh"
+    )
+    if boundary == "new-server":
+        transport = "ws://127.0.0.1:54321"
+    elif boundary == "expired":
+        now = 61.0
+    expected = "low" if boundary == "same-server" else "medium"
+    assert (
+        await app_server.resolve_codex_effort_for_model(
+            second, "minimal", "gpt-5.4", transport=transport
+        )
+        == expected
+    )
+    assert first.request.await_count == 1
+    assert second.request.await_count == (0 if boundary == "same-server" else 1)
+
+
 @pytest.mark.parametrize("failure", ["unavailable", "malformed", "timeout"])
 async def test_live_catalog_failures_do_not_block_effort_updates(
-    monkeypatch: pytest.MonkeyPatch, failure: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str
 ) -> None:
     client = AsyncMock(spec=app_server.CodexAppServerClient)
     if failure == "unavailable":
@@ -123,21 +195,59 @@ async def test_live_catalog_failures_do_not_block_effort_updates(
         client.request.side_effect = stalled
         monkeypatch.setattr(app_server, "_EFFORT_CATALOG_TIMEOUT_SECONDS", 0.01)
 
+    transport = str(tmp_path / "app-server.sock")
     assert (
-        await app_server.resolve_codex_effort_for_model(client, "ultra", "gpt-5.6-sol") == "ultra"
+        await app_server.resolve_codex_effort_for_model(
+            client, "ultra", "gpt-5.6-sol", transport=transport
+        )
+        == "ultra"
     )
-    assert await app_server.resolve_codex_effort_for_model(client, "ultra", "glm-5-2") == "medium"
+    assert (
+        await app_server.resolve_codex_effort_for_model(
+            client, "ultra", "glm-5-2", transport=transport
+        )
+        == "medium"
+    )
+    client.request.side_effect = None
+    client.request.return_value = {
+        "result": {
+            "data": [
+                {"id": "gpt-5.6-sol", "supportedReasoningEfforts": [{"reasoningEffort": "high"}]}
+            ]
+        }
+    }
+    assert (
+        await app_server.resolve_codex_effort_for_model(
+            client, "ultra", "gpt-5.6-sol", transport=transport
+        )
+        == "high"
+    )
 
 
-@pytest.mark.parametrize(("effort", "expected"), [("minimal", "low"), ("max", "xhigh")])
+@pytest.mark.parametrize(
+    ("model", "effort", "expected"),
+    [
+        ("gpt-5.4", "minimal", "low"),
+        ("gpt-5.4", "max", "xhigh"),
+        ("gpt-5.6-sol", "ultra", "ultra"),
+        (None, "ultra", "ultra"),
+        ("glm-5-2", "ultra", "medium"),
+    ],
+)
 async def test_resume_applies_and_mirrors_supported_effort(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, effort: str, expected: str
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    model: str | None,
+    effort: str,
+    expected: str,
 ) -> None:
     home = tmp_path / "codex-home"
     home.mkdir()
-    (home / "config.toml").write_text('model = "gpt-5.4"\nmodel_reasoning_effort = "medium"\n')
+    (home / "config.toml").write_text(
+        (f'model = "{model}"\n' if model else "") + 'model_reasoning_effort = "medium"\n'
+    )
     client = AsyncMock(spec=app_server.CodexAppServerClient)
-    client.request.side_effect = [
+    client.request.side_effect = lambda method, params: (
         {
             "result": {
                 "data": [
@@ -150,17 +260,24 @@ async def test_resume_applies_and_mirrors_supported_effort(
                     }
                 ]
             }
-        },
-        {"result": {}},
-    ]
+        }
+        if method == "model/list"
+        else {"result": {}}
+    )
     monkeypatch.setattr(app_server, "client_for_transport", lambda *args, **kwargs: client)
 
     await app_server.apply_codex_thread_effort(
-        "ws://127.0.0.1:9876", "thread_resumed", effort, bridge_dir=tmp_path
+        "ws://127.0.0.1:9876",
+        "thread_resumed",
+        effort,
+        model=None if model == "gpt-5.4" else model,
+        bridge_dir=tmp_path,
     )
 
     client.request.assert_awaited_with(
         "thread/settings/update", {"threadId": "thread_resumed", "effort": expected}
     )
     assert read_codex_config_effort(tmp_path) == expected
+    assert client.request.await_count == (2 if model else 1)
+    client.connect.assert_awaited_once()
     client.close.assert_awaited_once()

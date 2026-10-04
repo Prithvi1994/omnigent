@@ -730,11 +730,11 @@ def _codex_model_upgrade_target(catalog: object, model: str) -> str | None:
 def clamp_codex_effort_for_model(
     effort: str | None, model: str | None, catalog: object
 ) -> str | None:
-    """Choose the nearest effort the selected model advertises, with ties downward.
+    """Apply gateway caps, then choose the nearest advertised effort, with ties downward.
 
-    Accept both ``model/list`` and ``codex debug models`` catalogs. Missing
-    or unusable capabilities retain the deployment's existing effort rules;
-    another model's ladder must never govern this model.
+    Codex's catalog cannot lift a deployment's backend restrictions. Accept
+    both ``model/list`` and ``codex debug models`` catalogs; missing or unusable
+    capabilities retain the gateway-capped effort, never another model's ladder.
     """
     effort = clamp_effort_for_model(effort, model)
     if effort is None or model is None:
@@ -759,17 +759,31 @@ def clamp_codex_effort_for_model(
     return resolved
 
 
+_effort_catalog_cache: TTLCache[str, list[_JsonObject]] = TTLCache(maxsize=128, ttl=60.0)
+
+
 async def resolve_codex_effort_for_model(
-    client: CodexAppServerClient, effort: str, model: str | None
+    client: CodexAppServerClient,
+    effort: str,
+    model: str | None,
+    *,
+    transport: str | None = None,
 ) -> str:
-    """Clamp an effort using this app-server's live catalog without blocking discovery failures."""
-    catalog: object = None
-    if model:
+    """Resolve against live capabilities, reusing successful discovery for one minute.
+
+    A transport key lets successive turn clients share the catalog for their
+    app-server. New server transports and expired entries fetch fresh rows;
+    discovery failures are never cached and retain the gateway fallback.
+    """
+    catalog = _effort_catalog_cache.get(transport) if transport is not None else None
+    if model and catalog is None:
         try:
             catalog = await asyncio.wait_for(
                 list_codex_model_options(client, include_hidden=True),
                 timeout=_EFFORT_CATALOG_TIMEOUT_SECONDS,
             )
+            if transport is not None:
+                _effort_catalog_cache[transport] = catalog
         except Exception:  # noqa: BLE001 — discovery must not prevent a turn
             _logger.warning(
                 "Could not read Codex model capabilities for effort validation", exc_info=True
@@ -2120,19 +2134,28 @@ class CodexNativeAppServer:
                         startup_client, effective_effort, effective_model
                     )
                     if resolved_effort != effective_effort:
-                        await startup_client.request(
-                            "config/batchWrite",
-                            {
-                                "filePath": str(self.codex_home / "config.toml"),
-                                "edits": [
+                        try:
+                            await asyncio.wait_for(
+                                startup_client.request(
+                                    "config/batchWrite",
                                     {
-                                        "keyPath": "model_reasoning_effort",
-                                        "value": resolved_effort,
-                                        "mergeStrategy": "replace",
-                                    }
-                                ],
-                            },
-                        )
+                                        "filePath": str(self.codex_home / "config.toml"),
+                                        "edits": [
+                                            {
+                                                "keyPath": "model_reasoning_effort",
+                                                "value": resolved_effort,
+                                                "mergeStrategy": "replace",
+                                            }
+                                        ],
+                                    },
+                                ),
+                                timeout=_EFFORT_CATALOG_TIMEOUT_SECONDS,
+                            )
+                        except Exception:  # noqa: BLE001 - optional repair must not block startup
+                            _logger.warning(
+                                "Could not persist supported Codex reasoning effort at startup",
+                                exc_info=True,
+                            )
                 if self.policy_hook_disabled_reason is None:
                     try:
                         await self._trust_policy_hooks(client=startup_client)
