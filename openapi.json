@@ -7959,6 +7959,7 @@
             "type": "string"
           },
           "description": {
+            "description": "Skill description, capped at 8192 characters.",
             "maxLength": 8192,
             "title": "Description",
             "type": "string"
@@ -7969,6 +7970,7 @@
             "type": "string"
           },
           "truncated": {
+            "description": "Whether the SKILL.md body exceeded the 256 KiB UTF-8 limit.",
             "title": "Truncated",
             "type": "boolean"
           }
