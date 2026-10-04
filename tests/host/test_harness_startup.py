@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -112,32 +113,59 @@ def test_codex_prefers_config_then_a_resolvable_env_var(
 
 def test_unwraps_an_env_wrapper_naming_but_not_showing_its_variables(
     config: dict[str, object],
+    tmp_path: Path,
 ) -> None:
+    binary = str(_executable(tmp_path / "isaac"))
     config["harness"] = {
         "claude-native": {
             "command": "/usr/bin/env",
-            "args": ["-i", "-u", "HOME", "TOKEN=s3cret", "MODE=1", "isaac", "--model", "x"],
+            "args": ["-i", "-u", "HOME", "TOKEN=s3cret", "MODE=1", binary, "--model", "x"],
         }
     }
     startup = describe_harness_startup("claude-native")
-    assert (startup["command"], startup["resolved_path"]) == ("isaac", "/found/isaac")
+    assert (startup["command"], startup["resolved_path"]) == (binary, binary)
     assert startup["arg_count"] == 2
     assert startup["env_vars"] == ["TOKEN", "MODE"]
     assert "s3cret" not in str(startup)
 
 
+@pytest.mark.skipif(not Path("/usr/bin/env").exists(), reason="requires POSIX env")
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        [],
+        ["PATH={bin}"],
+        ["PATH={bin}/empty"],
+        ["-i"],
+        ["-u", "PATH"],
+        ["--unset=PATH"],
+        ["--ignore-environment", "PATH={bin}"],
+    ],
+)
 def test_env_wrapper_path_controls_resolution(
-    tmp_path: Path, config: dict[str, object], monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, config: dict[str, object], monkeypatch: pytest.MonkeyPatch, prefix: list[str]
 ) -> None:
     from omnigent._platform import resolve_cli_binary
 
     monkeypatch.setattr(harness_startup, "resolve_cli_binary", resolve_cli_binary)
-    binary = _executable(tmp_path / "claude")
-    config["harness"] = {
-        "claude-native": {"command": "env", "args": [f"PATH={tmp_path}", "claude"]}
-    }
+    monkeypatch.setattr("omnigent._platform._cli_fallback_dirs", lambda: [tmp_path])
+    runner_env = {"PATH": str(tmp_path)}
+    monkeypatch.setattr(harness_startup, "_runner_env", lambda _: runner_env)
+    binary = _executable(tmp_path / "test-launcher")
+    binary.write_text('#!/bin/sh\nprintf "%s\\n" "$0"\n')
+    args = [arg.format(bin=tmp_path) for arg in prefix] + [binary.name]
+    config["harness"] = {"claude-native": {"command": "/usr/bin/env", "args": args}}
     startup = describe_harness_startup("claude-native")
-    assert (startup["resolved_path"], startup["env_vars"]) == (str(binary), ["PATH"])
+    launched = subprocess.run(
+        ["/usr/bin/env", *args], env=runner_env, capture_output=True, text=True
+    )
+    assert launched.returncode in (0, 127)
+    assert startup["resolved_path"] == (
+        launched.stdout.strip() if launched.returncode == 0 else None
+    )
+    assert startup["env_vars"] == (
+        ["PATH"] if any(arg.startswith("PATH=") for arg in args) else []
+    )
     assert str(tmp_path) not in str({**startup, "resolved_path": None})
 
 

@@ -70,11 +70,13 @@ def describe_harness_startup(harness: str) -> HarnessStartup:
     if command and (unwrapped := _unwrap_env(command, args)):
         command, args, env_vars, wrapper_path = unwrapped
         search_path = wrapper_path if wrapper_path is not None else search_path
-    resolved = (
-        resolve_cli_binary(command, which=lambda name: shutil.which(name, path=search_path))
-        if command
-        else None
-    )
+        resolved = shutil.which(command, path=search_path)
+    else:
+        resolved = (
+            resolve_cli_binary(command, which=lambda name: shutil.which(name, path=search_path))
+            if command
+            else None
+        )
     return {
         "harness": canonical,
         "command": command,
@@ -142,8 +144,8 @@ def _unwrap_env(
     ``("isaac", ["codex"], ["FOO"], None)``.
 
     :returns: ``(cmd, cmd_args, env_names, path)``, where *path* is a ``PATH``
-        the wrapper sets (it decides which ``cmd`` runs; never sent off the
-        host), or ``None`` when *command* isn't ``env`` or uses options this
+        override, ``os.defpath`` when PATH is removed, or ``None`` to inherit it.
+        Returns ``None`` when *command* isn't ``env`` or uses options this
         doesn't parse (``-S``, ``-C``, …), so the caller shows it as-is.
     """
     if os.path.basename(command) != "env":
@@ -153,9 +155,14 @@ def _unwrap_env(
     index = 0
     while index < len(args):
         arg = args[index]
-        if arg in ("-i", "--ignore-environment", "--"):
+        if arg in ("-i", "--ignore-environment", "--unset=PATH"):
+            path = os.defpath
+            index += 1
+        elif arg == "--":
             index += 1
         elif arg in ("-u", "--unset"):
+            if index + 1 < len(args) and args[index + 1] == "PATH":
+                path = os.defpath
             index += 2
         elif arg.startswith("--unset="):
             index += 1
