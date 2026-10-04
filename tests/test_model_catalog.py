@@ -47,6 +47,7 @@ from omnigent.models.model_metadata import (
     ModelWireAPI,
 )
 from omnigent.models.model_resolver import ModelResolutionError, ModelResolutionSource
+from omnigent.onboarding.ambient import DetectedProvider
 from omnigent.onboarding.providers import ModelInfo
 from omnigent.runtime.credentials.databricks import WorkspaceCreds
 from omnigent.spec.types import AgentSpec, ApiKeyAuth, DatabricksAuth, ExecutorSpec, ProviderAuth
@@ -311,21 +312,43 @@ def test_resolve_provider_antigravity_native_is_cli_login(
     assert provider.cli == "agy"
 
 
-def test_resolve_provider_antigravity_native_ignores_spec_api_key(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A spec api-key never changes the native agy readout.
+_GEMINI_KEY_DEFAULT_YAML = (
+    "providers:\n"
+    "  gemini:\n"
+    "    kind: key\n"
+    "    default: true\n"
+    "    gemini:\n"
+    "      base_url: https://generativelanguage.googleapis.com/v1beta/openai\n"
+    "      api_key: AIzaSyFAKEgeminiKeyForUnitTest\n"
+)
 
-    The native launch passes no spec credential to agy
-    (``resolve_native_antigravity_launch`` takes only the model), so
-    reporting a spec key as the worker's provider would name a
-    credential the session never uses.
+
+@pytest.mark.parametrize(
+    ("config_yaml", "executor_kwargs"),
+    [
+        pytest.param("", {"auth": ApiKeyAuth(api_key="gemini-test-key")}, id="spec-api-key"),
+        pytest.param(_GEMINI_KEY_DEFAULT_YAML, {}, id="configured-gemini-default"),
+    ],
+)
+def test_resolve_provider_antigravity_native_ignores_omnigent_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    config_yaml: str,
+    executor_kwargs: dict[str, object],
+) -> None:
+    """Omnigent-side Gemini credentials never change the native agy readout.
+
+    The native launch passes neither a spec api-key nor a configured ``gemini``
+    default to agy, so the readout must stay its own CLI login rather than name
+    a credential the session never uses.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir.
+    :param config_yaml: The isolated ``providers:`` config, possibly empty.
+    :param executor_kwargs: Extra executor fields, e.g. a spec ``auth``.
     """
-    _isolate_config(monkeypatch, tmp_path, "")
-    spec = _worker_spec("antigravity-native", auth=ApiKeyAuth(api_key="gemini-test-key"))
+    _isolate_config(monkeypatch, tmp_path, config_yaml)
+    spec = _worker_spec("antigravity-native", **executor_kwargs)
     provider = resolve_model_provider(spec, "antigravity-native")
     assert provider.kind == "subscription"
     assert provider.cli == "agy"
@@ -336,51 +359,28 @@ def test_antigravity_native_listing_is_usable_without_omnigent_credentials(
 ) -> None:
     """The native agy worker row is never the dead-worker shape.
 
-    An orchestrator preflighting with ``sys_list_models`` used to read
-    ``source: "none"`` with the "dispatches to this worker cannot run
-    here" note for a signed-in agy install — and no configuration fixed
-    it, since the credential is agy's to resolve at launch. The row must
-    be the subscription-style readout regardless of an ambient Gemini key.
+    An orchestrator preflighting with ``sys_list_models`` must see the
+    subscription-style row for a signed-in agy install, not ``source: "none"``
+    with the "dispatches to this worker cannot run here" note; the credential is
+    agy's to resolve at launch, so an ambient Gemini key changes nothing.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir.
     """
     _isolate_config(monkeypatch, tmp_path, "")
     monkeypatch.setenv("GEMINI_API_KEY", "gemini-test-key")
+    monkeypatch.setattr(
+        "omnigent.onboarding.detected.detect_providers",
+        lambda: [
+            DetectedProvider(name="gemini", kind="key", family="gemini", source="$GEMINI_API_KEY")
+        ],
+    )
     listing = list_models_for_worker(_worker_spec("antigravity-native"), "antigravity-native")
     assert listing.source == "static"
     assert listing.verified is False
     assert listing.models == ()
     assert "agy" in listing.note
     assert "cannot run here" not in listing.note
-
-
-def test_resolve_provider_antigravity_native_configured_gemini_key_is_cli_login(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A configured ``gemini`` key provider leaves the native agy readout as its CLI login.
-
-    The reported host had a ``providers: gemini:`` default and no openai provider;
-    resolution used to miss that credential and report the worker as ``none``.
-    The native launch never consumes the key, so the readout stays agy's own login.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :param tmp_path: Per-test temp dir.
-    """
-    _isolate_config(
-        monkeypatch,
-        tmp_path,
-        "providers:\n"
-        "  gemini:\n"
-        "    kind: key\n"
-        "    default: true\n"
-        "    gemini:\n"
-        "      base_url: https://generativelanguage.googleapis.com/v1beta/openai\n"
-        "      api_key: AIzaSyFAKEgeminiKeyForUnitTest\n",
-    )
-    provider = resolve_model_provider(_worker_spec("antigravity-native"), "antigravity-native")
-    assert provider.kind == "subscription"
-    assert provider.cli == "agy"
 
 
 @pytest.mark.parametrize("harness", ["antigravity", "agy", "google-antigravity"])

@@ -189,47 +189,54 @@ def agy_install_runner(
     :yields: ``None`` once the replacement runner is online.
     """
     runner_id = str(_server_state["runner_id"])
-    if _runner_online(live_server, runner_id):
+    # Kill unconditionally: a transient status-probe miss must not leave the
+    # shared runner alive beside a replacement registered under the same id.
+    with contextlib.suppress(ProcessLookupError):
         os.kill(int(_server_state["runner_pid"]), signal.SIGKILL)
+    try:
         _wait_runner_state(live_server, runner_id, online=False, what="offline after SIGKILL")
 
-    home = tmp_path_factory.mktemp("agy_install_home")
-    token_path = home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-    token_path.parent.mkdir(parents=True)
-    token_path.write_text(json.dumps(_FAKE_OAUTH_TOKEN), encoding="utf-8")
-    (home / ".omnigent").mkdir()
+        home = tmp_path_factory.mktemp("agy_install_home")
+        token_path = home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+        token_path.parent.mkdir(parents=True)
+        token_path.write_text(json.dumps(_FAKE_OAUTH_TOKEN), encoding="utf-8")
+        (home / ".omnigent").mkdir()
 
-    env = {
-        **os.environ,
-        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
-        "OMNIGENT_RUNNER_ID": runner_id,
-        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": str(_server_state["binding_token"]),
-        "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-        "RUNNER_SERVER_URL": live_server,
-        "HOME": str(home),
-        "OMNIGENT_CONFIG_HOME": str(home / ".omnigent"),
-        "GEMINI_API_KEY": "AIza-e2e-fake-key",
-    }
-    for masking_var in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_API_KEY"):
-        env.pop(masking_var, None)
+        env = {
+            **os.environ,
+            "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+            "OMNIGENT_RUNNER_ID": runner_id,
+            "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": str(_server_state["binding_token"]),
+            "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
+            "RUNNER_SERVER_URL": live_server,
+            "HOME": str(home),
+            "OMNIGENT_CONFIG_HOME": str(home / ".omnigent"),
+            "GEMINI_API_KEY": "AIza-e2e-fake-key",
+        }
+        for masking_var in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_API_KEY"):
+            env.pop(masking_var, None)
 
-    log_path = tmp_path_factory.mktemp("agy_install_runner") / "runner.log"
-    with open(log_path, "w") as log_handle:
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "omnigent.runner._entry"],
-            env=env,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-        )
-    deadline = time.monotonic() + _RUNNER_SWAP_TIMEOUT_S
-    while not _runner_online(live_server, runner_id):
-        if proc.poll() is not None or time.monotonic() > deadline:
-            proc.terminate()
-            raise RuntimeError(
-                f"agy-install runner did not register; log:\n{log_path.read_text()[-3000:]}"
+        log_path = tmp_path_factory.mktemp("agy_install_runner") / "runner.log"
+        with open(log_path, "w") as log_handle:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "omnigent.runner._entry"],
+                env=env,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
             )
-        time.sleep(0.5)
-    _server_state["runner_pid"] = proc.pid
+        deadline = time.monotonic() + _RUNNER_SWAP_TIMEOUT_S
+        while not _runner_online(live_server, runner_id):
+            if proc.poll() is not None or time.monotonic() > deadline:
+                proc.terminate()
+                raise RuntimeError(
+                    f"agy-install runner did not register; log:\n{log_path.read_text()[-3000:]}"
+                )
+            time.sleep(0.5)
+        _server_state["runner_pid"] = proc.pid
+    except Exception:
+        # The shared runner is already dead; restore it before surfacing the failure.
+        _recover_shared_runner()
+        raise
 
     try:
         yield
@@ -238,8 +245,10 @@ def agy_install_runner(
         # The offline wait below catches a runner that outlives SIGKILL.
         with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=5)
-        _wait_runner_state(live_server, runner_id, online=False, what="offline after teardown")
-        _recover_shared_runner()
+        try:
+            _wait_runner_state(live_server, runner_id, online=False, what="offline after teardown")
+        finally:
+            _recover_shared_runner()
 
 
 @pytest.fixture

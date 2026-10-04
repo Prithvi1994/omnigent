@@ -169,16 +169,6 @@ _CURSOR_HARNESSES: frozenset[str] = frozenset({"cursor", "cursor-native", "nativ
 # provider-config lookup.
 _DEVIN_HARNESSES: frozenset[str] = frozenset({"devin-native", "native-devin"})
 
-# The native agy TUI authenticates itself: it inherits the user's persisted
-# Google OAuth login (or an ambient GEMINI_API_KEY) from its own ~/.gemini, and
-# the launch seeds no Omnigent credential (``resolve_native_antigravity_launch``
-# returns "subscription" unconditionally) — so, like cursor/devin, resolution
-# short-circuits to a subscription readout instead of consulting provider
-# config for a credential the launch would never consume.
-_ANTIGRAVITY_NATIVE_HARNESSES: frozenset[str] = frozenset(
-    {"antigravity-native", "native-antigravity", "agy-native", "native-agy"}
-)
-
 # Preferred inline family per single-family harness (pi consumes both).
 _KEY_AUTH_FAMILY: dict[str, str] = {
     "claude-sdk": ANTHROPIC_FAMILY,
@@ -624,7 +614,9 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
         )
     if (harness or "") in _DEVIN_HARNESSES:
         return ResolvedModelProvider(kind=SUBSCRIPTION_KIND, cli="devin", detail="devin CLI login")
-    if (canonical_harness or "") in _ANTIGRAVITY_NATIVE_HARNESSES:
+    # The native agy TUI owns its auth (~/.gemini OAuth or GEMINI_API_KEY) and the
+    # launch seeds no Omnigent credential, so it reads as a CLI login like cursor/devin.
+    if canonical_harness == "antigravity-native":
         return ResolvedModelProvider(kind=SUBSCRIPTION_KIND, cli="agy", detail="agy CLI login")
 
     harness_type = _PROVIDER_RESOLUTION_HARNESS.get(canonical_harness or "")
