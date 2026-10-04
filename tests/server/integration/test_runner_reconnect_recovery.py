@@ -1,0 +1,207 @@
+"""Reconnect recovery stays live when initialization or descendant work is slow."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import threading
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from typing import Any
+
+import httpx
+import pytest
+from fastapi import FastAPI
+
+from omnigent.db.utils import generate_agent_id
+from omnigent.entities import Conversation
+from omnigent.server.routes import runner_tunnel, sessions
+from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from tests.budgets import budget
+from tests.server.integration.test_runner_tunnel_route import (
+    _RUNNER_ID,
+    _TUNNEL_PATH,
+    _connect_route,
+    _send_hello,
+)
+
+pytestmark = pytest.mark.asyncio
+
+
+def _create_session(app: FastAPI, agent_id: str, **kwargs: Any) -> Conversation:
+    store = app.state.runner_router._conversation_store
+    conv = store.create_conversation(agent_id=agent_id, runner_id=_RUNNER_ID, **kwargs)
+    store.set_session_live_status(conv.id, "failed")
+    store.set_labels(
+        conv.id,
+        {
+            "omnigent.last_task_error_code": "runner_disconnected",
+            "omnigent.last_task_error_message": "Runner disconnected",
+        },
+    )
+    sessions._session_status_cache[conv.id] = "failed"
+    return conv
+
+
+@asynccontextmanager
+async def _recover(
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    respond: Callable[[httpx.Request], Awaitable[httpx.Response]],
+) -> AsyncIterator[tuple[list[str], asyncio.Event]]:
+    relays: list[str] = []
+    finished = asyncio.Event()
+    start = asyncio.Event()
+    real_hook = runner_tunnel._run_connect_hook
+
+    async def record_completion(hook: Any, connection: Any) -> None:
+        await start.wait()
+        await real_hook(hook, connection)
+        finished.set()
+
+    monkeypatch.setattr(runner_tunnel, "_run_connect_hook", record_completion)
+    monkeypatch.setattr(sessions, "_ensure_runner_relay", lambda sid, *_: relays.append(sid))
+    monkeypatch.setattr(sessions, "RUNNER_DISCONNECT_GRACE_S", 0)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://runner"
+    ) as client:
+        app.state.runner_router._clients[_RUNNER_ID] = client
+        communicator = await _connect_route(app, _TUNNEL_PATH)
+        try:
+            await _send_hello(communicator, app.state.tunnel_registry)
+            asyncio.get_running_loop().call_soon(start.set)
+            yield relays, finished
+        finally:
+            await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+            await communicator.wait(timeout=budget(5))
+            grace = [
+                task
+                for task in asyncio.all_tasks()
+                if task.get_name() == f"runner-disconnect-grace-{_RUNNER_ID}"
+            ]
+            await asyncio.gather(*grace)
+            for (
+                conv
+            ) in app.state.runner_router._conversation_store.list_conversations_by_runner_id(
+                _RUNNER_ID
+            ):
+                sessions._session_status_cache.pop(conv.id, None)
+
+
+async def test_multiple_slow_roots_recover_independently_with_descendants(
+    app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
+    hung, slow, healthy = [_create_session(app, agent.id) for _ in range(3)]
+    blocked_child = _create_session(
+        app, agent.id, kind="sub_agent", parent_conversation_id=hung.id
+    )
+    slow_child = _create_session(app, agent.id, kind="sub_agent", parent_conversation_id=slow.id)
+    healthy_child = _create_session(
+        app, agent.id, kind="sub_agent", parent_conversation_id=healthy.id
+    )
+    all_ids = {c.id for c in (hung, slow, healthy, blocked_child, slow_child, healthy_child)}
+    entered = {c.id: asyncio.Event() for c in (hung, slow, slow_child, healthy_child)}
+    release = asyncio.Event()
+    requested: list[str] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        sid = body["session_id"]
+        requested.append(sid)
+        assert all_ids <= set(relays), "initialization started before all bound streams attached"
+        if sid in entered:
+            entered[sid].set()
+        if sid in (hung.id, slow.id):
+            await (asyncio.Event() if sid == hung.id else release).wait()
+        if sid in (slow_child.id, healthy_child.id):
+            assert body["session_init"]["resume_interrupted_turn"] is True
+            assert sessions._session_status_cache[sid] == "failed"
+        return httpx.Response(201, json={})
+
+    async with _recover(app, monkeypatch, respond) as (relays, finished):
+        await asyncio.wait_for(
+            asyncio.gather(*(entered[c.id].wait() for c in (hung, slow, healthy_child))), budget(5)
+        )
+        assert sessions._session_status_cache[hung.id] == "failed"
+        assert sessions._session_status_cache[slow.id] == "failed"
+        assert sessions._session_status_cache[healthy.id] == "idle"
+        release.set()
+        await asyncio.wait_for(entered[slow_child.id].wait(), budget(5))
+        assert sessions._session_status_cache[slow.id] == "idle"
+        assert sessions._session_status_cache[hung.id] == "failed"
+        assert blocked_child.id not in requested
+        assert not finished.is_set()
+    assert not app.state.runner_session_initializer._tasks
+
+
+async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
+    app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
+    parent = _create_session(app, agent.id)
+    store = app.state.runner_router._conversation_store
+    mirrors = []
+    for _ in range(80):
+        child = _create_session(app, agent.id, kind="sub_agent", parent_conversation_id=parent.id)
+        store.set_labels(child.id, {"omnigent.wrapper": "claude-code-native-ui-subagent"})
+        mirrors.append(child.id)
+    loop_thread = threading.get_ident()
+    real_get = store.get_conversation
+    reads = []
+
+    def get_conversation(sid: str, *args: Any, **kwargs: Any) -> Any:
+        assert threading.get_ident() != loop_thread, (
+            "synchronous DB read on the replica event loop"
+        )
+        reads.append(sid)
+        return real_get(sid, *args, **kwargs)
+
+    monkeypatch.setattr(store, "get_conversation", get_conversation)
+    heartbeats: list[int] = []
+    stop = asyncio.Event()
+
+    async def heartbeat() -> None:
+        while not stop.is_set():
+            heartbeats.append(len(relays))
+            await asyncio.sleep(0)
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["session_id"] == parent.id
+        return httpx.Response(201, json={})
+
+    async with _recover(app, monkeypatch, respond) as (relays, finished):
+        ticker = asyncio.create_task(heartbeat())
+        try:
+            await asyncio.wait_for(finished.wait(), budget(5))
+        finally:
+            stop.set()
+            await ticker
+        assert relays[0] == parent.id
+        assert set(mirrors) <= set(relays)
+        assert not set(mirrors).intersection(reads)
+        assert any(0 < count < len(mirrors) for count in heartbeats)
+        assert sessions._session_status_cache[parent.id] == "idle"
+
+
+async def test_failed_root_init_keeps_failure_but_does_not_block_other_tree(
+    app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
+    failed, healthy = [_create_session(app, agent.id) for _ in range(2)]
+    blocked_child = _create_session(
+        app, agent.id, kind="sub_agent", parent_conversation_id=failed.id
+    )
+    requested = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        sid = json.loads(request.content)["session_id"]
+        requested.append(sid)
+        return httpx.Response(503 if sid == failed.id else 201, json={})
+
+    async with _recover(app, monkeypatch, respond) as (relays, finished):
+        await asyncio.wait_for(finished.wait(), budget(5))
+        assert {failed.id, healthy.id, blocked_child.id} <= set(relays)
+        assert sessions._session_status_cache[failed.id] == "failed"
+        assert sessions._session_status_cache[healthy.id] == "idle"
+        assert set(requested) == {failed.id, healthy.id}

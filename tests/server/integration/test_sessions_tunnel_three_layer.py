@@ -926,9 +926,9 @@ async def test_on_runner_connect_restarts_relay_via_router(
         async def post(self, *args: Any, **kwargs: Any) -> _StubResponse:
             return _StubResponse()
 
-    def _spy_resolver(conv_id: str):  # type: ignore[no-untyped-def]
+    def _spy_resolver(conv_id: str, **kwargs: Any):  # type: ignore[no-untyped-def]
         routed_calls.append(conv_id)
-        real_routed = real_resolver(conv_id)
+        real_routed = real_resolver(conv_id, **kwargs)
         fake = RoutedRunner(runner_id=real_routed.runner_id, client=_StubClient())  # type: ignore[arg-type]
         routed_clients[conv_id] = fake.client
         return fake
@@ -1068,7 +1068,7 @@ async def _reconnect_fires_connect_hook(
     ``_publish_runner_recovered_status`` with a spy that records
     completion (the closure re-imports it from the module on each call,
     so the patch is picked up). Waits until the recovery helper has run
-    to completion for ``wait_for_recover`` before yielding, so callers
+    to completion for the whole connection before yielding, so callers
     can assert on the post-recovery state.
 
     :yields: The list of session ids the recovery helper ran for.
@@ -1092,8 +1092,8 @@ async def _reconnect_fires_connect_hook(
         async def post(self, *args: Any, **kwargs: Any) -> _StubResponse:
             return _StubResponse()
 
-    def _spy_resolver(conv_id: str):  # type: ignore[no-untyped-def]
-        real_routed = real_resolver(conv_id)
+    def _spy_resolver(conv_id: str, **kwargs: Any):  # type: ignore[no-untyped-def]
+        real_routed = real_resolver(conv_id, **kwargs)
         return RoutedRunner(runner_id=real_routed.runner_id, client=_StubClient())  # type: ignore[arg-type]
 
     router.client_for_session_resources = _spy_resolver  # type: ignore[method-assign]
@@ -1122,6 +1122,17 @@ async def _reconnect_fires_connect_hook(
 
     sessions_routes._publish_runner_recovered_status = _spy_recover  # type: ignore[assignment]
 
+    from omnigent.server.routes import runner_tunnel
+
+    recovery_finished = asyncio.Event()
+    real_hook = runner_tunnel._run_connect_hook
+
+    async def _spy_hook(hook: Any, connection: Any) -> None:
+        await real_hook(hook, connection)
+        if ap_app.state.tunnel_registry.get(_RUNNER_ID) is connection:
+            recovery_finished.set()
+
+    runner_tunnel._run_connect_hook = _spy_hook
     communicator: ApplicationCommunicator | None = None
     forwarder_task: asyncio.Task[None] | None = None
     try:
@@ -1148,21 +1159,18 @@ async def _reconnect_fires_connect_hook(
             name="tunnel-recover-reconnect-forwarder",
         )
 
-        async def _recovered() -> None:
-            while wait_for_recover not in recovered_calls:
-                await asyncio.sleep(0.02)
-
         try:
-            await asyncio.wait_for(_recovered(), timeout=budget(5.0))
+            await asyncio.wait_for(recovery_finished.wait(), timeout=budget(5.0))
         except asyncio.TimeoutError:
             raise AssertionError(
-                "Reconnect did not drive _on_runner_connect to call "
-                f"_publish_runner_recovered_status for {wait_for_recover!r} "
+                "Reconnect did not finish recovery of the connection containing "
+                f"{wait_for_recover!r} "
                 f"within 5s. recovered_calls={recovered_calls}"
             ) from None
 
         yield recovered_calls
     finally:
+        runner_tunnel._run_connect_hook = real_hook
         router.client_for_session_resources = real_resolver  # type: ignore[method-assign]
         sessions_routes._ensure_runner_relay = real_ensure  # type: ignore[assignment]
         sessions_routes._ensure_runner_relay_ready = real_ensure_ready  # type: ignore[assignment]
@@ -1475,8 +1483,8 @@ def _stub_connect_hook_for_pumpless_ws(ap_app: FastAPI, monkeypatch: pytest.Monk
     router = ap_app.state.runner_router
     real_resolver = router.client_for_session_resources
 
-    def _stub_resolver(conv_id: str):  # type: ignore[no-untyped-def]
-        real_routed = real_resolver(conv_id)
+    def _stub_resolver(conv_id: str, **kwargs: Any):  # type: ignore[no-untyped-def]
+        real_routed = real_resolver(conv_id, **kwargs)
         return RoutedRunner(runner_id=real_routed.runner_id, client=_StubClient())  # type: ignore[arg-type]
 
     monkeypatch.setattr(router, "client_for_session_resources", _stub_resolver)

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
+from typing import ParamSpec, TypeVar
 from weakref import WeakValueDictionary
 
 import httpx
@@ -17,11 +19,13 @@ from omnigent.stores.conversation_store import ConversationNotFoundError, Conver
 from omnigent.util.session_lifecycle import is_session_closed
 
 _logger = logging.getLogger(__name__)
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
 _child_recovery_locks: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScopedCache(
     WeakValueDictionary
 )
 
-_restoration_tasks: WorkspaceScopedCache[tuple[str, str | None], asyncio.Task[None]] = (
+_restoration_tasks: WorkspaceScopedCache[tuple[str, str, int], asyncio.Task[None]] = (
     WorkspaceScopedCache()
 )
 
@@ -33,12 +37,15 @@ def schedule_child_restoration(
     initializer: RunnerSessionInitializer,
 ) -> None:
     """Restore children after parent readiness without delaying its next message."""
-    key = (parent.id, parent.runner_id)
+    if parent.runner_id is None:
+        return
+    generation = initializer.generation_for(parent.runner_id, client)
+    key = (parent.id, parent.runner_id, generation)
     existing = _restoration_tasks.get(key)
     if existing is not None and not existing.done():
         return
     task = asyncio.create_task(
-        restore_active_children(parent, client, store, initializer),
+        restore_active_children(parent, client, store, initializer, generation=generation),
         name=f"restore-children-{parent.id}",
     )
     _restoration_tasks[key] = task
@@ -104,6 +111,8 @@ async def restore_active_children(
     client: httpx.AsyncClient,
     store: ConversationStore,
     initializer: RunnerSessionInitializer,
+    *,
+    generation: int | None = None,
 ) -> None:
     """Rebind and initialize interrupted descendants on their recovered parent's runner."""
     from omnigent.runtime import get_runner_router
@@ -111,13 +120,24 @@ async def restore_active_children(
 
     if parent.runner_id is None or not _restorable(parent):
         return
+    runner_id = parent.runner_id
+    if generation is None:
+        generation = initializer.generation_for(runner_id, client)
+    initializer.require_generation(runner_id, client, generation)
     router = get_runner_router()
     runner_owner = router.runner_owner(parent.runner_id) if router is not None else None
+
+    # Bound each tree's database fan-out without holding slots during initialization.
+    store_slots = asyncio.Semaphore(8)
+
+    async def store_call(fn: Callable[_P, _T], /, *args: _P.args, **kwargs: _P.kwargs) -> _T:
+        async with store_slots:
+            return await asyncio.to_thread(fn, *args, **kwargs)
 
     async def ownership_allows(row: Conversation) -> bool:
         if runner_owner is None:
             return True
-        session_owner = await asyncio.to_thread(store.get_session_owner, row.id, owner_only=True)
+        session_owner = await store_call(store.get_session_owner, row.id, owner_only=True)
         # Internal children without an owner grant inherit from their restored ancestor.
         return session_owner is None or session_owner == runner_owner
 
@@ -144,30 +164,50 @@ async def restore_active_children(
                     and router.runner_is_online(row.runner_id)
                 )
                 or not _restorable(row)
+                or is_side_chat_child(row.labels)
             ):
                 continue
             tree[row.id] = row
             frontier.append(row.id)
+    if initializer.generation_for(runner_id, client) != generation:
+        _logger.info("Stopped restoring children of %s: runner tunnel changed", parent.id)
+        return
     active = {row.id for row in tree.values() if row.id != parent.id and _interrupted(row)}
     needed = set(active)
     for row in reversed(list(tree.values())):
         if row.id in needed and row.parent_conversation_id in tree:
             needed.add(row.parent_conversation_id)
 
-    restored = {parent.id}
-    for snapshot in tree.values():
-        if snapshot.id == parent.id or snapshot.id not in needed:
-            continue
+    # A same-runner mirror subtree only needs relays. Keep fresh reads and owner
+    # checks on every ancestor of a session that needs a rebind or continuation.
+    protocol_needed = {
+        row.id
+        for row in tree.values()
+        if row.id in needed and (row.runner_id != runner_id or not is_parent_owned_subagent(row))
+    }
+    for row in reversed(list(tree.values())):
+        if row.id in protocol_needed and row.parent_conversation_id in tree:
+            protocol_needed.add(row.parent_conversation_id)
+
+    restorations: dict[str, asyncio.Task[bool]] = {}
+
+    async def restore(snapshot: Conversation) -> bool:
+        ancestor = restorations.get(snapshot.parent_conversation_id or "")
+        if ancestor is not None and not await ancestor:
+            return False
+        initializer.require_generation(runner_id, client, generation)
+        if snapshot.id not in protocol_needed:
+            if not _restorable(snapshot):
+                return False
+            _ensure_runner_relay(snapshot.id, runner_id, client, store)
+            return True
         # Re-read and initialize under one lock so competing restores share readiness.
         async with _child_recovery_locks.setdefault(snapshot.id, asyncio.Lock()):
             assert snapshot.parent_conversation_id is not None
-            owner = await asyncio.to_thread(
-                store.get_conversation, snapshot.parent_conversation_id
-            )
-            child = await asyncio.to_thread(store.get_conversation, snapshot.id)
+            owner = await store_call(store.get_conversation, snapshot.parent_conversation_id)
+            child = await store_call(store.get_conversation, snapshot.id)
             if (
                 owner is None
-                or owner.id not in restored
                 or owner.runner_id != parent.runner_id
                 or not _restorable(owner)
                 or child is None
@@ -179,21 +219,22 @@ async def restore_active_children(
                 or not _restorable(child)
                 or (snapshot.id in active and not _interrupted(child))
             ):
-                continue
+                return False
             if not await ownership_allows(child):
-                continue
+                return False
+            initializer.require_generation(runner_id, client, generation)
             try:
                 if child.runner_id != parent.runner_id:
                     if router is not None and router.runner_is_online(child.runner_id):
-                        continue
-                    child = await asyncio.to_thread(
+                        return False
+                    child = await store_call(
                         store.replace_runner_id,
                         child.id,
                         parent.runner_id,
                         expected_runner_id=child.runner_id,
                     )
                     if child.runner_id != parent.runner_id:
-                        continue
+                        return False
                     initializer.invalidate_session(child.id)
                 mirrored = is_parent_owned_subagent(child)
                 if not mirrored:
@@ -203,11 +244,45 @@ async def restore_active_children(
                         timeout=10.0,
                         suppress_recovery_turn=not _interrupted(child),
                         resume_interrupted_turn=_interrupted(child),
+                        generation=generation,
                     )
                     response.raise_for_status()
+                initializer.require_generation(runner_id, client, generation)
                 _ensure_runner_relay(child.id, parent.runner_id, client, store)
                 # Only execution status can clear the interruption. Initialization
                 # may return before a native continuation emits its first running edge.
-                restored.add(child.id)
+                return True
             except (httpx.HTTPError, ConnectionError, ConversationNotFoundError):
-                _logger.warning("Failed to restore child session %s", snapshot.id, exc_info=True)
+                if initializer.generation_for(runner_id, client) != generation:
+                    _logger.info(
+                        "Stopped restoring child session %s: runner tunnel changed", snapshot.id
+                    )
+                else:
+                    _logger.warning(
+                        "Failed to restore child session %s", snapshot.id, exc_info=True
+                    )
+                return False
+
+    async def restore_safely(snapshot: Conversation) -> bool:
+        try:
+            return await restore(snapshot)
+        except ConnectionError:
+            if initializer.generation_for(runner_id, client) != generation:
+                _logger.info(
+                    "Stopped restoring child session %s: runner tunnel changed", snapshot.id
+                )
+            else:
+                _logger.exception("Failed to restore child session %s", snapshot.id)
+            return False
+        except Exception:
+            _logger.exception("Failed to restore child session %s", snapshot.id)
+            return False
+
+    # Each child waits only for its ancestor. Slow siblings cannot strand a tree,
+    # and TaskGroup joins all descendants on cancellation of the owning recovery.
+    async with asyncio.TaskGroup() as group:
+        for snapshot in tree.values():
+            if snapshot.id != parent.id and snapshot.id in needed:
+                restorations[snapshot.id] = group.create_task(
+                    restore_safely(snapshot), name=f"restore-child-{snapshot.id}"
+                )

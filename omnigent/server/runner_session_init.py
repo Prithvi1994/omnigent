@@ -57,6 +57,18 @@ class RunnerSessionInitializer:
         ] = {}
         self._recovery_ids: dict[tuple[str, int, str, str, str | None, bool], str] = {}
 
+    def generation_for(self, runner_id: str, runner_client: httpx.AsyncClient) -> int:
+        """Identify the current tunnel, or the client for embedded transports."""
+        connection = self._registry.get(runner_id)
+        return connection.generation if connection is not None else id(runner_client)
+
+    def require_generation(
+        self, runner_id: str, runner_client: httpx.AsyncClient, generation: int
+    ) -> None:
+        """Prevent delayed recovery work from following a replacement tunnel."""
+        if self.generation_for(runner_id, runner_client) != generation:
+            raise ConnectionError("runner tunnel changed during session recovery")
+
     async def initialize(
         self,
         conversation: Conversation,
@@ -65,17 +77,16 @@ class RunnerSessionInitializer:
         timeout: float,
         suppress_recovery_turn: bool = False,
         resume_interrupted_turn: bool = False,
+        generation: int | None = None,
     ) -> httpx.Response:
         """Initialize once for the current connection and persisted snapshot."""
         runner_id = conversation.runner_id
         agent_id = conversation.agent_id
         if runner_id is None or agent_id is None:
             raise ValueError("runner session initialization requires runner_id and agent_id")
-        connection = self._registry.get(runner_id)
-        # Production routed clients always have a registry entry. The client
-        # identity fallback keeps embedded/test transports usable without
-        # weakening the real tunnel-generation key.
-        generation = id(connection) if connection is not None else id(runner_client)
+        if generation is None:
+            generation = self.generation_for(runner_id, runner_client)
+        self.require_generation(runner_id, runner_client, generation)
         key = (
             runner_id,
             generation,
@@ -119,6 +130,7 @@ class RunnerSessionInitializer:
                             host_registry=None,
                             tunnel_registry=self._registry,
                         )
+                self.require_generation(runner_id, runner_client, generation)
                 return await self._post_initialize(
                     runner_client,
                     session_id=conversation.id,
@@ -128,6 +140,7 @@ class RunnerSessionInitializer:
                     resume_interrupted_turn=resume_interrupted_turn,
                     suppress_recovery_turn=suppress_recovery_turn,
                     recovery_id=recovery_id,
+                    generation=generation,
                 )
 
             task = asyncio.create_task(
@@ -137,12 +150,10 @@ class RunnerSessionInitializer:
             self._tasks[key] = task
 
             def _drop_failed(done: asyncio.Task[httpx.Response]) -> None:
+                failed = done.cancelled() or done.exception() is not None
                 if self._tasks.get(key) is not done:
                     return
-                if done.cancelled():
-                    self._tasks.pop(key, None)
-                    return
-                if done.exception() is not None:
+                if failed:
                     self._tasks.pop(key, None)
                     return
                 response = done.result()
@@ -153,11 +164,16 @@ class RunnerSessionInitializer:
         try:
             response = await asyncio.shield(task)
         except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if task.cancelled() and current is not None and not current.cancelling():
+                # Retiring a shared attempt must not cancel its independent callers.
+                raise ConnectionError("runner session initialization was cancelled") from None
             raise
         except Exception:
             if self._tasks.get(key) is task:
                 self._tasks.pop(key, None)
             raise
+        self.require_generation(runner_id, runner_client, generation)
         if not runner_inference_verified(conversation, response):
             response = httpx.Response(
                 409,
@@ -172,7 +188,9 @@ class RunnerSessionInitializer:
         """A new binding needs fresh readiness and a new continuation identity."""
         for key in list(self._tasks.keys() | self._recovery_ids.keys()):
             if key[2] == session_id:
-                self._tasks.pop(key, None)
+                task = self._tasks.pop(key, None)
+                if task is not None and not task.done():
+                    task.cancel()
                 self._recovery_ids.pop(key, None)
 
     async def _post_initialize(
@@ -186,6 +204,7 @@ class RunnerSessionInitializer:
         resume_interrupted_turn: bool,
         suppress_recovery_turn: bool,
         recovery_id: str | None,
+        generation: int,
     ) -> httpx.Response:
         with runner_log_scope(session_id, runner_id):
             # The flags name the caller: neither set is the tunnel-reconnect
@@ -205,6 +224,7 @@ class RunnerSessionInitializer:
                     "/v1/sessions",
                     json=payload,
                     timeout=timeout,
+                    extensions={"runner_tunnel_generation": generation},
                 )
             except Exception as exc:
                 _logger.exception(
@@ -235,13 +255,22 @@ class RunnerSessionInitializer:
             )
             return response
 
-    def invalidate_runner(self, runner_id: str) -> None:
-        """Forget completed readiness when a runner tunnel goes away."""
+    def invalidate_runner(
+        self, runner_id: str, *, generation: int | None = None
+    ) -> list[asyncio.Task[httpx.Response]]:
+        """Forget readiness and cancel work belonging to a retired connection."""
         for key in list(self._recovery_ids):
-            if key[0] == runner_id:
+            if key[0] == runner_id and (generation is None or key[1] == generation):
                 self._recovery_ids.pop(key)
-        stale = [key for key in self._tasks if key[0] == runner_id]
+        stale = [
+            key
+            for key in self._tasks
+            if key[0] == runner_id and (generation is None or key[1] == generation)
+        ]
+        cancelled = []
         for key in stale:
             task = self._tasks.pop(key)
             if not task.done():
                 task.cancel()
+                cancelled.append(task)
+        return cancelled

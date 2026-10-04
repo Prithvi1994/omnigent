@@ -485,7 +485,7 @@ async def test_simultaneous_retirement_and_peer_disconnect_logs_once(
     registry = TunnelRegistry()
     resume_handler = asyncio.Event()
 
-    async def on_connect(_runner_id: str) -> None:
+    async def on_connect(_runner_id: str, _connection: RunnerSession) -> None:
         await resume_handler.wait()
 
     app = FastAPI()
@@ -511,6 +511,115 @@ async def test_simultaneous_retirement_and_peer_disconnect_logs_once(
     assert ends[0]["connection_id"] == "conn-race"
     assert ends[0]["code"] == 1006
     assert ends[0]["ended_by"] == "tunnel-receive,tunnel-sender"
+
+
+@pytest.mark.parametrize("fail_recovery", [False, True])
+async def test_slow_recovery_continues_without_closing_healthy_tunnel(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, fail_recovery: bool
+) -> None:
+    from omnigent.server.routes import runner_tunnel
+
+    monkeypatch.setattr(runner_tunnel, "_RUNNER_RECOVERY_SLOW_SEC", 0.01)
+    caplog.set_level(logging.INFO, logger=runner_tunnel.__name__)
+    registry = TunnelRegistry()
+    entered, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def recover(_rid: str, _connection: RunnerSession) -> None:
+        entered.set()
+        await release.wait()
+        finished.set()
+        if fail_recovery:
+            raise RuntimeError("session initialization failed")
+
+    app = FastAPI()
+    app.include_router(
+        create_runner_tunnel_router(registry, on_runner_connect=recover), prefix="/v1"
+    )
+    communicator = await _connect_route(app, _TUNNEL_PATH)
+    try:
+        await _send_hello(communicator, registry)
+        await asyncio.wait_for(entered.wait(), budget(1))
+
+        async def warned() -> None:
+            while not any(
+                getattr(r, "attributes", {}).get("outcome") == "slow" for r in caplog.records
+            ):
+                await asyncio.sleep(0.001)
+
+        await asyncio.wait_for(warned(), budget(1))
+        assert not finished.is_set()
+        release.set()
+        await asyncio.wait_for(finished.wait(), budget(1))
+        assert registry.get(_RUNNER_ID) is not None
+        assert not communicator.future.done()
+        outcomes = [
+            r.attributes["outcome"]
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "runner_recovery"
+        ]
+        assert outcomes == ["slow", "failed" if fail_recovery else "completed"]
+    finally:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        await communicator.wait(timeout=budget(1))
+
+
+@pytest.mark.parametrize("end", ["peer", "replacement", "shutdown"])
+async def test_tunnel_end_cancels_and_joins_only_its_recovery(end: str) -> None:
+    registry = TunnelRegistry()
+    entered, replacement_entered = asyncio.Event(), asyncio.Event()
+    cancelled: list[RunnerSession] = []
+    disconnected: list[RunnerSession] = []
+
+    async def recover(_rid: str, connection: RunnerSession) -> None:
+        (replacement_entered if entered.is_set() else entered).set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(connection)
+
+    async def disconnect(_rid: str, connection: RunnerSession) -> None:
+        assert connection in cancelled, "disconnect hook ran before recovery cleanup"
+        disconnected.append(connection)
+
+    app = FastAPI()
+    app.include_router(
+        create_runner_tunnel_router(
+            registry, on_runner_connect=recover, on_runner_disconnect=disconnect
+        ),
+        prefix="/v1",
+    )
+    first = await _connect_route(app, _TUNNEL_PATH)
+    second = None
+    try:
+        await _send_hello(first, registry)
+        await asyncio.wait_for(entered.wait(), budget(1))
+        old = registry.get(_RUNNER_ID)
+        assert old is not None
+        if end == "replacement":
+            second = await _connect_route(app, _TUNNEL_PATH)
+            await _send_hello(second, registry)
+            await asyncio.wait_for(replacement_entered.wait(), budget(1))
+        elif end == "shutdown":
+            first.future.cancel()
+        else:
+            await first.send_input({"type": "websocket.disconnect", "code": 1006})
+        await asyncio.wait_for(asyncio.gather(first.future, return_exceptions=True), budget(1))
+        assert cancelled == disconnected == [old]
+        if second is not None:
+            assert registry.get(_RUNNER_ID) is not old
+            assert registry.get(_RUNNER_ID) is not None
+            assert not second.future.done()
+        else:
+            assert registry.get(_RUNNER_ID) is None
+    finally:
+        for communicator in (first, second):
+            if communicator is not None and not communicator.future.done():
+                await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+                await communicator.wait(timeout=budget(1))
+    assert not any(
+        task.get_name().startswith("tunnel-") and task.get_name().endswith(f":{_RUNNER_ID}")
+        for task in asyncio.all_tasks()
+    )
 
 
 async def test_replacement_logs_close_for_only_the_retired_connection(

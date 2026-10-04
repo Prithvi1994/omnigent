@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -30,9 +31,9 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 
 class _Registry:
     def __init__(self) -> None:
-        self.connection: object | None = object()
+        self.connection: Any = SimpleNamespace(generation=1)
 
-    def get(self, _runner_id: str) -> object | None:
+    def get(self, _runner_id: str) -> Any:
         return self.connection
 
 
@@ -244,6 +245,8 @@ async def test_recovery_has_own_readiness_and_stable_identity_across_failed_post
 
 
 class _AdvertisedRunner:
+    generation = 1
+
     def __init__(self, capabilities: list[str]) -> None:
         self.hello = HelloFrame(
             runner_version="test", frame_protocol_version=1, capabilities=capabilities
@@ -413,3 +416,114 @@ async def test_init_attributes_dropped_tunnel_to_runner(error: Exception) -> Non
     [failed] = [row for row in rows if row["event_name"] == "runner_session_init_failed"]
     assert failed["attributes"]["error_category"] == "runner"
     assert failed["attributes"]["error_impact"] == "transient"
+
+
+@pytest.mark.asyncio
+async def test_cancelling_waiter_preserves_shared_initialization() -> None:
+    registry, client = _Registry(), _Client()
+    initializer = RunnerSessionInitializer(registry, server_version="test")  # type: ignore[arg-type]
+    conv = _conversation()
+    waiter = asyncio.create_task(initializer.initialize(conv, client, timeout=10))  # type: ignore[arg-type]
+    await client.entered.wait()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    client.release.set()
+    assert (await initializer.initialize(conv, client, timeout=10)).status_code == 201  # type: ignore[arg-type]
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalidate", ["runner", "session"])
+@pytest.mark.parametrize("cancel_caller", [False, True])
+async def test_retired_initialization_preserves_each_callers_cancellation(
+    invalidate: str, cancel_caller: bool
+) -> None:
+    registry, client = _Registry(), _Client()
+    initializer = RunnerSessionInitializer(registry, server_version="test")  # type: ignore[arg-type]
+    conv = _conversation()
+    first = asyncio.create_task(initializer.initialize(conv, client, timeout=10))  # type: ignore[arg-type]
+    await client.entered.wait()
+    second = asyncio.create_task(initializer.initialize(conv, client, timeout=10))  # type: ignore[arg-type]
+    await asyncio.sleep(0)
+    if cancel_caller:
+        first.cancel()
+    if invalidate == "runner":
+        initializer.invalidate_runner("runner_init", generation=1)
+    else:
+        initializer.invalidate_session(conv.id)
+    results = await asyncio.gather(first, second, return_exceptions=True)
+    assert isinstance(results[0], asyncio.CancelledError if cancel_caller else ConnectionError)
+    assert isinstance(results[1], ConnectionError)
+    assert not second.cancelled()
+    assert len(client.calls) == 1
+
+    client.release.set()
+    assert (await initializer.initialize(conv, client, timeout=10)).status_code == 201  # type: ignore[arg-type]
+    assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_retiring_old_generation_cancels_only_its_initialization() -> None:
+    registry = _Registry()
+    old_client, new_client = _Client(), _Client()
+    initializer = RunnerSessionInitializer(registry, server_version="test")  # type: ignore[arg-type]
+    conv = _conversation()
+    old = asyncio.create_task(
+        initializer.initialize(conv, old_client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
+    )
+    await old_client.entered.wait()
+    registry.connection = SimpleNamespace(generation=2)
+    new = asyncio.create_task(
+        initializer.initialize(conv, new_client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
+    )
+    await new_client.entered.wait()
+    await asyncio.gather(
+        *initializer.invalidate_runner(conv.runner_id, generation=1), return_exceptions=True
+    )
+    with pytest.raises(ConnectionError):
+        await old
+    assert not new.done()
+    new_client.release.set()
+    response = await new
+    assert (
+        await initializer.initialize(  # type: ignore[arg-type]
+            conv, new_client, timeout=10, resume_interrupted_turn=True
+        )
+        is response
+    )
+    assert len(new_client.calls) == 1
+    assert (
+        old_client.calls[0]["session_init"]["recovery_id"]
+        != new_client.calls[0]["session_init"]["recovery_id"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_replaced_connection_cannot_post_after_attachment_lookup(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    from omnigent.server.routes._sessions import helpers
+
+    initializer, conv, registry, client = _attachment_initializer(db_uri, None, [])
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked_lookup(*_args: Any) -> None:
+        entered.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(helpers, "_filesystem_attachment_in_history", blocked_lookup)
+    client.release.set()
+    init = asyncio.create_task(initializer.initialize(conv, client, timeout=10))  # type: ignore[arg-type]
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        registry.connection = SimpleNamespace(generation=2)
+        release.set()
+        with pytest.raises(ConnectionError, match="tunnel changed"):
+            await init
+    finally:
+        release.set()
+        await asyncio.gather(init, return_exceptions=True)
+    assert not client.calls

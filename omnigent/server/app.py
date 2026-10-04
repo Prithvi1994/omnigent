@@ -1515,7 +1515,7 @@ def create_app(
             )
 
     from omnigent.runner.routing import RunnerRouter
-    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
     from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 
     tunnel_registry = TunnelRegistry()
@@ -3389,7 +3389,7 @@ def create_app(
             conversation_store,
         )
 
-    async def _on_runner_disconnect(runner_id: str) -> None:
+    async def _on_runner_disconnect(runner_id: str, connection: RunnerSession) -> None:
         """Schedule offline-marking for the turns *this* runner interrupted.
 
         Filters by ``runner_id`` against ``conversation_store`` so a
@@ -3411,6 +3411,10 @@ def create_app(
 
         :param runner_id: The disconnected runner's id.
         """
+        cancelled = runner_session_initializer.invalidate_runner(
+            runner_id, generation=connection.generation
+        )
+        await asyncio.gather(*cancelled, return_exceptions=True)
         # Newest-wins guard: a superseded tunnel's teardown fires this
         # hook after a fresh tunnel for the same ``runner_id`` already
         # registered (``TunnelRegistry.register`` retires the old
@@ -3433,7 +3437,6 @@ def create_app(
             "Runner disconnected",
             extra=debug_event("runner_disconnected", runner_id=runner_id),
         )
-        runner_session_initializer.invalidate_runner(runner_id)
         # Capture this replica's own last stamp before clearing, so the grace
         # timer can tell a fresher stamp another replica writes later from
         # one we wrote ourselves (the clear itself never erases this record).
@@ -3507,28 +3510,16 @@ def create_app(
             fail_idle_top_level=True,
         )
 
-    async def _on_runner_connect(runner_id: str) -> None:
-        """Re-assign sessions and restart SSE relays on reconnect.
+    async def _on_runner_connect(runner_id: str, connection: RunnerSession) -> None:
+        """Attach bound streams, then recover independent session trees concurrently."""
+        import httpx
 
-        Resolves the runner client per-session via
-        ``runner_router.client_for_session_resources``. The legacy
-        ``get_runner_client()`` returns ``None`` in multi-runner
-        deployments where only ``set_runner_router`` is wired, so
-        routing must go through the router.
-
-        :param runner_id: The reconnecting runner's id.
-        """
-        _logger.info(
-            "Runner connected",
-            extra=debug_event("runner_connected", runner_id=runner_id),
-        )
+        from omnigent.entities import Conversation
         from omnigent.server.child_session_recovery import (
             is_parent_owned_subagent,
             restore_active_children,
         )
-        from omnigent.server.routes._sessions.common import (
-            _session_sandbox_status_cache,
-        )
+        from omnigent.server.routes._sessions.common import _session_sandbox_status_cache
         from omnigent.server.routes.sessions import (
             _ensure_runner_relay,
             _publish_runner_recovered_status,
@@ -3536,119 +3527,97 @@ def create_app(
             prefetch_session_routing_catalogs,
         )
 
-        # Stamp liveness immediately so other replicas see the runner
-        # online before the first periodic sweep.
+        if tunnel_registry.get(runner_id) is not connection:
+            return
+        _logger.info(
+            "Runner connected",
+            extra=debug_event("runner_connected", runner_id=runner_id),
+        )
+        # Other replicas must see the runner online before the first liveness sweep.
         session_live_state.touch_runner_liveness([runner_id])
-
-        # Direct by-runner lookup instead of list-everything-and-filter:
-        # the listing path may be backed by an eventually-consistent
-        # search index in alternate store backends, which cannot see a
-        # session created seconds ago — exactly the window this callback
-        # runs in for a host-spawned runner. Missing the session here
-        # means create_session never reaches the runner and the
-        # claude-native terminal is never bootstrapped. Archived
-        # sessions are included by construction (their relays must
-        # restart on reconnect like any other).
+        # The by-runner lookup is read-after-write consistent and includes archived
+        # sessions, whose streams still need to be attached after a reconnect.
         convs = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
-        # Restore each tree from its root before ordinary child initialization
-        # can clear the interruption status or cache an init without continuation.
         bound_ids = {conv.id for conv in convs}
+        # Attach root streams before their bound children.
         convs.sort(key=lambda conv: conv.parent_conversation_id in bound_ids)
-        _logger.info(
-            "_on_runner_connect: runner=%s, %d bound session(s)",
-            runner_id,
-            len(convs),
-        )
+        _logger.info("_on_runner_connect: runner=%s, %d bound session(s)", runner_id, len(convs))
+        roots: list[tuple[Conversation, httpx.AsyncClient]] = []
         for conv in convs:
+            # Even the relay-only tail must yield so a large tree remains cancellable.
+            await asyncio.sleep(0)
+            if tunnel_registry.get(runner_id) is not connection:
+                return
             with runner_log_scope(conv.id, runner_id):
-                _logger.info(
-                    "_on_runner_connect: matched %s (agent=%s)",
-                    conv.id,
-                    conv.agent_id,
-                )
+                _logger.info("_on_runner_connect: matched %s (agent=%s)", conv.id, conv.agent_id)
                 try:
-                    routed = runner_router.client_for_session_resources(conv.id)
+                    routed = runner_router.client_for_session_resources(conv.id, conversation=conv)
                 except OmnigentError:
                     _logger.exception(
-                        "Failed to resolve runner client for session %s on reconnect",
-                        conv.id,
+                        "Failed to resolve runner client for session %s on reconnect", conv.id
                     )
                     continue
-                if not conv.agent_id:
-                    # The runner's create_session requires agent_id (it 400s
-                    # without one), so don't send a request it rejects by
-                    # contract. The old list path filtered these rows out via
-                    # has_agent_id=True; the by-runner lookup returns them, and
-                    # the relay restart below still applies — the session is
-                    # runner-bound regardless of having an agent.
-                    _logger.debug(
-                        "_on_runner_connect: skipping session-init POST for %s (no agent_id)",
-                        conv.id,
-                    )
-                elif not is_parent_owned_subagent(conv) and not (
-                    conv.parent_conversation_id in bound_ids and conv.host_id is None
-                ):
-                    try:
-                        init_response = await runner_session_initializer.initialize(
-                            conv,
-                            routed.client,
-                            timeout=10.0,
-                        )
-                        init_response.raise_for_status()
-                        await restore_active_children(
-                            conv, routed.client, conversation_store, runner_session_initializer
-                        )
-                    except Exception:
-                        _logger.exception(
-                            "Failed to re-assign session %s on reconnect",
-                            conv.id,
-                        )
-                _ensure_runner_relay(
-                    conv.id,
-                    runner_id,
-                    routed.client,
-                    conversation_store,
+                _ensure_runner_relay(conv.id, runner_id, routed.client, conversation_store)
+                independent = not (
+                    is_parent_owned_subagent(conv)
+                    or (conv.parent_conversation_id in bound_ids and conv.host_id is None)
                 )
-                # The session's terminal exists as of the handshake above, so its
-                # model catalogs are answerable now. Warming them here is what
-                # keeps the first routed message off the runner round trip. The
-                # helper self-gates on routing state, so the plain sessions in this
-                # loop (and any archived row) cost nothing.
-                prefetch_session_routing_catalogs(conv.id, conv, routed.client)
-                # Reconcile the persisted pending-elicitation count with this
-                # pod's live index. A runner that crashed with prompts parked
-                # leaves a stale row (no decrement is ever written on a crash),
-                # which the fresh index corrects to 0 here; a tunnel flap on the
-                # same pod resyncs the still-parked truth unchanged.
+                if independent:
+                    roots.append((conv, routed.client))
+                else:
+                    prefetch_session_routing_catalogs(conv.id, conv, routed.client)
+                # A crashed runner can leave a persisted count absent from the live index.
                 session_live_state.persist_pending_count(
                     conv.id, pending_elicitations.count_for(conv.id)
                 )
-                # A reconnect can land the runner back on an idle session with
-                # no new turn (a transient WS blip; the runner process
-                # survived). The disconnect left the session marked failed with
-                # persisted ``runner_disconnected`` labels, and without a
-                # ``running`` edge nothing clears them — the Subagents panel
-                # keeps the grey "Disconnected" dot until the next user
-                # message. Clearing on reconnect drops it as soon as the runner
-                # is reachable again. The helper self-guards: it only clears a
-                # session whose persisted failure is ``runner_disconnected``, so
-                # a genuine task failure survives the reconnect untouched.
-                if not is_parent_owned_subagent(conv) and not (
-                    conv.parent_conversation_id in bound_ids and conv.host_id is None
-                ):
+                cached_sandbox = _session_sandbox_status_cache.get(conv.id)
+                # A reconnect proves readiness only for a launch already marked failed.
+                if cached_sandbox is not None and cached_sandbox.stage == "failed":
+                    _publish_sandbox_status(conv.id, "ready")
+
+        async def recover_root(conv: Conversation, client: httpx.AsyncClient) -> None:
+            with runner_log_scope(conv.id, runner_id):
+                try:
+                    runner_session_initializer.require_generation(
+                        runner_id, client, connection.generation
+                    )
+                    # Sessions without an agent have no runner runtime to initialize.
+                    if conv.agent_id:
+                        response = await runner_session_initializer.initialize(
+                            conv, client, timeout=10.0, generation=connection.generation
+                        )
+                        response.raise_for_status()
+                    prefetch_session_routing_catalogs(conv.id, conv, client)
+                    # Clear only a root's disconnect failure, after successful init.
+                    # Children retain interruption evidence until continuation runs.
                     await _publish_runner_recovered_status(
                         conv.id, conversation_store, require_disconnect_code=True
                     )
-                # A managed launch that outlived its connect timeout cached
-                # sandbox_status "failed"; this runner connecting proves the
-                # sandbox is live, so drop the stale banner. Only "failed" is
-                # cleared -- an in-flight launch (provisioning/connecting) must
-                # not be short-circuited by an older runner reconnecting.
-                cached_sandbox = _session_sandbox_status_cache.get(conv.id)
-                if cached_sandbox is not None and cached_sandbox.stage == "failed":
-                    _publish_sandbox_status(conv.id, "ready")
+                    if conv.agent_id:
+                        await restore_active_children(
+                            conv,
+                            client,
+                            conversation_store,
+                            runner_session_initializer,
+                            generation=connection.generation,
+                        )
+                except ConnectionError:
+                    if tunnel_registry.get(runner_id) is connection:
+                        _logger.exception("Failed to re-assign session %s on reconnect", conv.id)
+                    else:
+                        _logger.info(
+                            "Stopped recovering session %s: runner tunnel changed", conv.id
+                        )
+                except Exception:
+                    _logger.exception("Failed to re-assign session %s on reconnect", conv.id)
+
+        # A hung initialization delays only its own tree. All tasks are joined and
+        # cancelled with this connection; no detached recovery or shared deadline.
+        async with asyncio.TaskGroup() as recoveries:
+            for conv, client in roots:
+                recoveries.create_task(recover_root(conv, client), name=f"recover-root-{conv.id}")
 
     def _mint_managed_runner_token(runner_id: str, ttl_seconds: int) -> str | None:
         assert runner_account_store is not None and auth_provider is not None
