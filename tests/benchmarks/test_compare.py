@@ -185,6 +185,9 @@ def test_table_marks_only_ungated_p95_deltas(monkeypatch: pytest.MonkeyPatch) ->
     baseline["journeys"]["list_sessions"] = _journey([100, 101, 102], [120, 125, 130])
     candidate["journeys"]["list_sessions"] = _journey([110, 111, 112], [125, 130, 135])
     _, rows = compare_reports(baseline, candidate, threshold=1.0, backend="sqlite")
+    monkeypatch.setenv("TERM", "xterm")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.delenv("COLUMNS", raising=False)
     console = Console(file=io.StringIO(), width=200, force_terminal=False)
     monkeypatch.setattr(compare, "console", console)
 
@@ -198,22 +201,23 @@ def test_table_marks_only_ungated_p95_deltas(monkeypatch: pytest.MonkeyPatch) ->
     assert any("P95 not gated" in line for line in lines)
 
 
-def test_table_highlights_only_the_gated_metric_of_a_failing_row(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("n_success", "p50", "expected_cells"),
+    [
+        # A five-sample journey failing on p50 keeps its p95 delta visible but unpainted.
+        (5, [250, 260, 270], ("[red]+157.4%[/red]", "+148.0%†")),
+        # A well-sampled journey failing on p95 paints only that cell.
+        (100, [110, 111, 112], ("+9.9%", "[red]+148.0%[/red]")),
+    ],
+)
+def test_table_cells_highlight_only_the_gated_metric_of_a_failing_row(
+    n_success: int, p50: list[float], expected_cells: tuple[str, str]
 ) -> None:
-    # A five-sample journey failing on p50 still shows its p95 delta, but only
-    # the p50 delta is painted red.
-    baseline = {"journeys": {"interrupt": _journey([100, 101, 102], [120, 125, 130], n_success=5)}}
-    candidate = {
-        "journeys": {"interrupt": _journey([250, 260, 270], [300, 310, 320], n_success=5)}
+    baseline = {
+        "journeys": {"interrupt": _journey([100, 101, 102], [120, 125, 130], n_success=n_success)}
     }
+    candidate = {"journeys": {"interrupt": _journey(p50, [300, 310, 320], n_success=n_success)}}
     _, rows = compare_reports(baseline, candidate, threshold=1.0, backend="sqlite")
-    console = Console(file=io.StringIO(), width=200, force_terminal=True, color_system="standard")
-    monkeypatch.setattr(compare, "console", console)
 
-    print_table(rows, threshold=1.0)
-
-    output = console.file.getvalue()
-    assert "\x1b[31m+157.4%\x1b[0m" in output
-    assert "+148.0%†" in output
-    assert "\x1b[31m+148.0%" not in output
+    assert rows[0]["status"] == "regression"
+    assert compare._delta_cells(rows[0], threshold=1.0) == expected_cells

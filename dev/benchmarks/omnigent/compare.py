@@ -228,6 +228,27 @@ def compare_reports(
     return passed, rows
 
 
+def _delta_cells(row: dict, threshold: float) -> tuple[str, str]:
+    """Rich markup for a row's Δ P50 and Δ P95 cells.
+
+    An ungated p95 carries the marker; only a gated breach is painted red.
+    """
+    p50 = _fmt_delta(row["delta_p50"])
+    p95 = _fmt_delta(row["delta_p95"])
+    if row["p95_gated"] is False:
+        p95 += _UNGATED_MARK
+    if row["status"] == "regression":
+        if row["delta_p50"] is not None and row["delta_p50"] > threshold:
+            p50 = f"[red]{p50}[/red]"
+        if (
+            row["p95_gated"] is True
+            and row["delta_p95"] is not None
+            and row["delta_p95"] > threshold
+        ):
+            p95 = f"[red]{p95}[/red]"
+    return p50, p95
+
+
 def _status_style(status: str) -> str:
     return {"regression": "red", "new": "cyan", "ok": "green", "skipped": "yellow"}.get(status, "")
 
@@ -254,20 +275,7 @@ def print_table(rows: list[dict], threshold: float) -> None:
 
     for row in rows:
         style = _status_style(row["status"])
-        delta_p50_str = _fmt_delta(row["delta_p50"])
-        delta_p95_str = _fmt_delta(row["delta_p95"])
-        if row["p95_gated"] is False:
-            delta_p95_str += _UNGATED_MARK
-
-        if row["status"] == "regression":
-            if row["delta_p50"] is not None and row["delta_p50"] > threshold:
-                delta_p50_str = f"[red]{delta_p50_str}[/red]"
-            if (
-                row["p95_gated"] is True
-                and row["delta_p95"] is not None
-                and row["delta_p95"] > threshold
-            ):
-                delta_p95_str = f"[red]{delta_p95_str}[/red]"
+        delta_p50_str, delta_p95_str = _delta_cells(row, threshold)
 
         table.add_row(
             row["journey"],
