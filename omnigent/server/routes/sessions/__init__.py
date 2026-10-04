@@ -506,7 +506,6 @@ from omnigent.server.routes._sessions.helpers import (
     _require_external_status_forward as _require_external_status_forward,
     _require_host_conn_for_worktree as _require_host_conn_for_worktree,
     _require_permission_mode_forward as _require_permission_mode_forward,
-    _reset_runner_resources_after_switch_impl as _reset_runner_resources_after_switch_impl,
     _resolve_llm_model as _resolve_llm_model,
     _resolve_skill_meta_text_via_runner as _resolve_skill_meta_text_via_runner,
     _resolve_subagent_spec as _resolve_subagent_spec,
@@ -583,9 +582,6 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_sandbox_status_impl as _publish_sandbox_status,
 )
 from omnigent.server.routes._sessions.helpers import (
-    _reset_runner_resources_after_switch_impl as _reset_runner_resources_after_switch,
-)
-from omnigent.server.routes._sessions.helpers import (
     _resolve_harness_impl as _resolve_harness,
 )
 from omnigent.server.routes._sessions.helpers import (
@@ -652,7 +648,9 @@ from omnigent.server.routes._sessions.orchestration import (
     _recover_subagent_status_forward_via_parent as _recover_subagent_status_forward_via_parent,
     _register_policy_elicitation as _register_policy_elicitation,
     _relay_runner_stream as _relay_runner_stream,
+    _relinquish_session_live_state as _relinquish_session_live_state,
     _resolve_elicitation as _resolve_elicitation,
+    _runner_live_on_another_replica_from_conversations as _runner_live_on_another_replica_from_conversations,
     _run_managed_launch as _run_managed_launch,
     _run_managed_wake as _run_managed_wake,
     _runner_reject_detail as _runner_reject_detail,
@@ -717,7 +715,6 @@ from omnigent.server.schemas import (
     SessionResourceObject,
     SessionResourcePaginatedList,
     SessionResponse,
-    SessionSwitchAgentRequest,
     SkillSummary,
     UpdateSessionRequest,
 )
@@ -766,7 +763,6 @@ if TYPE_CHECKING:
         "_presentation_labels_for_agent",
         "_publish_runner_recovered_status",
         "_publish_sandbox_status",
-        "_reset_runner_resources_after_switch",
         "_resolve_harness",
         "_same_provider_family",
         "_signal_terminal_resolved_harness_elicitation",
@@ -806,6 +802,7 @@ def create_sessions_router(
     host_registry: HostRegistry | None = None,
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    register_runner_ingest: Callable[..., None] | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -968,6 +965,7 @@ def create_sessions_router(
         host_registry=host_registry,
         background_title_coordinator=background_title_coordinator,
         runner_tunnel_tokens=runner_tunnel_tokens,
+        register_runner_ingest=register_runner_ingest,
     )
 
     register_permissions_routes(
