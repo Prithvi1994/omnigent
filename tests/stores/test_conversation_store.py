@@ -3170,7 +3170,11 @@ def test_replace_runner_id_allows_internal_non_session_conversation(
 def test_list_runner_session_statuses_pages(
     conversation_store: SqlAlchemyConversationStore, limit: int
 ) -> None:
-    from omnigent.db.db_models import workspace_scope
+    from omnigent.db.db_models import (
+        SqlConversationMetadata,
+        current_workspace_id,
+        workspace_scope,
+    )
 
     expected = []
     for status in (None, "running", "waiting", "idle", "failed"):
@@ -3180,6 +3184,12 @@ def test_list_runner_session_statuses_pages(
         if status == "running":
             conversation_store.update_conversation(row.id, archived=True)
         expected.append((row.id, status))
+    unknown = conversation_store.create_conversation(runner_id="runner-target")
+    with conversation_store._session_immediate("test_future_live_status") as session:
+        meta = session.get(SqlConversationMetadata, (current_workspace_id(), unknown.id))
+        assert meta is not None
+        meta.live_status = 32767
+    expected.append((unknown.id, None))
     conversation_store.create_conversation(runner_id="runner-other")
     conversation_store.create_conversation()
     with workspace_scope(424242):
@@ -3198,6 +3208,33 @@ def test_list_runner_session_statuses_pages(
         assert after is None or page[-1][0] > after
         after = page[-1][0]
     assert actual == sorted(expected)
+
+
+@pytest.mark.parametrize("status", [None, "idle", "running", "waiting", "failed"])
+def test_settle_intentionally_stopped_session_requires_current_runner(
+    conversation_store: SqlAlchemyConversationStore,
+    status: str | None,
+) -> None:
+    from omnigent.db.db_models import workspace_scope
+
+    conv = conversation_store.create_conversation(runner_id="runner-stopped")
+    if status is not None:
+        conversation_store.set_session_live_status(conv.id, status)
+    conversation_store.set_labels(conv.id, {"omnigent.last_task_error_code": "preserved"})
+    before = conversation_store.get_conversation(conv.id)
+    with workspace_scope(424242):
+        assert not conversation_store.settle_intentionally_stopped_session(
+            conv.id, "runner-stopped"
+        )
+    assert not conversation_store.settle_intentionally_stopped_session(conv.id, "runner-other")
+    assert conversation_store.get_conversation(conv.id).live_status == status
+    settled = conversation_store.settle_intentionally_stopped_session(conv.id, "runner-stopped")
+    assert settled is (status != "failed")
+    after = conversation_store.get_conversation(conv.id)
+    assert after.live_status == ("failed" if status == "failed" else "idle")
+    assert after.labels == before.labels
+    assert after.updated_at == before.updated_at
+    assert not conversation_store.settle_intentionally_stopped_session("0" * 32, "runner-stopped")
 
 
 def test_runner_session_status_page_uses_runner_index(

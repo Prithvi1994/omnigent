@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from collections.abc import Iterator
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from omnigent.runtime import session_stream
+from omnigent.server import session_live_state
 from omnigent.server.routes import sessions
 from omnigent.server.routes._sessions import common, orchestration
 from omnigent.server.schemas import ErrorDetail
@@ -309,27 +311,33 @@ async def test_unconsumed_stop_expires_before_a_later_disconnect(
 
 
 @pytest.mark.parametrize("stopped_runner", [_RUNNER, "runner-replacement"])
+@pytest.mark.parametrize("with_relay", [False, True])
 async def test_old_runner_sweep_preserves_rebound_session(
     family: tuple[SqlAlchemyConversationStore, dict[str, str]],
     stopped_runner: str,
+    with_relay: bool,
 ) -> None:
     store, ids = family
     child_id = ids["active"]
     old_row = store.get_conversation(child_id)
     store.replace_runner_id(child_id, "runner-replacement")
+    replacement_error = {"omnigent.last_task_error_code": "replacement_error"}
+    store.set_labels(child_id, replacement_error)
     sessions._intentional_stop_sessions[child_id] = stopped_runner
     gate = asyncio.Event()
     task = asyncio.create_task(gate.wait())
-    sessions._runner_relay_tasks[child_id] = sessions._RelayHandle(
-        "runner-replacement", task, gate
-    )
+    if with_relay:
+        sessions._runner_relay_tasks[child_id] = sessions._RelayHandle(
+            "runner-replacement", task, gate
+        )
     error = ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly.")
     try:
         await sessions._mark_runner_sessions_offline([old_row], error, store)
         assert sessions._session_status_cache[child_id] == "running"
-        assert (
-            sessions._last_task_error_from_labels(store.get_conversation(child_id).labels) is None
-        )
+        after = store.get_conversation(child_id)
+        assert after.runner_id == "runner-replacement"
+        assert after.live_status == "running"
+        assert after.labels["omnigent.last_task_error_code"] == "replacement_error"
         if stopped_runner == _RUNNER:
             assert child_id not in sessions._intentional_stop_sessions
             # The old stop must not suppress a real crash of the replacement.
@@ -342,6 +350,65 @@ async def test_old_runner_sweep_preserves_rebound_session(
     finally:
         gate.set()
         await task
+
+
+@pytest.mark.parametrize("rebind", [False, True])
+async def test_stop_settlement_is_ordered_and_checks_the_current_binding(
+    family: tuple[SqlAlchemyConversationStore, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    rebind: bool,
+) -> None:
+    store, ids = family
+    child_id = ids["active"]
+    old_row = store.get_conversation(child_id)
+    entered, release = threading.Event(), threading.Event()
+    write_status = store.set_session_live_status
+
+    def blocked_write(session_id, status):
+        entered.set()
+        assert release.wait(timeout=10), "test did not release the pending status write"
+        write_status(session_id, status)
+
+    monkeypatch.setattr(store, "set_session_live_status", blocked_write)
+    session_live_state.configure(store)
+    sessions._intentional_stop_sessions[child_id] = _RUNNER
+    session_live_state.persist_live_status(child_id, "running")
+    sweep = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        error = ErrorDetail(code="runner_disconnected", message="Runner disappeared.")
+        sweep = asyncio.create_task(
+            sessions._mark_runner_sessions_offline([old_row], error, store)
+        )
+        await asyncio.wait({sweep}, timeout=0.1)
+        assert not sweep.done(), "Settlement must follow the pending status write"
+        if rebind:
+            store.replace_runner_id(child_id, "runner-replacement")
+            store.set_labels(child_id, {"omnigent.last_task_error_code": "replacement_error"})
+        release.set()
+        await asyncio.wait_for(sweep, timeout=10)
+        after = store.get_conversation(child_id)
+        assert after.live_status == ("running" if rebind else "idle")
+        assert sessions._session_status_cache[child_id] == after.live_status
+        if rebind:
+            assert after.labels["omnigent.last_task_error_code"] == "replacement_error"
+        else:
+            # Settlement must not deduplicate away the next real running edge.
+            session_live_state.persist_live_status(child_id, "running")
+            await asyncio.wait_for(
+                asyncio.wrap_future(session_live_state.submit("drain_test_writes", lambda: None)),
+                timeout=10,
+            )
+            assert store.get_conversation(child_id).live_status == "running"
+    finally:
+        release.set()
+        if sweep is not None:
+            await asyncio.wait_for(asyncio.gather(sweep, return_exceptions=True), timeout=10)
+        await asyncio.wait_for(
+            asyncio.wrap_future(session_live_state.submit("drain_test_writes", lambda: None)),
+            timeout=10,
+        )
+        session_live_state.configure(None)
 
 
 @pytest.mark.parametrize("first_cancelled", [False, True])

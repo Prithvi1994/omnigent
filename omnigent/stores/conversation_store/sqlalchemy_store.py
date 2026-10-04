@@ -3711,6 +3711,33 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._session_immediate, "set_session_live_status", write)
 
+    def settle_intentionally_stopped_session(self, conversation_id: str, runner_id: str) -> bool:
+        """Settle stop intent without overwriting a replacement runner or failure."""
+
+        def write(session: Session) -> bool:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                        SqlConversationMetadata.runner_id == runner_id,
+                        or_(
+                            SqlConversationMetadata.live_status.is_(None),
+                            SqlConversationMetadata.live_status
+                            != encode_session_live_status("failed"),
+                        ),
+                    )
+                    .values(live_status=encode_session_live_status("idle"))
+                ),
+            )
+            return result.rowcount == 1
+
+        return run_write_transaction(
+            self._session_immediate, "settle_intentionally_stopped_session", write
+        )
+
     def settle_orphaned_live_status(self, conversation_id: str, stale_before: int) -> bool:
         """Settle a stale running row with one conditional update."""
 
@@ -3898,10 +3925,15 @@ class SqlAlchemyConversationStore(ConversationStore):
         statement = statement.order_by(SqlConversationMetadata.id).limit(limit)
         with self._session("list_runner_session_statuses") as session:
             rows = session.execute(statement).all()
-        return [
-            (session_id, decode_session_live_status(status) if status is not None else None)
-            for session_id, status in rows
-        ]
+        statuses: list[tuple[str, str | None]] = []
+        for session_id, status in rows:
+            try:
+                decoded = decode_session_live_status(status) if status is not None else None
+            except ValueError:
+                # A newer replica's status must not discard the rest of this page.
+                decoded = None
+            statuses.append((session_id, decoded))
+        return statuses
 
     def list_conversations_by_runner_id(
         self,

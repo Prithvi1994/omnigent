@@ -740,6 +740,10 @@ class _RecordingLabelStore:
     def set_labels(self, conversation_id: str, updates: dict[str, str]) -> None:
         self.labels.setdefault(conversation_id, {}).update(updates)
 
+    def settle_intentionally_stopped_session(self, conversation_id: str, runner_id: str) -> bool:
+        del conversation_id, runner_id
+        return self.live_status != "failed"
+
     def get_runner_liveness(self, conversation_id: str) -> tuple[str | None, int | None] | None:
         return self._runner_liveness.get(conversation_id)
 
@@ -1976,7 +1980,7 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
             }
         elif intentional_stop and (cached or live_status) in {"running", "waiting"}:
             assert status == "idle"
-            assert sessions_module._last_task_error_from_labels(persisted) is None
+            assert sessions_module._last_task_error_from_labels(persisted or {}) is None
             assert session_id not in sessions_module._intentional_stop_sessions
         else:
             assert status == cached

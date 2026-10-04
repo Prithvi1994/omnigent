@@ -519,6 +519,28 @@ def test_runner_session_status_pages_do_not_read_conversation_db(
         event.remove(store._conv_engine, "before_cursor_execute", unavailable)
 
 
+def test_intentional_stop_settlement_uses_only_metadata(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    from sqlalchemy import event
+
+    conv = store.create_conversation(runner_id="runner-stopped")
+    store.set_session_live_status(conv.id, "running")
+    store.set_labels(conv.id, {"omnigent.last_task_error_code": "preserved"})
+
+    def unavailable(*_args):
+        pytest.fail("Stop settlement must not read or write the conversation database")
+
+    event.listen(store._conv_engine, "before_cursor_execute", unavailable)
+    try:
+        assert store.settle_intentionally_stopped_session(conv.id, "runner-stopped")
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", unavailable)
+    after = store.get_conversation(conv.id)
+    assert after.live_status == "idle"
+    assert after.labels["omnigent.last_task_error_code"] == "preserved"
+
+
 # ── fork_conversation ──────────────────────────────────
 
 

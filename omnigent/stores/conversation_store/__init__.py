@@ -1448,6 +1448,19 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def settle_intentionally_stopped_session(self, conversation_id: str, runner_id: str) -> bool:
+        """Set idle only while this runner still owns a non-failed session.
+
+        Match the current runner binding in the update, without changing labels
+        or ``updated_at``. A failed status must survive teardown reconciliation.
+
+        :param conversation_id: Session whose runner was intentionally stopped.
+        :param runner_id: The stopped runner, which may have been replaced.
+        :returns: Whether the conditional update matched the session.
+        """
+        ...
+
+    @abstractmethod
     def settle_orphaned_live_status(self, conversation_id: str, stale_before: int) -> bool:
         """Atomically settle a stale running session to idle.
 

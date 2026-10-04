@@ -778,7 +778,8 @@ async def _stop_host_runner_intentionally(
             # Keep Stop available during a store outage; only known sessions can
             # inherit intent, so unseen cold sessions keep normal disconnect handling.
             _logger.warning(
-                "Cannot load sessions for intentionally stopped runner %s; using live relays",
+                "Cannot load all sessions for intentionally stopped runner %s; "
+                "using partial results and live relays",
                 runner_id,
                 exc_info=True,
                 extra={"session_id": session_id},
@@ -3601,15 +3602,36 @@ async def _mark_runner_sessions_offline_impl(
                 _intentional_stop_sessions.pop(conv.id, None)
             continue
         if stopped_runner_id is not None and stopped_runner_id != conv.runner_id:
-            _intentional_stop_sessions.pop(conv.id, None)
+            binding = await asyncio.to_thread(conversation_store.get_runner_liveness, conv.id)
+            if binding is None or binding[0] != conv.runner_id:
+                continue
+            if _intentional_stop_sessions.get(conv.id) == stopped_runner_id:
+                _intentional_stop_sessions.pop(conv.id, None)
         # The relay consumes stop intent; the sweep settles sessions without
         # a local relay so they cannot remain running after an expected exit.
         if stopped_runner_id is not None and stopped_runner_id == conv.runner_id:
             if handle is None or handle.task.done():
-                _intentional_stop_sessions.pop(conv.id, None)
                 if _session_status_cache.get(conv.id, conv.live_status) in _MID_TURN_STATUSES:
-                    _publish_status(conv.id, "idle")
-                    await _persist_session_status_error_labels(conv.id, None, conversation_store)
+                    # Order the conditional settlement after earlier live-state writes.
+                    # The database binding guards sessions rebound before a relay exists.
+                    settled = await asyncio.wrap_future(
+                        session_live_state.submit(
+                            "settle_intentional_stop",
+                            conversation_store.settle_intentionally_stopped_session,
+                            conv.id,
+                            stopped_runner_id,
+                        )
+                    )
+                    if settled is None:
+                        continue
+                    current_handle = _runner_relay_tasks.get(conv.id)
+                    if settled and (
+                        current_handle is None or current_handle.runner_id == stopped_runner_id
+                    ):
+                        session_live_state.forget_live_status(conv.id)
+                        _publish_status(conv.id, "idle", persist_live_status=False)
+                if _intentional_stop_sessions.get(conv.id) == stopped_runner_id:
+                    _intentional_stop_sessions.pop(conv.id, None)
             continue
         # Cache first (this replica holds the runner's tunnel, so it saw the
         # turn edges), falling back to the row for a session whose live state
