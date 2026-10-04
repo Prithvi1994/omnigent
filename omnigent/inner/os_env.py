@@ -677,7 +677,7 @@ class _HelperProcessClient:
             except Exception:  # noqa: BLE001 — stderr read is best-effort for error detail
                 stderr = ""
         try:
-            returncode: int | None = self._proc.wait(timeout=1)
+            returncode: int | None = self._proc.wait(timeout=0.1)
         except subprocess.TimeoutExpired:
             returncode = None
         if stderr:
