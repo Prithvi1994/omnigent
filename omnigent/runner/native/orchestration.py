@@ -5403,6 +5403,7 @@ async def _auto_create_codex_terminal(
                         launch_config.external_session_id,
                         launch_config.reasoning_effort,
                         model=_codex_launch.model,
+                        bridge_dir=bridge_dir,
                     )
                 except Exception:  # noqa: BLE001 — a failed update must not sink the launch
                     _logger.warning(

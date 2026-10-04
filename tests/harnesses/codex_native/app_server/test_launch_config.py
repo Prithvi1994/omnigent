@@ -372,6 +372,101 @@ async def test_start_pins_reasoning_effort_in_config(
     assert (real_codex_home / "config.toml").read_text(encoding="utf-8") == original
 
 
+@pytest.mark.parametrize(
+    ("requested", "inherited", "expected"),
+    [("minimal", "medium", "low"), ("max", "medium", "xhigh"), (None, "max", "xhigh")],
+)
+@pytest.mark.parametrize("pin_model", [True, False])
+async def test_start_clamps_effort_to_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requested: str | None,
+    inherited: str,
+    expected: str,
+    pin_model: bool,
+) -> None:
+    """The terminal and first turn start with a supported explicit or copied effort."""
+    source_home = tmp_path / "source"
+    source_home.mkdir()
+    original = f'model = "gpt-5.4"\nmodel_reasoning_effort = "{inherited}"\n'
+    (source_home / "config.toml").write_text(original)
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", tmp_path)
+    server.pinned_model = "databricks-gpt-5-4" if pin_model else None
+    server.pinned_effort = requested
+    server.model_catalog_rows = [
+        {
+            "id": "gpt-5.4",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": effort} for effort in ("low", "medium", "high", "xhigh")
+            ],
+        }
+    ]
+
+    try:
+        await server.start()
+        config = tomllib.loads((server.codex_home / "config.toml").read_text())
+        assert config["model_reasoning_effort"] == expected
+        assert (source_home / "config.toml").read_text() == original
+    finally:
+        await server.close()
+
+
+async def test_start_without_catalog_snapshot_checks_the_live_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Standalone CLI startup repairs an unsupported effort before terminal attach."""
+    from unittest.mock import AsyncMock, call
+
+    from omnigent.harnesses.codex_native import app_server
+
+    source_home = tmp_path / "source"
+    source_home.mkdir()
+    original = 'model = "gpt-5.4"\nmodel_reasoning_effort = "max"\n'
+    (source_home / "config.toml").write_text(original)
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    client = AsyncMock(spec=app_server.CodexAppServerClient)
+    client.request.side_effect = [
+        {
+            "result": {
+                "data": [
+                    {"id": "gpt-5.4", "supportedReasoningEfforts": [{"reasoningEffort": "xhigh"}]}
+                ]
+            }
+        },
+        {"result": {}},
+    ]
+    monkeypatch.setattr(
+        app_server.CodexNativeAppServer, "_wait_until_ready", AsyncMock(return_value=client)
+    )
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", tmp_path)
+
+    try:
+        await server.start()
+        assert client.request.await_args_list == [
+            call("model/list", {"includeHidden": True}),
+            call(
+                "config/batchWrite",
+                {
+                    "filePath": str(server.codex_home / "config.toml"),
+                    "edits": [
+                        {
+                            "keyPath": "model_reasoning_effort",
+                            "value": "xhigh",
+                            "mergeStrategy": "replace",
+                        }
+                    ],
+                },
+            ),
+        ]
+        assert (source_home / "config.toml").read_text() == original
+        client.close.assert_awaited_once()
+    finally:
+        await server.close()
+
+
 class TestPinCodexConfigModel:
     """_pin_codex_config_model seeds the per-session config.toml model."""
 
@@ -633,12 +728,18 @@ async def test_apply_codex_thread_effort_updates_the_loaded_thread(
 
         async def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
             requests.append((method, params))
+            if method == "model/list":
+                return {"result": {"data": [], "nextCursor": None}}
             return {"result": {}}
 
     monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _FakeClient)
     await codex_native_app_server.apply_codex_thread_effort(
         "ws://127.0.0.1:9876", "thread_abc", "ultra", model=model
     )
-    assert requests == [
+    expected_requests: list[tuple[str, dict[str, object]]] = []
+    if model:
+        expected_requests.append(("model/list", {"includeHidden": True}))
+    expected_requests.append(
         ("thread/settings/update", {"threadId": "thread_abc", "effort": expected_effort})
-    ]
+    )
+    assert requests == expected_requests

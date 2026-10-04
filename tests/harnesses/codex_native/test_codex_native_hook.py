@@ -1095,6 +1095,40 @@ def test_apply_thread_model_switches_in_codex_spelling(
     assert read_codex_config_model(bridge_dir) == applied
 
 
+@pytest.mark.parametrize(("inherited", "expected"), [("max", "xhigh"), ("high", "high")])
+def test_routed_model_switch_checks_inherited_effort(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inherited: str,
+    expected: str,
+) -> None:
+    """Routing corrects an incompatible effort and preserves an already supported one."""
+    from omnigent.harnesses.codex_native.bridge import read_codex_config_effort
+
+    home = codex_home_for_bridge_dir(bridge_dir)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text(
+        f'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "{inherited}"\n'
+    )
+    catalog = [
+        {
+            "id": "gpt-5.4",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": value} for value in ("low", "medium", "high", "xhigh")
+            ],
+        }
+    ]
+    client = _install_fake_client(monkeypatch, _FakeAppServerClient(catalog))
+
+    assert codex_native_hook._apply_thread_model(bridge_dir, "databricks-gpt-5-4") is None
+
+    update: dict[str, object] = {"threadId": "thread_abc", "model": "gpt-5.4"}
+    if inherited != expected:
+        update["effort"] = expected
+    assert client.requests[-1] == ("thread/settings/update", update)
+    assert read_codex_config_effort(bridge_dir) == expected
+
+
 def test_apply_thread_model_declines_a_model_this_pane_cannot_serve(
     bridge_dir: Path,
     monkeypatch: pytest.MonkeyPatch,

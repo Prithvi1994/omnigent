@@ -19,6 +19,7 @@ from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerResponseError,
     client_for_transport,
     is_stale_active_turn_error,
+    resolve_codex_effort_for_model,
 )
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_BRIDGE_DIR_ENV_VAR,
@@ -33,6 +34,8 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_startup_failure,
     read_bridge_startup_timeout,
     read_bridge_state,
+    read_codex_config_effort,
+    read_codex_config_model,
     read_mcp_startup,
     update_active_turn_id,
     write_codex_config_effort,
@@ -135,6 +138,13 @@ async def _start_codex_turn(
     settings_overrides: Mapping[str, object],
 ) -> None:
     """Apply optional settings and start one Codex turn on an idle thread."""
+    settings_overrides = dict(settings_overrides)
+    model = settings_overrides.get("model") or read_codex_config_model(bridge_dir)
+    effort = settings_overrides.get("effort") or read_codex_config_effort(bridge_dir)
+    if isinstance(model, str) and isinstance(effort, str):
+        resolved_effort = await resolve_codex_effort_for_model(client, effort, model)
+        if resolved_effort != effort:
+            settings_overrides["effort"] = resolved_effort
     if settings_overrides:
         await client.request(
             "thread/settings/update",

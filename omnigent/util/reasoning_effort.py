@@ -25,9 +25,9 @@ CLAUDE_EFFORTS = ANTHROPIC_EFFORTS
 CODEX_EFFORTS = OPENAI_EFFORTS
 # Codex-native drives the real codex process, which is the per-model authority
 # on reasoning levels — it advertises them via ``model/list`` and validates the
-# pairing itself. Sol reaches ``ultra``; the picker already gates which levels a
-# model offers, so accept codex's full ladder here rather than re-clamping a
-# valid pick down to ``xhigh``.
+# pairing itself. The native launch and dispatch paths use those capabilities
+# to clamp incompatible pairs; accept the full vocabulary here so supported
+# ``max``/``ultra`` settings survive harness-level validation.
 CODEX_NATIVE_EFFORTS = frozenset(
     {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 )

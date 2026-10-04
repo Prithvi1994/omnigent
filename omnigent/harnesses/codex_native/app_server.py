@@ -35,7 +35,13 @@ if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.harnesses.codex_native.bridge import write_policy_hook_config
+from omnigent.harnesses.codex_native.bridge import (
+    read_codex_config_model,
+    read_codex_home_config_effort,
+    read_codex_home_config_model,
+    write_codex_config_effort,
+    write_policy_hook_config,
+)
 from omnigent.harnesses.codex_native.launch_args import (
     _merge_tables,
     _write_private_config,
@@ -95,7 +101,7 @@ from omnigent.process_logging import (
     log_once,
     redact_log_text,
 )
-from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS
+from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS, clamp_effort_for_model
 
 _logger = logging.getLogger(__name__)
 
@@ -106,6 +112,8 @@ CodexParams: TypeAlias = _JsonObject
 CodexRequestFn = Callable[[str, CodexParams], Awaitable[CodexMessage]]
 
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
+_EFFORT_CATALOG_TIMEOUT_SECONDS = 2.0
+_REASONING_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 # Model discovery is a best-effort side process whose callers fall back to a
 # cached or bundled catalog, so it keeps a short readiness budget.
 _CONNECT_TIMEOUT_SECONDS = 10.0
@@ -719,6 +727,56 @@ def _codex_model_upgrade_target(catalog: object, model: str) -> str | None:
     return None
 
 
+def clamp_codex_effort_for_model(
+    effort: str | None, model: str | None, catalog: object
+) -> str | None:
+    """Choose the nearest effort the selected model advertises, with ties downward.
+
+    Accept both ``model/list`` and ``codex debug models`` catalogs. Missing
+    or unusable capabilities retain the deployment's existing effort rules;
+    another model's ladder must never govern this model.
+    """
+    effort = clamp_effort_for_model(effort, model)
+    if effort is None or model is None:
+        return effort
+    entry = _codex_model_catalog_entry(catalog, model)
+    if entry is None:
+        return effort
+    levels = entry.get("supportedReasoningEfforts", entry.get("supported_reasoning_levels"))
+    if not isinstance(levels, list):
+        return effort
+    advertised = [
+        level.get("reasoningEffort", level.get("effort"))
+        for level in levels
+        if isinstance(level, dict)
+    ]
+    supported = [value for value in _REASONING_EFFORT_ORDER if value in advertised]
+    if not supported or effort in supported or effort not in _REASONING_EFFORT_ORDER:
+        return effort
+    target = _REASONING_EFFORT_ORDER.index(effort)
+    resolved = min(supported, key=lambda value: abs(_REASONING_EFFORT_ORDER.index(value) - target))
+    _logger.info("Adjusted Codex reasoning effort for model %s: %s -> %s", model, effort, resolved)
+    return resolved
+
+
+async def resolve_codex_effort_for_model(
+    client: CodexAppServerClient, effort: str, model: str | None
+) -> str:
+    """Clamp an effort using this app-server's live catalog without blocking discovery failures."""
+    catalog: object = None
+    if model:
+        try:
+            catalog = await asyncio.wait_for(
+                list_codex_model_options(client, include_hidden=True),
+                timeout=_EFFORT_CATALOG_TIMEOUT_SECONDS,
+            )
+        except Exception:  # noqa: BLE001 — discovery must not prevent a turn
+            _logger.warning(
+                "Could not read Codex model capabilities for effort validation", exc_info=True
+            )
+    return clamp_codex_effort_for_model(effort, model, catalog) or effort
+
+
 def _codex_model_upgrade_metadata_is_malformed(entry: dict[str, object]) -> bool:
     """Return whether declared migration metadata lacks a usable target."""
     upgrade_info = entry.get("upgradeInfo")
@@ -1115,10 +1173,13 @@ def _codex_rejects_request_field(exc: CodexAppServerResponseError, field: str) -
     )
 
 
-async def list_codex_model_options(client: CodexAppServerClient) -> list[_JsonObject]:
-    """Read every visible model from an initialized Codex app-server client.
+async def list_codex_model_options(
+    client: CodexAppServerClient, *, include_hidden: bool = False
+) -> list[_JsonObject]:
+    """Read models from an initialized Codex app-server client.
 
     :param client: Connected Codex app-server client.
+    :param include_hidden: Include models omitted from the picker but still runnable.
     :returns: Raw ``model/list`` rows in Codex preference order.
     :raises ValueError: When Codex returns a malformed response.
     """
@@ -1126,7 +1187,7 @@ async def list_codex_model_options(client: CodexAppServerClient) -> list[_JsonOb
     cursor: str | None = None
     include_hidden_supported = True
     while True:
-        params: CodexParams = {"includeHidden": False} if include_hidden_supported else {}
+        params: CodexParams = {"includeHidden": include_hidden} if include_hidden_supported else {}
         if cursor is not None:
             params["cursor"] = cursor
         try:
@@ -1887,8 +1948,8 @@ class CodexNativeAppServer:
             minimal_config=minimal_config,
         )
         model_migration_target: str | None = None
+        catalog: object = self.model_catalog_rows
         if self.trust_project and self.pinned_model:
-            catalog: object = self.model_catalog_rows
             catalog_entry = _codex_model_catalog_entry(catalog, self.pinned_model)
             # ``model/list`` excludes hidden rows. A selected legacy model may
             # therefore be absent even from a fresh snapshot. A present row
@@ -1941,8 +2002,11 @@ class CodexNativeAppServer:
                     self.pinned_model,
                     model_migration_target,
                 )
-        if self.pinned_effort:
-            _pin_codex_config_effort(self.codex_home, self.pinned_effort, self.pinned_model)
+        effective_model = self.pinned_model or read_codex_home_config_model(self.codex_home)
+        requested_effort = self.pinned_effort or read_codex_home_config_effort(self.codex_home)
+        effective_effort = clamp_codex_effort_for_model(requested_effort, effective_model, catalog)
+        if effective_effort and (self.pinned_effort or effective_effort != requested_effort):
+            _pin_codex_config_effort(self.codex_home, effective_effort, effective_model)
         _sync_codex_developer_instructions(
             self.codex_home,
             self.developer_instructions,
@@ -2045,6 +2109,30 @@ class CodexNativeAppServer:
         try:
             startup_client = await self._wait_until_ready()
             try:
+                # Standalone CLI launches may have no shared catalog snapshot.
+                # Correct their copied defaults before a TUI creates its thread.
+                if (
+                    effective_model
+                    and effective_effort
+                    and _codex_model_catalog_entry(catalog, effective_model) is None
+                ):
+                    resolved_effort = await resolve_codex_effort_for_model(
+                        startup_client, effective_effort, effective_model
+                    )
+                    if resolved_effort != effective_effort:
+                        await startup_client.request(
+                            "config/batchWrite",
+                            {
+                                "filePath": str(self.codex_home / "config.toml"),
+                                "edits": [
+                                    {
+                                        "keyPath": "model_reasoning_effort",
+                                        "value": resolved_effort,
+                                        "mergeStrategy": "replace",
+                                    }
+                                ],
+                            },
+                        )
                 if self.policy_hook_disabled_reason is None:
                     try:
                         await self._trust_policy_hooks(client=startup_client)
@@ -4269,6 +4357,7 @@ async def apply_codex_thread_effort(
     effort: str,
     *,
     model: str | None = None,
+    bridge_dir: Path | None = None,
 ) -> None:
     """
     Set a loaded thread's reasoning effort via ``thread/settings/update``.
@@ -4285,17 +4374,22 @@ async def apply_codex_thread_effort(
     :param effort: Session-persisted effort, e.g. ``"ultra"``.
     :param model: Model the thread runs, or ``None``; the effort is clamped to
         a level that model accepts.
+    :param bridge_dir: Session bridge directory for reading the current model
+        and mirroring the applied effort back to the terminal config.
     :raises Exception: If the app-server rejects the update.
     """
-    from omnigent.util.reasoning_effort import clamp_effort_for_model
-
     client = client_for_transport(transport, client_name="omnigent-codex-native-effort")
     await client.connect()
     try:
+        if model is None and bridge_dir is not None:
+            model = read_codex_config_model(bridge_dir)
+        applied_effort = await resolve_codex_effort_for_model(client, effort, model)
         await client.request(
             "thread/settings/update",
-            {"threadId": thread_id, "effort": clamp_effort_for_model(effort, model)},
+            {"threadId": thread_id, "effort": applied_effort},
         )
+        if bridge_dir is not None and not write_codex_config_effort(bridge_dir, applied_effort):
+            _logger.warning("Failed to mirror resumed Codex reasoning effort into config.toml")
     finally:
         await client.close()
 

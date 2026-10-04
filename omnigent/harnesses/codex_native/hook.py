@@ -465,8 +465,15 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> str | None:
     """
     import asyncio
 
-    from omnigent.harnesses.codex_native.app_server import client_for_transport
-    from omnigent.harnesses.codex_native.bridge import write_codex_config_model
+    from omnigent.harnesses.codex_native.app_server import (
+        clamp_codex_effort_for_model,
+        client_for_transport,
+    )
+    from omnigent.harnesses.codex_native.bridge import (
+        read_codex_config_effort,
+        write_codex_config_effort,
+        write_codex_config_model,
+    )
     from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug
     from omnigent.runner.turn_routing import SETTINGS_UPDATE_TIMEOUT_S
 
@@ -477,10 +484,11 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> str | None:
     # The spelling codex accepted, mirrored into config.toml below so the
     # file and the live thread never disagree about the model.
     applied: str | None = None
+    applied_effort: str | None = None
     declined: str | None = None
 
     async def _switch() -> None:
-        nonlocal applied, declined
+        nonlocal applied, applied_effort, declined
         client = client_for_transport(state.socket_path, client_name="omnigent-route-turn-hook")
         await client.connect()
         try:
@@ -492,11 +500,14 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> str | None:
             if slug is None:
                 declined = f"routed model not in this pane's catalog ({model})"
                 return
-            await client.request(
-                "thread/settings/update",
-                {"threadId": state.thread_id, "model": slug},
-            )
+            inherited_effort = read_codex_config_effort(bridge_dir)
+            effort = clamp_codex_effort_for_model(inherited_effort, slug, rows)
+            settings: dict[str, object] = {"threadId": state.thread_id, "model": slug}
+            if effort is not None and effort != inherited_effort:
+                settings["effort"] = effort
+            await client.request("thread/settings/update", settings)
             applied = slug
+            applied_effort = effort if "effort" in settings else None
         finally:
             await client.close()
 
@@ -513,6 +524,8 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> str | None:
             f"omnigent codex route-turn hook: could not mirror {applied} into config.toml",
             file=sys.stderr,
         )
+    if applied_effort is not None and not write_codex_config_effort(bridge_dir, applied_effort):
+        print("omnigent codex route-turn hook: could not mirror reasoning effort", file=sys.stderr)
     return None
 
 
