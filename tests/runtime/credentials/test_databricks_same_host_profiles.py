@@ -106,6 +106,17 @@ class _SignedInCli:
         return [argv for argv in calls if argv[:2] == ["auth", "token"]]
 
 
+def _raise_offline_host_metadata(host: str) -> None:
+    """Stand in for ``databricks.sdk.config.get_host_metadata`` without connecting.
+
+    SDK releases from 0.94 onward probe the host over HTTPS while building a
+    ``Config`` and retry connection failures for a long time; raising keeps
+    these credential tests offline. Older releases have no such probe, so this
+    is only ever installed, never called, there.
+    """
+    raise ConnectionError(f"offline test stub: refusing to probe {host}")
+
+
 @pytest.fixture
 def signed_in_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _SignedInCli:
     """Two same-host profiles plus a stand-in for a signed-in ``databricks`` CLI on PATH."""
@@ -125,6 +136,11 @@ def signed_in_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _SignedInC
     monkeypatch.setenv("FAKE_DATABRICKS_CLI_LOG", str(log_path))
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setattr(
+        "databricks.sdk.config.get_host_metadata",
+        _raise_offline_host_metadata,
+        raising=False,
+    )
     return _SignedInCli(path=cli, log_path=log_path)
 
 
@@ -282,16 +298,43 @@ def test_sdk_config_pins_only_sdks_that_mint_by_host(monkeypatch: pytest.MonkeyP
     assert stock == {"profile": _PROFILE}
 
 
+def _force_host_minting(monkeypatch: pytest.MonkeyPatch, cli_path: Path) -> None:
+    """Make the SDK's CLI token source build a pre-0.94 host-keyed mint command.
+
+    Releases from 0.94 onward already mint by ``--profile``; forcing the host
+    shape keeps the pin under test exercised whatever SDK is installed.
+    """
+    from databricks.sdk import credentials_provider as sdk_credentials
+
+    original = sdk_credentials.DatabricksCliTokenSource.__init__
+
+    def forced_init(self, cfg):
+        original(self, cfg)
+        self._cmd = [str(cli_path), "auth", "token", "--host", cfg.host]
+
+    monkeypatch.setattr(sdk_credentials.DatabricksCliTokenSource, "__init__", forced_init)
+
+
 def test_profile_pinned_chain_mints_by_profile(
     signed_in_cli: _SignedInCli, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The pinned chain selects the profile even where the SDK's own mint is host-keyed."""
+    """The pin selects the profile where the SDK's own mint would key by host."""
+    from databricks.sdk import credentials_provider as sdk_credentials
+    from databricks.sdk.config import Config
+
+    _force_host_minting(monkeypatch, signed_in_cli.path)
     monkeypatch.setattr(databricks_sdk, "_sdk_version", lambda: (0, 67, 0))
 
-    cfg = databricks_sdk.sdk_config(profile=_PROFILE)
+    # Without the pin, the host-keyed mint hits the same-host ambiguity. The SDK
+    # surfaces the CLI's rejection as a ``ValueError`` while building the config.
+    with pytest.raises((ValueError, OSError), match="Use --profile"):
+        Config(
+            profile=_PROFILE, credentials_strategy=sdk_credentials.DefaultCredentials()
+        ).authenticate()
+    assert signed_in_cli.mint_invocations() == [["auth", "token", "--host", _WORKSPACE]]
 
+    # The pinned chain mints the same profile by name instead.
+    cfg = databricks_sdk.sdk_config(profile=_PROFILE)
     assert cfg.authenticate() == {"Authorization": f"Bearer tok-{_PROFILE}"}
     assert cfg.auth_type == "databricks-cli"
-    mints = signed_in_cli.mint_invocations()
-    assert mints
-    assert all("--profile" in argv and "--host" not in argv for argv in mints)
+    assert ["auth", "token", "--profile", _PROFILE] in signed_in_cli.mint_invocations()
