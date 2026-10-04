@@ -100,6 +100,18 @@ Cross-harness journeys:
 - **`resume`, bare picker scoped to this host:**
   `tests/e2e/test_native_resume_picker_cross_host_e2e.py::test_bare_resume_picker_excludes_other_hosts_sessions`
 - **`chat-render`, `steer`, per harness:** use the matrix.
+- **`launch-settings`:** no browser test yet (the page is behind the
+  `harness_settings_ui` release feature). Run with plain `uv run pytest`:
+  `tests/host/test_harness_startup.py::test_codex_prefers_config_then_a_resolvable_env_var`,
+  `tests/host/test_harness_startup.py::test_masks_secrets_inside_structured_args`,
+  `tests/server/routes/test_harness_startup.py::test_older_host_fails_fast_without_a_frame`;
+  the page itself is covered by `web/src/pages/settings/SettingsHarnessesSection.test.tsx`.
+  To drive it: enable `harness_settings_ui`, set `harness.claude-native.args` in
+  the host's `~/.omnigent/config.yaml` (include a fake `--api-key x`), restart the
+  host, then open Settings → Harnesses → Claude Code's gear. Expect the resolved
+  binary with its source, and the args with `--api-key ***`. A host without
+  the `harness_startup` capability shows "Update <host>…"; a server without
+  the route hides both fields and keeps the credential.
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.

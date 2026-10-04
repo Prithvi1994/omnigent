@@ -28,6 +28,7 @@ def test_defaults_to_the_harness_binary(config: dict[str, object]) -> None:
         "resolved_path": "/found/claude",
         "args": None,
         "env_vars": None,
+        "reads_config": True,
     }
 
 
@@ -110,12 +111,21 @@ def test_env_wrapper_path_controls_resolution(tmp_path: Path, config: dict[str, 
     assert str(tmp_path) not in str({**startup, "resolved_path": None})
 
 
-def test_codex_ignores_its_env_var_like_its_web_launch(
-    config: dict[str, object], monkeypatch: pytest.MonkeyPatch
+def test_codex_prefers_config_then_a_resolvable_env_var(
+    tmp_path: Path, config: dict[str, object], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("OMNIGENT_CODEX_PATH", "/env/codex")
+    binary = tmp_path / "codex"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("OMNIGENT_CODEX_PATH", str(binary))
+    startup = describe_harness_startup("codex-native")
+    assert (startup["command"], startup["command_source"]) == (str(binary), "env")
+    # The app server falls back to `codex` when the override doesn't resolve.
+    monkeypatch.setenv("OMNIGENT_CODEX_PATH", str(tmp_path / "missing"))
     startup = describe_harness_startup("codex-native")
     assert (startup["command"], startup["command_source"]) == ("codex", "default")
+    # A config command wins over the env var for the web-launched terminal.
+    monkeypatch.setenv("OMNIGENT_CODEX_PATH", str(binary))
     config["harness"] = {"codex-native": {"command": "/cfg/codex", "args": ["--profile", "x"]}}
     startup = describe_harness_startup("codex-native")
     assert (startup["command"], startup["command_source"], startup["args"]) == (
@@ -123,6 +133,33 @@ def test_codex_ignores_its_env_var_like_its_web_launch(
         "config",
         "--profile x",
     )
+
+
+def test_pi_ignores_global_config_its_web_launch_does_not_read(
+    config: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
+    monkeypatch.delenv("HARNESS_PI_PATH", raising=False)
+    config["harness"] = {"pi-native": {"command": "/cfg/pi", "args": ["--model", "x"]}}
+    startup = describe_harness_startup("pi-native")
+    assert (startup["command"], startup["command_source"]) == ("pi", "default")
+    assert (startup["args"], startup["reads_config"]) == (None, False)
+
+
+@pytest.mark.parametrize(
+    "arg,secret",
+    [
+        ('{"apiKey": "abc"}', "abc"),
+        ('{"env": {"ANTHROPIC_AUTH_TOKEN": "abc123"}}', "abc123"),
+    ],
+)
+def test_masks_secrets_inside_structured_args(
+    config: dict[str, object], arg: str, secret: str
+) -> None:
+    config["harness"] = {"claude-native": {"args": ["--settings", arg]}}
+    startup = describe_harness_startup("claude-native")
+    assert startup["args"] is not None and "--settings '{" in startup["args"]
+    assert secret not in str(startup)
 
 
 def test_reports_the_legacy_env_var_that_set_the_command(

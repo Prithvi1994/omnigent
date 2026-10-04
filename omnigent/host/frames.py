@@ -1049,7 +1049,7 @@ class HostHarnessStartupResultFrame:
 
     request_id: str
     status: str
-    startup: dict[str, str | list[str] | None] | None = None
+    startup: dict[str, str | list[str] | bool | None] | None = None
     error: str | None = None
 
 
@@ -2672,12 +2672,13 @@ def _decode_harness_startup_result(msg: _JsonObject) -> HostHarnessStartupResult
     raw = msg.get("startup")
     if raw is not None and not isinstance(raw, dict):
         raise ValueError("frame field must be a harness startup object: 'startup'")
-    startup: dict[str, str | list[str] | None] | None = None
+    startup: dict[str, str | list[str] | bool | None] | None = None
     if raw is not None:
         startup = {key: _optional_nullable_str(raw, key) for key in _HARNESS_STARTUP_FIELDS}
         startup["env_vars"] = (
             _optional_str_list(raw, "env_vars") if raw.get("env_vars") is not None else None
         )
+        startup["reads_config"] = raw.get("reads_config") is True
     return HostHarnessStartupResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),

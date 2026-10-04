@@ -2695,6 +2695,12 @@
             "title": "Harness",
             "type": "string"
           },
+          "reads_config": {
+            "default": false,
+            "description": "Whether the harness's launch reads `harness.<name>.command` / `args` from config at all.",
+            "title": "Reads Config",
+            "type": "boolean"
+          },
           "resolved_path": {
             "anyOf": [
               {

@@ -22,15 +22,24 @@ const STARTUP: HarnessStartup = {
   resolved_path: "/opt/claude",
   args: "--model opus",
   env_vars: null,
+  reads_config: true,
 };
-let startup: { data?: HarnessStartup; error?: unknown; isPending: boolean } = {
-  data: STARTUP,
-  isPending: false,
-};
+interface StartupQuery {
+  data?: HarnessStartup;
+  error?: unknown;
+  isPending: boolean;
+}
+let startup: StartupQuery = { data: STARTUP, isPending: false };
+// Per-host results, and the inputs of the latest lookup.
+let startupByHost: Record<string, StartupQuery> = {};
+let lastStartupLookup: [string, string] | null = null;
 vi.mock("@/hooks/useHosts", async (importActual) => ({
   ...(await importActual()),
   useHosts: () => ({ data: hosts }),
-  useHarnessStartup: () => startup,
+  useHarnessStartup: (hostId: string, harness: string) => {
+    lastStartupLookup = [hostId, harness];
+    return startupByHost[hostId] ?? startup;
+  },
 }));
 
 // Claude has two MCP servers (one from the toolkit plugin), a skill, and that
@@ -127,6 +136,8 @@ afterEach(() => {
   hosts = [];
   inventory = INVENTORY;
   startup = { data: STARTUP, isPending: false };
+  startupByHost = {};
+  lastStartupLookup = null;
   harnessInstall = true;
   setupDialogProps.mockReset();
 });
@@ -288,6 +299,39 @@ describe("Harness details", () => {
     expect(screen.getByText("Credential")).toBeTruthy();
     expect(screen.queryByText("Path to binary")).toBeNull();
     expect(screen.queryByTestId("harness-startup-error")).toBeNull();
+  });
+
+  it("reads launch settings from the host picked on the grid", () => {
+    hosts = [ONLINE, { ...ONLINE, host_id: "h2", name: "build-box" }];
+    startupByHost = { h2: { data: { ...STARTUP, resolved_path: "/h2/claude" }, isPending: false } };
+    renderHarnesses();
+
+    fireEvent.pointerDown(screen.getByTestId("harness-host-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("harness-host-h2"));
+    fireEvent.click(screen.getByTestId("harness-settings-claude-native"));
+
+    expect(lastStartupLookup).toEqual(["h2", "claude-native"]);
+    expect(screen.getByText("/h2/claude")).toBeTruthy();
+  });
+
+  it("says when a harness's launch reads neither command nor args from config", () => {
+    hosts = [ONLINE];
+    startup = {
+      data: {
+        ...STARTUP,
+        command: "pi",
+        command_source: "default",
+        env_var: "OMNIGENT_PI_PATH",
+        args: null,
+        reads_config: false,
+      },
+      isPending: false,
+    };
+    renderHarnesses("claude-native");
+
+    selectTab("Settings");
+    expect(screen.getByText(/set OMNIGENT_PI_PATH to override/)).toBeTruthy();
+    expect(screen.getByText(/doesn't take startup arguments from/)).toBeTruthy();
   });
 
   it("asks to update a host too old to report launch settings", () => {

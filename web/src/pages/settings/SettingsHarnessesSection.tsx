@@ -501,9 +501,11 @@ function StartupSettings({ host, harness }: { host: Host; harness: string }) {
       <SettingsField
         title="Startup arguments"
         hint={
-          data.args
-            ? "Passed to the harness binary on launch."
-            : `Set harness.${data.harness}.args in ~/.omnigent/config.yaml to pass arguments on launch.`
+          !data.reads_config
+            ? "This harness doesn't take startup arguments from ~/.omnigent/config.yaml."
+            : data.args
+              ? "Passed to the harness binary on launch."
+              : `Set harness.${data.harness}.args in ~/.omnigent/config.yaml to pass arguments on launch.`
         }
       >
         {data.args ?? "None"}
@@ -520,7 +522,11 @@ function commandHint(startup: HarnessStartup): string {
       ? `From ${startup.env_var}.`
       : startup.command_source === "config"
         ? `From harness.${startup.harness}.command in ~/.omnigent/config.yaml.`
-        : `Default command "${startup.command}"; set harness.${startup.harness}.command in ~/.omnigent/config.yaml to override.`;
+        : `Default command "${startup.command}"; set ${
+            startup.reads_config
+              ? `harness.${startup.harness}.command in ~/.omnigent/config.yaml`
+              : startup.env_var
+          } to override.`;
   const wrapper =
     startup.env_vars === null
       ? ""

@@ -365,6 +365,8 @@ export interface HarnessStartup {
   args: string | null;
   /** Names an `env` wrapper sets before the command; `null` without a wrapper. */
   env_vars: string[] | null;
+  /** Whether the launch reads `harness.<name>.command` / `args` from config at all. */
+  reads_config: boolean;
 }
 
 /** The binary and base args *harness* launches with on a host. Read-only. */

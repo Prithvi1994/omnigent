@@ -40,6 +40,8 @@ class HarnessStartupResponse(BaseModel):
         values masked, e.g. ``"--model opus"``; ``None`` when none are set.
     :param env_vars: Names an ``env`` wrapper sets before *command*, e.g.
         ``["FOO"]`` for ``env FOO=1 claude``; ``None`` when there's no wrapper.
+    :param reads_config: Whether the harness's launch reads
+        ``harness.<name>.command`` / ``args`` from config at all.
     """
 
     harness: str
@@ -49,6 +51,7 @@ class HarnessStartupResponse(BaseModel):
     resolved_path: str | None = None
     args: str | None = None
     env_vars: list[str] | None = None
+    reads_config: bool = False
 
 
 def create_harness_startup_router(

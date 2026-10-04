@@ -35,6 +35,7 @@ _STARTUP = {
     "resolved_path": "/usr/local/bin/claude",
     "args": None,
     "env_vars": None,
+    "reads_config": True,
 }
 
 

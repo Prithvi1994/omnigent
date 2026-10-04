@@ -24,19 +24,23 @@ from omnigent.harness_startup_config import (
 from omnigent.onboarding.harness_install import required_cli_for_harness
 from omnigent.process_logging import redact_log_text
 
-HarnessStartup = dict[str, str | list[str] | None]
+HarnessStartup = dict[str, str | list[str] | bool | None]
 
 _ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _CODEX_NATIVE = "codex-native"
+# Native harnesses whose web launch reads ``harness.<name>.command`` / ``args``
+# (the runner's ``_auto_create_claude_terminal`` / ``_launch_codex_native_tui``).
+_CONFIG_LAUNCHED = frozenset({"claude-native", _CODEX_NATIVE})
 
 
 def describe_harness_startup(harness: str) -> HarnessStartup:
-    """Describe the command and base args a launch of *harness* uses here.
+    """Describe the command and base args a web launch of *harness* uses here.
 
-    The command follows the launch precedence: the ``OMNIGENT_<NAME>_PATH`` env
-    var, then config ``harness.<name>.command``, then the harness's built-in
-    binary. The web-launched Codex terminal skips the env var (see the runner's
-    ``_launch_codex_native_tui``), so ``codex-native`` does too. A launch wrapped in
+    Mirrors each launcher. ``claude-native``: the ``OMNIGENT_<NAME>_PATH`` env
+    var, then config ``harness.<name>.command``, then the built-in binary.
+    ``codex-native``: config, then the env var when it resolves, then the
+    built-in binary. Other native harnesses: the env var, then the built-in
+    binary; they read neither command nor args from config. A launch wrapped in
     ``env NAME=value … cmd`` reports ``cmd`` and the args after it, plus the names
     (never the values) ``env`` sets.
 
@@ -47,27 +51,19 @@ def describe_harness_startup(harness: str) -> HarnessStartup:
         deprecated ``HARNESS_*`` name when that one supplied it);
         ``resolved_path``, the executable the command resolves to, or ``None``
         when not found; ``args``, the masked config args, or ``None`` when none
-        are set; and ``env_vars``, the names an ``env`` wrapper sets, or ``None``
-        without one.
+        are set; ``env_vars``, the names an ``env`` wrapper sets, or ``None``
+        without one; and ``reads_config``, whether the launch reads
+        ``harness.<name>.command`` / ``args`` at all.
     """
     canonical = canonicalize_harness(harness) or harness
-    _, overrides = resolve_harness_config(load_global_config())
-    override = overrides.get(canonical, {})
+    reads_config = canonical in _CONFIG_LAUNCHED
+    override = (
+        resolve_harness_config(load_global_config())[1].get(canonical, {}) if reads_config else {}
+    )
     spec = required_cli_for_harness(canonical)
-    env_var = _harness_path_env_var(canonical)
-    command: str | None
-    source: str | None
-    env_command = None if canonical == _CODEX_NATIVE else resolve_harness_path(canonical)
-    if env_command:
-        command, source = env_command, "env"
-        if not os.environ.get(env_var, "").strip():
-            env_var = "HARNESS_" + env_var.removeprefix("OMNIGENT_")
-    elif config_command := override.get("command"):
-        command, source = config_command, "config"
-    elif spec is not None:
-        command, source = spec.binary, "default"
-    else:
-        command, source = None, None
+    command, source, env_var = _launch_command(
+        canonical, override.get("command"), spec.binary if spec else None
+    )
     args = override.get("args") or []
     env_vars: list[str] | None = None
     search_path: str | None = None
@@ -88,7 +84,37 @@ def describe_harness_startup(harness: str) -> HarnessStartup:
         "resolved_path": resolved,
         "args": " ".join(_masked(args, codex=canonical == _CODEX_NATIVE)) if args else None,
         "env_vars": env_vars,
+        "reads_config": reads_config,
     }
+
+
+def _launch_command(
+    canonical: str, config_command: str | None, default: str | None
+) -> tuple[str | None, str | None, str]:
+    """Return ``(command, source, env_var)`` for the web launch of *canonical*."""
+    env_var = _harness_path_env_var(canonical)
+    if canonical == _CODEX_NATIVE:
+        if config_command:
+            return config_command, "config", env_var
+        # Like the app server's ``_find_codex_cli``: an unresolvable override falls back.
+        env_command = os.environ.get(env_var, "").strip()
+        if env_command and _is_executable(env_command):
+            return env_command, "env", env_var
+    else:
+        if env_command := resolve_harness_path(canonical):
+            if not os.environ.get(env_var, "").strip():
+                env_var = "HARNESS_" + env_var.removeprefix("OMNIGENT_")
+            return env_command, "env", env_var
+        if config_command:
+            return config_command, "config", env_var
+    if default:
+        return default, "default", env_var
+    return None, None, env_var
+
+
+def _is_executable(command: str) -> bool:
+    """Whether *command* names an executable on ``PATH`` or an executable file."""
+    return bool(shutil.which(command)) or (os.path.isfile(command) and os.access(command, os.X_OK))
 
 
 def _unwrap_env(
@@ -150,18 +176,30 @@ def _masked(args: list[str], *, codex: bool) -> list[str]:
     )
     masked: list[str] = []
     for arg in tokens:
-        if any(c.isspace() for c in arg):
-            try:
-                words = " ".join(_masked(shlex.split(arg), codex=codex))
-            except ValueError:  # unbalanced quotes: nothing safe to show
-                words = "***"
-            masked.append(shlex.quote(words))
+        # Mask the arg whole first: splitting it would strip the quotes the
+        # masker keys on (``{"apiKey": "k"}``).
+        whole = redact_log_text(arg)
+        if any(c.isspace() for c in whole):
+            masked.append(shlex.quote(_masked_command_line(whole, codex=codex)))
         else:
-            masked.append(redact_log_text(arg))
+            masked.append(whole)
     for index in range(1, len(masked)):
         if _names_secret(masked[index - 1]):
             masked[index] = "***"
     return masked
+
+
+def _masked_command_line(arg: str, *, codex: bool) -> str:
+    """Mask an arg holding a whole command line (``env -S "cmd --api-key k"``) word by word.
+
+    Kept as-is (e.g. a JSON blob) when its words need no further masking.
+    """
+    try:
+        words = shlex.split(arg)
+    except ValueError:  # unbalanced quotes: nothing safe to show
+        return "***"
+    masked = _masked(words, codex=codex)
+    return " ".join(masked) if masked != words else arg
 
 
 def _names_secret(arg: str) -> bool:

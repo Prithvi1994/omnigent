@@ -2281,6 +2281,7 @@ _STARTUP = {
     "resolved_path": "/usr/local/bin/claude",
     "args": "--model opus",
     "env_vars": ["FOO"],
+    "reads_config": True,
 }
 
 
