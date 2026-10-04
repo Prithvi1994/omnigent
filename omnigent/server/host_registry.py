@@ -40,6 +40,7 @@ from omnigent.db.account_authority import (
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
 from omnigent.host.frames import (
     CAP_CODEX_SIDE_CHAT,
+    HostHarnessStartupResultFrame,
     HostHelloFrame,
     HostMcpServersResultFrame,
     HostSkillsResultFrame,
@@ -308,6 +309,7 @@ class HostConnection:
         model catalogs resolved by the selected host.
     :param pending_skills: Per-``request_id`` futures for sessionless skill discovery.
     :param pending_mcp_servers: Per-``request_id`` futures for MCP inventory requests.
+    :param pending_harness_startup: Per-``request_id`` futures for harness startup lookups.
     """
 
     workspace_id: int
@@ -374,6 +376,9 @@ class HostConnection:
         default_factory=dict,
     )
     pending_mcp_servers: dict[str, asyncio.Future[HostMcpServersResultFrame]] = field(
+        default_factory=dict,
+    )
+    pending_harness_startup: dict[str, asyncio.Future[HostHarnessStartupResultFrame]] = field(
         default_factory=dict,
     )
     # Import streams one session per frame, so the tunnel pushes each onto a

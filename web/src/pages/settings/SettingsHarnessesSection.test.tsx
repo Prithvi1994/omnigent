@@ -9,13 +9,27 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { HarnessInventory } from "@/hooks/useHarnessInventory";
-import type { Host } from "@/hooks/useHosts";
+import type { HarnessStartup, Host } from "@/hooks/useHosts";
+import { ApiError } from "@/lib/sessionsApi";
 import { SettingsHarnessesSection } from "./SettingsHarnessesSection";
 
 let hosts: Host[] = [];
+const STARTUP: HarnessStartup = {
+  harness: "claude-native",
+  command: "/opt/claude",
+  command_source: "config",
+  env_var: "OMNIGENT_CLAUDE_PATH",
+  resolved_path: "/opt/claude",
+  args: "--model opus",
+};
+let startup: { data?: HarnessStartup; error?: unknown; isPending: boolean } = {
+  data: STARTUP,
+  isPending: false,
+};
 vi.mock("@/hooks/useHosts", async (importActual) => ({
   ...(await importActual()),
   useHosts: () => ({ data: hosts }),
+  useHarnessStartup: () => startup,
 }));
 
 // Claude has two MCP servers (one from the toolkit plugin), a skill, and that
@@ -111,6 +125,7 @@ afterEach(() => {
   cleanup();
   hosts = [];
   inventory = INVENTORY;
+  startup = { data: STARTUP, isPending: false };
   harnessInstall = true;
   setupDialogProps.mockReset();
 });
@@ -237,9 +252,21 @@ describe("Harness details", () => {
     expect(screen.getByTestId("catalog-row-github")).toBeTruthy();
     expect(screen.queryByTestId("catalog-row-docs")).toBeNull();
 
-    // The credential lives under the Settings tab.
+    // The credential and launch settings live under the Settings tab.
     selectTab("Settings");
     expect(screen.getByText("AI Gateway")).toBeTruthy();
+    expect(screen.getByText("/opt/claude")).toBeTruthy();
+    expect(screen.getByText(/From harness\.claude-native\.command/)).toBeTruthy();
+    expect(screen.getByText("--model opus")).toBeTruthy();
+  });
+
+  it("asks to update a host too old to report launch settings", () => {
+    hosts = [ONLINE];
+    startup = { error: new ApiError("501", 501, null), isPending: false };
+    renderHarnesses("claude-native");
+
+    selectTab("Settings");
+    expect(screen.getByTestId("harness-startup-error").textContent).toContain("Update my-laptop");
   });
 
   it("lists MCP servers and skills as plain rows with host-reported details only", () => {

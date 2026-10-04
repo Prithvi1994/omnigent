@@ -2626,6 +2626,80 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "HarnessStartupResponse": {
+        "description": "The command and base args a harness launch uses on a host.",
+        "properties": {
+          "args": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Base launch args from the host's config, with secret-looking values masked, e.g. `\"--model opus\"`; `None` when none are set.",
+            "title": "Args"
+          },
+          "command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Command a launch runs, e.g. `\"claude\"` or `\"/opt/bin/claude\"`; `None` for a harness without a CLI.",
+            "title": "Command"
+          },
+          "command_source": {
+            "anyOf": [
+              {
+                "enum": [
+                  "env",
+                  "config",
+                  "default"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where *command* comes from: the `env` var, the host's `config`, or the harness `default`.",
+            "title": "Command Source"
+          },
+          "env_var": {
+            "description": "Env var that overrides the command, e.g. `\"OMNIGENT_CLAUDE_PATH\"`.",
+            "title": "Env Var",
+            "type": "string"
+          },
+          "harness": {
+            "description": "Canonical harness id, e.g. `\"claude-native\"`.",
+            "title": "Harness",
+            "type": "string"
+          },
+          "resolved_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Executable *command* resolves to on the host, e.g. `\"/opt/homebrew/bin/claude\"`; `None` when it isn't found.",
+            "title": "Resolved Path"
+          }
+        },
+        "required": [
+          "harness",
+          "env_var"
+        ],
+        "title": "HarnessStartupResponse",
+        "type": "object"
+      },
       "HeartbeatEvent": {
         "description": "Keepalive event emitted on a fixed cadence during streaming.\n\nLets consumers detect stalled producers via missed-interval\ntiming. Cadence is set by `_HEARTBEAT_INTERVAL_S` in\n`omnigent/runtime/workflow.py` (15 seconds at the time of\nwriting). Wire shape matches the existing emit at\n`omnigent/runtime/workflow.py:4636-4639`.\n\nPer `designs/SERVER_HARNESS_CONTRACT.md` \u00a7Heartbeats, the\nevent MAY carry timing metadata so consumers can do richer\ndead-detection than \"did anything arrive\":\n\n- `server_time` is the producer's wall-clock at emission,\n  letting consumers detect clock drift between producer and\n  consumer.\n- `last_event_seq` is the `sequence_number` of the most\n  recent NON-heartbeat event (or `None` when this is the\n  first heartbeat before any user-visible event), letting\n  consumers detect dropped events on reconnect.\n\nBoth fields are optional on the wire (`None` round-trips as\nomitted) so older AP\u2192harness pairs that pre-date the field\naddition still parse cleanly.",
         "properties": {
@@ -10080,6 +10154,58 @@
           }
         },
         "summary": "Get Host Model Options",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/harnesses/{harness}/startup": {
+      "get": {
+        "description": "Describe the binary and base args *harness* launches with on a host.\n\nRead-only; secret-looking args are masked on the host. The caller must\nown the host.",
+        "operationId": "get_harness_startup_v1_hosts__host_id__harnesses__harness__startup_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HarnessStartupResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Harness Startup",
         "tags": [
           "hosts"
         ]

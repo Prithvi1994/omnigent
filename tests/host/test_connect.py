@@ -41,6 +41,8 @@ from omnigent.host.frames import (
     HostDetectCredentialsResultFrame,
     HostFsRequestFrame,
     HostHarnessReadinessFrame,
+    HostHarnessStartupFrame,
+    HostHarnessStartupResultFrame,
     HostHelloFrame,
     HostImportLocalByIdFrame,
     HostImportLocalFrame,
@@ -330,6 +332,39 @@ async def test_host_reports_mcp_inventory_failure(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(host._mcp_inventory, "discover", fail)
     result = host._handle_mcp_servers(HostMcpServersFrame(request_id="r"))
     assert (result.status, result.mcp_servers) == ("failed", [])
+    assert result.error is not None and "boom" not in result.error
+
+
+async def test_host_answers_harness_startup_over_the_tunnel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    startup = {"harness": "claude-native", "command": "claude", "env_var": "OMNIGENT_CLAUDE_PATH"}
+    monkeypatch.setattr(
+        "omnigent.host.harness_startup.describe_harness_startup",
+        lambda harness: {**startup, "harness": harness},
+    )
+    host = _make_host_process()
+    ws = _RecordingWS()
+    host._start_frame_task(
+        ws,  # type: ignore[arg-type] — duck-typed WebSocket
+        encode_host_frame(HostHarnessStartupFrame(request_id="s", harness="claude-native")),
+    )
+    await _drain_frame_tasks(host)
+    result = decode_host_frame(ws.sent[-1])
+    assert isinstance(result, HostHarnessStartupResultFrame)
+    assert (result.request_id, result.status) == ("s", "ok")
+    assert result.startup is not None and result.startup["command"] == "claude"
+
+
+async def test_host_reports_harness_startup_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(harness: str) -> dict[str, str | None]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("omnigent.host.harness_startup.describe_harness_startup", fail)
+    result = _make_host_process()._handle_harness_startup(
+        HostHarnessStartupFrame(request_id="r", harness="claude-native")
+    )
+    assert (result.status, result.startup) == ("failed", None)
     assert result.error is not None and "boom" not in result.error
 
 

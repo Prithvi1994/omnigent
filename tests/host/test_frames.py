@@ -20,6 +20,8 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostFsWriteFrame,
     HostHarnessReadinessFrame,
+    HostHarnessStartupFrame,
+    HostHarnessStartupResultFrame,
     HostHelloFrame,
     HostImportedLocalSession,
     HostImportLocalByIdFrame,
@@ -2269,3 +2271,42 @@ def test_list_worktrees_legacy_request_defaults_to_picker_mode() -> None:
     )
     assert isinstance(frame, HostListWorktreesFrame)
     assert frame.for_cleanup is False
+
+
+_STARTUP = {
+    "harness": "claude-native",
+    "command": "claude",
+    "command_source": "default",
+    "env_var": "OMNIGENT_CLAUDE_PATH",
+    "resolved_path": "/usr/local/bin/claude",
+    "args": "--model opus",
+}
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        HostHarnessStartupFrame(request_id="req_start", harness="claude-native"),
+        HostHarnessStartupResultFrame(request_id="req_start", status="ok", startup=_STARTUP),
+        HostHarnessStartupResultFrame(request_id="req_start", status="failed", error="boom"),
+    ],
+)
+def test_harness_startup_frames_round_trip(
+    frame: HostHarnessStartupFrame | HostHarnessStartupResultFrame,
+) -> None:
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+def test_harness_startup_result_keeps_only_allow_listed_fields() -> None:
+    frame = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.harness_startup_result",
+                "request_id": "r",
+                "status": "ok",
+                "startup": {**_STARTUP, "env": {"TOKEN": "secret"}},
+            }
+        )
+    )
+    assert isinstance(frame, HostHarnessStartupResultFrame)
+    assert frame.startup == _STARTUP

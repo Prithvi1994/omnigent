@@ -38,6 +38,7 @@ from omnigent.host.frames import (
     HostDetectCredentialsResultFrame,
     HostFsResultFrame,
     HostHarnessReadinessFrame,
+    HostHarnessStartupResultFrame,
     HostHelloFrame,
     HostImportedLocalSession,
     HostImportLocalDoneFrame,
@@ -861,6 +862,11 @@ async def _receive_loop(
             mcp_future = conn.pending_mcp_servers.pop(frame.request_id, None)
             if mcp_future is not None and not mcp_future.done():
                 mcp_future.set_result(frame)
+            continue
+        if isinstance(frame, HostHarnessStartupResultFrame):
+            startup_future = conn.pending_harness_startup.pop(frame.request_id, None)
+            if startup_future is not None and not startup_future.done():
+                startup_future.set_result(frame)
             continue
         if isinstance(frame, HostImportLocalSessionFrame):
             queue = conn.pending_import_local.get(frame.request_id)

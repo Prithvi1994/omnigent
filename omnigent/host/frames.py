@@ -51,11 +51,14 @@ WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 CAP_CODEX_SIDE_CHAT = "codex_side_chat"
 # The host answers ``host.mcp_servers`` with its user-level MCP inventory:
 CAP_MCP_INVENTORY = "mcp_inventory"
+# The host answers ``host.harness_startup`` with a harness's launch command and args:
+CAP_HARNESS_STARTUP = "harness_startup"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
     CAP_CODEX_SIDE_CHAT,
     CAP_FILESYSTEM_ATTACHMENTS,
+    CAP_HARNESS_STARTUP,
     CAP_MCP_INVENTORY,
 ]
 
@@ -144,6 +147,8 @@ class HostFrameKind(str, Enum):
     SKILLS_RESULT = "host.skills_result"
     MCP_SERVERS = "host.mcp_servers"
     MCP_SERVERS_RESULT = "host.mcp_servers_result"
+    HARNESS_STARTUP = "host.harness_startup"
+    HARNESS_STARTUP_RESULT = "host.harness_startup_result"
     IMPORT_LOCAL = "host.import_local"
     IMPORT_LOCAL_BY_ID = "host.import_local_by_id"
     IMPORT_LOCAL_SESSION = "host.import_local_session"
@@ -1031,6 +1036,24 @@ class HostMcpServersResultFrame:
 
 
 @dataclass
+class HostHarnessStartupFrame:
+    """Server → host: describe the command and base args a harness launch uses."""
+
+    request_id: str
+    harness: str
+
+
+@dataclass
+class HostHarnessStartupResultFrame:
+    """Host → server: a harness's launch command, its source, and masked args."""
+
+    request_id: str
+    status: str
+    startup: dict[str, str | None] | None = None
+    error: str | None = None
+
+
+@dataclass
 class HostImportedLocalSession:
     """One local transcript the host read, normalized for import.
 
@@ -1192,6 +1215,8 @@ HostFrame = (
     | HostSkillsResultFrame
     | HostMcpServersFrame
     | HostMcpServersResultFrame
+    | HostHarnessStartupFrame
+    | HostHarnessStartupResultFrame
     | HostImportLocalFrame
     | HostImportLocalByIdFrame
     | HostImportLocalSessionFrame
@@ -1616,6 +1641,24 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
             }
         )
+    if isinstance(frame, HostHarnessStartupFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_STARTUP.value,
+                "request_id": frame.request_id,
+                "harness": frame.harness,
+            }
+        )
+    if isinstance(frame, HostHarnessStartupResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_STARTUP_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "startup": frame.startup,
+                "error": frame.error,
+            }
+        )
     if isinstance(frame, HostImportLocalFrame):
         return _encode_payload(
             {
@@ -1992,6 +2035,13 @@ def _decode_known_host_frame(
             return HostMcpServersFrame(request_id=_required_str(msg, "request_id"))
         case HostFrameKind.MCP_SERVERS_RESULT:
             return _decode_mcp_servers_result(msg)
+        case HostFrameKind.HARNESS_STARTUP:
+            return HostHarnessStartupFrame(
+                request_id=_required_str(msg, "request_id"),
+                harness=_required_str(msg, "harness"),
+            )
+        case HostFrameKind.HARNESS_STARTUP_RESULT:
+            return _decode_harness_startup_result(msg)
         case HostFrameKind.IMPORT_LOCAL:
             return _decode_import_local(msg)
         case HostFrameKind.IMPORT_LOCAL_BY_ID:
@@ -2603,6 +2653,34 @@ def _decode_mcp_servers_result(msg: _JsonObject) -> HostMcpServersResultFrame:
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         mcp_servers=servers,
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+_HARNESS_STARTUP_FIELDS = (
+    "harness",
+    "command",
+    "command_source",
+    "env_var",
+    "resolved_path",
+    "args",
+)
+
+
+def _decode_harness_startup_result(msg: _JsonObject) -> HostHarnessStartupResultFrame:
+    """Decode a harness startup description, keeping only the allow-listed fields."""
+    raw = msg.get("startup")
+    if raw is not None and not isinstance(raw, dict):
+        raise ValueError("frame field must be a harness startup object: 'startup'")
+    startup = (
+        {key: _optional_nullable_str(raw, key) for key in _HARNESS_STARTUP_FIELDS}
+        if raw is not None
+        else None
+    )
+    return HostHarnessStartupResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        startup=startup,
         error=_optional_nullable_str(msg, "error"),
     )
 

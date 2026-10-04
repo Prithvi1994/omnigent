@@ -73,6 +73,8 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostFsWriteFrame,
     HostHarnessReadinessFrame,
+    HostHarnessStartupFrame,
+    HostHarnessStartupResultFrame,
     HostHelloFrame,
     HostImportedLocalSession,
     HostImportLocalByIdFrame,
@@ -3195,6 +3197,25 @@ class HostProcess:
             request_id=frame.request_id, status="ok", mcp_servers=servers
         )
 
+    def _handle_harness_startup(
+        self, frame: HostHarnessStartupFrame
+    ) -> HostHarnessStartupResultFrame:
+        """Describe a harness's launch command and args in a worker thread."""
+        from omnigent.host.harness_startup import describe_harness_startup
+
+        try:
+            startup = describe_harness_startup(frame.harness)
+        except Exception:
+            _logger.exception("harness startup lookup failed for %s", frame.harness)
+            return HostHarnessStartupResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error="harness startup lookup failed; see the host log",
+            )
+        return HostHarnessStartupResultFrame(
+            request_id=frame.request_id, status="ok", startup=startup
+        )
+
     def _fetch_skill_bundle(self, frame: HostSkillsFrame) -> httpx.Response:
         """Read the bound session bundle using this host's existing credentials."""
         from urllib.parse import quote
@@ -4731,6 +4752,9 @@ class HostProcess:
         elif isinstance(frame, HostMcpServersFrame):
             mcp_result = await asyncio.to_thread(self._handle_mcp_servers, frame)
             await ws.send(encode_host_frame(mcp_result))
+        elif isinstance(frame, HostHarnessStartupFrame):
+            startup_result = await asyncio.to_thread(self._handle_harness_startup, frame)
+            await ws.send(encode_host_frame(startup_result))
         elif isinstance(frame, HostModelOptionsFrame):
             # Every dispatched frame already runs on its own task (see
             # _start_frame_task), so a cold harness probe here cannot stall

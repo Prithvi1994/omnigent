@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { ChevronDownIcon, KeyRoundIcon, Plus, SearchIcon, SettingsIcon } from "lucide-react";
 import { Link, useNavigate } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
@@ -14,7 +14,8 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { ComposerAgentIcon } from "@/shell/NewChatDialog";
 import { HarnessSetupDialog } from "@/shell/HarnessSetupDialog";
-import { useHosts, type Host } from "@/hooks/useHosts";
+import { useHarnessStartup, useHosts, type HarnessStartup, type Host } from "@/hooks/useHosts";
+import { ApiError } from "@/lib/sessionsApi";
 import { INVENTORY_HARNESS_IDS } from "@/hooks/useHarnessInventory";
 import { BRAND_HARNESSES } from "@/components/onboarding/harnessBrand";
 import {
@@ -417,11 +418,16 @@ function HarnessDetail({
       </div>
     </>
   );
-  const credential = <CredentialCard gateway={host?.gateway_inference?.[entry.harness] === true} />;
+  const settings = (
+    <div className="flex flex-col gap-6">
+      <CredentialCard gateway={host?.gateway_inference?.[entry.harness] === true} />
+      {host && <StartupSettings host={host} harness={entry.harness} />}
+    </div>
+  );
   // The host inventory only covers these families' MCP servers, skills, and plugins.
   const family = BRAND_HARNESSES.find((f) => INVENTORY_HARNESS_IDS[f] === entry.harness);
   if (status.ready && host && family) {
-    return <HarnessCatalog header={header} settings={credential} host={host} family={family} />;
+    return <HarnessCatalog header={header} settings={settings} host={host} family={family} />;
   }
   return (
     <>
@@ -434,7 +440,7 @@ function HarnessDetail({
             <p className="text-ui text-muted-foreground">
               MCP servers, skills, and plugins aren't listed for {entry.name} yet.
             </p>
-            {credential}
+            {settings}
           </>
         ) : (
           <p className="text-ui text-muted-foreground">
@@ -466,6 +472,72 @@ function CredentialCard({ gateway }: { gateway: boolean }) {
           </span>
         </span>
       </div>
+    </section>
+  );
+}
+
+/** The binary and base args a launch of *harness* uses on *host*. Read-only. */
+function StartupSettings({ host, harness }: { host: Host; harness: string }) {
+  const { data, error, isPending } = useHarnessStartup(host.host_id, harness);
+  if (isPending) {
+    return <p className="text-ui text-muted-foreground">Loading launch settings…</p>;
+  }
+  if (!data) {
+    return (
+      <p className="text-ui text-muted-foreground" data-testid="harness-startup-error">
+        {error instanceof ApiError && error.status === 501
+          ? `Update ${host.name} to see this harness's launch settings.`
+          : `Couldn't load launch settings from ${host.name}.`}
+      </p>
+    );
+  }
+  return (
+    <>
+      <SettingsField title="Path to binary" hint={commandHint(data)}>
+        {data.resolved_path ?? data.command ?? "None"}
+      </SettingsField>
+      <SettingsField
+        title="Startup arguments"
+        hint={
+          data.args
+            ? "Passed to the harness binary on launch."
+            : `Set harness.${data.harness}.args in ~/.omnigent/config.yaml to pass arguments on launch.`
+        }
+      >
+        {data.args ?? "None"}
+      </SettingsField>
+    </>
+  );
+}
+
+/** Where the launch command comes from, and whether the host found it. */
+function commandHint(startup: HarnessStartup): string {
+  if (startup.command === null) return "This harness doesn't launch a CLI.";
+  const source =
+    startup.command_source === "env"
+      ? `From ${startup.env_var}.`
+      : startup.command_source === "config"
+        ? `From harness.${startup.harness}.command in ~/.omnigent/config.yaml.`
+        : `Default command "${startup.command}"; set ${startup.env_var} to override.`;
+  return startup.resolved_path ? source : `${source} Not found on this machine.`;
+}
+
+function SettingsField({
+  title,
+  hint,
+  children,
+}: {
+  title: string;
+  hint: string;
+  children: ReactNode;
+}) {
+  return (
+    <section className="flex flex-col gap-2">
+      <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">{title}</h2>
+      <div className="rounded-xl border border-border p-3 font-mono text-ui break-all">
+        {children}
+      </div>
+      <p className="text-xs text-muted-foreground">{hint}</p>
     </section>
   );
 }

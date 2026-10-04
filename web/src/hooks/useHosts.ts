@@ -7,6 +7,7 @@ import {
 } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { authenticatedFetch } from "@/lib/identity";
+import { ApiError } from "@/lib/sessionsApi";
 import type { NativeModelOption } from "@/lib/types";
 
 export interface Host {
@@ -349,6 +350,37 @@ export interface DetectedCredential {
  * dialog turns it on only for a harness whose credential the UI can write), so
  * we don't probe hosts for closed dialogs.
  */
+/** Wire shape of `GET /v1/hosts/{host_id}/harnesses/{harness}/startup`. */
+export interface HarnessStartup {
+  /** Canonical harness id, e.g. `"claude-native"`. */
+  harness: string;
+  /** Command a launch runs, e.g. `"claude"`; `null` for a harness without a CLI. */
+  command: string | null;
+  command_source: "env" | "config" | "default" | null;
+  /** Env var that overrides the command, e.g. `"OMNIGENT_CLAUDE_PATH"`. */
+  env_var: string;
+  /** Executable the command resolves to on the host; `null` when not found. */
+  resolved_path: string | null;
+  /** Base launch args from the host's config, secrets masked; `null` when none. */
+  args: string | null;
+}
+
+/** The binary and base args *harness* launches with on a host. Read-only. */
+export function useHarnessStartup(hostId: string, harness: string) {
+  return useQuery({
+    queryKey: ["harness-startup", hostId, harness],
+    queryFn: async (): Promise<HarnessStartup> => {
+      const res = await authenticatedFetch(
+        `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/startup`,
+      );
+      if (!res.ok) throw new ApiError(`${res.status} ${res.statusText}`, res.status, null);
+      return (await res.json()) as HarnessStartup;
+    },
+    staleTime: 30_000,
+    retry: false,
+  });
+}
+
 export function useDetectedCredentials(hostId: string | null | undefined, enabled: boolean) {
   return useQuery({
     queryKey: ["detected-credentials", hostId],
