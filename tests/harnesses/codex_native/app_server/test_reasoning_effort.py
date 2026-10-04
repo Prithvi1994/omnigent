@@ -15,13 +15,30 @@ from omnigent.harnesses.codex_native.bridge import read_codex_config_effort
 from omnigent.server.smart_routing import RoutingSettings, parse_routing_tables
 
 
+@pytest.mark.parametrize(
+    ("requested", "fallback", "advertised", "expected"),
+    [
+        ("ultra", "medium", ["low", "medium", "high", "max", "ultra"], "medium"),
+        ("high", "medium", ["low", "medium", "high", "max", "ultra"], "high"),
+        ("ultra", "high", ["low", "max", "ultra"], "low"),
+        ("ultra", "medium", ["max", "ultra"], "medium"),
+    ],
+)
 def test_gateway_restrictions_still_apply_to_catalog_supported_efforts(
     monkeypatch: pytest.MonkeyPatch,
+    requested: str,
+    fallback: str,
+    advertised: list[str],
+    expected: str,
 ) -> None:
     """A CLI's built-in catalog does not override restrictions of the serving gateway."""
     settings = RoutingSettings(
         **parse_routing_tables(
-            {"effort_caps": {"gpt-5.6-sol": {"fallback": "medium", "unsupported": ["ultra"]}}}
+            {
+                "effort_caps": {
+                    "gpt-5.6-sol": {"fallback": fallback, "unsupported": ["max", "ultra"]}
+                }
+            }
         )
     )
     monkeypatch.setattr(
@@ -30,13 +47,10 @@ def test_gateway_restrictions_still_apply_to_catalog_supported_efforts(
     catalog = [
         {
             "id": "gpt-5.6-sol",
-            "supportedReasoningEfforts": [
-                {"reasoningEffort": value} for value in ("low", "medium", "high", "max", "ultra")
-            ],
+            "supportedReasoningEfforts": [{"reasoningEffort": value} for value in advertised],
         }
     ]
-    assert app_server.clamp_codex_effort_for_model("ultra", "gpt-5.6-sol", catalog) == "medium"
-    assert app_server.clamp_codex_effort_for_model("max", "gpt-5.6-sol", catalog) == "max"
+    assert app_server.clamp_codex_effort_for_model(requested, "gpt-5.6-sol", catalog) == expected
 
 
 @pytest.mark.parametrize(
@@ -267,7 +281,7 @@ async def test_resume_applies_and_mirrors_supported_effort(
     monkeypatch.setattr(app_server, "client_for_transport", lambda *args, **kwargs: client)
 
     await app_server.apply_codex_thread_effort(
-        "ws://127.0.0.1:9876",
+        str(tmp_path / "app-server.sock"),
         "thread_resumed",
         effort,
         model=None if model == "gpt-5.4" else model,

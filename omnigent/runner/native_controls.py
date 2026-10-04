@@ -265,6 +265,7 @@ def build_native_controls(
             write_codex_config_effort,
             write_codex_config_model,
         )
+        from omnigent.util.reasoning_effort import effort_for_model_switch
 
         if not settings:
             return Response(status_code=204)
@@ -291,7 +292,16 @@ def build_native_controls(
             await codex_client.connect()
             if "model" in settings or "effort" in settings:
                 model = settings.get("model") or read_codex_config_model(bridge_dir)
-                effort = settings.get("effort", read_codex_config_effort(bridge_dir))
+                # An explicit null clears the selection; only an absent key inherits config.
+                effort = (
+                    settings["effort"]
+                    if "effort" in settings
+                    else read_codex_config_effort(bridge_dir)
+                )
+                if "model" in settings and isinstance(model, str) and effort is None:
+                    effort = effort_for_model_switch(None, model)
+                    if effort is not None:
+                        settings["effort"] = effort
                 if isinstance(model, str) and isinstance(effort, str):
                     resolved = await resolve_codex_effort_for_model(codex_client, effort, model)
                     if resolved != effort:

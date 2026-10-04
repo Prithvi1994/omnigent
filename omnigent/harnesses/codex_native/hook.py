@@ -476,6 +476,7 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> str | None:
     )
     from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug
     from omnigent.runner.turn_routing import SETTINGS_UPDATE_TIMEOUT_S
+    from omnigent.util.reasoning_effort import effort_for_model_switch
 
     state = read_bridge_state(bridge_dir)
     if state is None:
@@ -501,7 +502,9 @@ def _apply_thread_model(bridge_dir: Path, model: str) -> str | None:
                 declined = f"routed model not in this pane's catalog ({model})"
                 return
             inherited_effort = read_codex_config_effort(bridge_dir)
-            effort = clamp_codex_effort_for_model(inherited_effort, slug, rows)
+            effort = clamp_codex_effort_for_model(
+                effort_for_model_switch(inherited_effort, slug), slug, rows
+            )
             settings: dict[str, object] = {"threadId": state.thread_id, "model": slug}
             if effort is not None and effort != inherited_effort:
                 settings["effort"] = effort

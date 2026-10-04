@@ -1063,14 +1063,14 @@ _LIVE_CATALOG: list[dict[str, object]] = [
 
 
 @pytest.mark.parametrize(
-    ("routed", "applied"),
+    ("routed", "applied", "effort"),
     [
         # The routed arm arrives as a catalog id; codex only has metadata for
         # its own dotted slug, and ``/model`` only highlights that one.
-        ("databricks-gpt-5-6-luna", "gpt-5.6-luna"),
+        ("databricks-gpt-5-6-luna", "gpt-5.6-luna", None),
         # Extended-catalog rows are listed under the catalog spelling, which
         # IS codex's id for them — translating must not mangle it.
-        ("system.ai.glm-5-2", "system.ai.glm-5-2"),
+        ("system.ai.glm-5-2", "system.ai.glm-5-2", "medium"),
     ],
 )
 def test_apply_thread_model_switches_in_codex_spelling(
@@ -1078,21 +1078,29 @@ def test_apply_thread_model_switches_in_codex_spelling(
     monkeypatch: pytest.MonkeyPatch,
     routed: str,
     applied: str,
+    effort: str | None,
 ) -> None:
     """The thread switch and the config.toml mirror both speak codex."""
-    from omnigent.harnesses.codex_native.bridge import read_codex_config_model
+    from omnigent.harnesses.codex_native.bridge import (
+        read_codex_config_effort,
+        read_codex_config_model,
+    )
 
     codex_home_for_bridge_dir(bridge_dir).mkdir(parents=True, exist_ok=True)
     client = _install_fake_client(monkeypatch, _FakeAppServerClient(_LIVE_CATALOG))
 
     assert codex_native_hook._apply_thread_model(bridge_dir, routed) is None
 
+    settings = {"threadId": "thread_abc", "model": applied}
+    if effort is not None:
+        settings["effort"] = effort
     assert client.requests == [
         ("model/list", {"includeHidden": True}),
-        ("thread/settings/update", {"threadId": "thread_abc", "model": applied}),
+        ("thread/settings/update", settings),
     ]
     assert client.closed is True
     assert read_codex_config_model(bridge_dir) == applied
+    assert read_codex_config_effort(bridge_dir) == effort
 
 
 @pytest.mark.parametrize(("inherited", "expected"), [("max", "xhigh"), ("high", "high")])

@@ -139,6 +139,9 @@ Cross-harness journeys:
   Omnigent's managed setup; the managed and unmanaged paths behave differently.
 - The mock instance proves Omnigent's integration with Claude and Codex, not a
   live vendor model. A passing mock run is not evidence for another harness.
+- Codex's background title requests can echo the user's prompt on another model.
+  Identify the user thread when checking its outgoing model and effort, and
+  script repeatable replies so title generation cannot exhaust the turn's reply.
 - A transport check is not a full reconnect journey. To verify that claim,
   use an isolated configured harness, interrupt only its test connection, then
   resume and send another turn; check both terminal and chat for missing or

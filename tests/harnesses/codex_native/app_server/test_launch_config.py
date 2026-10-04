@@ -458,6 +458,7 @@ async def test_start_without_catalog_snapshot_checks_the_live_models(
 
     client.request.side_effect = request
     monkeypatch.setattr(app_server, "_EFFORT_CATALOG_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(app_server, "_EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(
         app_server.CodexNativeAppServer, "_wait_until_ready", AsyncMock(return_value=client)
     )
@@ -488,6 +489,14 @@ async def test_start_without_catalog_snapshot_checks_the_live_models(
         client.close.assert_awaited_once()
         if write_failure:
             assert "Could not persist supported Codex reasoning effort at startup" in caplog.text
+        next_client = AsyncMock(spec=app_server.CodexAppServerClient)
+        assert (
+            await app_server.resolve_codex_effort_for_model(
+                next_client, "max", "gpt-5.4", transport=str(server.socket_path)
+            )
+            == "xhigh"
+        )
+        next_client.request.assert_not_awaited()
     finally:
         await server.close()
 

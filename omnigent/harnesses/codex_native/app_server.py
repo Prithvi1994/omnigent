@@ -113,6 +113,7 @@ CodexRequestFn = Callable[[str, CodexParams], Awaitable[CodexMessage]]
 
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
 _EFFORT_CATALOG_TIMEOUT_SECONDS = 2.0
+_EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS = 2.0
 _REASONING_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 # Model discovery is a best-effort side process whose callers fall back to a
 # cached or bundled catalog, so it keeps a short readiness budget.
@@ -750,7 +751,11 @@ def clamp_codex_effort_for_model(
         for level in levels
         if isinstance(level, dict)
     ]
-    supported = [value for value in _REASONING_EFFORT_ORDER if value in advertised]
+    supported = [
+        value
+        for value in _REASONING_EFFORT_ORDER
+        if value in advertised and clamp_effort_for_model(value, model) == value
+    ]
     if not supported or effort in supported or effort not in _REASONING_EFFORT_ORDER:
         return effort
     target = _REASONING_EFFORT_ORDER.index(effort)
@@ -2065,6 +2070,8 @@ class CodexNativeAppServer:
         if self.reconcile_process_registry:
             reconcile_codex_native_process_registry()
         resolved_listen = self.listen_url or f"unix://{self.socket_path}"
+        effort_catalog_transport = self.listen_url or str(self.socket_path)
+        _effort_catalog_cache.pop(effort_catalog_transport, None)
         self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
         tagged_argv0 = (
             f"{Path(self.codex_path).name} "
@@ -2131,7 +2138,10 @@ class CodexNativeAppServer:
                     and _codex_model_catalog_entry(catalog, effective_model) is None
                 ):
                     resolved_effort = await resolve_codex_effort_for_model(
-                        startup_client, effective_effort, effective_model
+                        startup_client,
+                        effective_effort,
+                        effective_model,
+                        transport=effort_catalog_transport,
                     )
                     if resolved_effort != effective_effort:
                         try:
@@ -2149,7 +2159,7 @@ class CodexNativeAppServer:
                                         ],
                                     },
                                 ),
-                                timeout=_EFFORT_CATALOG_TIMEOUT_SECONDS,
+                                timeout=_EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS,
                             )
                         except Exception:  # noqa: BLE001 - optional repair must not block startup
                             _logger.warning(
@@ -4406,7 +4416,9 @@ async def apply_codex_thread_effort(
     try:
         if model is None and bridge_dir is not None:
             model = read_codex_config_model(bridge_dir)
-        applied_effort = await resolve_codex_effort_for_model(client, effort, model)
+        applied_effort = await resolve_codex_effort_for_model(
+            client, effort, model, transport=transport
+        )
         await client.request(
             "thread/settings/update",
             {"threadId": thread_id, "effort": applied_effort},

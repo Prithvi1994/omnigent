@@ -128,6 +128,10 @@ class _RecordingCodexAppServerClient:
             {"threadId": "thread_codex", "effort": "xhigh"},
         ),
         (
+            {"type": "effort_change", "effort": None},
+            {"threadId": "thread_codex", "effort": None},
+        ),
+        (
             {"type": "plan_mode_change", "enabled": True},
             {
                 "threadId": "thread_codex",
@@ -142,7 +146,7 @@ class _RecordingCodexAppServerClient:
             },
         ),
     ],
-    ids=["model_change", "effort_change", "plan_mode_change"],
+    ids=["model_change", "effort_change", "effort_reset", "plan_mode_change"],
 )
 async def test_events_codex_native_settings_change_uses_thread_settings_update(
     monkeypatch: pytest.MonkeyPatch,
@@ -179,6 +183,24 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
         transport="ws://127.0.0.1:43210",
         client_name="omnigent-codex-native-runner",
     )
+    if event_payload == {"type": "effort_change", "effort": None}:
+        codex_home = tmp_path / "codex-home"
+        codex_home.mkdir()
+        (codex_home / "config.toml").write_text(
+            'model = "gpt-5.4"\nmodel_reasoning_effort = "minimal"\n'
+        )
+        fake_client.model_list_responses = [
+            {
+                "result": {
+                    "data": [
+                        {
+                            "id": "gpt-5.4",
+                            "supportedReasoningEfforts": [{"reasoningEffort": "low"}],
+                        }
+                    ]
+                }
+            }
+        ]
 
     def _fake_client_for_transport(
         transport: str,
@@ -241,13 +263,14 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
         ("gpt-6-sol", "max", {"type": "model_change", "model": "gpt-5.4"}, "gpt-5.4", "xhigh"),
         ("gpt-5.4", "medium", {"type": "effort_change", "effort": "minimal"}, "gpt-5.4", "low"),
         ("gpt-6-sol", "medium", {"type": "effort_change", "effort": "max"}, "gpt-6-sol", "max"),
+        ("gpt-5.4", None, {"type": "model_change", "model": "glm-5-2"}, "glm-5-2", "medium"),
     ],
 )
 async def test_codex_native_settings_change_clamps_and_mirrors_effort(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     initial_model: str,
-    initial_effort: str,
+    initial_effort: str | None,
     event: dict[str, Any],
     expected_model: str,
     expected_effort: str,
@@ -261,7 +284,8 @@ async def test_codex_native_settings_change_clamps_and_mirrors_effort(
     codex_home = codex_native_bridge.codex_home_for_bridge_dir(bridge_dir)
     codex_home.mkdir(parents=True)
     (codex_home / "config.toml").write_text(
-        f'model = "{initial_model}"\nmodel_reasoning_effort = "{initial_effort}"\n'
+        f'model = "{initial_model}"\n'
+        + (f'model_reasoning_effort = "{initial_effort}"\n' if initial_effort else "")
     )
     codex_native_bridge.write_bridge_state(
         bridge_dir,
@@ -286,6 +310,7 @@ async def test_codex_native_settings_change_clamps_and_mirrors_effort(
                     for model, levels in [
                         ("gpt-5.4", ["low", "medium", "high", "xhigh"]),
                         ("gpt-6-sol", ["low", "medium", "high", "xhigh", "max", "ultra"]),
+                        ("glm-5-2", ["low", "medium", "high"]),
                     ]
                 ],
                 "nextCursor": None,

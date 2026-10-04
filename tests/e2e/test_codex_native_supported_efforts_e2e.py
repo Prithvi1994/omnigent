@@ -237,9 +237,11 @@ def _assert_turn(
 ) -> None:
     marker = f"EFFORT_OK_{uuid.uuid4().hex}"
     prompt = f"Reply with {marker}"
+    # Background title requests share the prompt; they must not exhaust the turn's reply.
     _json(
-        rig.model.post("/mock/configure", json={"responses": [{"text": marker}], "match": marker})
+        rig.model.post("/mock/configure", json={"key": marker, "responses": [], "match": marker})
     )
+    _json(rig.model.post("/mock/set_fallback", json={"key": marker, "text": marker}))
     before = len(_json(rig.model.get("/mock/requests"))["requests"])
     if terminal:
         metadata = session.terminal["metadata"]
@@ -293,6 +295,17 @@ def _assert_turn(
         )
     requests = _json(rig.model.get("/mock/requests"))["requests"][before:]
     requests = [request for request in requests if marker in json.dumps(request.get("input"))]
+    (rig.stack.root / f"{marker}-all-requests.json").write_text(json.dumps(requests, indent=2))
+    assert state is not None
+    # Codex's background title threads echo the same prompt but can use another model.
+    # Select the user thread by identity, leaving model and effort assertions unfiltered.
+    background_requests = sum(
+        request.get("prompt_cache_key") != state.thread_id for request in requests
+    )
+    requests = [
+        request for request in requests if request.get("prompt_cache_key") == state.thread_id
+    ]
+    (rig.stack.root / f"{marker}-requests.json").write_text(json.dumps(requests, indent=2))
     assert requests, "The real Codex process must send a Responses request for this turn"
     assert {request["model"] for request in requests} == {model}
     efforts = [request.get("reasoning", {}).get("effort") for request in requests]
@@ -315,6 +328,8 @@ def _assert_turn(
     assert state is not None
     config = tomllib.loads((Path(state.codex_home) / "config.toml").read_text())
     evidence = {
+        "thread_id": state.thread_id,
+        "background_requests": background_requests,
         "model": model,
         "expected": expected,
         "wire_efforts": efforts,
@@ -324,7 +339,6 @@ def _assert_turn(
         "advertised": settings["model"]["supportedReasoningEfforts"],
     }
     (rig.stack.root / f"{marker}.json").write_text(json.dumps(evidence, indent=2))
-    (rig.stack.root / f"{marker}-requests.json").write_text(json.dumps(requests, indent=2))
     print(json.dumps(evidence), flush=True)
     # Codex preserves ultra internally but serializes it as max on Responses.
     assert set(efforts) == {"max" if expected == "ultra" else expected}, evidence
