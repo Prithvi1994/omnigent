@@ -575,10 +575,9 @@ describe("ApprovalCard — Antigravity permission prompt details", () => {
   } as const;
 
   it("shows the action description and both persist choices when advertised", () => {
-    // agy's own TUI prompt describes the action and offers two
-    // always-allow entries (conversation-scoped, and persisted to its
-    // settings); the card must surface all of it instead of a bare
-    // binary Approve/Reject.
+    // agy's TUI prompt describes the action and offers two always-allow entries
+    // (conversation-scoped and persisted to settings); the card must surface
+    // all of it, not a bare Approve/Reject.
     const submitSpy = vi.fn();
     render(
       <ApprovalCard

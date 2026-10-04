@@ -288,11 +288,9 @@ export function ApprovalCard({
     submit(elicitationId, "accept", undefined, { persist: mode });
   };
   const submitAgyPersist = (mode: CodexPersistMode) => {
-    // Accept AND ask the bridge to take agy's own always-allow menu
-    // entry — conversation-scoped for "session", persisted to agy's
-    // settings for "always" — so agy records its advertised persist
-    // pattern. Same `_meta.persist` shape as the Codex persistence
-    // verdicts.
+    // Accept and take agy's own always-allow menu entry (conversation-scoped
+    // for "session", agy settings for "always") so it records its persist
+    // pattern. Same `_meta.persist` shape as the Codex persist verdicts.
     submit(elicitationId, "accept", undefined, { persist: mode });
   };
   const submitPlanRejection = (feedback: string) => {

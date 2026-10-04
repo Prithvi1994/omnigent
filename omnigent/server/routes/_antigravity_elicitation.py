@@ -385,15 +385,8 @@ def _agy_permission_response(result: ElicitationResult) -> dict[str, Any]:
     return {"permission": {"allow": result.action == "accept"}}
 
 
-# agy's attended-TUI permission prompt is a numbered list (live-verified on agy
-# 1.2.7): 1 "Yes, run command"; 2 "Yes, and always allow in this conversation
-# for commands that start with '<pattern>'"; 3 "Yes, and always allow for
-# commands that start with '<pattern>' (Persist to settings.json)"; 4 "No,
-# cancel". The web card's Approve drives the always-safe "Yes" (1), its persist
-# choices drive the conversation-scoped entry (2, ``_meta.persist ==
-# "session"``) or the settings-persisted entry (3, ``_meta.persist ==
-# "always"``), and Reject drives "No" (4). These are the digits typed into the
-# pane, each followed by Enter to confirm the selection.
+# Digits typed into the agy pane for each permission verdict; see
+# ``to_tui_selection_keys`` for the live-verified menu these map onto.
 _AGY_TUI_PERMISSION_APPROVE_OPTION = "1"
 _AGY_TUI_PERMISSION_SESSION_ALLOW_OPTION = "2"
 _AGY_TUI_PERMISSION_PERSIST_ALLOW_OPTION = "3"
@@ -419,12 +412,15 @@ def to_tui_selection_keys(
     :func:`omnigent.harnesses.antigravity_native.bridge.send_interaction_keys_via_tui`,
     mirroring cursor-native. This is the pure shape-mapper for those keys.
 
-    * **permission** — Approve → option ``"1"`` ("Yes"); a persist accept
-      (offered only when the spec advertises a persist pattern) → agy's own
-      always-allow menu entry: ``_meta.persist == "session"`` → option ``"2"``
-      (always allow in this conversation), ``_meta.persist == "always"`` →
-      option ``"3"`` (persist to settings.json); Reject → option ``"4"``
-      ("No") — each followed by ``Enter``.
+    * **permission** — agy's numbered menu, live-verified on agy 1.2.7:
+      ``1`` "Yes, run command"; ``2`` "Yes, and always allow in this
+      conversation for commands that start with '<pattern>'"; ``3`` "Yes, and
+      always allow ... (Persist to settings.json)"; ``4`` "No, cancel". Both
+      always-allow entries are pattern-scoped, not blanket grants, and exist
+      only when the spec advertised a persist pattern. Approve → ``"1"``; a
+      persist accept → ``_meta.persist == "session"`` → ``"2"``
+      (conversation-scoped) or ``_meta.persist == "always"`` → ``"3"``
+      (settings.json); Reject → ``"4"`` ("No") — each followed by ``Enter``.
     * **ask_question** — type the selected option id(s) ("1".."N") then ``Enter``;
       agy's TUI numbers questions' options the same way its RPC ``selectedOptionIds``
       do. A decline/cancel (or no usable selection) presses ``Escape`` to dismiss.
@@ -441,10 +437,8 @@ def to_tui_selection_keys(
         if result.action != "accept":
             return [_AGY_TUI_PERMISSION_REJECT_OPTION, _AGY_TUI_CONFIRM_KEY]
         persist = result.meta.get("persist") if result.meta is not None else None
-        # The always-allow menu entries exist only when the spec advertised a
-        # persist pattern; an unadvertised persist request falls back to the
-        # plain approve so a stale or crafted verdict can never select a menu
-        # entry agy's prompt does not have.
+        # Always-allow entries exist only when the spec advertised a persist
+        # pattern; otherwise fall back to plain approve, never a missing entry.
         if _suggested_persist_pattern(spec) is not None:
             if persist == "session":
                 return [_AGY_TUI_PERMISSION_SESSION_ALLOW_OPTION, _AGY_TUI_CONFIRM_KEY]

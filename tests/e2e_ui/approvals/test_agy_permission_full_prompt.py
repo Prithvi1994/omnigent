@@ -1,10 +1,10 @@
 """E2E (UI): the Antigravity (agy) permission card must surface the full prompt.
 
 When agy asks for command permission, its own TUI prompt offers the full menu —
-"Yes", the "always allow" persist variants, and "No" — and describes the action,
-but the Omnigent web card renders only the bare binary Approve/Reject pair. The
-persist ("always allow") choices and agy's action description are not captured
-by the UI.
+"Yes", the "always allow" persist variants, and "No" — and describes the action.
+This test guards that the Omnigent web card mirrors that prompt: it must surface
+agy's action description and the persist ("always allow") choices rather than
+collapsing to a bare binary Approve/Reject pair.
 
 The journey is driven exactly the way the production bridge drives it: a REAL
 recorded agy WAITING permission step
@@ -21,8 +21,8 @@ CI cannot run a live turn); everything from the bridge's shape-mapping to the
 browser render is the production path.
 
 Contrast: the Codex MCP approval card (``test_codex_mcp_persistence.py``)
-already renders "Approve / Approve for this session / Always allow / Reject"
-for an equivalent persist-capable prompt.
+renders "Approve / Approve for this session / Always allow / Reject" for an
+equivalent persist-capable prompt.
 """
 
 from __future__ import annotations
@@ -45,9 +45,8 @@ from omnigent.server.routes._antigravity_elicitation import to_elicitation_param
 
 _APPROVAL_CARD = '[data-testid="approval-card"]'
 _CARD_TIMEOUT_MS = 15_000
-# The buggy card renders instantly with only Approve/Reject, so a missing
-# affordance does not need a long grace period.
-_MISSING_AFFORDANCE_TIMEOUT_MS = 4_000
+# The card renders synchronously, so its affordances appear promptly.
+_AFFORDANCE_TIMEOUT_MS = 4_000
 
 # A real agy WAITING permission step recorded from a live `agy` session.
 _FIXTURE_PATH = (
@@ -70,8 +69,8 @@ def _load_pending_permission() -> PendingInteraction:
     pending = pending_interaction(step)
     assert pending is not None, "fixture step must be a WAITING interaction"
     assert pending["kind"] == "permission", "fixture step must be a permission gate"
-    # The recorded spec really does advertise an always-allow persist option —
-    # this is what agy's own TUI renders as its extra menu entries.
+    # The recorded spec advertises an always-allow persist option — the extra
+    # menu entries agy's own TUI renders for this prompt.
     spec = pending["spec"]
     assert spec.get("persistSuggestionType") == "PERSIST_SUGGESTION_TYPE_SUGGESTED"
     assert spec.get("suggestedPersistPattern") == "pwd"
@@ -128,6 +127,7 @@ def _wait_for(
     *,
     timeout_s: float = 30.0,
     interval_s: float = 0.25,
+    message: str = "condition not met within timeout",
 ) -> None:
     """Poll *predicate* until truthy or the deadline passes."""
     deadline = time.monotonic() + timeout_s
@@ -135,12 +135,28 @@ def _wait_for(
         if predicate():
             return
         time.sleep(interval_s)
-    raise AssertionError("condition not met within timeout")
+    raise AssertionError(message)
 
 
-def _open_pending_agy_card(page: Page, base_url: str, session_id: str):
+def _require_no_hook_error(result_holder: dict) -> None:
+    """Surface a failed elicitation hook POST instead of a generic timeout."""
+    if "error" in result_holder:
+        raise AssertionError(f"agy elicitation hook POST failed: {result_holder['error']}")
+
+
+def _open_pending_agy_card(
+    page: Page,
+    base_url: str,
+    session_id: str,
+    result_holder: dict,
+):
     """Navigate to the session and return the pending agy permission card."""
-    _wait_for(lambda: bool(_pending_elicitations(base_url, session_id)))
+
+    def _elicitation_ready() -> bool:
+        _require_no_hook_error(result_holder)
+        return bool(_pending_elicitations(base_url, session_id))
+
+    _wait_for(_elicitation_ready, message="agy permission elicitation did not appear")
     page.goto(f"{base_url}/c/{session_id}")
     card = (
         page.locator(f'{_APPROVAL_CARD}[data-state="pending"]')
@@ -149,6 +165,23 @@ def _open_pending_agy_card(page: Page, base_url: str, session_id: str):
     )
     expect(card).to_be_visible(timeout=_CARD_TIMEOUT_MS)
     return card
+
+
+def _reject_and_join(
+    card,
+    base_url: str,
+    session_id: str,
+    hook_thread: threading.Thread,
+    result_holder: dict,
+) -> None:
+    """Reject to settle the parked long-poll, then join so a late POST failure surfaces."""
+    card.get_by_role("button", name="Reject", exact=True).click()
+    _wait_for(
+        lambda: not _pending_elicitations(base_url, session_id),
+        message="agy permission elicitation did not clear after Reject",
+    )
+    hook_thread.join(timeout=30)
+    _require_no_hook_error(result_holder)
 
 
 @pytest.mark.timeout(120)
@@ -166,26 +199,20 @@ def test_agy_permission_card_offers_always_allow_choice(
     """
     base_url, session_id = seeded_session
     result_holder: dict = {}
-    _park_agy_permission_elicitation(base_url, session_id, result_holder)
+    hook_thread = _park_agy_permission_elicitation(base_url, session_id, result_holder)
 
-    card = _open_pending_agy_card(page, base_url, session_id)
+    card = _open_pending_agy_card(page, base_url, session_id, result_holder)
 
-    # Sanity: the binary pair renders (this is what ships today) and the card
-    # names the gated command, so we are looking at the right prompt.
+    # Sanity: the card names the gated command and still offers the binary pair.
     expect(card).to_contain_text("pwd")
     expect(card.get_by_role("button", name="Approve", exact=True)).to_be_visible()
     expect(card.get_by_role("button", name="Reject", exact=True)).to_be_visible()
 
-    # THE BUG: no always-allow / don't-ask-again affordance exists anywhere on
-    # the card, even though agy's prompt offers it for this very step.
+    # The card must surface agy's advertised always-allow choice.
     always_allow = card.get_by_role("button", name=_ALWAYS_ALLOW_PATTERN)
-    expect(always_allow.first).to_be_visible(timeout=_MISSING_AFFORDANCE_TIMEOUT_MS)
+    expect(always_allow.first).to_be_visible(timeout=_AFFORDANCE_TIMEOUT_MS)
 
-    # Settle the parked long-poll so the hook thread finishes cleanly.
-    card.get_by_role("button", name="Reject", exact=True).click()
-    _wait_for(lambda: not _pending_elicitations(base_url, session_id))
-    if "error" in result_holder:
-        raise AssertionError(f"hook thread failed: {result_holder['error']}")
+    _reject_and_join(card, base_url, session_id, hook_thread, result_holder)
 
 
 @pytest.mark.timeout(120)
@@ -195,26 +222,20 @@ def test_agy_permission_card_shows_action_description(
 ) -> None:
     """The card must show agy's action description, not just the raw command.
 
-    agy's TUI prompt describes what it wants to do ("Running pwd command");
-    the web card must capture that context so the approver sees the same
-    prompt the terminal shows. A card carrying only "Antigravity wants to
-    run: pwd" has dropped the ``actionDescription`` the recorded step
-    advertises.
+    agy's TUI prompt describes what it wants to do ("Running pwd command"); the
+    web card must capture that context so the approver sees the same prompt the
+    terminal shows, rather than only "Antigravity wants to run: pwd".
     """
     base_url, session_id = seeded_session
     result_holder: dict = {}
-    _park_agy_permission_elicitation(base_url, session_id, result_holder)
+    hook_thread = _park_agy_permission_elicitation(base_url, session_id, result_holder)
 
-    card = _open_pending_agy_card(page, base_url, session_id)
+    card = _open_pending_agy_card(page, base_url, session_id, result_holder)
 
     # Sanity: the card names the gated command.
     expect(card).to_contain_text("pwd")
 
-    # THE BUG: agy's action description never reaches the card.
-    expect(card).to_contain_text("Running pwd command", timeout=_MISSING_AFFORDANCE_TIMEOUT_MS)
+    # The card must surface agy's action description.
+    expect(card).to_contain_text("Running pwd command", timeout=_AFFORDANCE_TIMEOUT_MS)
 
-    # Settle the parked long-poll so the hook thread finishes cleanly.
-    card.get_by_role("button", name="Reject", exact=True).click()
-    _wait_for(lambda: not _pending_elicitations(base_url, session_id))
-    if "error" in result_holder:
-        raise AssertionError(f"hook thread failed: {result_holder['error']}")
+    _reject_and_join(card, base_url, session_id, hook_thread, result_holder)

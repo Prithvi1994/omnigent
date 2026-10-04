@@ -1051,11 +1051,9 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
                 : undefined,
           }
         : null;
-    // The agy permission mapper stamps the prompt's action description
-    // and, when agy's own prompt offers an always-allow choice, the
-    // advertised persist pattern. Surface them so the ApprovalCard shows
-    // the same prompt the agy TUI does (description + always-allow
-    // affordance) instead of a bare binary Approve/Reject.
+    // The agy permission mapper stamps the action description and, when agy's
+    // prompt offers an always-allow choice, the advertised persist pattern.
+    // Surface both so the card shows agy's full prompt, not a bare Approve/Reject.
     const actionDescriptionRaw = p.action_description;
     const alwaysAllowPatternRaw = p.always_allow_pattern;
     const agyPermission: AgyPermission | null =
