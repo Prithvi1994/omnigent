@@ -82,8 +82,8 @@ def profile_pinned_credentials() -> Any | None:  # type: ignore[explicit-any]  #
         from databricks.sdk import credentials_provider as sdk_credentials
     except ImportError:
         return None
+    strategy = sdk_credentials.DefaultCredentials()
     try:
-        strategy = sdk_credentials.DefaultCredentials()
         # Keep the swap local to this strategy in case a release shares the list.
         providers = list(strategy._auth_providers)
         strategy._auth_providers = providers
@@ -92,10 +92,12 @@ def profile_pinned_credentials() -> Any | None:  # type: ignore[explicit-any]  #
             for position, provider in enumerate(providers)
             if provider.auth_type() == "databricks-cli"
         )
-        providers[index] = _profile_pinned_databricks_cli(sdk_credentials)
     except (AttributeError, StopIteration, TypeError):
-        _logger.debug("databricks-sdk credential chain is not customizable; using it unchanged")
+        # Degrading here reactivates the same-host bug this module fixes, so keep
+        # it visible rather than hiding a reshaped chain behind the pin.
+        _logger.info("databricks-sdk credential chain is not customizable; using it unchanged")
         return None
+    providers[index] = _profile_pinned_databricks_cli(sdk_credentials)
     return strategy
 
 
@@ -129,11 +131,13 @@ def _profile_pinned_databricks_cli(sdk_credentials: Any) -> Any:  # type: ignore
         try:
             token_source.token()
         except OSError as exc:
-            # Decline (return None) so the chain can try another provider instead
-            # of a mint error escaping; log at INFO so the real cause isn't lost
-            # behind the SDK's generic "cannot configure default credentials".
-            _logger.info("databricks-cli mint failed; skipping provider: %s", exc)
-            return None
+            # Mirror the stock strategy: only the not-signed-in case declines to
+            # the next provider; surface other mint failures so their actionable
+            # CLI message reaches the caller instead of a generic config error.
+            if "databricks OAuth is not" in str(exc):
+                _logger.debug("databricks-cli not configured; skipping provider: %s", exc)
+                return None
+            raise
 
         def headers() -> dict[str, str]:
             token = token_source.token()

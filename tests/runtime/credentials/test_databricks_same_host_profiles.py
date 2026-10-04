@@ -366,29 +366,50 @@ def test_profile_pinned_chain_mints_by_profile(
     assert ["auth", "token", "--profile", _PROFILE] in signed_in_cli.mint_invocations()
 
 
-def test_profile_pinned_chain_skips_provider_when_mint_fails(
+def test_profile_pinned_chain_surfaces_actionable_mint_error(
+    host_minting_sdk: _SignedInCli, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mint failure other than "not signed in" keeps its actionable cause.
+
+    Mirroring the stock strategy, the pinned step declines only the not-signed-in
+    case and re-raises the rest, so a revoked-token error reaches the caller with
+    its ``databricks auth login`` hint instead of the SDK's generic config error.
+    """
+    from databricks.sdk import credentials_provider as sdk_credentials
+
+    def raise_actionable(self: object) -> None:
+        raise OSError("cannot get access token: run `databricks auth login`")
+
+    monkeypatch.setattr(sdk_credentials.DatabricksCliTokenSource, "token", raise_actionable)
+
+    # The eager mint runs during the pinned ``authenticate`` call; the SDK wraps
+    # the re-raised error, so the actionable CLI message survives in the result.
+    with pytest.raises(ValueError, match="databricks auth login"):
+        databricks_sdk.sdk_config(profile=_PROFILE).authenticate()
+
+
+def test_profile_pinned_chain_declines_when_not_signed_in(
     host_minting_sdk: _SignedInCli,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A failed CLI mint is declined and logged instead of silently lost.
+    """The not-signed-in mint failure declines so the chain can continue.
 
-    A broken login makes the eager mint raise ``OSError``; the pinned step
-    returns ``None`` so the chain continues, and logs the cause at INFO rather
-    than letting the mint error escape or hiding it behind the SDK's generic
-    configuration error.
+    This is the only case the stock strategy swallows: the pinned step logs the
+    skip at DEBUG and returns ``None`` rather than raising the "not configured"
+    error itself, leaving the chain to fall through to its generic result.
     """
     from databricks.sdk import credentials_provider as sdk_credentials
 
-    def raise_mint(self: object) -> None:
-        raise OSError("databricks CLI exited 1: run `databricks auth login`")
+    def raise_not_configured(self: object) -> None:
+        raise OSError(
+            "default auth: cannot configure default credentials, "
+            "databricks OAuth is not configured for this host"
+        )
 
-    monkeypatch.setattr(sdk_credentials.DatabricksCliTokenSource, "token", raise_mint)
+    monkeypatch.setattr(sdk_credentials.DatabricksCliTokenSource, "token", raise_not_configured)
 
-    # The chain mints eagerly (at construction on older SDKs, else on
-    # ``authenticate``), so wrap the whole call: the failure surfaces as the
-    # SDK's ValueError while the pinned step logs the real cause.
     logger = "omnigent.runtime.credentials.databricks_sdk"
-    with caplog.at_level(logging.INFO, logger=logger), pytest.raises(ValueError):
+    with caplog.at_level(logging.DEBUG, logger=logger), pytest.raises(ValueError):
         databricks_sdk.sdk_config(profile=_PROFILE).authenticate()
-    assert any("mint failed" in record.getMessage() for record in caplog.records)
+    assert any("not configured" in record.getMessage() for record in caplog.records)
