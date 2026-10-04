@@ -235,6 +235,80 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("initial_model", "initial_effort", "event", "expected_model", "expected_effort"),
+    [
+        ("gpt-6-sol", "max", {"type": "model_change", "model": "gpt-5.4"}, "gpt-5.4", "xhigh"),
+        ("gpt-5.4", "medium", {"type": "effort_change", "effort": "minimal"}, "gpt-5.4", "low"),
+        ("gpt-6-sol", "medium", {"type": "effort_change", "effort": "max"}, "gpt-6-sol", "max"),
+    ],
+)
+async def test_codex_native_settings_change_clamps_and_mirrors_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    initial_model: str,
+    initial_effort: str,
+    event: dict[str, Any],
+    expected_model: str,
+    expected_effort: str,
+) -> None:
+    """Immediate picker updates validate inherited effort and save the applied settings."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    conv_id = uuid.uuid4().hex
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_home = codex_native_bridge.codex_home_for_bridge_dir(bridge_dir)
+    codex_home.mkdir(parents=True)
+    (codex_home / "config.toml").write_text(
+        f'model = "{initial_model}"\nmodel_reasoning_effort = "{initial_effort}"\n'
+    )
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_codex",
+            codex_home=str(codex_home),
+        ),
+    )
+    fake = _RecordingCodexAppServerClient("ws://127.0.0.1:43210", "effort-test")
+    fake.model_list_responses = [
+        {
+            "result": {
+                "data": [
+                    {
+                        "id": model,
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": value} for value in levels
+                        ],
+                    }
+                    for model, levels in [
+                        ("gpt-5.4", ["low", "medium", "high", "xhigh"]),
+                        ("gpt-6-sol", ["low", "medium", "high", "xhigh", "max", "ultra"]),
+                    ]
+                ],
+                "nextCursor": None,
+            }
+        }
+    ]
+    monkeypatch.setattr(codex_native_app_server, "client_for_transport", lambda *a, **kw: fake)
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native", model=initial_model))
+    async with _runner_client(app) as client:
+        create = await client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": uuid.uuid4().hex}
+        )
+        assert create.status_code == 201, create.text
+        response = await client.post(f"/v1/sessions/{conv_id}/events", json=event)
+    assert response.status_code == 204, response.text
+    updates = [params for method, params in fake.requests if method == "thread/settings/update"]
+    assert len(updates) == 1
+    assert updates[0]["effort"] == expected_effort
+    assert codex_native_bridge.read_codex_config_model(bridge_dir) == expected_model
+    assert codex_native_bridge.read_codex_config_effort(bridge_dir) == expected_effort
+
+
+@pytest.mark.asyncio
 async def test_events_codex_native_plan_mode_change_preserves_developer_instructions(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

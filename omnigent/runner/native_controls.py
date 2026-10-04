@@ -255,7 +255,16 @@ def build_native_controls(
         conv_id: str,
         settings: _JsonObject,
     ) -> Response:
-        from omnigent.harnesses.codex_native.app_server import client_for_transport
+        from omnigent.harnesses.codex_native.app_server import (
+            client_for_transport,
+            resolve_codex_effort_for_model,
+        )
+        from omnigent.harnesses.codex_native.bridge import (
+            read_codex_config_effort,
+            read_codex_config_model,
+            write_codex_config_effort,
+            write_codex_config_model,
+        )
 
         if not settings:
             return Response(status_code=204)
@@ -276,8 +285,17 @@ def build_native_controls(
             state.socket_path,
             client_name="omnigent-codex-native-runner",
         )
+        bridge_dir = Path(state.codex_home).parent
+        settings = dict(settings)
         try:
             await codex_client.connect()
+            if "model" in settings or "effort" in settings:
+                model = settings.get("model") or read_codex_config_model(bridge_dir)
+                effort = settings.get("effort", read_codex_config_effort(bridge_dir))
+                if isinstance(model, str) and isinstance(effort, str):
+                    resolved = await resolve_codex_effort_for_model(codex_client, effort, model)
+                    if resolved != effort:
+                        settings["effort"] = resolved
             await codex_client.request(
                 "thread/settings/update",
                 {
@@ -306,6 +324,14 @@ def build_native_controls(
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
+        model = settings.get("model")
+        if isinstance(model, str) and not write_codex_config_model(bridge_dir, model):
+            _logger.warning("Could not mirror Codex model for session=%s", conv_id)
+        effort = settings.get("effort")
+        if isinstance(effort, str):
+            _session_reasoning_effort[conv_id] = effort
+            if not write_codex_config_effort(bridge_dir, effort):
+                _logger.warning("Could not mirror Codex effort for session=%s", conv_id)
         return Response(status_code=204)
 
     async def _codex_native_model_and_effort_for_settings_update(
