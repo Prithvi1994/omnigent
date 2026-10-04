@@ -1,3 +1,4 @@
+import { testAgent } from "@/test/agentFixtures";
 import type * as ReactRouterDomModule from "react-router-dom";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 
@@ -100,38 +101,16 @@ function setHosts(hosts: Host[]): void {
 // SDK targets plus same-family native (claude-native) and hide the
 // cross-family native target (codex-native).
 const AVAILABLE_AGENTS: AvailableAgent[] = [
-  {
-    id: "ag_claude_sdk",
-    name: "claude",
-    display_name: "Claude",
-    description: null,
-    harness: "claude-sdk",
-    skills: [],
-  },
-  {
-    id: "ag_claude_native",
-    name: "claude-native-ui",
+  testAgent("ag_claude_sdk", "claude", { display_name: "Claude", harness: "claude-sdk" }),
+  testAgent("ag_claude_native", "claude-native-ui", {
     display_name: "Claude Code",
-    description: null,
     harness: "claude-native",
-    skills: [],
-  },
-  {
-    id: "ag_codex_native",
-    name: "codex-native-ui",
+  }),
+  testAgent("ag_codex_native", "codex-native-ui", {
     display_name: "Codex",
-    description: null,
     harness: "codex-native",
-    skills: [],
-  },
-  {
-    id: "ag_openai",
-    name: "gpt",
-    display_name: "GPT",
-    description: null,
-    harness: "openai-agents",
-    skills: [],
-  },
+  }),
+  testAgent("ag_openai", "gpt", { display_name: "GPT", harness: "openai-agents" }),
 ];
 
 function setAgents(available: AvailableAgent[], sourceHarness: string | null): void {
@@ -447,14 +426,10 @@ describe("ForkSessionDialog", () => {
     // source"). Source here is databricks_coding_agent (openai-agents).
     const agents = [
       ...AVAILABLE_AGENTS,
-      {
-        id: "ag_dbx",
-        name: "databricks_coding_agent",
+      testAgent("ag_dbx", "databricks_coding_agent", {
         display_name: "databricks_coding_agent",
-        description: null,
         harness: "openai-agents",
-        skills: [],
-      },
+      }),
     ];
     setAgents(agents, "openai-agents");
     useSessionAgentMock.mockReturnValue({
@@ -531,22 +506,14 @@ describe("ForkSessionDialog", () => {
     // where the fork-only preamble target (opencode) is hidden.
     setAgents(
       [
-        {
-          id: "ag_opencode",
-          name: "opencode-native-ui",
+        testAgent("ag_opencode", "opencode-native-ui", {
           display_name: "OpenCode",
-          description: null,
           harness: "opencode-native",
-          skills: [],
-        },
-        {
-          id: "ag_hermes",
-          name: "hermes-native-ui",
+        }),
+        testAgent("ag_hermes", "hermes-native-ui", {
           display_name: "Hermes",
-          description: null,
           harness: "hermes-native",
-          skills: [],
-        },
+        }),
       ],
       "claude-sdk",
     );
@@ -561,15 +528,11 @@ describe("ForkSessionDialog", () => {
     // Custom agents discovered from session scans start with harness=null and
     // a sessionId. Without eager prefetch, forkTargetCarriesHistory(null)
     // returns false and they never appear in the fork picker.
-    const customAgent: AvailableAgent = {
-      id: "ag_custom",
-      name: "my-agent",
+    const customAgent: AvailableAgent = testAgent("ag_custom", "my-agent", {
       display_name: "My Agent",
-      description: null,
       harness: null,
-      skills: [],
       sessionId: "conv_custom",
-    };
+    });
     setAgents([...AVAILABLE_AGENTS, customAgent], "claude-sdk");
 
     renderDialog();
@@ -1279,6 +1242,84 @@ describe("ForkSessionDialog", () => {
       expect(launchRunnerMock).not.toHaveBeenCalled();
       expect(checkHostDirectoryMock).not.toHaveBeenCalled();
       await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+    });
+
+    it("inherits ALL repositories from a multi-repo sandbox source", async () => {
+      // A source with several repos records them space-joined; the single
+      // URL/branch fields can't represent that, so the fork shows a read-only
+      // list and inherits every repo (workspace omitted) instead of seeding a
+      // broken URL that would grey the submit button.
+      useSessionMock.mockReturnValue({
+        session: {
+          labels: {
+            [SANDBOX_REPO_LABEL_KEY]: "https://github.com/org/api#main https://github.com/org/web",
+          },
+        },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      // A multi-repo source can only inherit all repos onto a multi-repo dest.
+      renderDialog({
+        ...CODING,
+        info: {
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "agent_sandbox",
+          sandbox_providers: ["agent_sandbox"],
+          sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
+        },
+      });
+
+      selectSandbox();
+      openAdvanced();
+      // No editable single-repo field — a read-only list of every source repo.
+      expect(screen.queryByTestId("fork-session-sandbox-repo-input")).toBeNull();
+      const readonly = screen.getByTestId("fork-session-sandbox-repos-readonly");
+      expect(readonly.textContent).toContain("api#main");
+      expect(readonly.textContent).toContain("web");
+
+      // The space-joined label no longer greys the button on a multi-repo dest.
+      const submit = screen.getByTestId("fork-session-submit") as HTMLButtonElement;
+      expect(submit.disabled).toBe(false);
+      fireEvent.click(submit);
+
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      const call = forkSessionMock.mock.calls[0][1];
+      expect(call?.sandbox?.provider).toBe("agent_sandbox");
+      // workspace omitted (undefined) → the server re-clones ALL source repos.
+      expect(call?.sandbox?.workspace).toBeUndefined();
+    });
+
+    it("blocks forking a multi-repo source onto a single-repo provider", async () => {
+      // modal is single-repo; a source with several repos can't inherit them
+      // there, so the fork is blocked in the UI (not 422'd after creation).
+      useSessionMock.mockReturnValue({
+        session: {
+          labels: {
+            [SANDBOX_REPO_LABEL_KEY]: "https://github.com/org/api#main https://github.com/org/web",
+          },
+        },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      renderDialog({
+        ...CODING,
+        info: {
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "modal",
+          sandbox_providers: ["modal"],
+          sandbox_provider_capabilities: { modal: { multi_repo: false } },
+        },
+      });
+
+      selectSandbox();
+      openAdvanced();
+      // The read-only list warns the destination can't take them, and submit
+      // is blocked rather than deferring to a server-side 422.
+      expect(screen.getByTestId("fork-session-repos-unsupported")).toBeInTheDocument();
+      expect((screen.getByTestId("fork-session-submit") as HTMLButtonElement).disabled).toBe(true);
     });
 
     it("sends an explicit null workspace when the repository is cleared", async () => {

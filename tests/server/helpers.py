@@ -879,6 +879,7 @@ async def create_test_agent(
     skills: list[dict[str, str]] | None = None,
     user: str | None = None,
     guardrails: dict[str, Any] | None = None,
+    terminals: dict[str, Any] | None = None,
     include_llm: bool = True,
     sub_agents: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -906,6 +907,8 @@ async def create_test_agent(
     :param guardrails: Optional ``guardrails:`` block for the agent
         spec (e.g. a ``cost_budget`` policy). Passed verbatim to
         :func:`build_agent_bundle`. ``None`` omits guardrails.
+    :param terminals: Optional ``terminals:`` block written verbatim
+        into the agent spec.
     :param include_llm: Whether to include the default ``llm:`` block.
         Set ``False`` for model-less harness tests.
     :param sub_agents: Optional sub-agent config dicts declared in the
@@ -924,6 +927,7 @@ async def create_test_agent(
         executor=executor,
         skills=skills,
         guardrails=guardrails,
+        terminals=terminals,
         include_llm=include_llm,
         sub_agents=sub_agents,
     )
@@ -1116,3 +1120,56 @@ def echo_runner_client() -> httpx.AsyncClient:
         base_url="http://runner.test",
         transport=httpx.MockTransport(_handler),
     )
+
+
+def websocket_scope(path: str) -> dict[str, object]:
+    """Build a minimal ASGI WebSocket scope for the host tunnel."""
+    return {
+        "type": "websocket",
+        "asgi": {"version": "3.0"},
+        "scheme": "ws",
+        "path": path,
+        "raw_path": path.encode("ascii"),
+        "query_string": b"",
+        "headers": [],
+        "client": ("127.0.0.1", 50000),
+        "server": ("testserver", 80),
+        "subprotocols": [],
+    }
+
+
+async def create_session_for_agent(client: httpx.AsyncClient, agent_id: str) -> str:
+    """
+    Create a session bound to an agent.
+
+    :param client: Test HTTP client.
+    :param agent_id: Agent to bind.
+    :returns: New session id.
+    """
+    resp = await client.post("/v1/sessions", json={"agent_id": agent_id})
+    assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
+    return resp.json()["id"]
+
+
+def policy_tool_call_request(
+    tool_name: str = "Bash",
+    arguments: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Build a ``PHASE_TOOL_CALL`` policy-evaluate request.
+
+    :param tool_name: Tool name, e.g. ``"Bash"``.
+    :param arguments: Tool arguments dict.
+    :returns: JSON body for ``POST /v1/sessions/{id}/policies/evaluate``.
+    """
+    return {
+        "event": {
+            "type": "PHASE_TOOL_CALL",
+            "target": "",
+            "data": {
+                "name": tool_name,
+                "arguments": arguments or {},
+            },
+            "context": {},
+        },
+    }
