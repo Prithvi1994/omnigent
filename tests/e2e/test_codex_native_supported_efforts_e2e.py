@@ -370,10 +370,11 @@ def test_codex_clamps_unsupported_effort(
     rig = codex_effort_rig
     offered = rig.capabilities(model)
     assert requested not in offered and expected in offered, offered
-    initial = "medium" if entry_point == "existing" else requested
+    # The picker must be corrected even when clamping leaves the native effort unchanged.
+    initial = expected if entry_point == "existing" else requested
     with _session(rig, model, initial, inherited=entry_point == "inherited") as session:
         if entry_point == "existing":
-            _assert_turn(rig, session, model, "medium")
+            _assert_turn(rig, session, model, expected)
             _json(
                 rig.api.patch(f"/v1/sessions/{session.id}", json={"reasoning_effort": requested})
             )

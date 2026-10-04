@@ -27,7 +27,7 @@ class _CodexClient:
     """Inject catalog failures at the Codex RPC boundary, below both HTTP apps."""
 
     def __init__(self) -> None:
-        self.failure = "missing_default"
+        self.failure: str | None = "missing_default"
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.catalog_entered = asyncio.Event()
         self.release_catalog: asyncio.Event | None = None
@@ -53,10 +53,23 @@ class _CodexClient:
                     raise
             return {
                 "result": {
-                    "data": [{"id": "gpt-5.4", "supportedReasoningEfforts": []}],
+                    "data": [
+                        {
+                            "id": "gpt-5.4",
+                            "defaultReasoningEffort": (
+                                None if self.failure == "missing_default" else "medium"
+                            ),
+                            "supportedReasoningEfforts": [
+                                {"reasoningEffort": effort}
+                                for effort in ("low", "medium", "high", "xhigh")
+                            ],
+                        }
+                    ],
                     "nextCursor": None,
                 }
             }
+        if self.failure is None and method == "thread/settings/update":
+            return {"result": {}}
         raise AssertionError(f"Rejected reset must not send {method}")
 
 
@@ -115,6 +128,7 @@ async def native_session(
     def capture_controls(**kwargs: Any) -> NativeControls:
         nonlocal remembered_efforts
         remembered_efforts = kwargs["_session_reasoning_effort"]
+        kwargs["server_client"] = client
         return build_native_controls(**kwargs)
 
     monkeypatch.setattr(runner_app, "build_native_controls", capture_controls)
@@ -129,6 +143,34 @@ async def native_session(
             "omnigent.server.routes.sessions._get_runner_client", AsyncMock(return_value=runner)
         )
         yield _NativeSession(session_id, store, bridge_dir, codex, remembered_efforts, runner)
+
+
+@pytest.mark.parametrize(("requested", "applied"), [("minimal", "low"), ("default", "medium")])
+async def test_successful_update_mirrors_unchanged_native_effort_without_notification(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    requested: str,
+    applied: str,
+) -> None:
+    """Codex can acknowledge unchanged settings without emitting a notification."""
+    session = native_session
+    session.codex.failure = None
+    session.store.update_conversation(session.session_id, reasoning_effort=applied)
+    session.remembered_efforts[session.session_id] = applied
+    assert bridge.write_codex_config_effort(session.bridge_dir, applied)
+
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"reasoning_effort": requested}
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["reasoning_effort"] == applied
+    assert session.remembered_efforts[session.session_id] == applied
+    assert bridge.read_codex_config_effort(session.bridge_dir) == applied
+    assert session.codex.requests[-1] == (
+        "thread/settings/update",
+        {"threadId": "thread_codex", "effort": applied},
+    )
 
 
 async def test_reset_without_current_model_rejected_before_codex_connection(

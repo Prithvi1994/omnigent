@@ -212,7 +212,7 @@ async def test_successful_catalog_discovery_is_shared_between_turn_clients(
     assert second.request.await_count == (0 if boundary == "same-server" else 1)
 
 
-@pytest.mark.parametrize("failure", ["unavailable", "malformed", "timeout"])
+@pytest.mark.parametrize("failure", ["unavailable", "malformed", "empty", "timeout"])
 async def test_live_catalog_failures_do_not_block_effort_updates(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str
 ) -> None:
@@ -221,8 +221,8 @@ async def test_live_catalog_failures_do_not_block_effort_updates(
         client.request.side_effect = app_server.CodexAppServerResponseError(
             {"code": -32601, "message": "method unavailable"}
         )
-    elif failure == "malformed":
-        client.request.return_value = {"result": {"data": None}}
+    elif failure in ("malformed", "empty"):
+        client.request.return_value = {"result": {"data": None if failure == "malformed" else []}}
     else:
 
         async def stalled(*_args: object) -> None:

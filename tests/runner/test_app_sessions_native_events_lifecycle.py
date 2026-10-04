@@ -147,6 +147,7 @@ class _RecordingCodexAppServerClient:
 async def test_events_codex_native_settings_change_uses_thread_settings_update(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
     event_payload: dict[str, Any],
     expected_params: dict[str, Any],
 ) -> None:
@@ -226,6 +227,8 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
     )
     assert fake_client.connected
     assert fake_client.closed
+    if event_payload["type"] == "effort_change":
+        assert "effort change without a known model skips validation" in caplog.text
     assert fake_client.requests == [
         ("thread/settings/update", expected_params),
     ], (

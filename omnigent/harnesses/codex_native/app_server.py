@@ -792,7 +792,7 @@ async def resolve_codex_effort_for_model(
                 list_codex_model_options(client, include_hidden=True),
                 timeout=_EFFORT_CATALOG_TIMEOUT_SECONDS,
             )
-            if transport is not None:
+            if transport is not None and catalog:
                 _effort_catalog_cache[transport] = catalog
         except Exception:  # noqa: BLE001 — discovery must not prevent a turn
             _logger.warning(

@@ -296,6 +296,11 @@ def build_native_controls(
                     "detail": "Codex effort reset requires a current model",
                 },
             )
+        if isinstance(settings.get("effort"), str) and not isinstance(model, str):
+            _logger.warning(
+                "Codex-native effort change without a known model skips validation for session=%s",
+                conv_id,
+            )
         codex_client = client_for_transport(
             state.socket_path,
             client_name="omnigent-codex-native-runner",
@@ -361,6 +366,30 @@ def build_native_controls(
             _session_reasoning_effort[conv_id] = effort
             if not write_codex_config_effort(bridge_dir, effort):
                 _logger.warning("Could not mirror Codex effort for session=%s", conv_id)
+            # Codex emits no settings notification when normalization leaves
+            # its effort unchanged, so confirm the applied value explicitly.
+            if server_client is not None:
+                try:
+                    mirrored = await server_client.post(
+                        f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}/events",
+                        json={
+                            "type": "external_reasoning_effort_change",
+                            "data": {"reasoning_effort": effort},
+                        },
+                        timeout=5.0,
+                    )
+                    if mirrored.status_code >= 400:
+                        _logger.warning(
+                            "Could not mirror applied Codex effort for session=%s: HTTP %s",
+                            conv_id,
+                            mirrored.status_code,
+                        )
+                except (httpx.HTTPError, ConnectionError):
+                    _logger.warning(
+                        "Could not mirror applied Codex effort for session=%s",
+                        conv_id,
+                        exc_info=True,
+                    )
         return Response(status_code=204)
 
     async def _codex_native_model_and_effort_for_settings_update(
