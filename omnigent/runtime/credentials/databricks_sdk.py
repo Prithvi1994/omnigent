@@ -129,10 +129,10 @@ def _profile_pinned_databricks_cli(sdk_credentials: Any) -> Any:  # type: ignore
         try:
             token_source.token()
         except OSError as exc:
-            # A failed CLI mint should let the chain fall through to the next
-            # provider, not crash callers that handle only ValueError. CLI error
-            # wording varies by release, so skip on any mint failure here.
-            _logger.debug("databricks-cli mint failed; skipping provider: %s", exc)
+            # Decline (return None) so the chain can try another provider instead
+            # of a mint error escaping; log at INFO so the real cause isn't lost
+            # behind the SDK's generic "cannot configure default credentials".
+            _logger.info("databricks-cli mint failed; skipping provider: %s", exc)
             return None
 
         def headers() -> dict[str, str]:
@@ -146,7 +146,12 @@ def _profile_pinned_databricks_cli(sdk_credentials: Any) -> Any:  # type: ignore
 
 def pin_cli_command_to_profile(cmd: list[str], profile: str | None) -> list[str]:
     """
-    Select *profile* instead of ``--host`` in a ``databricks auth token`` command.
+    Select *profile* instead of ``--host`` in an SDK-built ``auth token`` command.
+
+    This handles the fixed shapes ``DatabricksCliTokenSource`` builds, where
+    ``--host`` is a flag followed by its value and neither ``--host`` nor
+    ``--profile``/``-p`` appears as an argument *value*. It is not a general
+    argv parser for arbitrary commands.
 
     :param cmd: The SDK-built command, e.g.
         ``["databricks", "auth", "token", "--host", "https://example.databricks.com"]``.

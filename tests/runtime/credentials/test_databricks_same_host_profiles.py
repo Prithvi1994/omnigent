@@ -11,6 +11,7 @@ minted fine. Every omnigent path that resolves a named profile builds its SDK
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -363,3 +364,31 @@ def test_profile_pinned_chain_mints_by_profile(
     assert cfg.authenticate() == {"Authorization": f"Bearer tok-{_PROFILE}"}
     assert cfg.auth_type == "databricks-cli"
     assert ["auth", "token", "--profile", _PROFILE] in signed_in_cli.mint_invocations()
+
+
+def test_profile_pinned_chain_skips_provider_when_mint_fails(
+    host_minting_sdk: _SignedInCli,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed CLI mint is declined and logged instead of silently lost.
+
+    A broken login makes the eager mint raise ``OSError``; the pinned step
+    returns ``None`` so the chain continues, and logs the cause at INFO rather
+    than letting the mint error escape or hiding it behind the SDK's generic
+    configuration error.
+    """
+    from databricks.sdk import credentials_provider as sdk_credentials
+
+    def raise_mint(self: object) -> None:
+        raise OSError("databricks CLI exited 1: run `databricks auth login`")
+
+    monkeypatch.setattr(sdk_credentials.DatabricksCliTokenSource, "token", raise_mint)
+
+    # The chain mints eagerly (at construction on older SDKs, else on
+    # ``authenticate``), so wrap the whole call: the failure surfaces as the
+    # SDK's ValueError while the pinned step logs the real cause.
+    logger = "omnigent.runtime.credentials.databricks_sdk"
+    with caplog.at_level(logging.INFO, logger=logger), pytest.raises(ValueError):
+        databricks_sdk.sdk_config(profile=_PROFILE).authenticate()
+    assert any("mint failed" in record.getMessage() for record in caplog.records)
