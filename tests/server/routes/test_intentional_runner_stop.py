@@ -165,10 +165,12 @@ async def test_sweep_leaves_intent_for_a_matching_live_relay(
 
 
 @pytest.mark.parametrize("delivered", [True, False])
+@pytest.mark.parametrize("first_page_succeeds", [False, True])
 async def test_stop_uses_live_relay_binding_when_row_lookup_fails(
     family: tuple[SqlAlchemyConversationStore, dict[str, str]],
     monkeypatch: pytest.MonkeyPatch,
     delivered: bool,
+    first_page_succeeds: bool,
 ) -> None:
     store, ids = family
     gate = asyncio.Event()
@@ -178,11 +180,20 @@ async def test_stop_uses_live_relay_binding_when_row_lookup_fails(
         "runner-other", task, gate
     )
 
-    def unavailable(_runner_id, **_kwargs):
+    first_page = sorted([(ids["active"], "running"), (ids["finished"], "idle")])
+    cursors: list[str | None] = []
+    expected = {ids["parent"], ids["cold"]}
+    if first_page_succeeds:
+        expected.add(ids["active"])
+
+    def unavailable(_runner_id, *, after=None, **_kwargs):
+        cursors.append(after)
+        if first_page_succeeds and after is None:
+            return first_page
         raise RuntimeError("store temporarily unavailable")
 
     async def teardown(*_args):
-        assert set(sessions._intentional_stop_sessions) == {ids["parent"], ids["cold"]}
+        assert set(sessions._intentional_stop_sessions) == expected
         return delivered
 
     monkeypatch.setattr(store, "list_runner_session_statuses", unavailable)
@@ -192,12 +203,50 @@ async def test_stop_uses_live_relay_binding_when_row_lookup_fails(
             ids["parent"], "host", _RUNNER, None, store
         )
         assert result is delivered
-        assert set(sessions._intentional_stop_sessions) == (
-            {ids["parent"], ids["cold"]} if delivered else set()
-        )
+        assert cursors == ([None, first_page[-1][0]] if first_page_succeeds else [None])
+        assert set(sessions._intentional_stop_sessions) == (expected if delivered else set())
     finally:
         gate.set()
         await task
+
+
+async def test_child_turn_started_during_teardown_remains_a_reported_failure(
+    family: tuple[SqlAlchemyConversationStore, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """New child work is outside the stop's snapshot of already active turns."""
+    store, ids = family
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def teardown(*_args):
+        entered.set()
+        await release.wait()
+        return True
+
+    monkeypatch.setattr(sessions, "_stop_session_host_runner", teardown)
+    stop = asyncio.create_task(
+        orchestration._stop_host_runner_intentionally(ids["parent"], "host", _RUNNER, None, store)
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        child_id = ids["finished"]
+        sessions._session_status_cache[child_id] = "running"
+        release.set()
+        assert await asyncio.wait_for(stop, timeout=10)
+        error = ErrorDetail(
+            code="runner_disconnected", message="Runner disconnected unexpectedly."
+        )
+        await sessions._mark_runner_sessions_offline(
+            store.list_conversations_by_runner_id(_RUNNER), error, store
+        )
+        assert sessions._session_status_cache[ids["active"]] == "idle"
+        assert sessions._session_status_cache[child_id] == "failed"
+        persisted = sessions._last_task_error_from_labels(store.get_conversation(child_id).labels)
+        assert persisted is not None and persisted["code"] == "runner_disconnected"
+    finally:
+        release.set()
+        stop.cancel()
+        await asyncio.gather(stop, return_exceptions=True)
 
 
 async def test_stop_burst_does_not_evict_other_pending_stops(
