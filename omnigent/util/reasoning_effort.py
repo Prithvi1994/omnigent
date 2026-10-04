@@ -8,7 +8,8 @@ from types import MappingProxyType
 
 from omnigent.llms.errors import PermanentLLMError
 
-EFFORT_VALUES = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
+EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+EFFORT_VALUES = frozenset(EFFORT_ORDER)
 EFFORT_CLEAR_VALUES = frozenset({"default", "off", "reset"})
 
 # Fold a value to a canonical one, but only where the target ladder lacks it:
@@ -26,9 +27,7 @@ CODEX_EFFORTS = OPENAI_EFFORTS
 # Codex advertises per-model reasoning levels via ``model/list``. Native launch
 # and dispatch clamp incompatible pairs; accept the full vocabulary here so
 # supported ``max``/``ultra`` settings survive harness-level validation.
-CODEX_NATIVE_EFFORTS = frozenset(
-    {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
-)
+CODEX_NATIVE_EFFORTS = EFFORT_VALUES
 OPENAI_AGENTS_EFFORTS = OPENAI_EFFORTS
 GEMINI_EFFORTS = frozenset({"low", "medium", "high"})
 ANTIGRAVITY_EFFORTS = GEMINI_EFFORTS

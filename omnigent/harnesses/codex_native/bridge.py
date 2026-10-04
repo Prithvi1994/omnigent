@@ -480,6 +480,11 @@ def codex_home_for_bridge_dir(bridge_dir: Path) -> Path:
     return bridge_dir / "codex-home"
 
 
+def bridge_dir_for_codex_home(codex_home: Path) -> Path:
+    """Invert :func:`codex_home_for_bridge_dir` for a private session home."""
+    return codex_home.parent
+
+
 def read_codex_config_model(bridge_dir: Path) -> str | None:
     """
     Read the active model from this session's Codex ``config.toml``.
@@ -1320,7 +1325,7 @@ def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
     codex_home = instance.env.get("CODEX_HOME")
     if not codex_home:
         return False
-    state = read_bridge_state(Path(codex_home).parent)
+    state = read_bridge_state(bridge_dir_for_codex_home(Path(codex_home)))
     return state is not None and state.session_id == session_id
 
 

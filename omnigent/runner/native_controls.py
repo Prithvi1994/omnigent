@@ -260,6 +260,7 @@ def build_native_controls(
             resolve_codex_effort_for_model,
         )
         from omnigent.harnesses.codex_native.bridge import (
+            bridge_dir_for_codex_home,
             read_codex_config_effort,
             read_codex_config_model,
             write_codex_config_effort,
@@ -286,7 +287,7 @@ def build_native_controls(
             state.socket_path,
             client_name="omnigent-codex-native-runner",
         )
-        bridge_dir = Path(state.codex_home).parent
+        bridge_dir = bridge_dir_for_codex_home(Path(state.codex_home))
         settings = dict(settings)
         try:
             await codex_client.connect()
@@ -315,8 +316,7 @@ def build_native_controls(
                     resolved = await resolve_codex_effort_for_model(
                         codex_client, effort, model, transport=state.socket_path
                     )
-                    if resolved != effort:
-                        settings["effort"] = resolved
+                    settings["effort"] = resolved
             await codex_client.request(
                 "thread/settings/update",
                 {

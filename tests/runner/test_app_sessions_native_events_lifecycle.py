@@ -244,6 +244,14 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
         ("gpt-5.4", None, {"type": "model_change", "model": "glm-5-2"}, "glm-5-2", "medium"),
         pytest.param(
             "gpt-5.4",
+            "high",
+            {"type": "model_change", "model": "gpt-6-sol"},
+            "gpt-6-sol",
+            "high",
+            id="inherited_supported_effort",
+        ),
+        pytest.param(
+            "gpt-5.4",
             "xhigh",
             {"type": "effort_change", "effort": None},
             "gpt-5.4",
@@ -334,7 +342,8 @@ async def test_codex_native_settings_change_clamps_and_mirrors_effort(
         )
         assert create.status_code == 201, create.text
         if initial_effort is not None:
-            remembered_efforts[conv_id] = initial_effort
+            # A terminal-side pick can leave the runner's remembered choice stale.
+            remembered_efforts[conv_id] = "minimal"
         for _ in range(2):
             if "type" in event:
                 response = await client.post(f"/v1/sessions/{conv_id}/events", json=event)

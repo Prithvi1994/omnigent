@@ -101,7 +101,11 @@ from omnigent.process_logging import (
     log_once,
     redact_log_text,
 )
-from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS, clamp_effort_for_model
+from omnigent.util.reasoning_effort import (
+    CODEX_NATIVE_EFFORTS,
+    EFFORT_ORDER,
+    clamp_effort_for_model,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -114,7 +118,6 @@ CodexRequestFn = Callable[[str, CodexParams], Awaitable[CodexMessage]]
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
 _EFFORT_CATALOG_TIMEOUT_SECONDS = 2.0
 _EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS = 2.0
-_REASONING_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 # Model discovery is a best-effort side process whose callers fall back to a
 # cached or bundled catalog, so it keeps a short readiness budget.
 _CONNECT_TIMEOUT_SECONDS = 10.0
@@ -753,13 +756,13 @@ def clamp_codex_effort_for_model(
     ]
     supported = [
         value
-        for value in _REASONING_EFFORT_ORDER
+        for value in EFFORT_ORDER
         if value in advertised and clamp_effort_for_model(value, model) == value
     ]
-    if not supported or effort in supported or effort not in _REASONING_EFFORT_ORDER:
+    if not supported or effort in supported or effort not in EFFORT_ORDER:
         return effort
-    target = _REASONING_EFFORT_ORDER.index(effort)
-    resolved = min(supported, key=lambda value: abs(_REASONING_EFFORT_ORDER.index(value) - target))
+    target = EFFORT_ORDER.index(effort)
+    resolved = min(supported, key=lambda value: abs(EFFORT_ORDER.index(value) - target))
     _logger.info("Adjusted Codex reasoning effort for model %s: %s -> %s", model, effort, resolved)
     return resolved
 
@@ -778,8 +781,8 @@ async def resolve_codex_effort_for_model(
 
     A transport key lets successive turn clients share the catalog for their
     app-server. New server transports and expired entries fetch fresh rows;
-    discovery failures are never cached and retain the gateway fallback.
-    An explicit reset requires the model's advertised default because Codex
+    discovery failures are never cached. Explicit levels retain the gateway
+    fallback; resets raise without a discoverable model default because Codex
     treats a null effort in ``thread/settings/update`` as unchanged.
     """
     catalog = _effort_catalog_cache.get(transport) if transport is not None else None
