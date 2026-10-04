@@ -1,8 +1,12 @@
 from __future__ import annotations
 
-import pytest
+import io
 
-from dev.benchmarks.omnigent.compare import build_markdown, compare_reports
+import pytest
+from rich.console import Console
+
+from dev.benchmarks.omnigent import compare
+from dev.benchmarks.omnigent.compare import build_markdown, compare_reports, print_table
 
 
 def _journey(p50: list[float], p95: list[float], *, n_success: int = 100) -> dict:
@@ -20,6 +24,13 @@ def _journey(p50: list[float], p95: list[float], *, n_success: int = 100) -> dic
 
 
 _FAILED_RUN = {"n_success": 0, "n_failures": 100, "p50_ms": 0.0, "p95_ms": 0.0}
+
+
+def _stalled_interrupt(*, baseline_n: int, candidate_n: int) -> tuple[dict, dict]:
+    """A flat-p50 interrupt journey whose candidate has one slow sample per run."""
+    baseline = {"interrupt": _journey([95, 99, 101], [99.1, 99.1, 99.1], n_success=baseline_n)}
+    candidate = {"interrupt": _journey([90, 95, 98], [100, 580.8, 590], n_success=candidate_n)}
+    return {"journeys": baseline}, {"journeys": candidate}
 
 
 def test_compare_uses_run_median_to_resist_one_outlier() -> None:
@@ -67,13 +78,13 @@ def test_compare_falls_back_to_summary_for_legacy_reports() -> None:
     assert rows[0]["status"] == "regression"
 
 
-def test_small_sample_runs_gate_on_p50_only() -> None:
-    # Five samples per run make p95 the slowest sample, so a single stall in the
+@pytest.mark.parametrize(("baseline_n", "candidate_n"), [(5, 5), (100, 5), (5, 100)])
+def test_small_sample_runs_on_either_side_gate_on_p50_only(
+    baseline_n: int, candidate_n: int
+) -> None:
+    # Below 20 samples a run's p95 is its slowest sample, so one stall in the
     # median run must not fail a journey whose p50 is flat.
-    baseline = {
-        "journeys": {"interrupt": _journey([95, 99, 101], [99.1, 99.1, 99.1], n_success=5)}
-    }
-    candidate = {"journeys": {"interrupt": _journey([90, 95, 98], [100, 580.8, 590], n_success=5)}}
+    baseline, candidate = _stalled_interrupt(baseline_n=baseline_n, candidate_n=candidate_n)
 
     passed, rows = compare_reports(baseline, candidate, threshold=1.0, backend="sqlite")
 
@@ -81,6 +92,17 @@ def test_small_sample_runs_gate_on_p50_only() -> None:
     assert rows[0]["status"] == "ok"
     assert rows[0]["p95_gated"] is False
     assert rows[0]["delta_p95"] > 1.0
+
+
+def test_one_under_sampled_run_turns_off_the_p95_gate() -> None:
+    baseline = {"journeys": {"warm_turn": _journey([100, 101, 102], [120, 125, 130])}}
+    candidate = {"journeys": {"warm_turn": _journey([100, 101, 102], [300, 310, 320])}}
+    candidate["journeys"]["warm_turn"]["runs"][1]["n_success"] = 19
+
+    passed, rows = compare_reports(baseline, candidate, threshold=1.0, backend="sqlite")
+
+    assert passed
+    assert rows[0]["p95_gated"] is False
 
 
 def test_small_sample_runs_still_gate_on_p50() -> None:
@@ -107,20 +129,6 @@ def test_p95_gate_needs_twenty_samples_per_run(n_success: int, passed_expected: 
     passed, _ = compare_reports(baseline, candidate, threshold=1.0, backend="sqlite")
 
     assert passed is passed_expected
-
-
-def test_small_sample_runs_on_either_side_turn_off_the_p95_gate() -> None:
-    baseline = {
-        "journeys": {"warm_turn": _journey([100, 101, 102], [120, 125, 130], n_success=100)}
-    }
-    candidate = {
-        "journeys": {"warm_turn": _journey([100, 101, 102], [300, 310, 320], n_success=5)}
-    }
-
-    passed, rows = compare_reports(baseline, candidate, threshold=1.0, backend="sqlite")
-
-    assert passed
-    assert rows[0]["p95_gated"] is False
 
 
 def test_fully_failed_runs_do_not_enter_the_comparison() -> None:
@@ -152,10 +160,7 @@ def test_all_runs_failed_is_reported_as_skipped() -> None:
 
 
 def test_markdown_marks_ungated_p95_deltas() -> None:
-    baseline = {
-        "journeys": {"interrupt": _journey([95, 99, 101], [99.1, 99.1, 99.1], n_success=5)}
-    }
-    candidate = {"journeys": {"interrupt": _journey([90, 95, 98], [100, 580.8, 590], n_success=5)}}
+    baseline, candidate = _stalled_interrupt(baseline_n=5, candidate_n=5)
     passed, rows = compare_reports(baseline, candidate, threshold=1.0, backend="sqlite")
 
     markdown = build_markdown(rows, threshold=1.0, passed=passed)
@@ -173,3 +178,42 @@ def test_markdown_omits_the_p95_note_when_every_run_is_well_sampled() -> None:
     markdown = build_markdown(rows, threshold=1.0, passed=passed)
 
     assert "†" not in markdown
+
+
+def test_table_marks_only_ungated_p95_deltas(monkeypatch: pytest.MonkeyPatch) -> None:
+    baseline, candidate = _stalled_interrupt(baseline_n=5, candidate_n=5)
+    baseline["journeys"]["list_sessions"] = _journey([100, 101, 102], [120, 125, 130])
+    candidate["journeys"]["list_sessions"] = _journey([110, 111, 112], [125, 130, 135])
+    _, rows = compare_reports(baseline, candidate, threshold=1.0, backend="sqlite")
+    console = Console(file=io.StringIO(), width=200, force_terminal=False)
+    monkeypatch.setattr(compare, "console", console)
+
+    print_table(rows, threshold=1.0)
+
+    lines = console.file.getvalue().splitlines()
+    interrupt = next(line for line in lines if line.lstrip().startswith("interrupt"))
+    list_sessions = next(line for line in lines if line.lstrip().startswith("list_sessions"))
+    assert "+486.1%†" in interrupt
+    assert "†" not in list_sessions
+    assert any("P95 not gated" in line for line in lines)
+
+
+def test_table_highlights_only_the_gated_metric_of_a_failing_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A five-sample journey failing on p50 still shows its p95 delta, but only
+    # the p50 delta is painted red.
+    baseline = {"journeys": {"interrupt": _journey([100, 101, 102], [120, 125, 130], n_success=5)}}
+    candidate = {
+        "journeys": {"interrupt": _journey([250, 260, 270], [300, 310, 320], n_success=5)}
+    }
+    _, rows = compare_reports(baseline, candidate, threshold=1.0, backend="sqlite")
+    console = Console(file=io.StringIO(), width=200, force_terminal=True, color_system="standard")
+    monkeypatch.setattr(compare, "console", console)
+
+    print_table(rows, threshold=1.0)
+
+    output = console.file.getvalue()
+    assert "\x1b[31m+157.4%\x1b[0m" in output
+    assert "+148.0%†" in output
+    assert "\x1b[31m+148.0%" not in output

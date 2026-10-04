@@ -21,7 +21,10 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-console = Console()
+# Rich falls back to 80 columns when stdout is not a TTY (CI logs), which
+# truncates the delta columns; give the non-interactive path room.
+_NONINTERACTIVE_WIDTH = 160
+console = Console(width=None if sys.stdout.isatty() else _NONINTERACTIVE_WIDTH)
 
 # Below this many successful samples in a run, the ceil-index p95 is the slowest
 # single sample, so one stall reads as a >100% regression. Such journeys gate on
@@ -110,8 +113,9 @@ def compare_reports(
     Run-level medians drive latency comparisons so one noisy timed run cannot
     dominate a three-run report. Summary averages remain the fallback for
     legacy reports that did not retain per-run metrics. P95 gates a journey
-    only when every run has at least ``_P95_MIN_SAMPLES_PER_RUN`` successful
-    samples; below that it is the slowest sample and is reported, not gated.
+    only when every run with successful samples, on both sides, has at least
+    ``_P95_MIN_SAMPLES_PER_RUN`` of them; below that it is the slowest sample
+    and is reported, not gated.
 
     :returns: ``(passed, rows)`` where *rows* hold per-journey comparison data.
     """
@@ -258,7 +262,11 @@ def print_table(rows: list[dict], threshold: float) -> None:
         if row["status"] == "regression":
             if row["delta_p50"] is not None and row["delta_p50"] > threshold:
                 delta_p50_str = f"[red]{delta_p50_str}[/red]"
-            if row["p95_gated"] and row["delta_p95"] is not None and row["delta_p95"] > threshold:
+            if (
+                row["p95_gated"] is True
+                and row["delta_p95"] is not None
+                and row["delta_p95"] > threshold
+            ):
                 delta_p95_str = f"[red]{delta_p95_str}[/red]"
 
         table.add_row(

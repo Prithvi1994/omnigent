@@ -99,8 +99,8 @@ drift negligible (~2 ms/turn).
 
 With five samples per run, the ceil-index p95 is simply the slowest sample, so
 `compare.py` gates these journeys on run-median p50 only and reports their p95
-as an indicator (marked `†`). The p95 gate applies once every run on both sides
-has at least 20 successful samples.
+as an indicator (marked `†`). The p95 gate applies once every run with
+successful samples, on both sides, has at least 20 of them.
 
 | Journey | Operation timed |
 | --- | --- |
