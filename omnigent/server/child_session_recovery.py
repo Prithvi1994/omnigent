@@ -123,7 +123,9 @@ async def restore_active_children(
     runner_id = parent.runner_id
     if generation is None:
         generation = initializer.generation_for(runner_id, client)
-    initializer.require_generation(runner_id, client, generation)
+    if initializer.generation_for(runner_id, client) != generation:
+        _logger.info("Stopped restoring children of %s: runner tunnel changed", parent.id)
+        return
     router = get_runner_router()
     runner_owner = router.runner_owner(parent.runner_id) if router is not None else None
 
@@ -235,7 +237,9 @@ async def restore_active_children(
                     )
                     if child.runner_id != parent.runner_id:
                         return False
-                    initializer.invalidate_session(child.id)
+                    await asyncio.gather(
+                        *initializer.invalidate_session(child.id), return_exceptions=True
+                    )
                 mirrored = is_parent_owned_subagent(child)
                 if not mirrored:
                     response = await initializer.initialize(

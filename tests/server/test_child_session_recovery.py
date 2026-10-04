@@ -499,6 +499,7 @@ async def test_hung_child_does_not_block_sibling_or_its_descendants(recovery_tre
     entered = {row.id: asyncio.Event() for row in (hung, slow)}
     release = asyncio.Event()
     restored = asyncio.Event()
+    stopped: set[str] = set()
     requested = []
     relay.side_effect = lambda sid, *_: restored.set() if sid == healthy_descendant.id else None
 
@@ -507,7 +508,10 @@ async def test_hung_child_does_not_block_sibling_or_its_descendants(recovery_tre
         requested.append(sid)
         if sid in entered:
             entered[sid].set()
-            await (asyncio.Event() if sid == hung.id else release).wait()
+            try:
+                await (asyncio.Event() if sid == hung.id else release).wait()
+            finally:
+                stopped.add(sid)
         return httpx.Response(201)
 
     async with httpx.AsyncClient(
@@ -527,7 +531,8 @@ async def test_hung_child_does_not_block_sibling_or_its_descendants(recovery_tre
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             await asyncio.gather(*initializer.invalidate_runner("new"), return_exceptions=True)
-    assert not initializer._tasks
+    assert stopped == set(entered)
+    assert not initializer.invalidate_runner("new")
 
 
 @pytest.mark.asyncio
@@ -605,7 +610,7 @@ async def test_store_fanout_is_bounded_without_blocking_on_hung_initializations(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("phase", ["scan", "read", "initialize"])
+@pytest.mark.parametrize("phase", ["start", "scan", "read", "initialize"])
 async def test_replaced_tunnel_stops_child_recovery_without_error_tracebacks(
     recovery_tree: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -628,7 +633,9 @@ async def test_replaced_tunnel_stops_child_recovery_without_error_tracebacks(
         registry.connection = SimpleNamespace(generation=2)
         return result
 
-    if phase != "initialize":
+    if phase == "start":
+        registry.connection = SimpleNamespace(generation=2)
+    elif phase != "initialize":
         monkeypatch.setattr(store, method_name, read_then_replace)
 
     def respond(_: httpx.Request) -> httpx.Response:
@@ -673,3 +680,68 @@ async def test_current_tunnel_store_connection_failure_remains_visible(
         and record.exc_info[1] is failure
         for record in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_rebinding_joins_old_initialization_without_blocking_siblings(
+    recovery_tree: Any,
+) -> None:
+    store, parent, child, relay, _, initializer = recovery_tree
+    row, sibling = child(), child()
+    entered, retiring, release, retired = (asyncio.Event() for _ in range(4))
+    sibling_restored = asyncio.Event()
+    requested: set[str] = set()
+    initialized_after_retirement: list[bool] = []
+    relay.side_effect = lambda sid, *_: sibling_restored.set() if sid == sibling.id else None
+
+    async def old_response(_: httpx.Request) -> httpx.Response:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            retiring.set()
+            await release.wait()
+            retired.set()
+        return httpx.Response(201)
+
+    def new_response(request: httpx.Request) -> httpx.Response:
+        sid = json.loads(request.content)["session_id"]
+        requested.add(sid)
+        if sid == row.id:
+            initialized_after_retirement.append(retired.is_set())
+        return httpx.Response(201)
+
+    async with (
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(old_response), base_url="http://old"
+        ) as old_client,
+        httpx.AsyncClient(
+            transport=httpx.MockTransport(new_response), base_url="http://new"
+        ) as new_client,
+    ):
+        old = asyncio.create_task(initializer.initialize(row, old_client, timeout=10))
+        await asyncio.wait_for(entered.wait(), 5)
+        recovery = asyncio.create_task(
+            restore_active_children(parent, new_client, store, initializer)
+        )
+        try:
+            await asyncio.wait_for(asyncio.gather(retiring.wait(), sibling_restored.wait()), 5)
+            assert row.id not in requested
+            assert not recovery.done()
+            release.set()
+            await asyncio.wait_for(recovery, 5)
+            with pytest.raises(ConnectionError):
+                await old
+            assert requested == {row.id, sibling.id}
+            assert initialized_after_retirement == [True]
+            assert {call.args[0] for call in relay.call_args_list} == requested
+        finally:
+            release.set()
+            recovery.cancel()
+            await asyncio.gather(recovery, return_exceptions=True)
+            await asyncio.gather(
+                *initializer.invalidate_runner("old"),
+                *initializer.invalidate_runner("new"),
+                return_exceptions=True,
+            )
+            await asyncio.gather(old, return_exceptions=True)

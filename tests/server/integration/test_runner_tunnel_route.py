@@ -564,7 +564,10 @@ async def test_slow_recovery_continues_without_closing_healthy_tunnel(
 
 
 @pytest.mark.parametrize("end", ["peer", "replacement", "shutdown"])
-async def test_tunnel_end_cancels_and_joins_only_its_recovery(end: str) -> None:
+async def test_tunnel_end_cancels_and_joins_only_its_recovery(
+    end: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
     registry = TunnelRegistry()
     entered, replacement_entered = asyncio.Event(), asyncio.Event()
     cancelled: list[RunnerSession] = []
@@ -591,13 +594,13 @@ async def test_tunnel_end_cancels_and_joins_only_its_recovery(end: str) -> None:
     first = await _connect_route(app, _TUNNEL_PATH)
     second = None
     try:
-        await _send_hello(first, registry)
+        await _send_hello(first, registry, connection_id="conn-original")
         await asyncio.wait_for(entered.wait(), budget(1))
         old = registry.get(_RUNNER_ID)
         assert old is not None
         if end == "replacement":
             second = await _connect_route(app, _TUNNEL_PATH)
-            await _send_hello(second, registry)
+            await _send_hello(second, registry, connection_id="conn-replacement")
             await asyncio.wait_for(replacement_entered.wait(), budget(1))
         elif end == "shutdown":
             first.future.cancel()
@@ -619,6 +622,22 @@ async def test_tunnel_end_cancels_and_joins_only_its_recovery(end: str) -> None:
     assert not any(
         task.get_name().startswith("tunnel-") and task.get_name().endswith(f":{_RUNNER_ID}")
         for task in asyncio.all_tasks()
+    )
+    events = [
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_recovery"
+    ]
+    expected_connections = ["conn-original"]
+    if end == "replacement":
+        expected_connections.append("conn-replacement")
+    assert [(event["connection_id"], event["outcome"]) for event in events] == [
+        (connection_id, "cancelled") for connection_id in expected_connections
+    ]
+    assert all(event["runner_id"] == _RUNNER_ID for event in events)
+    assert all(
+        isinstance(event["duration_s"], (int, float)) and event["duration_s"] >= 0
+        for event in events
     )
 
 

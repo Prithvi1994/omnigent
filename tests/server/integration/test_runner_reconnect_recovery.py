@@ -103,20 +103,21 @@ async def test_multiple_slow_roots_recover_independently_with_descendants(
     all_ids = {c.id for c in (hung, slow, healthy, blocked_child, slow_child, healthy_child)}
     entered = {c.id: asyncio.Event() for c in (hung, slow, slow_child, healthy_child)}
     release = asyncio.Event()
-    requested: list[str] = []
+    hung_stopped = asyncio.Event()
+    requests: dict[str, tuple[dict[str, Any], str | None, set[str]]] = {}
 
     async def respond(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         sid = body["session_id"]
-        requested.append(sid)
-        assert all_ids <= set(relays), "initialization started before all bound streams attached"
+        requests[sid] = (body, sessions._session_status_cache.get(sid), set(relays))
         if sid in entered:
             entered[sid].set()
         if sid in (hung.id, slow.id):
-            await (asyncio.Event() if sid == hung.id else release).wait()
-        if sid in (slow_child.id, healthy_child.id):
-            assert body["session_init"]["resume_interrupted_turn"] is True
-            assert sessions._session_status_cache[sid] == "failed"
+            try:
+                await (asyncio.Event() if sid == hung.id else release).wait()
+            finally:
+                if sid == hung.id:
+                    hung_stopped.set()
         return httpx.Response(201, json={})
 
     async with _recover(app, monkeypatch, respond) as (relays, finished):
@@ -130,9 +131,15 @@ async def test_multiple_slow_roots_recover_independently_with_descendants(
         await asyncio.wait_for(entered[slow_child.id].wait(), budget(5))
         assert sessions._session_status_cache[slow.id] == "idle"
         assert sessions._session_status_cache[hung.id] == "failed"
-        assert blocked_child.id not in requested
+        assert set(requests) == all_ids - {blocked_child.id}
+        assert all(all_ids <= attached for _, _, attached in requests.values())
+        for child in (slow_child, healthy_child):
+            body, status, _ = requests[child.id]
+            assert body["session_init"]["resume_interrupted_turn"] is True
+            assert status == "failed"
         assert not finished.is_set()
-    assert not app.state.runner_session_initializer._tasks
+    assert hung_stopped.is_set()
+    assert not app.state.runner_session_initializer.invalidate_runner(_RUNNER_ID)
 
 
 async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
@@ -148,18 +155,16 @@ async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
         mirrors.append(child.id)
     loop_thread = threading.get_ident()
     real_get = store.get_conversation
-    reads = []
+    reads: list[tuple[str, int]] = []
 
     def get_conversation(sid: str, *args: Any, **kwargs: Any) -> Any:
-        assert threading.get_ident() != loop_thread, (
-            "synchronous DB read on the replica event loop"
-        )
-        reads.append(sid)
+        reads.append((sid, threading.get_ident()))
         return real_get(sid, *args, **kwargs)
 
     monkeypatch.setattr(store, "get_conversation", get_conversation)
     heartbeats: list[int] = []
     stop = asyncio.Event()
+    requests: list[str] = []
 
     async def heartbeat() -> None:
         while not stop.is_set():
@@ -167,7 +172,7 @@ async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
             await asyncio.sleep(0)
 
     async def respond(request: httpx.Request) -> httpx.Response:
-        assert json.loads(request.content)["session_id"] == parent.id
+        requests.append(json.loads(request.content)["session_id"])
         return httpx.Response(201, json={})
 
     async with _recover(app, monkeypatch, respond) as (relays, finished):
@@ -179,7 +184,9 @@ async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
             await ticker
         assert relays[0] == parent.id
         assert set(mirrors) <= set(relays)
-        assert not set(mirrors).intersection(reads)
+        assert not set(mirrors).intersection(sid for sid, _ in reads)
+        assert all(thread != loop_thread for _, thread in reads)
+        assert requests == [parent.id]
         assert any(0 < count < len(mirrors) for count in heartbeats)
         assert sessions._session_status_cache[parent.id] == "idle"
 
