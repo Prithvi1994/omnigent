@@ -8,6 +8,7 @@ import logging
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -145,14 +146,18 @@ async def test_multiple_slow_roots_recover_independently_with_descendants(
     assert not app.state.runner_session_initializer.invalidate_runner(_RUNNER_ID)
 
 
+@pytest.mark.parametrize("superseded", [False, True])
 async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
-    app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch, superseded: bool
 ) -> None:
+    import omnigent.server.app as server_app
+
     agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
     parent = _create_session(app, agent.id)
     store = app.state.runner_router._conversation_store
     mirrors = []
-    for _ in range(80):
+    batch_size = server_app._RECONNECT_BINDING_BATCH_SIZE
+    for _ in range(2 * batch_size + 1):
         child = _create_session(app, agent.id, kind="sub_agent", parent_conversation_id=parent.id)
         store.set_labels(child.id, {"omnigent.wrapper": "claude-code-native-ui-subagent"})
         mirrors.append(child.id)
@@ -161,6 +166,9 @@ async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
     real_get_many = store.get_conversations
     reads: list[tuple[str, int]] = []
     batches: list[set[str]] = []
+    attachment_batches: list[set[str]] = []
+    registry = app.state.tunnel_registry
+    registry_get = registry.get
 
     def get_conversation(sid: str, *args: Any, **kwargs: Any) -> Any:
         reads.append((sid, threading.get_ident()))
@@ -175,6 +183,24 @@ async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
     heartbeats: list[int] = []
     stop = asyncio.Event()
     requests: list[str] = []
+
+    async def read_then_replace(call: Any, *args: Any, **kwargs: Any) -> Any:
+        result = await asyncio.to_thread(call, *args, **kwargs)
+        if call == store.get_conversations and parent.id not in args[0] and not requests:
+            attachment_batches.append(set(args[0]))
+            if superseded and len(attachment_batches) == 2:
+                current = registry_get(_RUNNER_ID)
+                if current is not None:
+                    newer = replace(current, generation=current.generation + 1)
+                    # Exercise the generation check before route cancellation can stop recovery.
+                    monkeypatch.setattr(registry, "get", lambda _: newer)
+        return result
+
+    monkeypatch.setattr(
+        server_app,
+        "asyncio",
+        SimpleNamespace(**(vars(asyncio) | {"to_thread": read_then_replace})),
+    )
 
     async def heartbeat() -> None:
         while not stop.is_set():
@@ -192,15 +218,25 @@ async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
         finally:
             stop.set()
             await ticker
+            monkeypatch.setattr(registry, "get", registry_get)
         assert relays[0] == parent.id
-        assert set(mirrors) <= set(relays)
         assert not set(mirrors).intersection(sid for sid, _ in reads)
-        revalidated = [ids for ids in batches if parent.id in ids and set(mirrors) & ids]
-        assert revalidated == [{parent.id, *mirrors}]
         assert all(thread != loop_thread for _, thread in reads)
-        assert requests == [parent.id]
-        assert any(0 < count < len(mirrors) for count in heartbeats)
-        assert sessions._session_status_cache[parent.id] == "idle"
+        assert all(0 < len(ids) <= batch_size for ids in attachment_batches)
+        assert any(1 < count <= batch_size + 1 for count in heartbeats)
+        if superseded:
+            assert len(attachment_batches) == 2
+            assert set(relays) == {parent.id, *attachment_batches[0]}
+            assert requests == []
+            assert sessions._session_status_cache[parent.id] == "failed"
+        else:
+            assert len(attachment_batches) == 3
+            assert set().union(*attachment_batches) == set(mirrors)
+            assert set(mirrors) <= set(relays)
+            revalidated = [ids for ids in batches if parent.id in ids and set(mirrors) & ids]
+            assert revalidated == [{parent.id, *mirrors}]
+            assert requests == [parent.id]
+            assert sessions._session_status_cache[parent.id] == "idle"
 
 
 async def test_failed_root_init_keeps_failure_but_does_not_block_other_tree(

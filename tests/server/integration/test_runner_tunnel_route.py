@@ -1093,6 +1093,49 @@ async def test_ws_tunnel_rejects_non_hello_first_frame(app: FastAPI) -> None:
         await communicator.wait(timeout=budget(1.0))
 
 
+@pytest.mark.parametrize("end", ["disconnect", "non_hello"])
+async def test_second_connection_ending_before_hello_preserves_healthy_tunnel(end: str) -> None:
+    registry = TunnelRegistry()
+    disconnected: list[RunnerSession] = []
+
+    async def on_disconnect(_rid: str, connection: RunnerSession) -> None:
+        disconnected.append(connection)
+
+    app = FastAPI()
+    app.include_router(
+        create_runner_tunnel_router(registry, on_runner_disconnect=on_disconnect), prefix="/v1"
+    )
+    first = await _connect_route(app, _TUNNEL_PATH)
+    second = None
+    try:
+        await _send_hello(first, registry, connection_id="healthy-connection")
+        original = registry.get(_RUNNER_ID)
+        assert original is not None
+        second = await _connect_route(app, _TUNNEL_PATH)
+        if end == "disconnect":
+            await second.send_input({"type": "websocket.disconnect", "code": 1006})
+        else:
+            await second.send_input(
+                {"type": "websocket.receive", "text": encode_frame(PingFrame(ts=1))}
+            )
+            close = await second.receive_output(timeout=budget(1))
+            assert close["type"] == "websocket.close"
+            assert close["code"] == 4001
+        await asyncio.wait_for(second.future, budget(1))
+        assert registry.get(_RUNNER_ID) is original
+        assert not first.future.done()
+        assert disconnected == []
+
+        await first.send_input({"type": "websocket.disconnect", "code": 1000})
+        await asyncio.wait_for(first.future, budget(1))
+        assert disconnected == [original]
+    finally:
+        for communicator in (first, second):
+            if communicator is not None:
+                communicator.stop(exceptions=False)
+                await asyncio.gather(communicator.future, return_exceptions=True)
+
+
 async def test_ws_tunnel_route_is_not_double_prefixed(app: FastAPI) -> None:
     """The tunnel route is accepted at one ``/v1`` prefix, not two.
 
