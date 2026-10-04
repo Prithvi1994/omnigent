@@ -2,13 +2,11 @@
 
 ``sys_session_close`` historically freed a closed child's unique title
 slot by appending ``:closed:<child id>`` to its title, and the server
-still reads that marker back out of stored titles as closed state via a
-bare substring match. A sidebar rename round-trips the user's title
-verbatim through ``PATCH /v1/sessions/{id}``, so a title merely
-*containing* ``:closed:`` is read back as internal state: the display
-title is truncated at the marker, API responses synthesize
-``omnigent.closed=true``, and every later message is refused with
-``409 Session is closed`` — silently, since the rename itself succeeds.
+reads that marker back out of stored titles as closed state. A sidebar
+rename round-trips the user's title verbatim through
+``PATCH /v1/sessions/{id}``, so a title that merely *contains*
+``:closed:`` must stay user text: no truncation, no synthesized
+``omnigent.closed=true`` label, and no ``409 Session is closed``.
 
 Journey (real SPA against the live server): rename a session from the
 sidebar row kebab to ``notes about a :closed: door``, reload so the
@@ -69,9 +67,8 @@ def test_rename_with_closed_infix_preserves_title(
 ) -> None:
     """The renamed title must display and persist exactly as written.
 
-    Today the server treats everything after ``:closed:`` as a legacy
-    close marker: the row re-renders as ``notes about a`` after the
-    reload and the session snapshot returns the truncated title.
+    A substring match on ``:closed:`` would truncate the sidebar row, the
+    header and the session snapshot to ``notes about a`` after the reload.
 
     :param page: Playwright page fixture (fresh context per test).
     :param seeded_session: ``(base_url, session_id)`` for a pre-created
@@ -86,6 +83,7 @@ def test_rename_with_closed_infix_preserves_title(
     link = page.locator(f'a[href="/c/{session_id}"]')
     expect(link).to_be_visible()
     expect(link).to_contain_text(_TITLE)
+    expect(page.get_by_test_id("header-title")).to_have_text(_TITLE)
 
     snap = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
     snap.raise_for_status()
@@ -100,10 +98,9 @@ def test_rename_with_closed_infix_keeps_session_open(
 ) -> None:
     """A session renamed to a ``:closed:``-carrying title stays writable.
 
-    Today the synthesized ``omnigent.closed=true`` label disables the
-    composer ("This sub-agent session is closed") and the events route
-    refuses new messages with a 409, so the session silently stops
-    accepting input.
+    A synthesized ``omnigent.closed=true`` label would disable the composer
+    ("This sub-agent session is closed") and make the events route refuse
+    new messages with a 409.
 
     :param page: Playwright page fixture (fresh context per test).
     :param seeded_session: ``(base_url, session_id)`` for a pre-created
