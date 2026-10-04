@@ -529,8 +529,9 @@ def test_shell_command_does_not_see_omnigent_project_root(
         ("exit 0", "exited with code 0"),
         ("echo 'helper: boom' >&2\nexit 3", "exited with code 3: helper: boom"),
         ("exec >&- 2>&-\nexec sleep 30", "exited with code None"),
+        ("exec >&-\nexec sleep 30", "exited with code None"),
     ],
-    ids=["silent-exit-0", "stderr-exit-3", "alive-after-closing-pipes"],
+    ids=["silent-exit-0", "stderr-exit-3", "alive-after-closing-pipes", "alive-with-stderr-open"],
 )
 def test_helper_exit_without_reply_logs_each_attempt_with_exit_detail(
     tmp_path: Path,
@@ -544,7 +545,8 @@ def test_helper_exit_without_reply_logs_each_attempt_with_exit_detail(
     The client restarts the helper and retries once, and only the retry's
     error reaches the agent; both attempts must be logged with the exit
     detail so a broken runner can be diagnosed from the runner log. A helper
-    that closes its pipes but stays alive must not stall the request.
+    that stops replying but stays alive, with or without its stderr still
+    open, must not stall the request.
     """
     shim = tmp_path / "python-shim"
     shim.write_text(f"#!/bin/sh\nread -r _request\n{shim_exit}\n", encoding="utf-8")
@@ -552,16 +554,22 @@ def test_helper_exit_without_reply_logs_each_attempt_with_exit_detail(
     monkeypatch.setattr(sys, "executable", str(shim))
     client = _HelperProcessClient(cwd=tmp_path, shell_path="/bin/sh", sandbox=_inactive_policy())
 
+    # Capture from the module logger directly so an earlier test that turned
+    # off propagation on the ``omnigent`` logger cannot hide the records.
+    helper_logger = logging.getLogger("omnigent.inner.os_env")
+    monkeypatch.setattr(helper_logger, "propagate", False)
+    helper_logger.addHandler(caplog.handler)
     started = time.monotonic()
-    with caplog.at_level(logging.WARNING, logger="omnigent.inner.os_env"):
-        try:
+    try:
+        with caplog.at_level(logging.WARNING, logger=helper_logger.name):
             result = client.request({"op": "shell", "command": "true", "timeout": 5})
-        finally:
-            client.close()
+    finally:
+        client.close()
+        helper_logger.removeHandler(caplog.handler)
     assert time.monotonic() - started < 10
 
     assert result == {"error": f"os_env helper failed: OS environment helper {exit_detail}"}
-    records = [record for record in caplog.records if record.name == "omnigent.inner.os_env"]
+    records = [record for record in caplog.records if record.name == helper_logger.name]
     assert len(records) == 2
     for record in records:
         pid, backend, active, op, exc, _retry = record.args

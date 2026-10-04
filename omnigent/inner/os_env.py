@@ -9,16 +9,18 @@ import contextlib
 import json
 import logging
 import os
+import select
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
+from typing import IO, TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse, urlunparse
 
 from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
@@ -370,6 +372,25 @@ class OSEnvironment(ABC):
         """
 
 
+def _read_stderr_bounded(stream: IO[str], *, timeout: float, exited: bool) -> str:
+    """Collect the helper's stderr without blocking on a write end that is still open."""
+    if IS_WINDOWS:
+        # select() rejects pipes on Windows; read only once the helper has exited.
+        return stream.read().strip() if exited else ""
+    fd = stream.fileno()
+    chunks: list[bytes] = []
+    deadline = time.monotonic() + timeout
+    while (remaining := deadline - time.monotonic()) > 0:
+        readable, _, _ = select.select([fd], [], [], remaining)
+        if not readable:
+            break
+        data = os.read(fd, 65536)
+        if not data:
+            break
+        chunks.append(data)
+    return b"".join(chunks).decode("utf-8", "replace").strip()
+
+
 class _HelperProcessClient:
     """JSON-line RPC client for the sandboxed OS helper process."""
 
@@ -670,16 +691,18 @@ class _HelperProcessClient:
     def _helper_exit_detail_locked(self) -> str:
         if self._proc is None:
             return "OS environment helper exited unexpectedly"
-        stderr = ""
-        if self._proc.stderr is not None:
-            try:
-                stderr = self._proc.stderr.read().strip()
-            except Exception:  # noqa: BLE001 — stderr read is best-effort for error detail
-                stderr = ""
         try:
             returncode: int | None = self._proc.wait(timeout=0.1)
         except subprocess.TimeoutExpired:
             returncode = None
+        stderr = ""
+        if self._proc.stderr is not None:
+            try:
+                stderr = _read_stderr_bounded(
+                    self._proc.stderr, timeout=0.1, exited=returncode is not None
+                )
+            except Exception:  # noqa: BLE001 — stderr read is best-effort for error detail
+                stderr = ""
         if stderr:
             return f"OS environment helper exited with code {returncode}: {stderr}"
         return f"OS environment helper exited with code {returncode}"
