@@ -437,19 +437,20 @@ async def bridge_interaction(
                 step_index=fresh["step_index"],
                 payload=payload,
             )
-            # The RPC flipped the backend trajectory step, but the attended agy
-            # TUI keeps its OWN permission/question prompt open in parallel
-            # (live-verified — see the module note / spike doc). Type the verdict's
-            # selection into the pane so the terminal actually advances (#1200) and
-            # the next typed turn does not land in the stale prompt's buffer. The
-            # backend is already answered, so a TUI-typing failure is logged, not
-            # raised — never undo a delivered verdict over a flaky pane.
-            # Map keys against the DELIVERED gate's spec, but bind persist consent
-            # to what the user saw: a stale accept only always-allows when the
-            # delivered gate advertises the same pattern the surfaced one did.
-            keys = to_tui_selection_keys(
-                fresh["kind"], result, fresh["spec"], consented_spec=current["spec"]
-            )
+            # The RPC answered the backend step, but the attended agy TUI keeps
+            # its own prompt open in parallel. Type the verdict's selection into
+            # the pane so the next turn does not land in the stale prompt's buffer.
+            if fresh["kind"] == "permission":
+                # The on-screen menu follows the delivered gate, but persist only
+                # when its pattern matches the surfaced consent, so a stale accept
+                # can never durably grant a different command.
+                keys = to_tui_selection_keys(
+                    "permission", result, fresh["spec"], consented_spec=current["spec"]
+                )
+            else:
+                # Map an answer against the surfaced spec the RPC payload used, so
+                # the typed digit and the delivered option id cannot disagree.
+                keys = to_tui_selection_keys(fresh["kind"], result, current["spec"])
             if keys:
                 try:
                     await inject_tui(keys)

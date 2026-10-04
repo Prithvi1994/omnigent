@@ -53,7 +53,10 @@ _TRAJ = "test-trajectory-id"
 
 
 def _question_step(
-    *, step_index: int, status: str = "CORTEX_STEP_STATUS_WAITING"
+    *,
+    step_index: int,
+    status: str = "CORTEX_STEP_STATUS_WAITING",
+    options: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """
     Build a WAITING ask_question step dict at a given trajectory index.
@@ -65,6 +68,9 @@ def _question_step(
 
     :param step_index: Trajectory ``stepIndex`` for this step.
     :param status: Step status; defaults to WAITING.
+    :param options: Option id/text dicts; defaults to First=1, Second=2. A
+        fallback gate can supply a different id/text map to prove the keys and
+        the RPC payload stay bound to the same spec.
     :returns: A step dict suitable for ``pending_interaction``.
     """
     return {
@@ -75,7 +81,8 @@ def _question_step(
                 "questions": [
                     {
                         "question": "Pick one",
-                        "options": [
+                        "options": options
+                        or [
                             {"id": "1", "text": "First"},
                             {"id": "2", "text": "Second"},
                         ],
@@ -319,6 +326,39 @@ async def test_happy_path_delivers_selected_option_to_fresh_step() -> None:
     assert len(elicit_calls) == 1
     assert elicit_calls[0][0] == agy_elicitation_id(_CASCADE, _TRAJ, 3)
     # The TUI prompt was dismissed by typing the selected option id + Enter.
+    assert inject_tui.calls == [["2", "Enter"]]
+
+
+@pytest.mark.asyncio
+async def test_fallback_question_types_keys_against_the_surfaced_spec() -> None:
+    """ask_question keys follow the surfaced spec the RPC payload was built from.
+
+    The surfaced question timed out and the verdict falls back to a different
+    same-kind gate whose options reuse the ids differently ("Second" is id "1"
+    there, not "2"). The typed digit must match the option id delivered over RPC
+    (both resolved against the surfaced spec), never the fallback gate's own id.
+    """
+    pending = _pending_question(step_index=3)
+    fallback = _question_step(
+        step_index=4,
+        options=[{"id": "1", "text": "Second"}, {"id": "2", "text": "Third"}],
+    )
+    request, _ = _elicitation_returner(ElicitationResult(action="accept", content={"0": "Second"}))
+    deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder()
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([fallback]),
+        request_elicitation=request,
+        deliver=deliver,
+        inject_tui=inject_tui,
+    )
+
+    assert deliver.calls[0]["step_index"] == 4
+    assert deliver.calls[0]["payload"]["askQuestion"]["responses"][0]["selectedOptionIds"] == ["2"]
     assert inject_tui.calls == [["2", "Enter"]]
 
 

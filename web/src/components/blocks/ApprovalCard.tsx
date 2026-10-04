@@ -182,16 +182,12 @@ interface ApprovalCardProps {
   /** Codex-native MCP persistence scopes advertised by the request. */
   codexPersistModes?: CodexPersistMode[];
   /**
-   * Antigravity (agy) permission prompts only: the prompt details agy's
-   * own TUI shows. ``actionDescription`` renders as the card's context
-   * line; ``alwaysAllowPattern``, when set, grows "Allow <pattern> for
-   * this session" / "Always allow <pattern>" buttons whose accept
-   * verdicts carry ``_meta.persist`` of ``"session"`` / ``"always"``
-   * (the server types agy's own conversation-scoped or
-   * settings-persisted always-allow menu entry into the TUI).
-   * Absent/null for every other
-   * elicitation, so the affordances never appear where agy's prompt
-   * doesn't offer them.
+   * Antigravity (agy) permission details advertised by the current prompt.
+   * ``actionDescription`` renders as the card's context line;
+   * ``alwaysAllowPattern``, when set, grows the "Allow <pattern> for this
+   * session" / "Always allow <pattern>" accepts (carrying ``_meta.persist``).
+   * Null for every other elicitation, so these affordances never appear where
+   * agy's prompt does not offer them.
    */
   agyPermission?: AgyPermission | null;
   /**
@@ -284,13 +280,9 @@ export function ApprovalCard({
     // permission update back to the PermissionRequest hook.
     submit(elicitationId, "accept", { remember: true });
   };
-  const submitCodexPersist = (mode: CodexPersistMode) => {
-    submit(elicitationId, "accept", undefined, { persist: mode });
-  };
-  const submitAgyPersist = (mode: CodexPersistMode) => {
-    // Accept and take agy's own always-allow menu entry (conversation-scoped
-    // for "session", agy settings for "always") so it records its persist
-    // pattern. Same `_meta.persist` shape as the Codex persist verdicts.
+  // Codex MCP and agy always-allow accepts share the same `_meta.persist`
+  // verdict shape; the server routes each to its own persistence mechanism.
+  const submitPersist = (mode: CodexPersistMode) => {
     submit(elicitationId, "accept", undefined, { persist: mode });
   };
   const submitPlanRejection = (feedback: string) => {
@@ -393,7 +385,7 @@ export function ApprovalCard({
           <Button
             size="sm"
             variant="outline"
-            onClick={() => submitAgyPersist("session")}
+            onClick={() => submitPersist("session")}
             title={`Antigravity won't ask again for “${agyPermission.alwaysAllowPattern}” in this conversation`}
             data-testid="approval-card-agy-session-allow"
             componentId="approval.approve_session_agy"
@@ -408,7 +400,7 @@ export function ApprovalCard({
           <Button
             size="sm"
             variant="outline"
-            onClick={() => submitAgyPersist("always")}
+            onClick={() => submitPersist("always")}
             title={`Antigravity will persist always-allowing “${agyPermission.alwaysAllowPattern}” to its settings`}
             data-testid="approval-card-agy-always-allow"
             componentId="approval.approve_always_agy"
@@ -425,7 +417,7 @@ export function ApprovalCard({
         <Button
           size="sm"
           variant="outline"
-          onClick={() => submitCodexPersist("session")}
+          onClick={() => submitPersist("session")}
           componentId="approval.approve_session"
         >
           <CheckIcon className="mr-1 size-3.5" />
@@ -436,7 +428,7 @@ export function ApprovalCard({
         <Button
           size="sm"
           variant="outline"
-          onClick={() => submitCodexPersist("always")}
+          onClick={() => submitPersist("always")}
           componentId="approval.approve_always"
         >
           <CheckIcon className="mr-1 size-3.5" />
