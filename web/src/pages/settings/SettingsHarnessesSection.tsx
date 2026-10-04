@@ -520,7 +520,7 @@ function commandHint(startup: HarnessStartup): string {
       ? `From ${startup.env_var}.`
       : startup.command_source === "config"
         ? `From harness.${startup.harness}.command in ~/.omnigent/config.yaml.`
-        : `Default command "${startup.command}"; set ${startup.env_var} to override.`;
+        : `Default command "${startup.command}"; set harness.${startup.harness}.command in ~/.omnigent/config.yaml to override.`;
   const wrapper =
     startup.env_vars === null
       ? ""

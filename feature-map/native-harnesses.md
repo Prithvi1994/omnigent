@@ -28,6 +28,11 @@ implements them separately, so a fix for one harness does not reach the others.
 - `disconnect`: startup waits and active operations settle when their native
   connection ends; reconnect can receive fresh events. Distinguish a native
   CLI disconnect, a runner going offline, and a browser stream reconnect.
+- `launch-settings`: the harness's Settings tab shows, read-only, the binary a
+  launch on the selected host runs (its source: `OMNIGENT_<NAME>_PATH`,
+  `harness.<name>.command`, or the default; an `env` wrapper is unwrapped) and
+  its startup arguments, with secrets masked. An older host asks to be updated;
+  an older server hides the fields.
 
 ## How to get to it (user POV)
 
@@ -37,6 +42,11 @@ view appear in the session.
 
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
+
+**Launch settings:** with the `harness_settings_ui` release feature on, open
+Settings → Harnesses, click a configured harness's gear (or its card, then the
+Settings tab). Set `harness.<name>.command` / `args` in the host's
+`~/.omnigent/config.yaml` to change what it shows.
 
 **Interrupted session:** observe startup before the first message, a running
 turn, and Stop separately. For an offline host use the reconnect paths in

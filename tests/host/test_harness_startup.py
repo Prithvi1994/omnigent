@@ -83,14 +83,64 @@ def test_unwraps_an_env_wrapper_naming_but_not_showing_its_variables(
     assert "s3cret" not in str(startup)
 
 
-def test_shows_an_env_wrapper_it_cannot_parse_as_is(config: dict[str, object]) -> None:
-    config["harness"] = {"claude-native": {"command": "env", "args": ["-S", "isaac --"]}}
+def test_shows_an_env_wrapper_it_cannot_parse_as_is_with_secrets_masked(
+    config: dict[str, object],
+) -> None:
+    config["harness"] = {
+        "claude-native": {"command": "env", "args": ["-S", "claude --api-key synthetic-value --"]}
+    }
     startup = describe_harness_startup("claude-native")
     assert (startup["command"], startup["args"], startup["env_vars"]) == (
         "env",
-        "-S 'isaac --'",
+        "-S 'claude --api-key *** --'",
         None,
     )
+    assert "synthetic-value" not in str(startup)
+
+
+def test_env_wrapper_path_controls_resolution(tmp_path: Path, config: dict[str, object]) -> None:
+    binary = tmp_path / "claude"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    config["harness"] = {
+        "claude-native": {"command": "env", "args": [f"PATH={tmp_path}", "claude"]}
+    }
+    startup = describe_harness_startup("claude-native")
+    assert (startup["resolved_path"], startup["env_vars"]) == (str(binary), ["PATH"])
+    assert str(tmp_path) not in str({**startup, "resolved_path": None})
+
+
+def test_codex_ignores_its_env_var_like_its_web_launch(
+    config: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OMNIGENT_CODEX_PATH", "/env/codex")
+    startup = describe_harness_startup("codex-native")
+    assert (startup["command"], startup["command_source"]) == ("codex", "default")
+    config["harness"] = {"codex-native": {"command": "/cfg/codex", "args": ["--profile", "x"]}}
+    startup = describe_harness_startup("codex-native")
+    assert (startup["command"], startup["command_source"], startup["args"]) == (
+        "/cfg/codex",
+        "config",
+        "--profile x",
+    )
+
+
+def test_reports_the_legacy_env_var_that_set_the_command(
+    config: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
+    monkeypatch.setenv("HARNESS_PI_PATH", "/legacy/pi")
+    startup = describe_harness_startup("pi-native")
+    assert (startup["command"], startup["command_source"], startup["env_var"]) == (
+        "/legacy/pi",
+        "env",
+        "HARNESS_PI_PATH",
+    )
+
+
+def test_leaves_claude_continue_flag_alone(config: dict[str, object]) -> None:
+    config["harness"] = {"claude-native": {"args": ["-c", "--model=opus"]}}
+    assert describe_harness_startup("claude-native")["args"] == "-c --model=opus"
 
 
 def test_harness_without_a_cli(config: dict[str, object]) -> None:
