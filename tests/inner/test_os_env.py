@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import logging
 import os
 import shutil
+import sys
 import tracemalloc
 from pathlib import Path
 
@@ -15,8 +17,10 @@ import pytest
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import (
     _child_shell_env,
+    _HelperProcessClient,
     _project_root,
     _read_impl,
+    _run_helper,
     _shell_impl,
     build_helper_env,
     create_os_environment,
@@ -515,3 +519,58 @@ def test_shell_command_does_not_see_omnigent_project_root(
     out = result.get("stdout", "")
     assert project_entry in out
     assert str(_project_root()) not in out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shebang behaviour")
+def test_helper_exit_without_reply_logs_each_attempt_with_exit_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A helper that exits cleanly without replying leaves a runner-log trail.
+
+    The client restarts the helper and retries once, and only the retry's
+    error reaches the agent; both attempts must be logged with the exit
+    detail so a broken runner can be diagnosed from the runner log.
+    """
+    shim = tmp_path / "python-shim"
+    shim.write_text("#!/bin/sh\nread -r _request\nexit 0\n", encoding="utf-8")
+    shim.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(shim))
+    client = _HelperProcessClient(cwd=tmp_path, shell_path="/bin/sh", sandbox=_inactive_policy())
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.inner.os_env"):
+        try:
+            result = client.request({"op": "shell", "command": "true", "timeout": 5})
+        finally:
+            client.close()
+
+    assert result == {"error": "os_env helper failed: OS environment helper exited with code 0"}
+    messages = [record.getMessage() for record in caplog.records]
+    assert len(messages) == 2
+    for message in messages:
+        assert "failed on op 'shell'" in message
+        assert "exited with code 0" in message
+        assert "backend none" in message
+    assert "retrying once" in messages[0]
+    assert "retrying once" not in messages[1]
+
+
+def test_helper_reports_stdin_closed_before_any_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The helper names an empty stdin on stderr, so a reply-less exit 0 is diagnosable."""
+    config = {
+        "cwd": str(tmp_path),
+        "shell_path": "/bin/sh",
+        "sandbox": _inactive_policy().to_jsonable(),
+    }
+    monkeypatch.chdir(tmp_path)
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    assert _run_helper(config) == 0
+    assert "stdin closed before any request was received" in capsys.readouterr().err
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO('{"op": "unknown"}\n'))
+    assert _run_helper(config) == 0
+    captured = capsys.readouterr()
+    assert "error" in captured.out
+    assert captured.err == ""
