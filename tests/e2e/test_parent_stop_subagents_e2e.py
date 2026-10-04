@@ -109,7 +109,10 @@ class _Stream:
                         if self.done.is_set():
                             return
                         if line.startswith("data:"):
-                            event = json.loads(line[5:].strip())
+                            payload = line[5:].strip()
+                            if payload == "[DONE]":
+                                return
+                            event = json.loads(payload)
                             self.events.append(event)
                             self.ready.set()
         except httpx.ReadTimeout as exc:
@@ -175,6 +178,7 @@ def test_native_parent_teardown_preserves_child_outcome(
     dispatch_guard = "mcp__omnigent__sys_session_send" if harness == "claude" else tool_guard
     httpx.post(
         f"{mock_url}/mock/configure",
+        trust_env=False,
         json={
             "required_tools": [dispatch_guard],
             "key": "parent",
@@ -200,6 +204,7 @@ def test_native_parent_teardown_preserves_child_outcome(
     ).raise_for_status()
     httpx.post(
         f"{mock_url}/mock/configure",
+        trust_env=False,
         json={
             "required_tools": [tool_guard],
             "key": "child",
@@ -298,7 +303,9 @@ def test_native_parent_teardown_preserves_child_outcome(
         _wait(
             lambda: (
                 any(child_prompt in json.dumps(req) for req in get_mock_requests(mock_url))
-                and httpx.get(f"{mock_url}/gate/pending", timeout=5).json()["pending"]
+                and httpx.get(f"{mock_url}/gate/pending", timeout=5, trust_env=False).json()[
+                    "pending"
+                ]
             ),
             "native child's real model request to block",
         )

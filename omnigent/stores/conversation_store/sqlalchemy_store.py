@@ -3725,8 +3725,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                         SqlConversationMetadata.runner_id == runner_id,
                         or_(
                             SqlConversationMetadata.live_status.is_(None),
-                            SqlConversationMetadata.live_status
-                            != encode_session_live_status("failed"),
+                            SqlConversationMetadata.live_status.in_(
+                                [
+                                    encode_session_live_status("idle"),
+                                    encode_session_live_status("running"),
+                                    encode_session_live_status("waiting"),
+                                ]
+                            ),
                         ),
                     )
                     .values(live_status=encode_session_live_status("idle"))

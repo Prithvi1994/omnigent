@@ -3240,6 +3240,25 @@ def test_settle_intentionally_stopped_session_requires_current_runner(
     assert not conversation_store.settle_intentionally_stopped_session("0" * 32, "runner-stopped")
 
 
+def test_intentional_stop_preserves_unknown_live_status(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
+
+    conv = conversation_store.create_conversation(runner_id="runner-stopped")
+    metadata_key = (current_workspace_id(), conv.id)
+    with conversation_store._session_immediate("test_future_live_status") as session:
+        meta = session.get(SqlConversationMetadata, metadata_key)
+        assert meta is not None
+        meta.live_status = 32767
+
+    assert not conversation_store.settle_intentionally_stopped_session(conv.id, "runner-stopped")
+    with conversation_store._session("check_future_live_status") as session:
+        meta = session.get(SqlConversationMetadata, metadata_key)
+        assert meta is not None
+        assert meta.live_status == 32767
+
+
 def test_runner_session_status_page_uses_runner_index(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
