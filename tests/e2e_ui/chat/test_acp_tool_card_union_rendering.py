@@ -3,25 +3,20 @@
 An ACP agent reports tool results as the spec's ToolCallContent union
 (https://agentclientprotocol.com/protocol/tool-calls): a ``content`` wrapper
 holding a nested content block, or ``diff`` / ``terminal`` variants. The
-executor adapter stringifies tool payloads for transcript tool cards; when it
-doesn't recognize the union it falls back to ``json.dumps``, so the web UI's
-tool-card Output panel shows the escaped JSON wrapper instead of the tool's
-result text.
+executor adapter stringifies that list for the transcript's tool cards.
 
-These tests drive the reported journey for real: register a generic ACP agent
-(a hermetic stdio fake, same shape as
+These tests register a generic ACP agent (a hermetic stdio fake, same shape as
 ``tests/e2e_ui/files/test_files_tab_survives_acp_reply.py``) whose one turn
-reports a ``content``, a ``diff``, and a ``terminal`` tool result; send a
-message from the web composer; expand the settled turn's tool cards; and
-assert each Output panel carries readable text rather than the raw union
-JSON.
+reports a ``content``, a ``diff``, and a ``terminal`` tool result, send a
+message from the web composer, expand the settled turn's tool cards, and assert
+each Output panel shows readable text rather than the raw union JSON.
 """
 
 from __future__ import annotations
 
+import contextlib
 import gzip
 import io
-import json
 import re
 import shlex
 import subprocess
@@ -34,18 +29,17 @@ import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
+from tests._helpers.session import bind_session_runner, post_session_bundle
 from tests.e2e_ui.conftest import _ensure_runner_online
 
 _ACP_SLUG = "fake-union-agent"
 _ACP_REPLY_TEXT = "Checked the keys and updated the config."
 _CONTENT_RESULT_TEXT = "keys: ['token', 'user_id', 'expires_at', 'refresh_token']"
 
-# A minimal ACP agent speaking the Agent Client Protocol over stdio. Each
-# session/prompt reports three completed tool calls whose results use the
-# three ToolCallContent union variants (content / diff / terminal), then
-# streams one deterministic reply chunk and ends the turn. Stdlib only, so
-# any Python interpreter on the runner host can run it.
-_FAKE_ACP_AGENT = r"""
+# Minimal stdio ACP agent: each prompt reports three completed tool calls using the
+# content/diff/terminal ToolCallContent union variants, then streams one reply chunk
+# and ends the turn. Stdlib only; the fixture fills in the placeholder texts.
+_FAKE_ACP_AGENT_TEMPLATE = r"""
 import json
 import sys
 
@@ -92,10 +86,7 @@ for line in sys.stdin:
             "status": "completed",
             "content": [{
                 "type": "content",
-                "content": {
-                    "type": "text",
-                    "text": "keys: ['token', 'user_id', 'expires_at', 'refresh_token']",
-                },
+                "content": {"type": "text", "text": "__CONTENT_RESULT_TEXT__"},
             }],
         })
         update(sid, {
@@ -133,7 +124,7 @@ for line in sys.stdin:
         })
         update(sid, {
             "sessionUpdate": "agent_message_chunk",
-            "content": {"type": "text", "text": "Checked the keys and updated the config."},
+            "content": {"type": "text", "text": "__REPLY_TEXT__"},
         })
         send({"jsonrpc": "2.0", "id": mid, "result": {
             "stopReason": "end_turn",
@@ -189,14 +180,15 @@ def acp_union_session(
     :returns: ``(base_url, session_id)``.
     """
     agent_script = tmp_path / "fake_acp_union_agent.py"
-    agent_script.write_text(_FAKE_ACP_AGENT)
+    agent_script.write_text(
+        _FAKE_ACP_AGENT_TEMPLATE.replace("__CONTENT_RESULT_TEXT__", _CONTENT_RESULT_TEXT).replace(
+            "__REPLY_TEXT__", _ACP_REPLY_TEXT
+        )
+    )
     command = shlex.join([sys.executable, str(agent_script)])
 
-    create_resp = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _acp_launcher_bundle(command), "application/gzip")},
-        timeout=30.0,
+    create_resp = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", _acp_launcher_bundle(command), timeout=30.0
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
@@ -204,12 +196,7 @@ def acp_union_session(
     respawned_runner: subprocess.Popen[bytes] | None = None
     try:
         respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
-        patch_resp = httpx.patch(
-            f"{live_server}/v1/sessions/{session_id}",
-            json={"runner_id": runner_id},
-            timeout=10.0,
-        )
-        patch_resp.raise_for_status()
+        bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
         yield (live_server, session_id)
     finally:
         try:
@@ -248,9 +235,12 @@ def _reveal_tool_card(page: Page, title_pattern: re.Pattern[str]) -> Locator:
     """
     fold_trigger = page.get_by_test_id("turn-worked-fold").get_by_role("button").first
     expect(fold_trigger).to_be_visible(timeout=30_000)
-    # The fold mounts open and auto-collapses a frame later; let it settle.
-    page.wait_for_timeout(500)
+    # The fold mounts open and auto-collapses once the turn settles; wait for that
+    # collapse instead of racing it with a fixed sleep.
+    with contextlib.suppress(AssertionError):
+        expect(fold_trigger).to_have_attribute("data-state", "closed", timeout=5_000)
     _expand_if_collapsed(fold_trigger)
+    expect(fold_trigger).to_have_attribute("data-state", "open")
 
     group_trigger = page.get_by_role("button", name=re.compile(r"Called 3 tools")).first
     expect(group_trigger).to_be_visible(timeout=10_000)
@@ -263,18 +253,13 @@ def _reveal_tool_card(page: Page, title_pattern: re.Pattern[str]) -> Locator:
 
 
 def test_acp_content_union_tool_card_renders_text(
-    page: Page,
+    request: pytest.FixtureRequest,
     acp_union_session: tuple[str, str],
 ) -> None:
-    """A ``content``-variant ACP tool result renders as its inner text.
-
-    The assertion pins the correct behavior: the card's Output panel shows
-    the nested block's text, not the escaped ToolCallContent wrapper. With
-    the bug the panel shows the ``json.dumps`` of the union list, so the
-    wrapper's ``"type": "content"`` discriminator is visible and this test
-    fails.
-    """
+    """A ``content``-variant ACP tool result renders as its inner text, not the union JSON."""
     base_url, session_id = acp_union_session
+    # Request the page after the session setup so a recording starts at the journey.
+    page: Page = request.getfixturevalue("page")
     _drive_turn(page, base_url, session_id)
 
     card = _reveal_tool_card(page, re.compile("read_auth_keys"))
@@ -284,17 +269,12 @@ def test_acp_content_union_tool_card_renders_text(
 
 
 def test_acp_diff_and_terminal_union_tool_cards_render_summaries(
-    page: Page,
+    request: pytest.FixtureRequest,
     acp_union_session: tuple[str, str],
 ) -> None:
-    """``diff`` / ``terminal`` ACP tool results don't render as raw JSON.
-
-    The union's other two variants must render as readable summaries; with
-    the bug both Output panels show the ``json.dumps`` of the union list,
-    so the JSON-quoted discriminators and field names are visible and this
-    test fails.
-    """
+    """``diff`` / ``terminal`` ACP tool results render as readable summaries, not union JSON."""
     base_url, session_id = acp_union_session
+    page: Page = request.getfixturevalue("page")
     _drive_turn(page, base_url, session_id)
 
     diff_card = _reveal_tool_card(page, re.compile("apply_config_diff"))
@@ -302,6 +282,9 @@ def test_acp_diff_and_terminal_union_tool_cards_render_summaries(
     expect(diff_card.get_by_text("Output", exact=True)).to_be_visible(timeout=10_000)
     expect(terminal_card.get_by_text("Output", exact=True)).to_be_visible(timeout=10_000)
 
+    expect(diff_card).to_contain_text("diff /work/config.py (1 line)", timeout=10_000)
+    expect(diff_card).to_contain_text("timeout = 60")
+    expect(terminal_card).to_contain_text("[terminal term-1]", timeout=10_000)
     expect(diff_card).not_to_contain_text('"type": "diff"')
     expect(diff_card).not_to_contain_text('"oldText"')
     expect(terminal_card).not_to_contain_text('"terminalId"')

@@ -2777,14 +2777,21 @@ def test_stringify_tool_payload_renders_diff_and_terminal_variants() -> None:
             }
         ]
     )
-    assert "diff /work/config.py" in diff_result
-    assert "timeout = 60" in diff_result
-    assert '"oldText"' not in diff_result
+    assert diff_result == "diff /work/config.py (1 line)\ntimeout = 60\n"
+    assert _stringify_tool_payload([{"type": "diff", "newText": "a\nb\n"}]) == (
+        "diff (2 lines)\na\nb\n"
+    )
 
     assert _stringify_tool_payload([{"type": "terminal", "terminalId": "term-1"}]) == (
         "[terminal term-1]"
     )
     assert _stringify_tool_payload([{"type": "terminal"}]) == "[terminal]"
+
+    mixed = [
+        {"type": "content", "content": {"type": "text", "text": "ok"}},
+        {"type": "terminal", "terminalId": "t"},
+    ]
+    assert _stringify_tool_payload(mixed) == "ok\n[terminal t]"
 
 
 def test_stringify_tool_payload_preserves_flat_blocks_and_fallbacks() -> None:
@@ -2801,3 +2808,6 @@ def test_stringify_tool_payload_preserves_flat_blocks_and_fallbacks() -> None:
 
     non_text = [{"type": "image", "source": {"data": "..."}}]
     assert _stringify_tool_payload(non_text) == json.dumps(non_text)
+
+    foreign_wrapper = [{"type": "tool_result", "content": [{"type": "text", "text": "inner"}]}]
+    assert _stringify_tool_payload(foreign_wrapper) == json.dumps(foreign_wrapper)
