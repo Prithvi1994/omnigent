@@ -1406,7 +1406,9 @@ async def _find_existing_child_session(
         )
         title_value = child.get("title")
         session_title = title_value if isinstance(title_value, str) else None
-        if is_session_closed(labels, session_title, _optional_string(child.get("id"))):
+        if is_session_closed(
+            labels, session_title, conversation_id=_optional_string(child.get("id"))
+        ):
             continue
         return child
     return None
@@ -3185,7 +3187,9 @@ async def _send_to_existing_session(
                 ),
             }
         )
-    if is_session_closed(snap_data.get("labels"), snap_data.get("title"), target_session_id):
+    if is_session_closed(
+        snap_data.get("labels"), snap_data.get("title"), conversation_id=target_session_id
+    ):
         return json.dumps(
             {
                 "error": "session_closed",
@@ -3194,7 +3198,7 @@ async def _send_to_existing_session(
             }
         )
     display_title = title_without_closed_marker(
-        _optional_string(snap_data.get("title")), target_session_id
+        _optional_string(snap_data.get("title")), conversation_id=target_session_id
     )
     parsed = _parse_session_title(display_title, target_session_id)
     # A sys_session_create child keeps its verbatim title and has no
@@ -4694,7 +4698,7 @@ def _parse_session_title(
         ends with, so the suffix is stripped for display.
     :returns: The parsed agent/title pair.
     """
-    display_title = title_without_closed_marker(raw_title, conversation_id)
+    display_title = title_without_closed_marker(raw_title, conversation_id=conversation_id)
     if not display_title or ":" not in display_title:
         return _ParsedTitle(agent=None, title=None)
     head, _, tail = display_title.partition(":")
@@ -6119,7 +6123,7 @@ def _child_rows_to_entries(
         if (
             not title
             or ":" not in title
-            or is_session_closed(labels, title, _optional_string(row.get("id")))
+            or is_session_closed(labels, title, conversation_id=_optional_string(row.get("id")))
         ):
             continue
         entries.append(

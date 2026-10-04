@@ -486,7 +486,7 @@ def _child_label(child: Conversation) -> str:
     :param child: The child :class:`Conversation`.
     :returns: A label like ``"codex/auth-refactor"``.
     """
-    title = title_without_closed_marker(child.title, child.id) or ""
+    title = title_without_closed_marker(child.title, conversation_id=child.id) or ""
     if ":" in title:
         agent, _, sa_title = title.partition(":")
         return f"{agent}/{sa_title}" if sa_title else agent

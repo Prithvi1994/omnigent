@@ -1,18 +1,10 @@
 """E2E: a user title containing ``:closed:`` must not close the session.
 
-``sys_session_close`` historically freed a closed child's unique title
-slot by appending ``:closed:<child id>`` to its title, and the server
-reads that marker back out of stored titles as closed state. A sidebar
-rename round-trips the user's title verbatim through
-``PATCH /v1/sessions/{id}``, so a title that merely *contains*
-``:closed:`` must stay user text: no truncation, no synthesized
-``omnigent.closed=true`` label, and no ``409 Session is closed``.
-
-Journey (real SPA against the live server): rename a session from the
-sidebar row kebab to ``notes about a :closed: door``, reload so the
-sidebar and session snapshot refetch server state, then keep using the
-session. Expected: the row shows the title as written and the session
-still accepts messages.
+``sys_session_close`` tombstones a closed child's title as ``:closed:<child id>``
+and the server reads that suffix back as closed state. A sidebar rename
+round-trips the user's title verbatim through ``PATCH /v1/sessions/{id}``, so a
+title that merely *contains* ``:closed:`` must stay user text: no truncation, no
+synthesized ``omnigent.closed=true`` label, and no ``409 Session is closed``.
 """
 
 from __future__ import annotations
@@ -61,14 +53,15 @@ def _rename_via_sidebar(page: Page, base_url: str, session_id: str, title: str) 
     )
 
 
-def test_rename_with_closed_infix_preserves_title(
+def test_rename_with_closed_infix_keeps_title_and_session_open(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The renamed title must display and persist exactly as written.
+    """The renamed title persists as written and the session stays writable.
 
-    A substring match on ``:closed:`` would truncate the sidebar row, the
-    header and the session snapshot to ``notes about a`` after the reload.
+    A substring match on ``:closed:`` would truncate the row, header and
+    snapshot to ``notes about a``, synthesize ``omnigent.closed=true``,
+    disable the composer and make the events route refuse messages with 409.
 
     :param page: Playwright page fixture (fresh context per test).
     :param seeded_session: ``(base_url, session_id)`` for a pre-created
@@ -77,48 +70,15 @@ def test_rename_with_closed_infix_preserves_title(
     base_url, session_id = seeded_session
     _rename_via_sidebar(page, base_url, session_id, _TITLE)
 
-    # Reload: the sidebar refetches GET /v1/sessions, so the row now
-    # renders the server's view of the title, not the optimistic paint.
+    # Reload so the sidebar and snapshot render server state, not the optimistic paint.
     page.reload()
     link = page.locator(f'a[href="/c/{session_id}"]')
     expect(link).to_be_visible()
     expect(link).to_contain_text(_TITLE)
     expect(page.get_by_test_id("header-title")).to_have_text(_TITLE)
 
-    snap = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
-    snap.raise_for_status()
-    assert snap.json().get("title") == _TITLE, (
-        f"server should return the title as written {_TITLE!r}, got {snap.json().get('title')!r}"
-    )
-
-
-def test_rename_with_closed_infix_keeps_session_open(
-    page: Page,
-    seeded_session: tuple[str, str],
-) -> None:
-    """A session renamed to a ``:closed:``-carrying title stays writable.
-
-    A synthesized ``omnigent.closed=true`` label would disable the composer
-    ("This sub-agent session is closed") and make the events route refuse
-    new messages with a 409.
-
-    :param page: Playwright page fixture (fresh context per test).
-    :param seeded_session: ``(base_url, session_id)`` for a pre-created
-        runner-bound session.
-    """
-    base_url, session_id = seeded_session
-    _rename_via_sidebar(page, base_url, session_id, _TITLE)
-
-    page.reload()
-    link = page.locator(f'a[href="/c/{session_id}"]')
-    expect(link).to_be_visible()
-    # The row text confirms the sessions list (labels included) has
-    # rendered, so the composer state below reflects server state.
-    expect(link).to_contain_text("notes about a")
-
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_editable()
-
     composer.fill(_FOLLOWUP)
     with page.expect_response(
         lambda r: (
@@ -135,7 +95,10 @@ def test_rename_with_closed_infix_keeps_session_open(
 
     snap = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
     snap.raise_for_status()
-    labels = snap.json().get("labels") or {}
-    assert labels.get(_CLOSED_LABEL) is None, (
-        f"a user rename must not mark the session closed; labels: {labels!r}"
+    body = snap.json()
+    assert body.get("title") == _TITLE, (
+        f"server should return the title as written {_TITLE!r}, got {body.get('title')!r}"
+    )
+    assert (body.get("labels") or {}).get(_CLOSED_LABEL) is None, (
+        f"a user rename must not mark the session closed; labels: {body.get('labels')!r}"
     )

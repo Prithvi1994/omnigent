@@ -1299,7 +1299,7 @@ def register_core_routes(
             # Collapse per-user pin keys for this caller (never leak another
             # user's pin key to a native harness bridge).
             labels=labels_with_closed_status(
-                _labels_for_viewer(conv.labels, user_id), conv.title, conv.id
+                _labels_for_viewer(conv.labels, user_id), conv.title, conversation_id=conv.id
             ),
         )
 

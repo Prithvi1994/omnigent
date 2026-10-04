@@ -1043,15 +1043,45 @@ async def test_closed_child_session_display_is_sanitized_and_read_only(
     assert "Session is closed" in message_resp.text
 
 
+async def test_open_child_title_containing_closed_text_is_shown_verbatim(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    An open child whose title contains ``:closed:`` keeps its display title and stays open.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    session = await _create_parent_session(client)
+    title = "researcher:notes about a :closed: door"
+    child = _seed_child(
+        conv_store=SqlAlchemyConversationStore(db_uri),
+        parent_id=session["id"],
+        title=title,
+        agent_id=session["agent_id"],
+    )
+
+    children_resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+    assert children_resp.status_code == 200
+    row = children_resp.json()["data"][0]
+    assert row["title"] == title
+    assert row["tool"] == "researcher"
+    assert row["session_name"] == "notes about a :closed: door"
+    assert CLOSED_LABEL_KEY not in row["labels"]
+
+    snapshot_resp = await client.get(f"/v1/sessions/{child.id}")
+    assert snapshot_resp.status_code == 200
+    assert snapshot_resp.json()["title"] == title
+    assert CLOSED_LABEL_KEY not in snapshot_resp.json()["labels"]
+
+
 async def test_a_user_title_containing_closed_does_not_close_the_session(
     client: httpx.AsyncClient,
 ) -> None:
-    """Renaming a session must not read as the internal closed marker.
-
-    The marker is ``":closed:<the row's own id>"``, appended by
-    ``sys_session_close``. Matching the bare substring let a rename to
-    ``"release:closed:beta"`` truncate the title, synthesize the closed label,
-    and make every later message 409, with nothing said at rename time.
+    """
+    A user title containing ``:closed:`` reads back verbatim, carries no closed
+    label and keeps accepting messages.
 
     :param client: The test HTTP client.
     """

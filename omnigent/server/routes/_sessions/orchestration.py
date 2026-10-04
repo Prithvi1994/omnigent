@@ -1029,11 +1029,11 @@ def _build_session_list_item(
         ),
         created_at=conv.created_at,
         updated_at=conv.updated_at,
-        title=title_without_closed_marker(conv.title, conv.id),
+        title=title_without_closed_marker(conv.title, conversation_id=conv.id),
         # Collapse per-user pin keys to the canonical bare key for this viewer
         # (never leak another user's pin key), then add the closed marker.
         labels=labels_with_closed_status(
-            _labels_for_viewer(conv.labels, user_id), conv.title, conv.id
+            _labels_for_viewer(conv.labels, user_id), conv.title, conversation_id=conv.id
         ),
         runner_id=conv.runner_id,
         host_id=conv.host_id,
@@ -1243,7 +1243,7 @@ def _build_session_response(
     # Collapse per-user pin keys to the canonical bare key for this viewer, so
     # the snapshot never carries another user's pin key (see _labels_for_viewer).
     labels = labels_with_closed_status(
-        _labels_for_viewer(conv.labels, viewer_id), conv.title, conv.id
+        _labels_for_viewer(conv.labels, viewer_id), conv.title, conversation_id=conv.id
     )
     # Restore terminal access for older custom native sessions. Child mirrors
     # can inherit the parent's harness without owning a terminal of their own.
@@ -1267,7 +1267,7 @@ def _build_session_response(
         background_tasks=background_tasks,
         created_at=conv.created_at,
         updated_at=conv.updated_at,
-        title=title_without_closed_marker(conv.title, conv.id),
+        title=title_without_closed_marker(conv.title, conversation_id=conv.id),
         labels=labels,
         runner_id=conv.runner_id,
         host_id=conv.host_id,

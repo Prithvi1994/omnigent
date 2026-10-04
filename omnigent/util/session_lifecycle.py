@@ -19,9 +19,7 @@ def closed_title_marker(conversation_id: str) -> str:
     return f"{CLOSED_TITLE_INFIX}{conversation_id}"
 
 
-def title_without_closed_marker(
-    title: str | None, conversation_id: str | None = None
-) -> str | None:
+def title_without_closed_marker(title: str | None, *, conversation_id: str | None) -> str | None:
     """
     Remove the legacy internal closed marker from a stored title.
 
@@ -35,26 +33,28 @@ def title_without_closed_marker(
         ``"researcher:auth:closed:conv_abc123"``.
     :param conversation_id: The row's own id, which the marker ends with. A
         title is only treated as marked when it carries that exact suffix, so a
-        user-chosen title containing ``":closed:"`` is left alone.
+        user-chosen title containing ``":closed:"`` is left alone. Pass ``None``
+        when the row's id is unknown; the title is then returned unchanged.
     :returns: Title without the closed suffix, e.g.
         ``"researcher:auth"``, or the original value when no marker
         is present.
     """
-    if title is None or conversation_id is None:
+    if title is None or not conversation_id:
         return title
     return title.removesuffix(closed_title_marker(conversation_id))
 
 
-def has_closed_title_marker(title: str | None, conversation_id: str | None = None) -> bool:
+def has_closed_title_marker(title: str | None, *, conversation_id: str | None) -> bool:
     """
     Return whether a stored title carries the legacy closed marker.
 
     :param title: Stored conversation title, e.g.
         ``"researcher:auth:closed:conv_abc123"``.
     :param conversation_id: The row's own id, which the marker ends with.
+        An unknown (``None``) id never matches.
     :returns: ``True`` when the title ends with this row's closed suffix.
     """
-    if not title or conversation_id is None:
+    if not title or not conversation_id:
         return False
     return title.endswith(closed_title_marker(conversation_id))
 
@@ -62,7 +62,8 @@ def has_closed_title_marker(title: str | None, conversation_id: str | None = Non
 def labels_with_closed_status(
     labels: Mapping[str, str] | None,
     title: str | None,
-    conversation_id: str | None = None,
+    *,
+    conversation_id: str | None,
 ) -> dict[str, str]:
     """
     Return labels augmented with the derived closed-state marker.
@@ -80,7 +81,7 @@ def labels_with_closed_status(
         added when the title marker is present.
     """
     result = dict(labels or {})
-    if has_closed_title_marker(title, conversation_id):
+    if has_closed_title_marker(title, conversation_id=conversation_id):
         result[CLOSED_LABEL_KEY] = CLOSED_LABEL_VALUE
     return result
 
@@ -88,7 +89,8 @@ def labels_with_closed_status(
 def is_session_closed(
     labels: Mapping[str, str] | None,
     title: str | None = None,
-    conversation_id: str | None = None,
+    *,
+    conversation_id: str | None,
 ) -> bool:
     """
     Return whether a session is closed to new user input.
@@ -98,11 +100,11 @@ def is_session_closed(
     :param title: Optional stored title for legacy closed rows, e.g.
         ``"researcher:auth:closed:conv_abc123"``.
     :param conversation_id: The row's own id, which the legacy marker ends
-        with. Without it only the label is consulted, so a title is never
+        with. With ``None`` only the label is consulted, so a title is never
         mistaken for internal state.
     :returns: ``True`` when the explicit label is set or the legacy
         title marker is present.
     """
     return (labels or {}).get(CLOSED_LABEL_KEY) == CLOSED_LABEL_VALUE or has_closed_title_marker(
-        title, conversation_id
+        title, conversation_id=conversation_id
     )
