@@ -3337,10 +3337,13 @@ def _refresh_effort_from_config(bridge_dir: Path, forwarder_state: _CodexForward
     with contextlib.suppress(OSError):
         config_stat = (codex_home_for_bridge_dir(bridge_dir) / "config.toml").stat()
         revision = (config_stat.st_ino, config_stat.st_mtime_ns)
-        if revision != forwarder_state.last_config_effort_revision:
+        if (
+            forwarder_state.last_config_effort_revision is not None
+            and revision != forwarder_state.last_config_effort_revision
+        ):
             # Retry a failed immediate mirror even when the effort is unchanged.
             forwarder_state.posted_effort_known = False
-            forwarder_state.last_config_effort_revision = revision
+        forwarder_state.last_config_effort_revision = revision
     # Change is detected by VALUE, not file revision, so an ABA rewrite between
     # reads (config A -> live settings B -> terminal back to A) reads as
     # "unchanged" and the live B wins. Narrow race; the next real change heals it.
