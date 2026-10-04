@@ -39,8 +39,10 @@ def sdk_config(**kwargs: Any) -> Any:  # type: ignore[explicit-any]  # SDK Confi
     """
     from databricks.sdk.config import Config
 
-    strategy = profile_pinned_credentials() if _sdk_mints_by_host() else None
-    if strategy is None or "credentials_strategy" in kwargs:
+    if "credentials_strategy" in kwargs or not kwargs.get("profile") or not _sdk_mints_by_host():
+        return Config(**kwargs)  # type: ignore[arg-type]
+    strategy = profile_pinned_credentials()
+    if strategy is None:
         return Config(**kwargs)  # type: ignore[arg-type]
     return Config(credentials_strategy=strategy, **kwargs)  # type: ignore[arg-type]
 
@@ -77,7 +79,9 @@ def profile_pinned_credentials() -> Any | None:  # type: ignore[explicit-any]  #
         return None
     try:
         strategy = sdk_credentials.DefaultCredentials()
-        providers = strategy._auth_providers
+        # Keep the swap local to this strategy in case a release shares the list.
+        providers = list(strategy._auth_providers)
+        strategy._auth_providers = providers
         index = next(
             position
             for position, provider in enumerate(providers)

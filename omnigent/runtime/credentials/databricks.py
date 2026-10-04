@@ -298,7 +298,7 @@ def _call_sdk_authenticate(profile: str | None) -> WorkspaceCreds | None:
         config invalid, non-Bearer auth scheme).
     """
     try:
-        import databricks.sdk.config  # noqa: F401 — the `databricks` extra
+        import databricks.sdk.config  # noqa: F401 - probe that the `databricks` extra is importable
     except ImportError as exc:
         # Pinned dep missing = real env bug, not routine auth failure.
         _logger.warning(
