@@ -16,6 +16,8 @@ import importlib.metadata
 import logging
 from typing import Any
 
+from packaging.version import InvalidVersion, Version
+
 _logger = logging.getLogger(__name__)
 
 # databricks-sdk mints a named profile with ``auth token --profile`` from here on.
@@ -38,23 +40,21 @@ def sdk_config(**kwargs: Any) -> Any:  # type: ignore[explicit-any]  # SDK Confi
     from databricks.sdk.config import Config
 
     strategy = profile_pinned_credentials() if _sdk_mints_by_host() else None
-    if strategy is None:
+    if strategy is None or "credentials_strategy" in kwargs:
         return Config(**kwargs)  # type: ignore[arg-type]
     return Config(credentials_strategy=strategy, **kwargs)  # type: ignore[arg-type]
 
 
 def _sdk_version() -> tuple[int, ...]:
-    """Return the installed databricks-sdk version as integers, or ``()`` when unknown."""
+    """Return the installed databricks-sdk release as integers, or ``()`` when unknown."""
     try:
         raw = importlib.metadata.version("databricks-sdk")
     except importlib.metadata.PackageNotFoundError:
         return ()
-    parts: list[int] = []
-    for piece in raw.split("."):
-        if not piece.isdigit():
-            break
-        parts.append(int(piece))
-    return tuple(parts)
+    try:
+        return Version(raw).release
+    except InvalidVersion:
+        return ()
 
 
 def _sdk_mints_by_host() -> bool:
@@ -103,7 +103,12 @@ def _profile_pinned_databricks_cli(sdk_credentials: Any) -> Any:  # type: ignore
     class _ProfileTokenSource(sdk_credentials.DatabricksCliTokenSource):  # type: ignore[misc]
         def __init__(self, cfg: Any) -> None:  # type: ignore[explicit-any]
             super().__init__(cfg)
-            self._cmd = pin_cli_command_to_profile(self._cmd, cfg.profile)
+            # The mint command only exists on the SDK releases this pins; degrade
+            # to the stock host-keyed mint if a release ever drops it.
+            if hasattr(self, "_cmd"):
+                self._cmd = pin_cli_command_to_profile(self._cmd, cfg.profile)
+            else:
+                _logger.debug("DatabricksCliTokenSource has no _cmd; minting unchanged")
 
     @sdk_credentials.oauth_credentials_strategy("databricks-cli", ["host"])
     def databricks_cli(cfg: Any) -> Any:  # type: ignore[explicit-any]

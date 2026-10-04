@@ -519,7 +519,7 @@ def _databricks_config(profile: str) -> object:
         the profile cannot be loaded.
     """
     try:
-        import databricks.sdk.config  # noqa: F401 — the `databricks` extra
+        import databricks.sdk.config  # noqa: F401 - probe that the `databricks` extra is importable
     except ImportError as exc:
         raise OmnigentError(
             "os_env.sandbox.credential_proxy type 'databricks_cli' requires the "
