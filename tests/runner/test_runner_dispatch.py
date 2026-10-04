@@ -6928,6 +6928,51 @@ async def test_session_close_patches_tombstoned_title() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_close_keeps_user_closed_text_in_rebuilt_title() -> None:
+    """
+    The rebuilt tombstone keeps ``:closed:`` user text whole and appends only
+    the target row's own suffix.
+    """
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    patched: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_target",
+                    "title": "researcher:my :closed: notes",
+                    "root_conversation_id": "conv_root",
+                    "parent_session_id": "conv_caller",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(
+                200,
+                json={"id": "conv_caller", "root_conversation_id": "conv_root"},
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_target":
+            patched.update(json.loads(request.content))
+            return httpx.Response(200, json={"id": "conv_target"})
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_close",
+                json.dumps({"conversation_id": "conv_target"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+    assert patched["title"] == "researcher:my :closed: notes:closed:conv_target"
+    assert out["agent"] == "researcher"
+    assert out["title"] == "my :closed: notes"
+
+
+@pytest.mark.asyncio
 async def test_session_close_rejects_out_of_tree_target_without_patch() -> None:
     """
     ``sys_session_close`` refuses a target in a different spawn tree and
