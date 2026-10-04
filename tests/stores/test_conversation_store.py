@@ -3208,6 +3208,9 @@ def test_list_runner_session_statuses_pages(
         assert after is None or page[-1][0] > after
         after = page[-1][0]
     assert actual == sorted(expected)
+    for invalid_limit in (0, 1001):
+        with pytest.raises(ValueError, match="limit must be between 1 and 1000"):
+            conversation_store.list_runner_session_statuses("runner-target", limit=invalid_limit)
 
 
 @pytest.mark.parametrize("status", [None, "idle", "running", "waiting", "failed"])
