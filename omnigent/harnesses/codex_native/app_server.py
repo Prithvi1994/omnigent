@@ -4432,16 +4432,19 @@ async def apply_codex_thread_effort(
     :raises Exception: If the app-server rejects the update.
     """
     client = client_for_transport(transport, client_name="omnigent-codex-native-effort")
-    await client.connect()
     try:
+        await asyncio.wait_for(client.connect(), timeout=_EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS)
         if model is None and bridge_dir is not None:
             model = read_codex_config_model(bridge_dir)
         applied_effort = await resolve_codex_effort_for_model(
             client, effort, model, transport=transport
         )
-        await client.request(
-            "thread/settings/update",
-            {"threadId": thread_id, "effort": applied_effort},
+        await asyncio.wait_for(
+            client.request(
+                "thread/settings/update",
+                {"threadId": thread_id, "effort": applied_effort},
+            ),
+            timeout=_EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS,
         )
         if bridge_dir is not None and not write_codex_config_effort(bridge_dir, applied_effort):
             _logger.warning("Failed to mirror resumed Codex reasoning effort into config.toml")

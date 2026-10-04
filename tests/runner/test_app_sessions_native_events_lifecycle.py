@@ -357,11 +357,117 @@ async def test_codex_native_settings_change_clamps_and_mirrors_effort(
                 assert result.status_code == 204
     updates = [params for method, params in fake.requests if method == "thread/settings/update"]
     assert len(updates) == 2
-    assert updates[0]["effort"] == expected_effort
+    assert all(params["effort"] == expected_effort for params in updates)
     assert sum(method == "model/list" for method, _ in fake.requests) == 1
     assert codex_native_bridge.read_codex_config_model(bridge_dir) == expected_model
     assert codex_native_bridge.read_codex_config_effort(bridge_dir) == expected_effort
     assert remembered_efforts.get(conv_id) == expected_effort
+
+
+@pytest.mark.asyncio
+async def test_codex_native_concurrent_settings_use_the_applied_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An effort pick waits for an overlapping model switch to finish mirroring."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    conv_id = uuid.uuid4().hex
+    transport = str(tmp_path / "codex.sock")
+    monkeypatch.setattr(codex_native_app_server, "_effort_catalog_cache", {})
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_home = codex_native_bridge.codex_home_for_bridge_dir(bridge_dir)
+    codex_home.mkdir(parents=True)
+    (codex_home / "config.toml").write_text(
+        'model = "gpt-6-sol"\nmodel_reasoning_effort = "max"\n'
+    )
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path=transport,
+            thread_id="thread_codex",
+            codex_home=str(codex_home),
+        ),
+    )
+    applied_model = asyncio.Event()
+    release_first_close = asyncio.Event()
+    native_settings = {"model": "gpt-6-sol", "effort": "max"}
+    updates: list[dict[str, Any]] = []
+    clients: list[_RecordingCodexAppServerClient] = []
+
+    class ConcurrentClient(_RecordingCodexAppServerClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "model/list":
+                return {
+                    "result": {
+                        "data": [
+                            {
+                                "id": model,
+                                "supportedReasoningEfforts": [
+                                    {"reasoningEffort": level} for level in levels
+                                ],
+                            }
+                            for model, levels in [
+                                ("gpt-5.4", ["low", "medium", "high", "xhigh"]),
+                                ("gpt-6-sol", ["low", "medium", "high", "xhigh", "max"]),
+                            ]
+                        ]
+                    }
+                }
+            assert method == "thread/settings/update"
+            updates.append(params)
+            native_settings.update({k: v for k, v in params.items() if k != "threadId"})
+            if "model" in params:
+                applied_model.set()
+            return {"result": {}}
+
+        async def close(self) -> None:
+            if self is clients[0]:
+                await release_first_close.wait()
+            await super().close()
+
+    def make_client(*args: object, **kwargs: object) -> ConcurrentClient:
+        result = ConcurrentClient(transport, "effort-test")
+        clients.append(result)
+        return result
+
+    monkeypatch.setattr(codex_native_app_server, "client_for_transport", make_client)
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native", model="gpt-6-sol"))
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": uuid.uuid4().hex}
+        )
+        assert created.status_code == 201, created.text
+        first = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "model_change", "model": "gpt-5.4"},
+            )
+        )
+        second: asyncio.Task[Any] | None = None
+        try:
+            await asyncio.wait_for(applied_model.wait(), timeout=2)
+            second = asyncio.create_task(
+                client.post(
+                    f"/v1/sessions/{conv_id}/events",
+                    json={"type": "effort_change", "effort": "max"},
+                )
+            )
+            await asyncio.wait({second}, timeout=0.1)
+        finally:
+            release_first_close.set()
+            tasks = [first, *([second] if second is not None else [])]
+            responses = await asyncio.wait_for(asyncio.gather(*tasks), timeout=2)
+        assert all(response.status_code == 204 for response in responses)
+    assert updates == [
+        {"threadId": "thread_codex", "model": "gpt-5.4", "effort": "xhigh"},
+        {"threadId": "thread_codex", "effort": "xhigh"},
+    ]
+    assert native_settings == {"model": "gpt-5.4", "effort": "xhigh"}
+    assert codex_native_bridge.read_codex_config_model(bridge_dir) == "gpt-5.4"
+    assert codex_native_bridge.read_codex_config_effort(bridge_dir) == "xhigh"
 
 
 @pytest.mark.asyncio

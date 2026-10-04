@@ -12,6 +12,7 @@ import dataclasses
 import logging
 import time
 import urllib.parse
+import weakref
 from collections.abc import Callable, Coroutine, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -250,8 +251,21 @@ def build_native_controls(
 
     The keyword arguments are the runner app's shared session state and helpers.
     """
+    _codex_settings_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+        weakref.WeakValueDictionary()
+    )
 
     async def _handle_codex_native_settings_update(
+        conv_id: str,
+        settings: _JsonObject,
+    ) -> Response:
+        if not settings:
+            return Response(status_code=204)
+        lock = _codex_settings_locks.setdefault(conv_id, asyncio.Lock())
+        async with lock:
+            return await _apply_codex_native_settings_update(conv_id, settings)
+
+    async def _apply_codex_native_settings_update(
         conv_id: str,
         settings: _JsonObject,
     ) -> Response:
@@ -268,8 +282,6 @@ def build_native_controls(
         )
         from omnigent.util.reasoning_effort import effort_for_model_switch
 
-        if not settings:
-            return Response(status_code=204)
         state = await _codex_native_bridge_state_for_session(conv_id, action="settings update")
         if state is None:
             # No loaded Codex bridge means nothing applied the settings; a

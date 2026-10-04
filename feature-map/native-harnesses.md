@@ -96,6 +96,9 @@ Cross-harness journeys:
   replies are mocked; models absent from the installed CLI are skipped.
   Existing-session cases also require the picker to show the applied effort
   when an unsupported request clamps back to the already active native value.
+  Concurrent runner controls are covered by
+  `tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_concurrent_settings_use_the_applied_model`
+  (component test): an overlapping effort pick uses the newly applied model.
 - **`model-and-effort`, rejected Codex reset (server/runner integration):**
   `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_reset_returns_error_and_preserves_applied_settings`,
   `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_reset_preserves_concurrent_selection_and_sibling_settings`,
@@ -113,6 +116,8 @@ Cross-harness journeys:
 - **`resume`, Codex persisted effort after a runner restart:**
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_resume_clamps_persisted_effort`
   (own environment, real Codex with mock model replies).
+  `tests/harnesses/codex_native/app_server/test_reasoning_effort.py::test_resume_effort_update_times_out_and_closes_client`
+  checks that a stalled settings connection or write cannot block resume.
 - **`chat-render`, `steer`, per harness:** use the matrix.
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm

@@ -317,3 +317,43 @@ async def test_resume_applies_and_mirrors_supported_effort(
     assert client.request.await_count == (2 if model else 1)
     client.connect.assert_awaited_once()
     client.close.assert_awaited_once()
+
+
+@pytest.mark.parametrize("stalled_phase", ["connect", "update"])
+async def test_resume_effort_update_times_out_and_closes_client(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stalled_phase: str,
+) -> None:
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    (home / "config.toml").write_text('model_reasoning_effort = "medium"\n')
+    client = AsyncMock(spec=app_server.CodexAppServerClient)
+
+    async def stalled(*args: object, **kwargs: object) -> None:
+        await asyncio.Event().wait()
+
+    if stalled_phase == "connect":
+        client.connect.side_effect = stalled
+    else:
+        client.request.side_effect = stalled
+    monkeypatch.setattr(app_server, "client_for_transport", lambda *args, **kwargs: client)
+    monkeypatch.setattr(app_server, "_EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS", 0.01)
+
+    task = asyncio.create_task(
+        app_server.apply_codex_thread_effort(
+            str(tmp_path / "app-server.sock"),
+            "thread_resumed",
+            "high",
+            bridge_dir=tmp_path,
+        )
+    )
+    done, _ = await asyncio.wait({task}, timeout=0.5)
+    if not done:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert done, f"A stalled {stalled_phase} must not block native resume"
+    with pytest.raises(TimeoutError):
+        task.result()
+    assert read_codex_config_effort(tmp_path) == "medium"
+    client.close.assert_awaited_once()
