@@ -17,6 +17,7 @@ from fastapi import FastAPI
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import Conversation
+from omnigent.server.child_session_recovery import RECOVERY_STORE_CONCURRENCY
 from omnigent.server.routes import runner_tunnel, sessions
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from tests.budgets import budget
@@ -157,13 +158,20 @@ async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
         mirrors.append(child.id)
     loop_thread = threading.get_ident()
     real_get = store.get_conversation
+    real_get_many = store.get_conversations
     reads: list[tuple[str, int]] = []
+    batches: list[set[str]] = []
 
     def get_conversation(sid: str, *args: Any, **kwargs: Any) -> Any:
         reads.append((sid, threading.get_ident()))
         return real_get(sid, *args, **kwargs)
 
+    def get_conversations(sids: list[str]) -> dict[str, Conversation]:
+        batches.append(set(sids))
+        return real_get_many(sids)
+
     monkeypatch.setattr(store, "get_conversation", get_conversation)
+    monkeypatch.setattr(store, "get_conversations", get_conversations)
     heartbeats: list[int] = []
     stop = asyncio.Event()
     requests: list[str] = []
@@ -187,6 +195,8 @@ async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
         assert relays[0] == parent.id
         assert set(mirrors) <= set(relays)
         assert not set(mirrors).intersection(sid for sid, _ in reads)
+        revalidated = [ids for ids in batches if parent.id in ids]
+        assert revalidated == [{parent.id, *mirrors}]
         assert all(thread != loop_thread for _, thread in reads)
         assert requests == [parent.id]
         assert any(0 < count < len(mirrors) for count in heartbeats)
@@ -328,7 +338,7 @@ async def test_reconnecting_trees_share_store_budget_without_waiting_for_initial
         assert requested == expected
         assert attachment_sessions == expected
         assert expected <= set(relays)
-        assert 1 < peak_reads <= 8
+        assert 1 < peak_reads <= RECOVERY_STORE_CONCURRENCY
         assert not finished.is_set()
 
 

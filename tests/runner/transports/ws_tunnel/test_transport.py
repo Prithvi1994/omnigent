@@ -11,7 +11,6 @@ import asyncio
 import httpx
 import pytest
 
-from omnigent.entities import Conversation
 from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
     ResponseBodyFrame,
@@ -23,7 +22,6 @@ from omnigent.runner.transports.ws_tunnel.transport import (
     WSTunnelTransport,
     _TunneledByteStream,
 )
-from omnigent.server.runner_session_init import RunnerSessionInitializer
 
 
 class _NoopWS:
@@ -73,39 +71,16 @@ async def test_handle_async_request_raises_connect_error_on_race() -> None:
 
 
 @pytest.mark.asyncio
-async def test_delayed_initialization_cannot_follow_a_replacement_tunnel() -> None:
-    """Even a request paused inside httpx remains pinned to its original connection."""
+async def test_handle_async_request_rejects_replaced_generation() -> None:
     reg = TunnelRegistry()
     old = reg.register("r1", _NoopWS(), _hello())
-    entered, release = asyncio.Event(), asyncio.Event()
+    transport = WSTunnelTransport(reg, "r1")
+    request = _make_request()
+    request.extensions["runner_tunnel_generation"] = old.generation
+    new = reg.register("r1", _NoopWS(), _hello())
 
-    async def delay_send(_request: httpx.Request) -> None:
-        entered.set()
-        await release.wait()
-
-    initializer = RunnerSessionInitializer(reg, server_version="test")
-    conv = Conversation(
-        id="conv_init",
-        root_conversation_id="conv_init",
-        created_at=1,
-        updated_at=1,
-        agent_id="agent_init",
-        runner_id="r1",
-    )
-    async with httpx.AsyncClient(
-        transport=WSTunnelTransport(reg, "r1"),
-        base_url="http://runner",
-        event_hooks={"request": [delay_send]},
-    ) as client:
-        init = asyncio.create_task(
-            initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)
-        )
-        await asyncio.wait_for(entered.wait(), timeout=1)
-        new = reg.register("r1", _NoopWS(), _hello())
-        assert new.generation > old.generation
-        release.set()
-        with pytest.raises(ConnectionError, match="tunnel changed"):
-            await asyncio.wait_for(init, timeout=1)
+    with pytest.raises(ConnectionError, match="before request was sent"):
+        await transport.handle_async_request(request)
     assert not new.in_flight
     assert new.outbound_queue.empty()
 

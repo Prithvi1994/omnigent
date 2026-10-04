@@ -3518,6 +3518,7 @@ def create_app(
 
         from omnigent.entities import Conversation
         from omnigent.server.child_session_recovery import (
+            RECOVERY_STORE_CONCURRENCY,
             is_parent_owned_subagent,
             restore_active_children,
         )
@@ -3547,7 +3548,7 @@ def create_app(
         convs.sort(key=lambda conv: conv.parent_conversation_id in bound_ids)
         _logger.info("_on_runner_connect: runner=%s, %d bound session(s)", runner_id, len(convs))
         roots: list[tuple[Conversation, httpx.AsyncClient]] = []
-        store_slots = asyncio.Semaphore(8)
+        store_slots = asyncio.Semaphore(RECOVERY_STORE_CONCURRENCY)
         for conv in convs:
             # Even the relay-only tail must yield so a large tree remains cancellable.
             await asyncio.sleep(0)

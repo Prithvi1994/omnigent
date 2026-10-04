@@ -15,7 +15,10 @@ import pytest
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import Conversation
-from omnigent.server.child_session_recovery import restore_active_children
+from omnigent.server.child_session_recovery import (
+    RECOVERY_STORE_CONCURRENCY,
+    restore_active_children,
+)
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -537,7 +540,7 @@ async def test_hung_child_does_not_block_sibling_or_its_descendants(recovery_tre
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("child_owner", ["owner", "other", None])
-async def test_same_runner_mirrors_check_ownership_without_conversation_reads_or_initialization(
+async def test_same_runner_mirrors_check_ownership_without_individual_reads_or_initialization(
     recovery_tree: Any,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -577,6 +580,158 @@ async def test_same_runner_mirrors_check_ownership_without_conversation_reads_or
     assert [call.args[0] for call in relay.call_args_list] == expected
     assert initialized == []
     recovered.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["rebound", "closed", "archived", "finished"])
+@pytest.mark.parametrize("phase", ["ancestor", "ownership"])
+async def test_mirror_changed_while_recovery_waits_is_not_attached(
+    recovery_tree: Any, monkeypatch: pytest.MonkeyPatch, change: str, phase: str
+) -> None:
+    store, parent, child, relay, _, initializer = recovery_tree
+    ancestor = child()
+    mirror, healthy = child(owner=ancestor), child(owner=ancestor)
+    for row in (mirror, healthy):
+        store.replace_runner_id(row.id, "new")
+        store.set_labels(row.id, {"omnigent.wrapper": "codex-native-ui-subagent"})
+    entered, release = asyncio.Event(), asyncio.Event()
+    requested: list[str] = []
+    bindings = {mirror.id: "new"}
+    relay.side_effect = lambda sid, rid, *_: bindings.update({sid: rid})
+
+    def change_mirror() -> None:
+        if change == "rebound":
+            store.replace_runner_id(mirror.id, "elsewhere")
+            bindings[mirror.id] = "elsewhere"
+        elif change == "closed":
+            store.set_labels(mirror.id, {"omnigent.closed": "true"})
+        elif change == "archived":
+            store.update_conversation(mirror.id, archived=True)
+        else:
+            store.set_session_live_status(mirror.id, "idle")
+
+    if phase == "ownership":
+        get_owner = store.get_session_owner
+
+        def change_during_ownership_lookup(sid: str, **kwargs: Any) -> str | None:
+            if sid == mirror.id:
+                change_mirror()
+            return get_owner(sid, **kwargs)
+
+        monkeypatch.setattr(store, "get_session_owner", change_during_ownership_lookup)
+        monkeypatch.setattr(
+            "omnigent.runtime.get_runner_router",
+            lambda: Mock(
+                runner_owner=lambda _: "owner", runner_is_online=lambda rid: rid == "new"
+            ),
+        )
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        requested.append(json.loads(request.content)["session_id"])
+        entered.set()
+        await release.wait()
+        return httpx.Response(201)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://runner"
+    ) as client:
+        task = asyncio.create_task(restore_active_children(parent, client, store, initializer))
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            if phase == "ancestor":
+                change_mirror()
+            release.set()
+            await asyncio.wait_for(task, 5)
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    assert requested == [ancestor.id]
+    assert {call.args[0] for call in relay.call_args_list} == {ancestor.id, healthy.id}
+    if change == "rebound":
+        assert bindings[mirror.id] == "elsewhere"
+
+
+@pytest.mark.asyncio
+async def test_mirror_lookup_failure_does_not_cancel_executable_sibling(
+    recovery_tree: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    store, parent, child, relay, _, initializer = recovery_tree
+    mirrors, executable = [child(), child()], child()
+    for mirror in mirrors:
+        store.replace_runner_id(mirror.id, "new")
+        store.set_labels(mirror.id, {"omnigent.wrapper": "codex-native-ui-subagent"})
+    get_many = store.get_conversations
+    failure = RuntimeError("mirror lookup failed")
+
+    def fail_mirror_lookup(ids: list[str]) -> dict[str, Conversation]:
+        if parent.id in ids:
+            raise failure
+        return get_many(ids)
+
+    monkeypatch.setattr(store, "get_conversations", fail_mirror_lookup)
+    requested: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requested.append(json.loads(request.content)["session_id"])
+        return httpx.Response(201)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://runner"
+    ) as client:
+        await asyncio.wait_for(restore_active_children(parent, client, store, initializer), 5)
+    assert requested == [executable.id]
+    assert [call.args[0] for call in relay.call_args_list] == [executable.id]
+    assert {
+        row.id
+        for row in mirrors
+        if any(
+            row.id in record.getMessage()
+            and record.exc_info is not None
+            and record.exc_info[1] is failure
+            for record in caplog.records
+        )
+    } == {row.id for row in mirrors}
+
+
+@pytest.mark.asyncio
+async def test_cancellation_joins_pending_mirror_revalidation(
+    recovery_tree: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server import child_session_recovery as recovery
+
+    store, parent, child, relay, _, initializer = recovery_tree
+    for _ in range(2):
+        mirror = child()
+        store.replace_runner_id(mirror.id, "new")
+        store.set_labels(mirror.id, {"omnigent.wrapper": "codex-native-ui-subagent"})
+    entered, stopped = asyncio.Event(), asyncio.Event()
+
+    async def scheduled_store_call(call: Any, *args: Any, **kwargs: Any) -> Any:
+        if call == store.get_conversations and parent.id in args[0]:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+        return await asyncio.to_thread(call, *args, **kwargs)
+
+    monkeypatch.setattr(
+        recovery,
+        "asyncio",
+        SimpleNamespace(**(vars(asyncio) | {"to_thread": scheduled_store_call})),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: pytest.fail("mirror initialized"))
+    ) as client:
+        task = asyncio.create_task(restore_active_children(parent, client, store, initializer))
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+        finally:
+            task.cancel()
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+    assert stopped.is_set()
+    relay.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -626,7 +781,7 @@ async def test_store_fanout_is_bounded_without_blocking_on_hung_initializations(
         try:
             await asyncio.wait_for(asyncio.gather(restored.wait(), all_requested.wait()), 5)
             assert requested == {row.id for row in rows}
-            assert 1 < peak_reads <= 8
+            assert 1 < peak_reads <= RECOVERY_STORE_CONCURRENCY
             assert not task.done(), "hung initialization must not occupy a store slot"
         finally:
             task.cancel()

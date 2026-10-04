@@ -19,6 +19,7 @@ from omnigent.stores.conversation_store import ConversationNotFoundError, Conver
 from omnigent.util.session_lifecycle import is_session_closed
 
 _logger = logging.getLogger(__name__)
+RECOVERY_STORE_CONCURRENCY = 8
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
 _child_recovery_locks: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScopedCache(
@@ -132,7 +133,7 @@ async def restore_active_children(
 
     # A reconnect can share this database budget across its independent trees.
     if store_slots is None:
-        store_slots = asyncio.Semaphore(8)
+        store_slots = asyncio.Semaphore(RECOVERY_STORE_CONCURRENCY)
 
     async def store_call(fn: Callable[_P, _T], /, *args: _P.args, **kwargs: _P.kwargs) -> _T:
         async with store_slots:
@@ -182,8 +183,7 @@ async def restore_active_children(
         if row.id in needed and row.parent_conversation_id in tree:
             needed.add(row.parent_conversation_id)
 
-    # Same-runner mirror subtrees need relays and ownership checks, without
-    # reloading each conversation or initializing an independent terminal.
+    # Same-runner mirror subtrees only need relays, fresh bindings, and ownership checks.
     protocol_needed = {
         row.id
         for row in tree.values()
@@ -194,23 +194,59 @@ async def restore_active_children(
             protocol_needed.add(row.parent_conversation_id)
 
     restorations: dict[str, asyncio.Task[bool]] = {}
+    mirror_batch: tuple[set[str], asyncio.Future[dict[str, Conversation]]] | None = None
+
+    async def read_mirror_batch(
+        ids: set[str], result: asyncio.Future[dict[str, Conversation]]
+    ) -> None:
+        nonlocal mirror_batch
+        await asyncio.sleep(0)
+        mirror_batch = None
+        try:
+            rows = await store_call(store.get_conversations, list(ids))
+        except Exception as error:  # noqa: BLE001 - raised by the waiting restorations.
+            if not result.done():
+                result.set_exception(error)
+        else:
+            if not result.done():
+                result.set_result(rows)
+
+    async def fresh_mirror_rows(snapshot: Conversation) -> dict[str, Conversation]:
+        nonlocal mirror_batch
+        # Coalesce mirrors that are ready after their ancestor and ownership waits.
+        if mirror_batch is None:
+            mirror_batch = (set(), asyncio.get_running_loop().create_future())
+            group.create_task(read_mirror_batch(*mirror_batch))
+        ids, result = mirror_batch
+        ids.add(snapshot.id)
+        assert snapshot.parent_conversation_id is not None
+        ids.add(snapshot.parent_conversation_id)
+        return await result
+
+    def log_restore_failure(session_id: str, level: int) -> None:
+        if initializer.generation_for(runner_id, client) != generation:
+            _logger.info("Stopped restoring child session %s: runner tunnel changed", session_id)
+        else:
+            _logger.log(level, "Failed to restore child session %s", session_id, exc_info=True)
 
     async def restore(snapshot: Conversation) -> bool:
         ancestor = restorations.get(snapshot.parent_conversation_id or "")
         if ancestor is not None and not await ancestor:
             return False
         initializer.require_generation(runner_id, client, generation)
-        if snapshot.id not in protocol_needed:
-            if not await ownership_allows(snapshot) or not _restorable(snapshot):
-                return False
-            initializer.require_generation(runner_id, client, generation)
-            _ensure_runner_relay(snapshot.id, runner_id, client, store)
-            return True
         # Re-read and initialize under one lock so competing restores share readiness.
         async with _child_recovery_locks.setdefault(snapshot.id, asyncio.Lock()):
             assert snapshot.parent_conversation_id is not None
-            owner = await store_call(store.get_conversation, snapshot.parent_conversation_id)
-            child = await store_call(store.get_conversation, snapshot.id)
+            mirror_only = snapshot.id not in protocol_needed
+            if mirror_only:
+                if not await ownership_allows(snapshot):
+                    return False
+                rows = await fresh_mirror_rows(snapshot)
+                owner = rows.get(snapshot.parent_conversation_id)
+                child = rows.get(snapshot.id)
+            else:
+                owner = await store_call(store.get_conversation, snapshot.parent_conversation_id)
+                child = await store_call(store.get_conversation, snapshot.id)
             if (
                 owner is None
                 or owner.runner_id != parent.runner_id
@@ -223,9 +259,10 @@ async def restore_active_children(
                 or is_side_chat_child(child.labels)
                 or not _restorable(child)
                 or (snapshot.id in active and not _interrupted(child))
+                or (mirror_only and not is_parent_owned_subagent(child))
             ):
                 return False
-            if not await ownership_allows(child):
+            if not mirror_only and not await ownership_allows(child):
                 return False
             initializer.require_generation(runner_id, client, generation)
             try:
@@ -263,28 +300,17 @@ async def restore_active_children(
                 # may return before a native continuation emits its first running edge.
                 return True
             except (httpx.HTTPError, ConnectionError, ConversationNotFoundError):
-                if initializer.generation_for(runner_id, client) != generation:
-                    _logger.info(
-                        "Stopped restoring child session %s: runner tunnel changed", snapshot.id
-                    )
-                else:
-                    _logger.warning(
-                        "Failed to restore child session %s", snapshot.id, exc_info=True
-                    )
+                log_restore_failure(snapshot.id, logging.WARNING)
                 return False
 
     async def restore_safely(snapshot: Conversation) -> bool:
         try:
             return await restore(snapshot)
         except ConnectionError:
-            if initializer.generation_for(runner_id, client) != generation:
-                _logger.info(
-                    "Stopped restoring child session %s: runner tunnel changed", snapshot.id
-                )
-            else:
-                _logger.exception("Failed to restore child session %s", snapshot.id)
+            log_restore_failure(snapshot.id, logging.ERROR)
             return False
         except Exception:
+            # A failed branch must not cancel sibling restoration in the TaskGroup.
             _logger.exception("Failed to restore child session %s", snapshot.id)
             return False
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -18,6 +19,8 @@ from omnigent.runner.session_init_protocol import (
     parse_runner_session_init_envelope,
 )
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store import (
@@ -527,3 +530,41 @@ async def test_replaced_connection_cannot_post_after_attachment_lookup(
         release.set()
         await asyncio.gather(init, return_exceptions=True)
     assert not client.calls
+
+
+@pytest.mark.asyncio
+async def test_delayed_initialization_cannot_follow_a_replacement_tunnel() -> None:
+    """Even a request paused inside httpx remains pinned to its original connection."""
+    reg = TunnelRegistry()
+    hello = HelloFrame(runner_version="0.1.0", frame_protocol_version=1, harnesses=[], envs=[])
+    old = reg.register("runner_init", AsyncMock(), hello)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def delay_send(_request: httpx.Request) -> None:
+        entered.set()
+        await release.wait()
+
+    initializer = RunnerSessionInitializer(reg, server_version="test")
+    async with httpx.AsyncClient(
+        transport=WSTunnelTransport(reg, "runner_init"),
+        base_url="http://runner",
+        event_hooks={"request": [delay_send]},
+    ) as client:
+        init = asyncio.create_task(
+            initializer.initialize(
+                _conversation(), client, timeout=10, resume_interrupted_turn=True
+            )
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            new = reg.register("runner_init", AsyncMock(), hello)
+            assert new.generation > old.generation
+            release.set()
+            with pytest.raises(ConnectionError, match="before request was sent"):
+                await asyncio.wait_for(init, timeout=1)
+        finally:
+            release.set()
+            init.cancel()
+            await asyncio.gather(init, return_exceptions=True)
+    assert not new.in_flight
+    assert new.outbound_queue.empty()
