@@ -5,10 +5,10 @@ An ACP agent reports tool results as the spec's ToolCallContent union
 holding a nested content block, or ``diff`` / ``terminal`` variants. The
 executor adapter stringifies that list for the transcript's tool cards.
 
-These tests register a generic ACP agent (a hermetic stdio fake, same shape as
+This test registers a generic ACP agent (a hermetic stdio fake, same shape as
 ``tests/e2e_ui/files/test_files_tab_survives_acp_reply.py``) whose one turn
-reports a ``content``, a ``diff``, and a ``terminal`` tool result, send a
-message from the web composer, expand the settled turn's tool cards, and assert
+reports a ``content``, a ``diff``, and a ``terminal`` tool result, sends a
+message from the web composer, expands the settled turn's tool cards, and asserts
 each Output panel shows readable text rather than the raw union JSON.
 """
 
@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import gzip
 import io
+import json
 import re
 import shlex
 import subprocess
@@ -38,7 +39,7 @@ _CONTENT_RESULT_TEXT = "keys: ['token', 'user_id', 'expires_at', 'refresh_token'
 
 # Minimal stdio ACP agent: each prompt reports three completed tool calls using the
 # content/diff/terminal ToolCallContent union variants, then streams one reply chunk
-# and ends the turn. Stdlib only; the fixture fills in the placeholder texts.
+# and ends the turn. Stdlib only; the fixture JSON-encodes the placeholder texts.
 _FAKE_ACP_AGENT_TEMPLATE = r"""
 import json
 import sys
@@ -86,7 +87,7 @@ for line in sys.stdin:
             "status": "completed",
             "content": [{
                 "type": "content",
-                "content": {"type": "text", "text": "__CONTENT_RESULT_TEXT__"},
+                "content": {"type": "text", "text": __CONTENT_RESULT_TEXT__},
             }],
         })
         update(sid, {
@@ -124,7 +125,7 @@ for line in sys.stdin:
         })
         update(sid, {
             "sessionUpdate": "agent_message_chunk",
-            "content": {"type": "text", "text": "__REPLY_TEXT__"},
+            "content": {"type": "text", "text": __REPLY_TEXT__},
         })
         send({"jsonrpc": "2.0", "id": mid, "result": {
             "stopReason": "end_turn",
@@ -181,9 +182,9 @@ def acp_union_session(
     """
     agent_script = tmp_path / "fake_acp_union_agent.py"
     agent_script.write_text(
-        _FAKE_ACP_AGENT_TEMPLATE.replace("__CONTENT_RESULT_TEXT__", _CONTENT_RESULT_TEXT).replace(
-            "__REPLY_TEXT__", _ACP_REPLY_TEXT
-        )
+        _FAKE_ACP_AGENT_TEMPLATE.replace(
+            "__CONTENT_RESULT_TEXT__", json.dumps(_CONTENT_RESULT_TEXT)
+        ).replace("__REPLY_TEXT__", json.dumps(_ACP_REPLY_TEXT))
     )
     command = shlex.join([sys.executable, str(agent_script)])
 
@@ -226,22 +227,22 @@ def _expand_if_collapsed(trigger: Locator) -> None:
         trigger.click()
 
 
-def _reveal_tool_card(page: Page, title_pattern: re.Pattern[str]) -> Locator:
-    """Expand the settled turn's folds down to one tool card; return its root.
+def _expand_worked_fold(page: Page) -> None:
+    """Expand the settled turn's "Worked for" fold once its auto-collapse has landed.
 
-    Once the turn settles, the trace collapses behind the "Worked for" row
-    and the contiguous completed tool run folds into a "Called 3 tools"
-    summary, so both must be expanded before the card's trigger is visible.
+    The fold mounts open and collapses a frame after the turn settles, so wait for
+    that collapse (when it comes) instead of racing it with a fixed sleep.
     """
     fold_trigger = page.get_by_test_id("turn-worked-fold").get_by_role("button").first
     expect(fold_trigger).to_be_visible(timeout=30_000)
-    # The fold mounts open and auto-collapses once the turn settles; wait for that
-    # collapse instead of racing it with a fixed sleep.
     with contextlib.suppress(AssertionError):
         expect(fold_trigger).to_have_attribute("data-state", "closed", timeout=5_000)
     _expand_if_collapsed(fold_trigger)
     expect(fold_trigger).to_have_attribute("data-state", "open")
 
+
+def _reveal_tool_card(page: Page, title_pattern: re.Pattern[str]) -> Locator:
+    """Expand the "Called 3 tools" group of an open worked fold down to one tool card."""
     group_trigger = page.get_by_role("button", name=re.compile(r"Called 3 tools")).first
     expect(group_trigger).to_be_visible(timeout=10_000)
     _expand_if_collapsed(group_trigger)
@@ -252,30 +253,21 @@ def _reveal_tool_card(page: Page, title_pattern: re.Pattern[str]) -> Locator:
     return card_trigger.locator("xpath=..")
 
 
-def test_acp_content_union_tool_card_renders_text(
+def test_acp_union_tool_cards_render_readable_output(
     request: pytest.FixtureRequest,
     acp_union_session: tuple[str, str],
 ) -> None:
-    """A ``content``-variant ACP tool result renders as its inner text, not the union JSON."""
+    """Each ACP union variant renders as readable text in its tool card, not the union JSON."""
     base_url, session_id = acp_union_session
     # Request the page after the session setup so a recording starts at the journey.
     page: Page = request.getfixturevalue("page")
     _drive_turn(page, base_url, session_id)
+    _expand_worked_fold(page)
 
-    card = _reveal_tool_card(page, re.compile("read_auth_keys"))
-    expect(card.get_by_text("Output", exact=True)).to_be_visible(timeout=10_000)
-    expect(card).to_contain_text(_CONTENT_RESULT_TEXT, timeout=10_000)
-    expect(card).not_to_contain_text('"type": "content"')
-
-
-def test_acp_diff_and_terminal_union_tool_cards_render_summaries(
-    request: pytest.FixtureRequest,
-    acp_union_session: tuple[str, str],
-) -> None:
-    """``diff`` / ``terminal`` ACP tool results render as readable summaries, not union JSON."""
-    base_url, session_id = acp_union_session
-    page: Page = request.getfixturevalue("page")
-    _drive_turn(page, base_url, session_id)
+    content_card = _reveal_tool_card(page, re.compile("read_auth_keys"))
+    expect(content_card.get_by_text("Output", exact=True)).to_be_visible(timeout=10_000)
+    expect(content_card).to_contain_text(_CONTENT_RESULT_TEXT, timeout=10_000)
+    expect(content_card).not_to_contain_text('"type": "content"')
 
     diff_card = _reveal_tool_card(page, re.compile("apply_config_diff"))
     terminal_card = _reveal_tool_card(page, re.compile("tail_build_log"))

@@ -2781,6 +2781,7 @@ def test_stringify_tool_payload_renders_diff_and_terminal_variants() -> None:
     assert _stringify_tool_payload([{"type": "diff", "newText": "a\nb\n"}]) == (
         "diff (2 lines)\na\nb\n"
     )
+    assert _stringify_tool_payload([{"type": "diff", "path": "/f"}]) == "diff /f (0 lines)"
 
     assert _stringify_tool_payload([{"type": "terminal", "terminalId": "term-1"}]) == (
         "[terminal term-1]"
@@ -2809,5 +2810,18 @@ def test_stringify_tool_payload_preserves_flat_blocks_and_fallbacks() -> None:
     non_text = [{"type": "image", "source": {"data": "..."}}]
     assert _stringify_tool_payload(non_text) == json.dumps(non_text)
 
-    foreign_wrapper = [{"type": "tool_result", "content": [{"type": "text", "text": "inner"}]}]
-    assert _stringify_tool_payload(foreign_wrapper) == json.dumps(foreign_wrapper)
+    foreign_block = {"type": "tool_result", "content": [{"type": "text", "text": "inner"}]}
+    assert _stringify_tool_payload([foreign_block]) == json.dumps([foreign_block])
+
+    assert _stringify_tool_payload([]) == "[]"
+
+    # Entries an ACP list cannot render stay visible through a per-entry JSON fallback.
+    terminal = {"type": "terminal", "terminalId": "term-1"}
+    image_content = {"type": "content", "content": {"type": "image", "data": "..."}}
+    assert _stringify_tool_payload([{"type": "content"}]) == json.dumps({"type": "content"})
+    assert _stringify_tool_payload([image_content, terminal]) == (
+        f"{json.dumps(image_content)}\n[terminal term-1]"
+    )
+    assert _stringify_tool_payload([foreign_block, terminal]) == (
+        f"{json.dumps(foreign_block)}\n[terminal term-1]"
+    )

@@ -1345,62 +1345,66 @@ def _serialize_tool_result(event: ToolCallComplete) -> str:
     return ""
 
 
+_ACP_TOOL_CALL_CONTENT_TYPES = frozenset({"content", "diff", "terminal"})
+
+
 def _stringify_tool_payload(value: Any) -> str:
     """Coerce a result payload to string (str pass-through, content-block join, JSON fallback).
 
     Handles Anthropic-style flat text blocks and the ACP ``ToolCallContent`` union
     (``content`` wrapper, ``diff``, ``terminal``; agentclientprotocol.com/protocol/tool-calls).
     """
-    import json
-
     if isinstance(value, str):
         return value
     if isinstance(value, list):
+        if any(
+            isinstance(block, dict) and block.get("type") in _ACP_TOOL_CALL_CONTENT_TYPES
+            for block in value
+        ):
+            # ACP entries are self-contained summaries; keep each on its own line.
+            return "\n".join(_render_acp_tool_call_content(block) for block in value)
         # Anthropic-style content blocks: join text fields; skip non-text (image, tool_use, etc.).
-        text_parts: list[str] = []
-        acp_union = False
-        for block in value:
-            if not isinstance(block, dict):
-                continue
-            block_type = block.get("type")
-            if block_type == "diff":
-                acp_union = True
-                path = block.get("path")
-                new_text = block.get("newText")
-                line_count = len(new_text.splitlines()) if isinstance(new_text, str) else 0
-                count = f"{line_count} line" + ("" if line_count == 1 else "s")
-                label = f"diff {path} ({count})" if path else f"diff ({count})"
-                if isinstance(new_text, str) and new_text:
-                    text_parts.append(f"{label}\n{new_text}")
-                else:
-                    text_parts.append(label)
-                continue
-            if block_type == "terminal":
-                acp_union = True
-                terminal_id = block.get("terminalId")
-                text_parts.append(f"[terminal {terminal_id}]" if terminal_id else "[terminal]")
-                continue
-            if block_type == "content":
-                # An ACP content wrapper holds one block or a block list.
-                acp_union = True
-                inner = block.get("content")
-                if isinstance(inner, dict):
-                    block = inner
-                elif isinstance(inner, list):
-                    inner_parts = [
-                        b.get("text")
-                        for b in inner
-                        if isinstance(b, dict) and isinstance(b.get("text"), str)
-                    ]
-                    if inner_parts:
-                        text_parts.append("".join(inner_parts))
-                    continue
-            block_text = block.get("text")
-            if isinstance(block_text, str):
-                text_parts.append(block_text)
+        text_parts = [
+            block["text"]
+            for block in value
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
         if text_parts:
-            # ACP union entries are self-contained summaries; keep each on its own line.
-            return ("\n" if acp_union else "").join(text_parts)
+            return "".join(text_parts)
+    return _json_or_repr(value)
+
+
+def _render_acp_tool_call_content(block: Any) -> str:
+    """Render one ACP ``ToolCallContent`` entry; shapes without text keep a JSON fallback."""
+    if isinstance(block, dict):
+        block_type = block.get("type")
+        if block_type == "content":
+            inner = block.get("content")
+            inner_blocks = inner if isinstance(inner, list) else [inner]
+            texts = [
+                b["text"]
+                for b in inner_blocks
+                if isinstance(b, dict) and isinstance(b.get("text"), str)
+            ]
+            if texts:
+                return "".join(texts)
+        elif block_type == "diff":
+            path = block.get("path")
+            new_text = block.get("newText")
+            line_count = len(new_text.splitlines()) if isinstance(new_text, str) else 0
+            count = f"{line_count} line" + ("" if line_count == 1 else "s")
+            label = f"diff {path} ({count})" if path else f"diff ({count})"
+            return f"{label}\n{new_text}" if isinstance(new_text, str) and new_text else label
+        elif block_type == "terminal":
+            terminal_id = block.get("terminalId")
+            return f"[terminal {terminal_id}]" if terminal_id else "[terminal]"
+    return _json_or_repr(block)
+
+
+def _json_or_repr(value: Any) -> str:
+    """JSON-encode ``value``, falling back to ``repr`` for non-serializable payloads."""
+    import json
+
     try:
         return json.dumps(value)
     except (TypeError, ValueError):
