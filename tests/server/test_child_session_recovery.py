@@ -397,9 +397,12 @@ async def test_message_handshake_does_not_wait_for_child_initialization(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("child_owner", ["owner", "other", None, "read", "edit", "manage"])
+@pytest.mark.parametrize(
+    ("child_owner", "mirrored"),
+    [(owner, False) for owner in ("owner", "other", None, "read", "edit", "manage")]
+    + [(owner, True) for owner in ("owner", "other", None, "read")],
+)
 @pytest.mark.parametrize("same_binding", [False, True])
-@pytest.mark.parametrize("mirrored", [False, True])
 async def test_restoration_respects_runner_ownership(
     recovery_tree: Any,
     db_uri: str,

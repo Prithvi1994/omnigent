@@ -195,7 +195,7 @@ async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
         assert relays[0] == parent.id
         assert set(mirrors) <= set(relays)
         assert not set(mirrors).intersection(sid for sid, _ in reads)
-        revalidated = [ids for ids in batches if parent.id in ids]
+        revalidated = [ids for ids in batches if parent.id in ids and set(mirrors) & ids]
         assert revalidated == [{parent.id, *mirrors}]
         assert all(thread != loop_thread for _, thread in reads)
         assert requests == [parent.id]
@@ -227,15 +227,34 @@ async def test_failed_root_init_keeps_failure_but_does_not_block_other_tree(
 
 
 @pytest.mark.parametrize("phase", ["listing", "attachment"])
+@pytest.mark.parametrize("dependent_kind", [None, "child", "mirror"])
 async def test_reconnect_skips_root_rebound_before_initialization(
-    app: FastAPI, db_uri: str, monkeypatch: pytest.MonkeyPatch, phase: str
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    dependent_kind: str | None,
 ) -> None:
     import omnigent.server.app as server_app
 
     agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
     moved, healthy = [_create_session(app, agent.id) for _ in range(2)]
     store = app.state.runner_router._conversation_store
+    dependent = None
+    if dependent_kind is not None:
+        dependent = _create_session(
+            app, agent.id, kind="sub_agent", parent_conversation_id=moved.id
+        )
+        if dependent_kind == "mirror":
+            store.set_labels(dependent.id, {"omnigent.wrapper": "codex-native-ui-subagent"})
+    moved_ids = [moved.id, *([dependent.id] if dependent is not None else [])]
+    relay_bindings: dict[str, str] = {}
     requested: list[str] = []
+
+    def rebind_subtree() -> None:
+        for sid in moved_ids:
+            store.replace_runner_id(sid, "destination-runner")
+            relay_bindings[sid] = "destination-runner"
 
     async def rebind_after_listing(call: Any, *args: Any, **kwargs: Any) -> Any:
         result = await asyncio.to_thread(call, *args, **kwargs)
@@ -244,7 +263,7 @@ async def test_reconnect_skips_root_rebound_before_initialization(
             and call == store.list_conversations_by_runner_id
             and any(row.id == moved.id for row in result)
         ):
-            await asyncio.to_thread(store.replace_runner_id, moved.id, "destination-runner")
+            await asyncio.to_thread(rebind_subtree)
         return result
 
     monkeypatch.setattr(
@@ -259,25 +278,29 @@ async def test_reconnect_skips_root_rebound_before_initialization(
 
     try:
         async with _recover(app, monkeypatch, respond) as (relays, finished):
-            if phase == "attachment":
-                original_relay = sessions._ensure_runner_relay
+            original_relay = sessions._ensure_runner_relay
 
-                def attach_then_rebind(sid: str, *args: Any) -> None:
-                    original_relay(sid, *args)
-                    if sid == moved.id:
-                        store.replace_runner_id(moved.id, "destination-runner")
+            def attach_then_rebind(sid: str, rid: str, *args: Any) -> None:
+                original_relay(sid, rid, *args)
+                relay_bindings[sid] = rid
+                if phase == "attachment" and sid == moved.id:
+                    rebind_subtree()
 
-                monkeypatch.setattr(sessions, "_ensure_runner_relay", attach_then_rebind)
+            monkeypatch.setattr(sessions, "_ensure_runner_relay", attach_then_rebind)
             await asyncio.wait_for(finished.wait(), budget(5))
             assert requested == [healthy.id]
             assert (moved.id in relays) == (phase == "attachment")
+            if dependent is not None:
+                assert dependent.id not in relays
+            assert all(relay_bindings[sid] == "destination-runner" for sid in moved_ids)
             assert sessions._session_status_cache[moved.id] == "failed"
             current = store.get_conversation(moved.id)
             assert current is not None
             assert current.runner_id == "destination-runner"
             assert current.labels["omnigent.last_task_error_code"] == "runner_disconnected"
     finally:
-        sessions._session_status_cache.pop(moved.id, None)
+        for sid in moved_ids:
+            sessions._session_status_cache.pop(sid, None)
 
 
 async def test_reconnecting_trees_share_store_budget_without_waiting_for_initialization(

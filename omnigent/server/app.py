@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from functools import partial
 from importlib import import_module
+from itertools import batched, groupby
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -140,6 +141,7 @@ from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
+_RECONNECT_BINDING_BATCH_SIZE = 128
 
 
 class SmartRoutingSourcesInfo(BaseModel):
@@ -3544,51 +3546,66 @@ def create_app(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
         bound_ids = {conv.id for conv in convs}
-        # Attach root streams before their bound children.
-        convs.sort(key=lambda conv: conv.parent_conversation_id in bound_ids)
+
+        def is_independent(conv: Conversation) -> bool:
+            return not (
+                is_parent_owned_subagent(conv)
+                or (conv.parent_conversation_id in bound_ids and conv.host_id is None)
+            )
+
+        # Refresh dependent bindings after attaching roots, which may have moved.
+        convs.sort(key=lambda conv: not is_independent(conv))
         _logger.info("_on_runner_connect: runner=%s, %d bound session(s)", runner_id, len(convs))
         roots: list[tuple[Conversation, httpx.AsyncClient]] = []
         store_slots = asyncio.Semaphore(RECOVERY_STORE_CONCURRENCY)
-        for conv in convs:
-            # Even the relay-only tail must yield so a large tree remains cancellable.
-            await asyncio.sleep(0)
-            if tunnel_registry.get(runner_id) is not connection:
-                return
-            with runner_log_scope(conv.id, runner_id):
-                _logger.info("_on_runner_connect: matched %s (agent=%s)", conv.id, conv.agent_id)
-                independent = not (
-                    is_parent_owned_subagent(conv)
-                    or (conv.parent_conversation_id in bound_ids and conv.host_id is None)
-                )
+        for _, candidates in groupby(convs, key=is_independent):
+            # Bound attachment work between asynchronous reads, including mirror-only trees.
+            for batch in batched(candidates, _RECONNECT_BINDING_BATCH_SIZE):
                 try:
-                    if independent:
-                        fresh = await asyncio.to_thread(
-                            conversation_store.get_conversation, conv.id
+                    async with store_slots:
+                        current = await asyncio.to_thread(
+                            conversation_store.get_conversations, [conv.id for conv in batch]
                         )
-                        if fresh is None or fresh.runner_id != runner_id:
-                            continue
-                        conv = fresh
-                        if tunnel_registry.get(runner_id) is not connection:
-                            return
-                    routed = runner_router.client_for_session_resources(conv.id, conversation=conv)
                 except OmnigentError:
                     _logger.exception(
-                        "Failed to resolve runner client for session %s on reconnect", conv.id
+                        "Failed to refresh session bindings for runner %s on reconnect", runner_id
                     )
                     continue
-                _ensure_runner_relay(conv.id, runner_id, routed.client, conversation_store)
-                if independent:
-                    roots.append((conv, routed.client))
-                else:
-                    prefetch_session_routing_catalogs(conv.id, conv, routed.client)
-                # A crashed runner can leave a persisted count absent from the live index.
-                session_live_state.persist_pending_count(
-                    conv.id, pending_elicitations.count_for(conv.id)
-                )
-                cached_sandbox = _session_sandbox_status_cache.get(conv.id)
-                # A reconnect proves readiness only for a launch already marked failed.
-                if cached_sandbox is not None and cached_sandbox.stage == "failed":
-                    _publish_sandbox_status(conv.id, "ready")
+                if tunnel_registry.get(runner_id) is not connection:
+                    return
+                for snapshot in batch:
+                    conv = current.get(snapshot.id)
+                    if conv is None or conv.runner_id != runner_id:
+                        continue
+                    with runner_log_scope(conv.id, runner_id):
+                        _logger.info(
+                            "_on_runner_connect: matched %s (agent=%s)", conv.id, conv.agent_id
+                        )
+                        try:
+                            routed = runner_router.client_for_session_resources(
+                                conv.id, conversation=conv
+                            )
+                        except OmnigentError:
+                            _logger.exception(
+                                "Failed to resolve runner client for session %s on reconnect",
+                                conv.id,
+                            )
+                            continue
+                        if routed.runner_id != runner_id:
+                            continue
+                        _ensure_runner_relay(conv.id, runner_id, routed.client, conversation_store)
+                        if is_independent(conv):
+                            roots.append((conv, routed.client))
+                        else:
+                            prefetch_session_routing_catalogs(conv.id, conv, routed.client)
+                        # A crash can leave a persisted count absent from the live index.
+                        session_live_state.persist_pending_count(
+                            conv.id, pending_elicitations.count_for(conv.id)
+                        )
+                        cached_sandbox = _session_sandbox_status_cache.get(conv.id)
+                        # A reconnect proves readiness only for a launch already marked failed.
+                        if cached_sandbox is not None and cached_sandbox.stage == "failed":
+                            _publish_sandbox_status(conv.id, "ready")
 
         async def recover_root(conv: Conversation, client: httpx.AsyncClient) -> None:
             with runner_log_scope(conv.id, runner_id):
