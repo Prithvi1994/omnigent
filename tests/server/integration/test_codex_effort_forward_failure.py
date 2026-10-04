@@ -222,6 +222,56 @@ async def test_combined_model_and_effort_uses_target_model_capabilities(
         assert updates == [{"threadId": "thread_codex", "model": "gpt-6-sol", "effort": expected}]
 
 
+async def test_legacy_server_split_reset_uses_the_previous_model_default(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+) -> None:
+    """An older server resets first; selecting Default after the switch repairs it."""
+    session = native_session
+    session.codex.failure = None
+    session.store.update_conversation(
+        session.session_id, model_override="gpt-6-sol", _unset_reasoning_effort=True
+    )
+
+    # Older servers save both fields, then send reset before model as separate events.
+    for event in (
+        {"type": "effort_change", "effort": None},
+        {"type": "model_change", "model": "gpt-6-sol"},
+    ):
+        response = await session.runner.post(
+            f"/v1/sessions/{session.session_id}/events", json=event
+        )
+        assert response.status_code == 204, response.text
+
+    updates = [
+        params for method, params in session.codex.requests if method == "thread/settings/update"
+    ]
+    assert updates == [
+        {"threadId": "thread_codex", "effort": "medium"},
+        {"threadId": "thread_codex", "model": "gpt-6-sol", "effort": "medium"},
+    ]
+    snapshot = await client.get(f"/v1/sessions/{session.session_id}")
+    assert snapshot.json()["model_override"] == "gpt-6-sol"
+    assert snapshot.json()["reasoning_effort"] == "medium"
+    assert bridge.read_codex_config_model(session.bridge_dir) == "gpt-6-sol"
+    assert bridge.read_codex_config_effort(session.bridge_dir) == "medium"
+    assert session.remembered_efforts[session.session_id] == "medium"
+
+    # A separate Default selection after the model change uses the target default.
+    response = await session.runner.post(
+        f"/v1/sessions/{session.session_id}/events", json={"type": "effort_change", "effort": None}
+    )
+    assert response.status_code == 204, response.text
+    assert session.codex.requests[-1] == (
+        "thread/settings/update",
+        {"threadId": "thread_codex", "effort": "low"},
+    )
+    snapshot = await client.get(f"/v1/sessions/{session.session_id}")
+    assert snapshot.json()["reasoning_effort"] == "low"
+    assert bridge.read_codex_config_effort(session.bridge_dir) == "low"
+    assert session.remembered_efforts[session.session_id] == "low"
+
+
 @pytest.mark.parametrize("reset_failure", ["refused", "disconnected"])
 async def test_legacy_combined_reset_failure_preserves_the_applied_model(
     client: httpx.AsyncClient,

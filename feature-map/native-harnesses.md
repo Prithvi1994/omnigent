@@ -106,6 +106,7 @@ Cross-harness journeys:
   `tests/server/integration/test_codex_effort_forward_failure.py::test_reset_without_current_model_rejected_before_codex_connection`,
   `tests/server/integration/test_codex_effort_forward_failure.py::test_successful_update_mirrors_unchanged_native_effort_without_notification`,
   `tests/server/integration/test_codex_effort_forward_failure.py::test_combined_model_and_effort_uses_target_model_capabilities`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_legacy_server_split_reset_uses_the_previous_model_default`,
   `tests/server/integration/test_codex_effort_forward_failure.py::test_legacy_combined_reset_failure_preserves_the_applied_model`,
   `tests/server/integration/test_codex_effort_forward_failure.py::test_forwarder_recovers_a_failed_immediate_effort_mirror`,
   `tests/server/integration/test_codex_effort_forward_failure.py::test_offline_or_silent_effort_change_is_saved_for_resume`.
@@ -117,6 +118,10 @@ Cross-harness journeys:
   runners apply the model first and then the effort; if that second step
   fails, the error preserves the model already applied. A failed immediate
   mirror is retried when the forwarder next reads the private config.
+  Target-model Default requires the updated server's combined-update path.
+  An older server resets the previous model first, even with an updated runner;
+  its default is then inherited if the target supports it. On older servers,
+  switch models first and select Default as a separate action afterward.
   While a connected runner is still starting Codex and has no loaded bridge,
   live settings return a retryable 503 and retain the previous selection.
   Retry once the terminal is ready; fully offline and silent saves remain deferred.
