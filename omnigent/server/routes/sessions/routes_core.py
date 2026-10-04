@@ -2708,7 +2708,7 @@ def register_core_routes(
         # writes skip both recovery and forwarding to avoid recursive launches.
         live_forward = not body.silent
         if live_forward and (effort is not None or clear_effort):
-            await _forward_session_change_to_runner(
+            effort_forward = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
                 {"type": "effort_change", "effort": updated.reasoning_effort},
@@ -2717,6 +2717,26 @@ def register_core_routes(
                 # command.
                 timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
+            if (
+                updated.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+                == _CODEX_NATIVE_WRAPPER_LABEL_VALUE
+                and conv is not None
+                and effort_forward is not None
+                and not 200 <= effort_forward.status_code < 300
+            ):
+                # A live refusal must not leave the picker claiming unapplied
+                # settings. No runner response still permits saving for resume.
+                await asyncio.to_thread(
+                    conversation_store.restore_session_settings_if_matches,
+                    session_id,
+                    previous=conv,
+                    attempted=updated,
+                    restore_model=live_model_change,
+                )
+                raise OmnigentError(
+                    "The terminal did not apply the reasoning effort change. Please try again.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
         if live_model_change:
             _model_forward = await _forward_session_change_to_runner(
                 session_id,

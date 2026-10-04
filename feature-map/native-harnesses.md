@@ -94,6 +94,14 @@ Cross-harness journeys:
   real Codex TUI and REST session settings, checking the outgoing Responses
   effort, native settings, private config, and session state. Only the model
   replies are mocked; models absent from the installed CLI are skipped.
+- **`model-and-effort`, rejected Codex reset (server/runner integration):**
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_reset_returns_error_and_preserves_applied_settings`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_reset_preserves_concurrent_selection_and_sibling_settings`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_offline_or_silent_effort_change_is_saved_for_resume`.
+  Run with plain `uv run pytest`. Both HTTP apps and persistence are real;
+  Codex RPC failures inject missing defaults and discovery timeouts. A refused
+  reset returns an error and preserves applied settings and concurrent edits;
+  offline and silent changes remain available for resume.
 - **`approvals`:**
   `tests/e2e_ui/approvals/test_native_edit_tools_approval_card.py::test_native_file_edit_tools_require_approval_card`
 - **`resume`, bare picker scoped to this host:**
