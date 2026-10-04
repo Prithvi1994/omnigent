@@ -187,8 +187,30 @@ describe("ChatComposer", () => {
         keyboard={{ submitWithModEnter: true, preventsKeyboardSubmit: true }}
       />,
     );
-    expect(fireEvent.keyDown(input, { key: "Enter", ctrlKey: true })).toBe(true);
+    expect(fireEvent.keyDown(input, { key: "Enter" })).toBe(true);
+    expect(fireEvent.keyDown(input, { key: "Enter", shiftKey: true })).toBe(true);
     expect(onKeyDown).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Enter", ctrlKey: true });
+    expect(onKeyDown).toHaveBeenLastCalledWith(expect.anything(), {
+      shouldSubmitFromKeyboard: true,
+      shouldPreferSendOverCompletion: true,
+      shouldSteerAllFromKeyboard: false,
+    });
+    onKeyDown.mockClear();
+    rerender(
+      <ChatComposer
+        {...props}
+        keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: true }}
+      />,
+    );
+    expect(fireEvent.keyDown(input, { key: "Enter" })).toBe(true);
+    expect(onKeyDown).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Enter", metaKey: true });
+    expect(onKeyDown).toHaveBeenLastCalledWith(expect.anything(), {
+      shouldSubmitFromKeyboard: true,
+      shouldPreferSendOverCompletion: false,
+      shouldSteerAllFromKeyboard: true,
+    });
   });
 });
 
