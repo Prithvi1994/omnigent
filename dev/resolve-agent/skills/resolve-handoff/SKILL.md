@@ -134,10 +134,11 @@ readiness; name pending publication/review steps in `remaining_work`.
   in `remaining_work`. Do not describe it as a proven fix.
 - `failure_class` — `""` unless broken infrastructure, not the bug or its
   evidence, stopped the run. Use exactly `"infrastructure"` when the runner,
-  sandbox, OS-environment tools, workflow-provided environment, or tracker/GitHub
-  access failed so that you could not inspect the checkout or run checks — for
+  sandbox, OS-environment tools, or workflow-provided environment or credentials
+  failed so that you could not inspect the checkout or run checks — for
   example every `sys_os_shell` / `sys_os_read` / `sys_os_write` call returns
-  `os_env helper failed`, or the tracker answers 401/403. Keep `outcome` as
+  `os_env helper failed`, or the workflow's tracker/GitHub credential is missing,
+  expired, or rejected (401/403) on access it normally has. Keep `outcome` as
   `needs_more_info` so existing consumers still parse the handoff; the class
   requests an infrastructure retry. A workflow that supports the signal should
   retry the attempt on a healthy runner and keep earlier checkpoints instead of
@@ -145,8 +146,10 @@ readiness; name pending publication/review steps in `remaining_work`.
   outcome with the signal beside it. Name the failing calls
   and exact error text in `test_audit`, and list the unfinished steps in
   `remaining_work` so a retry can resume. Never set it for missing report
-  information, unsafe evidence, conflicting bug identities, or an unresolved
-  design choice.
+  information, unsafe evidence, conflicting bug identities, an unresolved
+  design choice, or access denied by policy: permission the credential was
+  never granted, such as a `denied by policy` 403, needs human authorization
+  and no retry can supply it.
 - `problem_summary` / `solution_summary` — the two user-facing paragraphs shown
   prominently in the Linear update under **What's the problem?** and **How is it
   fixed?** Write plain, natural English for someone who uses the product but has

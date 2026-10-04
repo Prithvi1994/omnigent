@@ -261,6 +261,8 @@ def test_infrastructure_blockers_request_a_retry_instead_of_a_verdict() -> None:
         "retry the attempt on a healthy runner",
         "instead of posting a verdict",
         "Never set it for missing report information",
+        "credential is missing, expired, or rejected (401/403) on access it normally has",
+        "`denied by policy` 403, needs human authorization",
     ):
         assert requirement in failure_class
 
