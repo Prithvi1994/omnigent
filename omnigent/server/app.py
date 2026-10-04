@@ -3559,14 +3559,15 @@ def create_app(
         roots: list[tuple[Conversation, httpx.AsyncClient]] = []
         store_slots = asyncio.Semaphore(RECOVERY_STORE_CONCURRENCY)
         for _, candidates in groupby(convs, key=is_independent):
-            # Bound attachment work between asynchronous reads, including mirror-only trees.
+            # Batch reads let attachment yield between groups, even for native mirrors.
             for batch in batched(candidates, _RECONNECT_BINDING_BATCH_SIZE):
                 try:
                     async with store_slots:
                         current = await asyncio.to_thread(
                             conversation_store.get_conversations, [conv.id for conv in batch]
                         )
-                except OmnigentError:
+                except Exception:
+                    # A failed lookup must not strand the remaining batches.
                     _logger.exception(
                         "Failed to refresh session bindings for runner %s on reconnect", runner_id
                     )

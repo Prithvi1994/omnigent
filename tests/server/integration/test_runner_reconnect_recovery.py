@@ -262,6 +262,54 @@ async def test_failed_root_init_keeps_failure_but_does_not_block_other_tree(
         assert set(requested) == {failed.id, healthy.id}
 
 
+async def test_failed_binding_batch_does_not_strand_later_roots(
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from sqlalchemy.exc import OperationalError
+
+    import omnigent.server.app as server_app
+
+    monkeypatch.setattr(server_app, "_RECONNECT_BINDING_BATCH_SIZE", 1)
+    agent = SqlAlchemyAgentStore(db_uri).create(generate_agent_id(), "test", "bundle")
+    failed, healthy = [_create_session(app, agent.id) for _ in range(2)]
+    store = app.state.runner_router._conversation_store
+    get_many = store.get_conversations
+    list_bound = store.list_conversations_by_runner_id
+    failure = OperationalError("binding lookup", {}, RuntimeError("database unavailable"))
+
+    def failed_batch_first(runner_id: str) -> list[Conversation]:
+        return sorted(list_bound(runner_id), key=lambda row: row.id != failed.id)
+
+    def read_bindings(ids: list[str]) -> dict[str, Conversation]:
+        if failed.id in ids:
+            raise failure
+        return get_many(ids)
+
+    monkeypatch.setattr(store, "get_conversations", read_bindings)
+    monkeypatch.setattr(store, "list_conversations_by_runner_id", failed_batch_first)
+    requested: list[str] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        requested.append(json.loads(request.content)["session_id"])
+        return httpx.Response(201)
+
+    async with _recover(app, monkeypatch, respond) as (relays, finished):
+        await asyncio.wait_for(finished.wait(), budget(5))
+        assert relays == requested == [healthy.id]
+        assert sessions._session_status_cache[healthy.id] == "idle"
+        assert sessions._session_status_cache[failed.id] == "failed"
+        assert any(
+            record.levelno == logging.ERROR
+            and "Failed to refresh session bindings" in record.getMessage()
+            and record.exc_info is not None
+            and record.exc_info[1] is failure
+            for record in caplog.records
+        )
+
+
 @pytest.mark.parametrize("phase", ["listing", "attachment"])
 @pytest.mark.parametrize("dependent_kind", [None, "child", "mirror"])
 async def test_reconnect_skips_root_rebound_before_initialization(
