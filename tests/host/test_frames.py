@@ -45,6 +45,8 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSkillContentFrame,
+    HostSkillContentResultFrame,
     HostSkillsFrame,
     HostSkillsResultFrame,
     HostStatFrame,
@@ -2269,3 +2271,47 @@ def test_list_worktrees_legacy_request_defaults_to_picker_mode() -> None:
     )
     assert isinstance(frame, HostListWorktreesFrame)
     assert frame.for_cleanup is False
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        HostSkillContentFrame("s", "claude-native", "plugin:skill"),
+        HostSkillContentResultFrame(
+            "s", "ok", {"name": "skill", "description": "", "content": "body", "truncated": False}
+        ),
+        HostSkillContentResultFrame("s", "failed"),
+    ],
+)
+def test_skill_content_round_trip(frame):
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+def test_skill_content_allow_list_and_correlated_malformed_result():
+    payload = {
+        "kind": "host.skill_content_result",
+        "request_id": "s",
+        "status": "ok",
+        "skill": {
+            "name": "skill",
+            "description": "",
+            "content": "body",
+            "truncated": False,
+            "skill_dir": "/private",
+            "files": "secret",
+        },
+        "error": "private",
+    }
+    frame = decode_host_frame(json.dumps(payload))
+    assert isinstance(frame, HostSkillContentResultFrame)
+    assert frame.skill == {
+        "name": "skill",
+        "description": "",
+        "content": "body",
+        "truncated": False,
+    }
+    assert frame.error is None
+    payload["skill"]["truncated"] = "yes"
+    frame = decode_host_frame(json.dumps(payload))
+    assert isinstance(frame, HostSkillContentResultFrame)
+    assert (frame.request_id, frame.status, frame.skill) == ("s", "failed", None)
