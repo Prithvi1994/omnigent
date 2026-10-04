@@ -227,8 +227,15 @@ def _sanitized_env() -> dict[str, str]:
     env = dict(os.environ)
     for key in list(env):
         if key.startswith(
-            ("OMNIGENT_RUNNER", "OMNIGENT_PROCESS", "ANTHROPIC_", "OPENAI_")
-        ) or key.startswith(("DATABRICKS_", "CLAUDE_")):
+            (
+                "OMNIGENT_RUNNER",
+                "OMNIGENT_PROCESS",
+                "ANTHROPIC_",
+                "OPENAI_",
+                "DATABRICKS_",
+                "CLAUDE_",
+            )
+        ):
             env.pop(key)
     for key in ("CLAUDECODE", "RUNNER_SERVER_URL", "OMNIGENT", "CODEX_HOME"):
         env.pop(key, None)
@@ -240,7 +247,7 @@ def _start_fake_workspace(bare_model_ids: tuple[str, ...]) -> tuple[str, Callabl
     """Serve the two Databricks discovery listings for a fake workspace."""
 
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler API
+        def do_GET(self) -> None:
             path = self.path.split("?", 1)[0]
             if path == "/api/2.1/unity-catalog/model-services":
                 body: dict[str, object] = {
@@ -351,41 +358,7 @@ def _booted_rig(root: Path, *, ambient_workspace: bool) -> Iterator[ClaudeParity
     server_env = _sanitized_env()
     server_env["OMNIGENT_CONFIG_HOME"] = str(root / "server-config-home")
     server_env["OMNIGENT_DATA_DIR"] = str(root / "server-data")
-    server_handle = open(server_log, "w")  # noqa: SIM115 — subprocess lifetime
-    logs.append(server_handle)
-    server = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "omnigent.cli",
-            "server",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--database-uri",
-            f"sqlite:///{root / 'rig.db'}",
-            "--artifact-location",
-            str(root / "artifacts"),
-        ],
-        env=server_env,
-        cwd=str(_REPO_ROOT),
-        stdout=server_handle,
-        stderr=subprocess.STDOUT,
-    )
-
-    host_env = _sanitized_env()
-    host_env["HOME"] = str(home)
-    host_env["PATH"] = f"{stub_bin}{os.pathsep}{os.environ['PATH']}"
-    host_env["OMNIGENT_CONFIG_HOME"] = str(host_config_home)
-    host_env["OMNIGENT_DATA_DIR"] = str(root / "host-data")
-    if ambient_workspace:
-        ambient_ws, stop_ambient_ws = _start_fake_workspace(_WS_AMBIENT_MODELS)
-        stoppers.append(stop_ambient_ws)
-        host_env["DATABRICKS_HOST"] = ambient_ws
-        host_env["DATABRICKS_TOKEN"] = "dapi-fake-ambient-token"
-    host_handle = open(host_log, "w")  # noqa: SIM115 — subprocess lifetime
-    logs.append(host_handle)
+    server: subprocess.Popen[bytes] | None = None
     host: subprocess.Popen[bytes] | None = None
 
     def _stop(proc: subprocess.Popen[bytes] | None) -> None:
@@ -399,6 +372,41 @@ def _booted_rig(root: Path, *, ambient_workspace: bool) -> Iterator[ClaudeParity
             proc.wait(timeout=5)
 
     try:
+        server_handle = open(server_log, "w")  # noqa: SIM115 — subprocess lifetime
+        logs.append(server_handle)
+        server = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "omnigent.cli",
+                "server",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--database-uri",
+                f"sqlite:///{root / 'rig.db'}",
+                "--artifact-location",
+                str(root / "artifacts"),
+            ],
+            env=server_env,
+            cwd=str(_REPO_ROOT),
+            stdout=server_handle,
+            stderr=subprocess.STDOUT,
+        )
+
+        host_env = _sanitized_env()
+        host_env["HOME"] = str(home)
+        host_env["PATH"] = f"{stub_bin}{os.pathsep}{os.environ['PATH']}"
+        host_env["OMNIGENT_CONFIG_HOME"] = str(host_config_home)
+        host_env["OMNIGENT_DATA_DIR"] = str(root / "host-data")
+        if ambient_workspace:
+            ambient_ws, stop_ambient_ws = _start_fake_workspace(_WS_AMBIENT_MODELS)
+            stoppers.append(stop_ambient_ws)
+            host_env["DATABRICKS_HOST"] = ambient_ws
+            host_env["DATABRICKS_TOKEN"] = "dapi-fake-ambient-token"
+        host_handle = open(host_log, "w")  # noqa: SIM115 — subprocess lifetime
+        logs.append(host_handle)
 
         def _healthy() -> bool:
             if server.poll() is not None:
@@ -601,7 +609,7 @@ def _session_default_model(base_url: str, session_id: str) -> str | None:
 
 
 def test_created_session_offers_the_previewed_claude_catalog(
-    page: Page, parity_rig: ClaudeParityRig
+    request: pytest.FixtureRequest, parity_rig: ClaudeParityRig
 ) -> None:
     """The session created from New Chat must offer the previewed catalog.
 
@@ -612,6 +620,9 @@ def test_created_session_offers_the_previewed_claude_catalog(
     to Claude's own login, so the session's model rows and default must match
     the preview.
     """
+    # Create the recorded page only after the rig has booted, so footage starts
+    # at the New Chat journey rather than the server/host warmup.
+    page = request.getfixturevalue("page")
     page.goto(parity_rig.base_url)
     expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible(timeout=30_000)
     _pick_agent(page, "Claude Code")
@@ -658,7 +669,7 @@ def test_created_session_offers_the_previewed_claude_catalog(
 
 
 def test_preview_discovery_stays_on_the_profile_workspace(
-    page: Page, ambient_rig: ClaudeParityRig
+    request: pytest.FixtureRequest, ambient_rig: ClaudeParityRig
 ) -> None:
     """An ambient DATABRICKS_HOST must not redirect the preview's discovery.
 
@@ -667,6 +678,9 @@ def test_preview_discovery_stays_on_the_profile_workspace(
     pointing at a different workspace that serves only Haiku 5. The New Chat
     preview must keep the named profile's workspace catalog.
     """
+    # Create the recorded page only after the rig has booted, so footage starts
+    # at the New Chat journey rather than the server/host warmup.
+    page = request.getfixturevalue("page")
     page.goto(ambient_rig.base_url)
     expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible(timeout=30_000)
     _pick_agent(page, "Claude Code")

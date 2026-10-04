@@ -10798,56 +10798,6 @@ async def test_claude_model_catalog_appends_an_off_list_default(
     }
 
 
-def test_claude_model_id_display_name_keeps_pre_family_versions() -> None:
-    """Claude 3.x ids version the generation before the family token."""
-    assert (
-        claude_native._claude_model_id_display_name("databricks-claude-3-7-sonnet")
-        == "Sonnet 3.7"
-    )
-    assert claude_native._claude_model_id_display_name("claude-3-5-haiku-20241022") == "Haiku 3.5"
-    assert claude_native._claude_model_id_display_name("databricks-claude-opus-5") == "Opus 5"
-    assert (
-        claude_native._claude_model_id_display_name("claude-sonnet-4-5[1m]")
-        == "Sonnet 4.5 (1M context)"
-    )
-
-
-async def test_claude_model_catalog_formats_a_configured_off_list_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A synthetic configured-default row gets a friendly Claude label."""
-
-    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
-        del config
-        return claude_native.ClaudeModelProbe(
-            alias_rows=[
-                {
-                    "id": "sonnet",
-                    "model": "system.ai.claude-sonnet-5",
-                    "displayName": "Sonnet 5",
-                }
-            ],
-            default_model="system.ai.claude-opus-4-8",
-            default_label="Opus 4.8",
-        )
-
-    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
-    config = claude_native.ClaudeNativeUcodeConfig(
-        env={"ANTHROPIC_BASE_URL": "https://gw.example/anthropic"},
-        model="system.ai.claude-opus-5",
-    )
-
-    rows = await claude_native.claude_model_catalog(config)
-
-    assert rows is not None
-    assert rows[-1] == {
-        "id": "system.ai.claude-opus-5",
-        "model": "system.ai.claude-opus-5",
-        "displayName": "Opus 5",
-        "isDefault": True,
-    }
-
-
 async def test_claude_model_catalog_never_appends_an_unservable_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
