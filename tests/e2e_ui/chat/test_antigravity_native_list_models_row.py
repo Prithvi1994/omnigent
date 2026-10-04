@@ -33,6 +33,7 @@ Run (spawns its own local server + runner; build the SPA first)::
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -161,7 +162,9 @@ def _wait_runner_state(base_url: str, runner_id: str, *, online: bool, what: str
     deadline = time.monotonic() + _RUNNER_SWAP_TIMEOUT_S
     while _runner_online(base_url, runner_id) is not online:
         if time.monotonic() > deadline:
-            raise RuntimeError(f"runner did not become {what} within {_RUNNER_SWAP_TIMEOUT_S:.0f}s")
+            raise RuntimeError(
+                f"runner did not become {what} within {_RUNNER_SWAP_TIMEOUT_S:.0f}s"
+            )
         time.sleep(0.5)
 
 
@@ -232,10 +235,9 @@ def agy_install_runner(
         yield
     finally:
         proc.kill()
-        try:
+        # The offline wait below catches a runner that outlives SIGKILL.
+        with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=5)
-        except Exception:
-            pass
         _wait_runner_state(live_server, runner_id, online=False, what="offline after teardown")
         _recover_shared_runner()
 

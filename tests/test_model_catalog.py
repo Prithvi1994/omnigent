@@ -355,6 +355,34 @@ def test_antigravity_native_listing_is_usable_without_omnigent_credentials(
     assert "cannot run here" not in listing.note
 
 
+def test_resolve_provider_antigravity_native_configured_gemini_key_is_cli_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A configured ``gemini`` key provider leaves the native agy readout as its CLI login.
+
+    The reported host had a ``providers: gemini:`` default and no openai provider;
+    resolution used to miss that credential and report the worker as ``none``.
+    The native launch never consumes the key, so the readout stays agy's own login.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  gemini:\n"
+        "    kind: key\n"
+        "    default: true\n"
+        "    gemini:\n"
+        "      base_url: https://generativelanguage.googleapis.com/v1beta/openai\n"
+        "      api_key: AIzaSyFAKEgeminiKeyForUnitTest\n",
+    )
+    provider = resolve_model_provider(_worker_spec("antigravity-native"), "antigravity-native")
+    assert provider.kind == "subscription"
+    assert provider.cli == "agy"
+
+
 @pytest.mark.parametrize("harness", ["antigravity", "agy", "google-antigravity"])
 def test_resolve_provider_antigravity_sdk_keeps_provider_resolution(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
