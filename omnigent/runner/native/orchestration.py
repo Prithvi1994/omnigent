@@ -4815,7 +4815,10 @@ async def _auto_create_codex_terminal(
     # Thread the spec so its executor.auth / legacy profile win over
     # machine-level config, parity with the in-process harness (#2744).
     _launch_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
-    _codex_launch = resolve_native_codex_launch(model=default_model, spec=_launch_spec)
+    _codex_terminal_args = launch_config.terminal_launch_args or ()
+    _codex_launch = resolve_native_codex_launch(
+        model=default_model, spec=_launch_spec, terminal_launch_args=_codex_terminal_args
+    )
     from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
 
     codex_binding = binding_for_harness(load_runtime_inference_config(), "codex-native")
@@ -4826,7 +4829,10 @@ async def _auto_create_codex_terminal(
     _fresh_codex_catalog: list[_JsonObject] | None = None
     try:
         _catalog_launch = await asyncio.to_thread(
-            resolve_native_codex_launch, model=None, spec=_launch_spec
+            resolve_native_codex_launch,
+            model=None,
+            spec=_launch_spec,
+            terminal_launch_args=_codex_terminal_args,
         )
         _fresh_codex_catalog = fresh_codex_launch_catalog(
             codex_path=_codex_cli_path,
@@ -4863,7 +4869,10 @@ async def _auto_create_codex_terminal(
         try:
             if _catalog_launch is None:
                 _catalog_launch = await asyncio.to_thread(
-                    resolve_native_codex_launch, model=None, spec=_launch_spec
+                    resolve_native_codex_launch,
+                    model=None,
+                    spec=_launch_spec,
+                    terminal_launch_args=_codex_terminal_args,
                 )
             # Read staleness before the fetch can start a background probe.
             # The fingerprint and probe must use this session's provider.
@@ -4896,7 +4905,9 @@ async def _auto_create_codex_terminal(
                 # Re-resolve so provider overrides cannot retain the old model.
                 # A failed probe permits fallback, but cannot retire the pick.
                 _codex_launch = resolve_native_codex_launch(
-                    model=unpinned_model, spec=_launch_spec
+                    model=unpinned_model,
+                    spec=_launch_spec,
+                    terminal_launch_args=_codex_terminal_args,
                 )
                 pick_to_reset = pick if fresh_rows else None
                 outcome = (
@@ -5895,6 +5906,24 @@ async def _codex_discover_thread_and_forward(
                 except Exception as diagnostics_error:  # noqa: BLE001
                     # Diagnostics must not replace the startup error or prevent cleanup.
                     diagnostics = {"diagnostics_error_type": type(diagnostics_error).__name__}
+                # A timeout after the TUI already died is a symptom: attribute the
+                # exit itself rather than the generic TimeoutError.
+                exit_attribution: dict[str, object] = {}
+                if isinstance(exc, _CodexTerminalExited) or diagnostics.get(
+                    "terminal_exited_undetected"
+                ):
+                    from omnigent.runner.launch_failure import classify_terminal_failure
+
+                    exit_status = diagnostics.get("terminal_exit_status")
+                    last_output = diagnostics.get("terminal_last_output")
+                    diagnosis = classify_terminal_failure(
+                        command="codex",
+                        exit_status=exit_status if isinstance(exit_status, int) else None,
+                        output=last_output if isinstance(last_output, str) else None,
+                    )
+                    exit_attribution["error_category"] = (
+                        diagnosis.category if diagnosis else ErrorCategory.RUNNER
+                    ).value
                 failure_event = debug_event("codex_thread_start_failed", session_id=session_id)
                 failure_event["attributes"] = {
                     "harness": "codex-native",
@@ -5918,6 +5947,9 @@ async def _codex_discover_thread_and_forward(
                     "elapsed_ms": round((time.monotonic() - discovery_started_at) * 1000),
                     "login_required": login_required,
                     **diagnostics,
+                    **exit_attribution,
+                    "error_impact": ErrorImpact.BLOCKING.value,
+                    "error_phase": ErrorPhase.HARNESS_STARTUP.value,
                 }
                 _logger.exception(
                     "Codex TUI never started a thread for %s; chat will not forward%s%s",
@@ -7512,6 +7544,12 @@ def _native_terminal_start_error_payload(
         exception_type=type(exc).__name__,
         exception_cause_type=type(exc.__cause__).__name__ if exc.__cause__ is not None else None,
         cause_code=exc.code if isinstance(exc, OmnigentError) else None,
+        # The warning below carries no exc_info for a missing agent, so the
+        # sink cannot derive its category.
+        error_category=exc.category.value
+        if isinstance(exc, OmnigentError) and missing_agent
+        else None,
+        error_impact=ErrorImpact.BLOCKING.value,
     )
     if missing_agent:
         # Expected session-lifecycle condition: the session's agent was deleted
@@ -9626,6 +9664,8 @@ async def _launch_native_terminal(
                     session_id=ctx.session_id,
                     harness=harness_name,
                     stage="terminal_start",
+                    error_impact=ErrorImpact.BLOCKING.value,
+                    error_phase=ErrorPhase.HARNESS_STARTUP.value,
                 ),
             )
             if reraise:
@@ -9784,6 +9824,7 @@ async def _ensure_native_terminal(
                         session_id=ctx.session_id,
                         terminal_name=terminal_name,
                         stage="terminal_start",
+                        error_impact=ErrorImpact.BLOCKING.value,
                     ),
                 )
             return _native_terminal_start_error_response(

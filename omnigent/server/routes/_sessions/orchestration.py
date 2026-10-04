@@ -68,6 +68,7 @@ from omnigent.host.frames import (
 )
 from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.native.failure_telemetry import FailureContext, normalize_failure_context
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
@@ -323,6 +324,7 @@ from omnigent.server.routes._sessions.helpers import (
     _SessionEventDispatchResult,
     _signal_terminal_resolved_harness_elicitation,
     _spec_harness,
+    _stable_id_reuse_is_exact_retry,
     _stop_session_via_runner,
     _usage_by_model_for_display,
     _validate_session_workspace,
@@ -353,6 +355,11 @@ from omnigent.server.schemas import (
     SessionResponse,
     SessionStatusEvent,
     SessionUsageEvent,
+)
+from omnigent.server.subagent_activity import (
+    claude_subagent_completion_markers,
+    record_claude_subagent_return,
+    record_subagent_activity,
 )
 from omnigent.spec.types import (
     AgentSpec,
@@ -2432,6 +2439,9 @@ async def _persist_external_antigravity_subagent_start(
     )
     if existing is not None:
         await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
+        await record_subagent_activity(
+            existing.id, "delegated", conversation_store, parent_id=parent_id
+        )
         return existing.id
     return await _create_and_publish_antigravity_child(
         parent_id,
@@ -2482,6 +2492,9 @@ async def _persist_external_codex_subagent_start(
     labels = _codex_subagent_labels_from_body(thread_id, body)
     if existing is not None:
         await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
+        await record_subagent_activity(
+            existing.id, "delegated", conversation_store, parent_id=parent_id
+        )
         return existing.id
     return await _create_and_publish_codex_child(
         parent_id, parent_conv, thread_id, labels, conversation_store
@@ -2739,9 +2752,14 @@ async def _persist_external_conversation_item_unlocked(
         # Skipped older entries are persisted as undelivered. A miss falls back
         # to the oldest entry, except for Kiro, whose prompt text is exact.
         text = _message_text(item.data.content) or ""
+        agent_message_candidate = body.data.get("agent_message_candidate") is True
         matched = pending_inputs.resolve_matching_text(session_id, text, hold=True)
         drained = matched.matched
-        if item.stable_id is not None or _is_kiro_native_session(conv):
+        if agent_message_candidate:
+            # Ambiguous markup can be direct terminal input. Only its exact
+            # pending match is evidence of a web submission; preserve others.
+            held_older = [*matched.skipped, *matched.uncertain]
+        elif item.stable_id is not None or _is_kiro_native_session(conv):
             skipped_pending = matched.skipped
             # Jumped-over entries that a positional drain may already have
             # settled: drained without an undelivered record.
@@ -2752,7 +2770,7 @@ async def _persist_external_conversation_item_unlocked(
             # message would brand everything queued in between undelivered.
             # Leave the older entries queued for a later mirror instead.
             held_older = [*matched.skipped, *matched.uncertain]
-        if drained is None and not _is_kiro_native_session(conv):
+        if drained is None and not agent_message_candidate and not _is_kiro_native_session(conv):
             drained = pending_inputs.resolve_oldest(session_id, hold=True)
             if drained is not None:
                 # The mirror's true owner may be any entry still queued, so none
@@ -2778,6 +2796,10 @@ async def _persist_external_conversation_item_unlocked(
             # No pending entry — direct terminal input. Fall back to the
             # identity authenticated on the forwarder's own request.
             item = item.model_copy(update={"created_by": created_by})
+        if agent_message_candidate:
+            item = item.model_copy(
+                update={"data": item.data.model_copy(update={"user_authored": True})}
+            )
     elif item.type == "slash_command" and isinstance(item.data, SlashCommandData):
         # A command typed in the web composer was queued as plain text but comes
         # back as a slash_command item. Drain its own entry so it is not later
@@ -2799,7 +2821,7 @@ async def _persist_external_conversation_item_unlocked(
     # back deduplicated and its queue entries are unheld.
     try:
         skipped_new_items = _build_skipped_native_items(session_id, conv, skipped_pending)
-        batch = [*skipped_new_items, item]
+        batch = [*skipped_new_items, item, *claude_subagent_completion_markers(item)]
         pending_background_title = prepare_background_session_title(
             coordinator=background_title_coordinator,
             conversation=conv,
@@ -2815,7 +2837,7 @@ async def _persist_external_conversation_item_unlocked(
             session_id, [*skipped_pending, *uncertain_pending, *held_older], drained
         )
         raise
-    persisted = persisted_items[-1]
+    persisted = persisted_items[len(skipped_new_items)]
     if persisted.deduplicated:
         # A re-post of an already-committed item: nothing new to render or
         # title. Every pending entry consumed above belongs to a LATER user
@@ -2823,6 +2845,7 @@ async def _persist_external_conversation_item_unlocked(
         _restore_drained_inputs(
             session_id, [*skipped_pending, *uncertain_pending, *held_older], drained
         )
+        await record_claude_subagent_return(session_id, persisted, conversation_store)
         return persisted.id
     # Landed: the drained entries are settled (uncertain ones leave without a
     # record — their mirror may already have been attributed by position);
@@ -2848,6 +2871,7 @@ async def _persist_external_conversation_item_unlocked(
     _publish_persisted_external_item(
         session_id, body, persisted, cleared_pending_id=cleared_pending_id
     )
+    await record_claude_subagent_return(session_id, persisted, conversation_store)
     return persisted.id
 
 
@@ -2856,6 +2880,16 @@ def _new_external_conversation_item(
 ) -> NewConversationItem:
     """Parse an external item event, keyed by its ``source_id`` when it has one."""
     item = _parse_external_conversation_item(body)
+    return_id = body.data.get("subagent_return_id")
+    if (
+        isinstance(return_id, str)
+        and return_id
+        and isinstance(item.data, (MessageData, FunctionCallOutputData))
+    ):
+        # Child discovery can lag behind the result; retain its explicit provenance.
+        item = item.model_copy(
+            update={"data": item.data.model_copy(update={"subagent_return_id": return_id})}
+        )
     # An at-least-once producer (the native transcript forwarders) retries a
     # timed-out POST it cannot know the disposition of, so the item's id is
     # derived from its ``source_id`` and the append is idempotent — the
@@ -2921,12 +2955,18 @@ async def _persist_external_conversation_items(
         except Exception as exc:  # noqa: BLE001 — re-raised once the valid prefix is applied
             error = exc
             break
+    markers = [marker for item in items for marker in claude_subagent_completion_markers(item)]
     persisted_items = (
-        await asyncio.to_thread(conversation_store.append, session_id, items) if items else []
+        (await asyncio.to_thread(conversation_store.append, session_id, [*items, *markers]))[
+            : len(items)
+        ]
+        if items
+        else []
     )
     for body, persisted in zip(bodies[: len(items)], persisted_items, strict=True):
         if not persisted.deduplicated:
             _publish_persisted_external_item(session_id, body, persisted)
+        await record_claude_subagent_return(session_id, persisted, conversation_store)
     if error is not None:
         raise error
     return [persisted.id for persisted in persisted_items]
@@ -2987,7 +3027,7 @@ async def _settle_undelivered_native_input(
     item = NewConversationItem(
         type="message",
         response_id=response_id or generate_task_id(),
-        data=MessageData(role="user", content=drained.content),
+        data=MessageData(role="user", content=drained.content, user_authored=True),
         created_by=drained.created_by,
         stable_id=drained.stable_id,
     )
@@ -3088,7 +3128,7 @@ def _build_skipped_native_items(
             NewConversationItem(
                 type="message",
                 response_id=turn_id,
-                data=MessageData(role="user", content=skipped.content),
+                data=MessageData(role="user", content=skipped.content, user_authored=True),
                 created_by=skipped.created_by,
                 stable_id=uuid.uuid5(
                     uuid.NAMESPACE_URL,
@@ -3142,13 +3182,21 @@ async def _enrich_terminal_status_with_subagent_output(
     """
     if status not in ("idle", "failed"):
         return data
+    context: FailureContext = {}
+    if status == "failed":
+        context = normalize_failure_context(data.get("failure_context"))
+        context.setdefault("failure_source", "external_status")
+        data = {**data, "failure_context": context}
     current_turn_only = status == "failed" or data.get("turn_outcome") == "cancelled"
     existing = data.get("output")
     if current_turn_only and isinstance(existing, str) and existing.strip():
+        if status == "failed":
+            context.setdefault("detail_source", "external_status_output")
         return data
     # The store's latest assistant text can be prose that preceded the error.
     failure_detail = data.get("failure_detail") if status == "failed" else None
     if isinstance(failure_detail, str) and failure_detail.strip():
+        context.setdefault("detail_source", "external_status_failure_detail")
         return {**data, "output": failure_detail.strip()}
     raw_response_id = data.get("response_id") if current_turn_only else None
     response_id = raw_response_id if isinstance(raw_response_id, str) and raw_response_id else None
@@ -3160,7 +3208,11 @@ async def _enrich_terminal_status_with_subagent_output(
         stop_at_user_message=current_turn_only,
     )
     if output is None:
+        if status == "failed":
+            context["detail_source"] = "missing"
         return data
+    if status == "failed":
+        context["detail_source"] = "assistant_output_fallback"
     return {**data, "output": output}
 
 
@@ -3249,6 +3301,11 @@ async def _heal_subagent_runner_binding_via_parent(
         return None
 
     if live_runner_id != child_conv.runner_id:
+        from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+
+        if is_side_chat_child(child_conv.labels):
+            # The side chat's ephemeral fork died with its runner; it can't move.
+            return None
         # Heal the divergence so this child's row matches the live runner: the
         # next forward resolves directly and a future ``_on_runner_connect``
         # (which rebinds by matching runner_id) can recover it.
@@ -3483,7 +3540,11 @@ async def _mark_runner_sessions_offline_impl(
         dead_on_arrival = fail_idle_top_level and conv.kind != "sub_agent"
         if not interrupted and not dead_on_arrival:
             continue
+        turn_id = _session_active_response_cache.get(conv.id)
         _publish_status(conv.id, "failed", error, failure_origin="runner_offline_sweep")
+        await record_subagent_activity(
+            conv.id, "returned", conversation_store, turn_id=turn_id, status="failed"
+        )
         await _persist_session_status_error_labels(conv.id, error, conversation_store)
 
 
@@ -5876,12 +5937,29 @@ async def _forward_event_to_runner(
     import uuid
 
     turn_id = f"turn_{uuid.uuid4().hex}"
-    item = _build_new_item(body, turn_id, created_by=created_by)
+    # A web send is persisted under its client stable id (see _web_send_stable_id).
+    item = _build_new_item(body, turn_id, created_by=created_by, adopt_stable_id=True)
     persisted_items = await asyncio.to_thread(
         conversation_store.append,
         session_id,
         [item],
     )
+    if (
+        item.stable_id is not None
+        and persisted_items[0].deduplicated
+        and not _stable_id_reuse_is_exact_retry(persisted_items[0], item)
+    ):
+        # A persisted retry may still need forwarding if the first attempt
+        # failed before reaching the runner. A different body under the id
+        # (a pre-adoption web bundle resending an edited restored draft) is a
+        # new message: give it a store-assigned id so it runs under the item
+        # that holds it.
+        item = _build_new_item(body, turn_id, created_by=created_by)
+        persisted_items = await asyncio.to_thread(
+            conversation_store.append,
+            session_id,
+            [item],
+        )
     await _seed_missing_title_from_user_message(
         conv,
         item,
@@ -6340,8 +6418,10 @@ async def _forward_event_to_runner(
             _reject_error = ErrorDetail(code="runner_rejected_event", message=_reject_detail)
             # Persist before publishing: a client that reloads on the ``failed``
             # edge must not race a snapshot that has no ``last_task_error`` yet.
+            # The item id lets a client whose 503 was lost match the refusal to
+            # its own send instead of to any message the snapshot holds.
             await _persist_session_status_error_labels(
-                session_id, _reject_error, conversation_store
+                session_id, _reject_error, conversation_store, item_id=persisted_items[0].id
             )
             _publish_status(
                 session_id,
@@ -7144,38 +7224,40 @@ async def _relay_runner_live_elsewhere(
     conversation_store: ConversationStore,
 ) -> bool:
     """
-    Resolve this relay's bound runner and check it against another replica.
+    Check this relay's bound runner using shared runner metadata.
 
-    The active relay's runner id is normally known from its own
-    ``_runner_relay_tasks`` registration; a caller that drives
-    :func:`_relay_runner_stream` directly (tests, or a code path
-    bypassing :func:`_ensure_runner_relay`) has no such entry, so fall
-    back to the session row's binding. One row read serves both the
-    binding and the liveness stamp, keeping this path bounded.
+    A full-conversation read can depend on unrelated backends; their outage
+    must not hide a fresh heartbeat from another replica. Prefer the active
+    relay's runner binding, falling back to the metadata binding when called
+    without a registered relay.
 
     :param session_id: Session/conversation identifier.
-    :param conversation_store: Store used to read the session row.
+    :param conversation_store: Store used to read runner metadata.
     :returns: ``True`` when the bound runner is confirmed live on
         another replica; ``False`` when unbound, unreadable, or not.
     """
     try:
-        row = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        liveness = await asyncio.to_thread(conversation_store.get_runner_liveness, session_id)
     except Exception:  # noqa: BLE001 — fall through to the mid-turn check instead
         _logger.warning(
-            "Relay: session-row lookup failed for session=%s",
+            "Relay: runner liveness lookup failed for session=%s",
             session_id,
             exc_info=True,
             extra={"session_id": session_id},
         )
         return False
-    if row is None:
+    if liveness is None:
         return False
+    bound_runner_id, runner_last_seen = liveness
     handle = _runner_relay_tasks.get(session_id)
-    runner_id = handle.runner_id if handle is not None else row.runner_id
+    runner_id = handle.runner_id if handle is not None else bound_runner_id
     if runner_id is None:
         return False
     reference_stamp = session_live_state.last_liveness_stamp(runner_id)
-    return _runner_live_on_another_replica_from_conversations([row], runner_id, reference_stamp)
+    return bound_runner_id == runner_id and _runner_stamp_is_live_elsewhere(
+        stamp=runner_last_seen,
+        reference_stamp=reference_stamp,
+    )
 
 
 async def _relay_runner_stream(
@@ -7349,11 +7431,15 @@ async def _relay_runner_stream(
                     code="runner_disconnected",
                     message="Runner disconnected unexpectedly.",
                 )
+                turn_id = _session_active_response_cache.get(session_id)
                 _publish_status(
                     session_id,
                     "failed",
                     disconnect_error,
                     failure_origin="runner_disconnected_mid_turn",
+                )
+                await record_subagent_activity(
+                    session_id, "returned", conversation_store, turn_id=turn_id, status="failed"
                 )
                 # Persist the disconnect cause as durable labels so the
                 # distinction survives into snapshots and child-session
@@ -7406,6 +7492,8 @@ async def _relay_runner_stream_once(
     """
     text_acc: list[str] = []
     current_response_id: str | None = None
+    pending_subagent_return_id: str | None = None
+    pending_subagent_return_status = "completed"
     # Model/agent label from the turn header, stamped on text segments
     # flushed at tool-call boundaries (the boundary event carries no model).
     current_model: str | None = None
@@ -7486,6 +7574,20 @@ async def _relay_runner_stream_once(
                             ready.set()
                         continue
 
+                    if evt_type == "session.created":
+                        child_id = event.get("child_session_id")
+                        if isinstance(child_id, str) and child_id:
+                            await _flush_relay_text(
+                                conversation_store,
+                                session_id,
+                                text_acc,
+                                current_response_id,
+                                current_model,
+                            )
+                            await record_subagent_activity(
+                                child_id, "delegated", conversation_store, parent_id=session_id
+                            )
+
                     # Stopped turn: drop its trailing response.* output (no
                     # forward, no persist) but keep text_acc — the pre-stop
                     # narration the user watched persists at the terminal flush.
@@ -7504,6 +7606,15 @@ async def _relay_runner_stream_once(
 
                     if evt_type == "session.status":
                         status = event.get("status", "")
+                        if status in {"idle", "failed"} and pending_subagent_return_id is not None:
+                            await record_subagent_activity(
+                                session_id,
+                                "returned",
+                                conversation_store,
+                                turn_id=pending_subagent_return_id,
+                                status=pending_subagent_return_status,
+                            )
+                            pending_subagent_return_id = None
                         if status:
                             # Forward the runner's failure detail on a
                             # ``failed`` transition so a SETUP-phase
@@ -7616,10 +7727,13 @@ async def _relay_runner_stream_once(
                     # events so persisted items share one id.
                     if evt_type == "response.in_progress":
                         _turn_start_s = time.monotonic()
+                        pending_subagent_return_id = None
                         resp_obj = event.get("response", {})
                         _rid = resp_obj.get("id")
                         if isinstance(_rid, str) and _rid:
                             current_response_id = _rid
+                            # Keep the turn identity across transport retries until final status.
+                            _session_active_response_cache[session_id] = _rid
                         _model = resp_obj.get("model")
                         failure_agent_name = _model if isinstance(_model, str) and _model else None
                         if isinstance(_model, str) and _model:
@@ -7697,6 +7811,8 @@ async def _relay_runner_stream_once(
                             # call (the segment persists here, ahead of the
                             # terminal-flush evaluation).
                             evaluate_response_phase=_boundary_deny is None,
+                            # Progress text precedes more tool calls.
+                            turn_final=False,
                         )
                         # A failed append leaves text_acc for retry — re-arm
                         # the marker so the retry persists the sentinel.
@@ -7753,16 +7869,21 @@ async def _relay_runner_stream_once(
                             current_response_id,
                             _final_model,
                             deny_reason=_deny_reason,
-                            # Terminal flush is the only place the runner
-                            # topology can evaluate the spec's RESPONSE-phase
-                            # output policies over the final assistant text.
+                            # Gate any remaining text before persistence.
                             evaluate_response_phase=_deny_reason is None,
+                            # Only successful completion triggers final-response actions.
+                            turn_final=evt_type == "response.completed",
                         )
                         # A failed append leaves text_acc intact for a retry
                         # at a later flush — re-arm the marker so the retry
                         # still persists the sentinel, not the denied text.
                         if _deny_reason is not None and text_acc:
                             _llm_response_denied_turns[session_id] = _deny_reason
+                        pending_subagent_return_id = current_response_id
+                        pending_subagent_return_status = {
+                            "response.failed": "failed",
+                            "response.cancelled": "cancelled",
+                        }.get(evt_type, "completed")
 
                     if evt_type == "response.failed":
                         # The runner could not hand this turn to a native
@@ -9802,6 +9923,7 @@ async def _create_session_from_existing_agent(
         )
 
     inference_snapshot = None
+    selection_spec = None
     if agent_cache is not None:
         from omnigent.harness_aliases import canonicalize_harness
         from omnigent.runtime.workflow import _find_spec_by_name
@@ -9869,7 +9991,7 @@ async def _create_session_from_existing_agent(
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
     if body.parent_session_id is not None:
-        parent_conv = conversation_store.get_conversation(body.parent_session_id)
+        parent_conv = _parent_for_routing
         if parent_conv is not None:
             inherited_runner_id = parent_conv.runner_id
             # Defense-in-depth: don't inherit a runner the
@@ -9900,6 +10022,28 @@ async def _create_session_from_existing_agent(
             agent_cache=agent_cache,
             request=request,
         )
+
+    from omnigent.server.routes._session_harness_readiness import (
+        validate_create_harness_readiness,
+    )
+
+    selected_harness = (
+        harness_override or _spec_harness(selection_spec)
+        if selection_spec is not None
+        else await asyncio.to_thread(
+            _create_resolved_harness, agent, harness_override, agent_cache
+        )
+    )
+    await validate_create_harness_readiness(
+        harness=selected_harness,
+        host_id=body.host_id,
+        parent_session_id=body.parent_session_id,
+        inherited_runner_id=inherited_runner_id,
+        user_id=user_id,
+        conversation_store=conversation_store,
+        host_store=getattr(request.app.state, "host_store", None),
+        parent=_parent_for_routing,
+    )
 
     # Git worktree options (optional). Two modes on body.git:
     #  - create (default): make a worktree; it becomes the stored
@@ -10049,10 +10193,7 @@ async def _create_session_from_existing_agent(
         initial_labels.update(_subagent_labels)
     elif (
         body.sub_agent_name is None
-        and native_coding_agent_for_harness(
-            await asyncio.to_thread(_create_resolved_harness, agent, harness_override, agent_cache)
-        )
-        is not None
+        and native_coding_agent_for_harness(selected_harness) is not None
     ):
         initial_labels[_CLAUDE_NATIVE_UI_LABEL_KEY] = _CLAUDE_NATIVE_UI_LABEL_VALUE
     elif body.sub_agent_name is None and body.host_id is not None:
@@ -10154,7 +10295,13 @@ async def _create_session_from_existing_agent(
     # joins the session's session.id group.
     from omnigent.runtime import telemetry
 
-    session_created(conv.id, conv.runner_id)
+    session_created(
+        conv.id,
+        conv.runner_id,
+        parent_session_id=body.parent_session_id,
+        agent_id=conv.agent_id,
+        harness=selected_harness,
+    )
     telemetry.set_session_id(conv.id)
 
     if _native_smart_routing:
@@ -11066,9 +11213,6 @@ async def _fetch_model_options(
     return cached or []
 
 
-_SIDE_CHAT_NICKNAME = "Side chat"
-
-
 async def _codex_side_chat_fork_sealed(conv: Conversation, conv_store: ConversationStore) -> bool:
     """
     Whether a codex ``/side`` child's ephemeral fork is no longer reachable.
@@ -11081,20 +11225,44 @@ async def _codex_side_chat_fork_sealed(conv: Conversation, conv_store: Conversat
     the same live runner does not diverge, so a still-live side chat stays
     sendable.
     """
-    from omnigent.server.routes._sessions.common import (
-        _CODEX_NATIVE_SUBAGENT_NICKNAME_LABEL_KEY,
-    )
+    from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 
     if (
         not _is_codex_native_subagent(conv)
         or conv.parent_conversation_id is None
         or not conv.runner_id
-        or (conv.labels or {}).get(_CODEX_NATIVE_SUBAGENT_NICKNAME_LABEL_KEY)
-        != _SIDE_CHAT_NICKNAME
+        or not is_side_chat_child(conv.labels)
     ):
         return False
     parent = await asyncio.to_thread(conv_store.get_conversation, conv.parent_conversation_id)
     return parent is not None and bool(parent.runner_id) and parent.runner_id != conv.runner_id
+
+
+async def _codex_side_chat_fork_lost(
+    conv: Conversation,
+    conv_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+    host_registry: HostRegistry | None,
+) -> bool:
+    """Whether a side chat's ephemeral fork is provably gone with its runner."""
+    if await _codex_side_chat_fork_sealed(conv, conv_store):
+        return True
+    from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+    from omnigent.runner.routing import routing_host_id
+
+    if not _is_codex_native_subagent(conv) or not conv.runner_id or host_registry is None:
+        return False
+    if not is_side_chat_child(conv.labels) or (
+        runner_router is not None and runner_router.runner_is_online(conv.runner_id)
+    ):
+        return False
+    host_id = await asyncio.to_thread(routing_host_id, conv, conv_store)
+    host_conn = host_registry.get(host_id) if host_id is not None else None
+    if host_conn is None:
+        return False
+    # The host owns the process: "unknown" means it is not running there either.
+    status = await _query_host_runner_status(host_conn, host_registry, conv.runner_id)
+    return status in {"dead", "unknown"}
 
 
 def _resolve_harness_impl_is_acp(conv: Conversation, agent_store: AgentStore | None) -> bool:

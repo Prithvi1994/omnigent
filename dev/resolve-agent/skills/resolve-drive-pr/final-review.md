@@ -1,11 +1,15 @@
 ### 4.5 — Submit the final review verdict, then tag the maintainer
 
 When the branch is **mergeable** (4.2 — re-check `mergeable` now; `main` may have
-moved again since your last push), CI is green (4.2), **and** the automated review
-is clean (4.3), you're done iterating — now record your verdict and hand off to a
-human. A `CONFLICTING`/`DIRTY` branch is **not** `fixed`: rebase and resolve
-(4.2) before you submit a verdict, or, if you truly can't, downgrade the outcome
+moved again since your last push), CI is green (4.2), **and** both Polly and OCR
+reviews are complete with all findings settled for the current head (4.3), record
+your verdict and hand off to a human. A `CONFLICTING`/`DIRTY` branch is **not**
+`fixed`: rebase and resolve (4.2) before you submit a verdict, or, if you truly can't, downgrade the outcome
 and say the PR needs a conflict resolution the maintainer must do.
+
+**Gate: the live review receipt is current.** Run `review_cycle.py check` from
+Step 4.3 immediately before this verdict. If either reviewer is incomplete or
+feedback has changed, return to the review loop; do not approve or report ready.
 
 **Gate: the shared impact assessment covers the current candidate.** Confirm
 its base/head and tested contents still match, all required checks passed, and
