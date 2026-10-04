@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -67,6 +67,7 @@ class _NativeSession:
     bridge_dir: Path
     codex: _CodexClient
     remembered_efforts: dict[str, str]
+    runner: httpx.AsyncClient
 
 
 @pytest.fixture
@@ -127,7 +128,30 @@ async def native_session(
         monkeypatch.setattr(
             "omnigent.server.routes.sessions._get_runner_client", AsyncMock(return_value=runner)
         )
-        yield _NativeSession(session_id, store, bridge_dir, codex, remembered_efforts)
+        yield _NativeSession(session_id, store, bridge_dir, codex, remembered_efforts, runner)
+
+
+async def test_reset_without_current_model_rejected_before_codex_connection(
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unsatisfiable native reset is invalid input and must not open a connection."""
+    session = native_session
+    config = bridge.codex_home_for_bridge_dir(session.bridge_dir) / "config.toml"
+    config.write_text('model_reasoning_effort = "xhigh"\n')
+    factory = Mock(return_value=session.codex)
+    monkeypatch.setattr(app_server, "client_for_transport", factory)
+
+    response = await session.runner.post(
+        f"/v1/sessions/{session.session_id}/events", json={"type": "effort_change", "effort": None}
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"] == "invalid_input"
+    assert "requires a current model" in response.json()["detail"]
+    factory.assert_not_called()
+    assert session.remembered_efforts[session.session_id] == "xhigh"
+    assert bridge.read_codex_config_effort(session.bridge_dir) == "xhigh"
 
 
 @pytest.mark.parametrize("failure", ["missing_default", "timeout"])

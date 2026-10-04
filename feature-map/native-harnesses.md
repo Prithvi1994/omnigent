@@ -97,6 +97,7 @@ Cross-harness journeys:
 - **`model-and-effort`, rejected Codex reset (server/runner integration):**
   `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_reset_returns_error_and_preserves_applied_settings`,
   `tests/server/integration/test_codex_effort_forward_failure.py::test_rejected_reset_preserves_concurrent_selection_and_sibling_settings`,
+  `tests/server/integration/test_codex_effort_forward_failure.py::test_reset_without_current_model_rejected_before_codex_connection`,
   `tests/server/integration/test_codex_effort_forward_failure.py::test_offline_or_silent_effort_change_is_saved_for_resume`.
   Run with plain `uv run pytest`. Both HTTP apps and persistence are real;
   Codex RPC failures inject missing defaults and discovery timeouts. A refused

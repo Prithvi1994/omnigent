@@ -6,8 +6,10 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
+import tomlkit
 
 try:
     import tomllib
@@ -414,14 +416,24 @@ async def test_start_clamps_effort_to_catalog(
         await server.close()
 
 
-@pytest.mark.parametrize("write_failure", [None, "rejected", "disconnected", "timeout"])
+@pytest.mark.parametrize(
+    ("write_failure", "symlink_config"),
+    [
+        (None, False),
+        (None, True),
+        ("rejected", False),
+        ("disconnected", False),
+        ("timeout", False),
+    ],
+)
 async def test_start_without_catalog_snapshot_checks_the_live_models(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     write_failure: str | None,
+    symlink_config: bool,
 ) -> None:
-    """Startup attempts the repair and still trusts hooks if the write fails."""
+    """Startup isolates config repairs from the source and survives failed writes."""
     from unittest.mock import AsyncMock, call
 
     from omnigent.harnesses.codex_native import app_server
@@ -430,11 +442,15 @@ async def test_start_without_catalog_snapshot_checks_the_live_models(
     source_home.mkdir()
     original = 'model = "gpt-5.4"\nmodel_reasoning_effort = "max"\n'
     (source_home / "config.toml").write_text(original)
+    private_home = tmp_path / "codex-home"
+    if symlink_config:
+        private_home.mkdir()
+        (private_home / "config.toml").symlink_to(source_home / "config.toml")
     monkeypatch.setenv("CODEX_HOME", str(source_home))
     _disable_codex_startup_rpc(monkeypatch)
     client = AsyncMock(spec=app_server.CodexAppServerClient)
 
-    async def request(method: str, _params: object) -> dict[str, object]:
+    async def request(method: str, params: dict[str, Any]) -> dict[str, object]:
         if method == "model/list":
             return {
                 "result": {
@@ -454,6 +470,13 @@ async def test_start_without_catalog_snapshot_checks_the_live_models(
             raise ConnectionError("control socket disconnected")
         if write_failure == "timeout":
             await asyncio.Event().wait()
+        assert method == "config/batchWrite"
+        # Perform the write so an unmaterialized symlink would change the source.
+        config_path = Path(params["filePath"])
+        document = tomlkit.parse(config_path.read_text())
+        for edit in params["edits"]:
+            document[edit["keyPath"]] = edit["value"]
+        config_path.write_text(tomlkit.dumps(document))
         return {"result": {}}
 
     client.request.side_effect = request
@@ -464,7 +487,7 @@ async def test_start_without_catalog_snapshot_checks_the_live_models(
     )
     trust = AsyncMock()
     monkeypatch.setattr(app_server.CodexNativeAppServer, "_trust_policy_hooks", trust)
-    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", tmp_path)
+    server = _test_app_server(tmp_path, private_home, tmp_path / "bridge", tmp_path)
 
     try:
         await server.start()
@@ -485,6 +508,12 @@ async def test_start_without_catalog_snapshot_checks_the_live_models(
             ),
         ]
         assert (source_home / "config.toml").read_text() == original
+        assert not (private_home / "config.toml").is_symlink()
+        if write_failure is None:
+            assert (
+                tomllib.loads((private_home / "config.toml").read_text())["model_reasoning_effort"]
+                == "xhigh"
+            )
         trust.assert_awaited_once_with(client=client)
         client.close.assert_awaited_once()
         if write_failure:

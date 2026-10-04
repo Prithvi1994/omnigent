@@ -283,16 +283,26 @@ def build_native_controls(
                 },
             )
 
+        bridge_dir = bridge_dir_for_codex_home(Path(state.codex_home))
+        settings = dict(settings)
+        model = None
+        if "model" in settings or "effort" in settings:
+            model = settings.get("model") or read_codex_config_model(bridge_dir)
+        if "effort" in settings and settings["effort"] is None and not isinstance(model, str):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "invalid_input",
+                    "detail": "Codex effort reset requires a current model",
+                },
+            )
         codex_client = client_for_transport(
             state.socket_path,
             client_name="omnigent-codex-native-runner",
         )
-        bridge_dir = bridge_dir_for_codex_home(Path(state.codex_home))
-        settings = dict(settings)
         try:
             await codex_client.connect()
             if "model" in settings or "effort" in settings:
-                model = settings.get("model") or read_codex_config_model(bridge_dir)
                 # Only an absent key inherits config; null selects the model's default.
                 effort = (
                     settings["effort"]
@@ -308,8 +318,6 @@ def build_native_controls(
                     effort = effort_for_model_switch(None, model)
                     if effort is not None:
                         settings["effort"] = effort
-                if "effort" in settings and effort is None and not isinstance(model, str):
-                    raise ValueError("Codex effort reset requires a current model")
                 if isinstance(model, str) and (
                     isinstance(effort, str) or ("effort" in settings and effort is None)
                 ):
