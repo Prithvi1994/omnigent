@@ -96,7 +96,11 @@ _LOAD_PROBE_JS = """
     const status = host.parentElement && host.parentElement.querySelector('[role="status"]');
     window.__modelLoadProbe.statusAtHostMount = status ? status.textContent : null;
   };
-  new MutationObserver(check).observe(document, { childList: true, subtree: true });
+  const observer = new MutationObserver(() => {
+    check();
+    if (window.__modelLoadProbe.statusAtHostMount !== undefined) observer.disconnect();
+  });
+  observer.observe(document, { childList: true, subtree: true });
   check();
 })();
 """

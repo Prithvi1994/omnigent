@@ -451,6 +451,22 @@ describe("ModelViewer loading state", () => {
     expect(screen.getByLabelText("3D preview of part.stl").querySelector("canvas")).not.toBeNull();
   });
 
+  it("shows the status again when a new model starts loading", async () => {
+    const { rerender } = render(<ModelViewer data={makeData()} path="part.stl" />);
+    // The first model builds, so its overlay clears and the canvas is shown.
+    await waitFor(() => expect(screen.queryByRole("status")).toBeNull());
+    expect(screen.getByLabelText("3D preview of part.stl").querySelector("canvas")).not.toBeNull();
+
+    // A new file arrives whose bytes are still downloading. The overlay must
+    // return instead of leaving the previous model's canvas on screen.
+    blobBehavior.pending = true;
+    rerender(<ModelViewer data={makeData({ path: "next.stl" })} path="next.stl" />);
+
+    const host = screen.getByLabelText("3D preview of next.stl");
+    expect(host.querySelector("canvas")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent("Preparing model…");
+  });
+
   it("replaces the status with the error overlay when the load fails", async () => {
     behavior.mode = "throw";
     render(<ModelViewer data={makeData()} path="part.stl" />);
