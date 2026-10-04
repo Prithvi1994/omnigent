@@ -3883,6 +3883,26 @@ class SqlAlchemyConversationStore(ConversationStore):
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
+    def list_runner_session_statuses(
+        self, runner_id: str, *, after: str | None = None, limit: int = 200
+    ) -> list[tuple[str, str | None]]:
+        """Page teardown candidates through the workspace/runner/session-ID index."""
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        statement = select(SqlConversationMetadata.id, SqlConversationMetadata.live_status).where(
+            SqlConversationMetadata.workspace_id == current_workspace_id(),
+            SqlConversationMetadata.runner_id == runner_id,
+        )
+        if after is not None:
+            statement = statement.where(SqlConversationMetadata.id > after)
+        statement = statement.order_by(SqlConversationMetadata.id).limit(limit)
+        with self._session("list_runner_session_statuses") as session:
+            rows = session.execute(statement).all()
+        return [
+            (session_id, decode_session_live_status(status) if status is not None else None)
+            for session_id, status in rows
+        ]
+
     def list_conversations_by_runner_id(
         self,
         runner_id: str,

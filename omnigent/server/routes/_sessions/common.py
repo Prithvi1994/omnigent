@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 import weakref
 from dataclasses import dataclass
 from typing import Any
@@ -54,6 +55,7 @@ from omnigent.server.schemas import (
 from omnigent.spec.types import (
     StateUpdate,
 )
+from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
 
 # Pinned to the historical module path so log records keep landing on the
 # ``omnigent.server.routes.sessions`` logger after the split into this package.
@@ -630,7 +632,13 @@ _read_explicit_unread: WorkspaceScopedCache[str, set[str]] = WorkspaceScopedCach
 _interrupt_fenced_sessions: WorkspaceScopedSet[str] = WorkspaceScopedSet()
 
 
-_intentional_stop_sessions: WorkspaceScopedSet[str] = WorkspaceScopedSet()
+# A marker covers only the stopped runner. Orphaned replica-local markers expire
+# after the host teardown and a full disconnect grace have had time to finish.
+_intentional_stop_sessions: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
+    lambda: cachetools.TTLCache(
+        maxsize=16384, ttl=2 * RUNNER_LIVENESS_TTL_S, timer=lambda: time.monotonic()
+    )
+)
 
 
 _TERMINAL_RESPONSE_EVENT_TYPES: frozenset[str] = frozenset(

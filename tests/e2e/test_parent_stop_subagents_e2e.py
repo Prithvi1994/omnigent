@@ -97,7 +97,6 @@ class _Stream:
         self.ready = threading.Event()
         self.done = threading.Event()
         self.error: Exception | None = None
-        self.response: httpx.Response | None = None
         self.url = f"{base_url}/v1/sessions/{session_id}/stream"
         self.thread = threading.Thread(target=self._read, daemon=True)
 
@@ -105,7 +104,6 @@ class _Stream:
         try:
             with httpx.Client(trust_env=False, timeout=httpx.Timeout(30, read=30)) as client:
                 with client.stream("GET", self.url) as response:
-                    self.response = response
                     response.raise_for_status()
                     for line in response.iter_lines():
                         if self.done.is_set():
@@ -118,19 +116,21 @@ class _Stream:
             if not self.done.is_set():
                 self.error = AssertionError("session stream timed out before teardown")
         except Exception as exc:
-            if not self.done.is_set():
-                self.error = exc
+            self.error = exc
 
     def __enter__(self):
         self.thread.start()
-        assert self.ready.wait(20), f"Stream never became ready: {self.error}"
+        if not self.ready.wait(20):
+            self.__exit__(None, None, None)
+            raise AssertionError(f"Stream never became ready: {self.error}")
         return self
 
-    def __exit__(self, *_args):
+    def __exit__(self, exc_type, *_args):
         self.done.set()
-        if self.response is not None:
-            self.response.close()
-        self.thread.join(timeout=5)
+        self.thread.join(timeout=35)
+        assert not self.thread.is_alive(), "SSE reader did not exit within its read timeout"
+        if exc_type is None:
+            assert self.error is None, self.error
 
 
 @pytest.mark.parametrize("harness", ["claude", "codex"])
@@ -223,13 +223,7 @@ def test_native_parent_teardown_preserves_child_outcome(
             )
         )
         # The host itself launches the dedicated runner via the production API.
-        stack._spawn(
-            "host",
-            ["-m", "omnigent.host._daemon_entry", "--server", stack.base_url],
-            stack.runner_home,
-            env,
-            cwd=_REPO,
-        )
+        stack.start_host(env=env, cwd=_REPO)
         client = resources.enter_context(
             httpx.Client(
                 base_url=stack.base_url,
@@ -294,7 +288,7 @@ def test_native_parent_teardown_preserves_child_outcome(
             )
 
         child = _wait(dispatched_child, "native parent to dispatch its sub-agent")
-        child_id = child.get("session_id") or child["id"]
+        child_id = child["id"]
         _wait(
             lambda: (
                 any(child_prompt in json.dumps(req) for req in get_mock_requests(mock_url))
@@ -355,10 +349,9 @@ def test_native_parent_teardown_preserves_child_outcome(
                 "child's disconnect decision after the production reconnect grace",
                 timeout=RUNNER_DISCONNECT_GRACE_S + 20,
             )
-            _wait(
-                lambda: time.monotonic() - disconnected_at > RUNNER_DISCONNECT_GRACE_S + 5,
-                "the runner-wide disconnect sweep",
-                timeout=RUNNER_DISCONNECT_GRACE_S + 15,
+            # Keep collecting through the full offline grace, including late failures.
+            time.sleep(
+                max(0, RUNNER_DISCONNECT_GRACE_S + 5 - (time.monotonic() - disconnected_at))
             )
             evidence = {
                 "commit": subprocess.check_output(

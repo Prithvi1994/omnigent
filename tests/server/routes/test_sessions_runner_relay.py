@@ -974,7 +974,7 @@ async def test_relay_suppresses_disconnect_error_on_intentional_stop(
     try:
         # Simulate the Stop handler: mark the intentional teardown before
         # the tunnel drops.
-        sessions_module._intentional_stop_sessions.add(session_id)
+        sessions_module._intentional_stop_sessions[session_id] = "runner_intentional_stop"
 
         handle = await sessions_module._ensure_runner_relay_ready(
             session_id,
@@ -1013,7 +1013,7 @@ async def test_relay_suppresses_disconnect_error_on_intentional_stop(
         assert sessions_module._last_task_error_from_labels(persisted) is None
     finally:
         gate.set()
-        sessions_module._intentional_stop_sessions.discard(session_id)
+        sessions_module._intentional_stop_sessions.pop(session_id, None)
         if collector is not None:
             await collector.stop()
         handle = sessions_module._runner_relay_tasks.get(session_id)
@@ -1088,6 +1088,90 @@ class _ScriptedThenDropRunnerClient:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mark_before_rebind", [True, False])
+async def test_relay_ignores_stop_intent_for_a_different_runner(
+    monkeypatch: pytest.MonkeyPatch, mark_before_rebind: bool
+) -> None:
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S", 0.0
+    )
+    session_id = "rebound-stop-session"
+    gate = asyncio.Event()
+    store = _RecordingLabelStore()
+    sessions_module._session_status_cache[session_id] = "running"
+    if mark_before_rebind:
+        sessions_module._intentional_stop_sessions[session_id] = "runner-old"
+    handle = await sessions_module._ensure_runner_relay_ready(
+        session_id,
+        "runner-new",
+        _TunnelCloseRunnerClient(gate),  # type: ignore[arg-type]
+        conversation_store=store,  # type: ignore[arg-type]
+    )
+    assert handle is not None
+    try:
+        assert session_id not in sessions_module._intentional_stop_sessions
+        if not mark_before_rebind:
+            # A late old-runner teardown cannot apply to the new relay either.
+            sessions_module._intentional_stop_sessions[session_id] = "runner-old"
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        assert sessions_module._session_status_cache[session_id] == "failed"
+        assert sessions_module._last_task_error_from_labels(store.labels[session_id])["code"] == (
+            "runner_disconnected"
+        )
+    finally:
+        gate.set()
+        handle.task.cancel()
+        await asyncio.gather(handle.task, return_exceptions=True)
+        sessions_module._intentional_stop_sessions.pop(session_id, None)
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_old_relay_preserves_replacement_runner_stop() -> None:
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "replacement-stop-session"
+    old_gate, new_gate = asyncio.Event(), asyncio.Event()
+    store = _RecordingLabelStore()
+    old_handle = await sessions_module._ensure_runner_relay_ready(
+        session_id,
+        "runner-old",
+        _TunnelCloseRunnerClient(old_gate),  # type: ignore[arg-type]
+        conversation_store=store,  # type: ignore[arg-type]
+    )
+    assert old_handle is not None
+    new_handle = sessions_module._ensure_runner_relay(
+        session_id,
+        "runner-new",
+        _TunnelCloseRunnerClient(new_gate),  # type: ignore[arg-type]
+        conversation_store=store,  # type: ignore[arg-type]
+    )
+    assert new_handle is not None
+    sessions_module._intentional_stop_sessions[session_id] = "runner-new"
+    try:
+        await asyncio.gather(old_handle.task, return_exceptions=True)
+        assert sessions_module._intentional_stop_sessions.get(session_id) == "runner-new"
+        new_gate.set()
+        await asyncio.wait_for(new_handle.task, timeout=_TASK_TIMEOUT_S)
+        assert sessions_module._session_status_cache[session_id] == "idle"
+        assert sessions_module._last_task_error_from_labels(store.labels[session_id]) is None
+    finally:
+        old_gate.set()
+        new_gate.set()
+        new_handle.task.cancel()
+        await asyncio.gather(new_handle.task, return_exceptions=True)
+        sessions_module._intentional_stop_sessions.pop(session_id, None)
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
 async def test_relay_running_edge_clears_stale_intentional_stop_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1127,7 +1211,7 @@ async def test_relay_running_edge_clears_stale_intentional_stop_marker(
         # A prior Stop left both markers set (terminal event will clear the
         # fence; the marker must survive to the running edge, then clear).
         sessions_module._interrupt_fenced_sessions.add(session_id)
-        sessions_module._intentional_stop_sessions.add(session_id)
+        sessions_module._intentional_stop_sessions[session_id] = "runner_stale_marker"
 
         handle = await sessions_module._ensure_runner_relay_ready(
             session_id,
@@ -1160,7 +1244,7 @@ async def test_relay_running_edge_clears_stale_intentional_stop_marker(
     finally:
         gate.set()
         sessions_module._interrupt_fenced_sessions.discard(session_id)
-        sessions_module._intentional_stop_sessions.discard(session_id)
+        sessions_module._intentional_stop_sessions.pop(session_id, None)
         if collector is not None:
             await collector.stop()
         handle = sessions_module._runner_relay_tasks.get(session_id)
@@ -1735,15 +1819,16 @@ def _bound_conv(
     """
     Build a conversation-shaped row for the offline-reconciliation helper.
 
-    ``_mark_runner_sessions_offline`` reads only ``id``, ``kind`` and
-    ``live_status`` off each row, so a namespace is enough.
+    Include the departed runner binding so stop intent can be matched to it.
 
     :param session_id: Conversation identifier.
     :param kind: ``"default"`` (top-level) or ``"sub_agent"``.
     :param live_status: Persisted live status, read only on a cache miss.
     :returns: A conversation-shaped namespace.
     """
-    return SimpleNamespace(id=session_id, kind=kind, live_status=live_status)
+    return SimpleNamespace(
+        id=session_id, kind=kind, live_status=live_status, runner_id="runner-offline"
+    )
 
 
 @pytest.mark.asyncio
@@ -1804,7 +1889,7 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
     if cached is not None:
         sessions_module._session_status_cache[session_id] = cached
     if intentional_stop:
-        sessions_module._intentional_stop_sessions.add(session_id)
+        sessions_module._intentional_stop_sessions[session_id] = "runner-offline"
 
     try:
         await sessions_module._mark_runner_sessions_offline(
@@ -1835,7 +1920,7 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
             assert status == cached
             assert persisted is None
     finally:
-        sessions_module._intentional_stop_sessions.discard(session_id)
+        sessions_module._intentional_stop_sessions.pop(session_id, None)
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
 

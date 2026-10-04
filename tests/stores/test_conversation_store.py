@@ -3166,6 +3166,71 @@ def test_replace_runner_id_allows_internal_non_session_conversation(
     assert fetched.runner_id == "runner-uuid-1"
 
 
+@pytest.mark.parametrize("limit", [1, 3])
+def test_list_runner_session_statuses_pages(
+    conversation_store: SqlAlchemyConversationStore, limit: int
+) -> None:
+    from omnigent.db.db_models import workspace_scope
+
+    expected = []
+    for status in (None, "running", "waiting", "idle", "failed"):
+        row = conversation_store.create_conversation(runner_id="runner-target")
+        if status is not None:
+            conversation_store.set_session_live_status(row.id, status)
+        if status == "running":
+            conversation_store.update_conversation(row.id, archived=True)
+        expected.append((row.id, status))
+    conversation_store.create_conversation(runner_id="runner-other")
+    conversation_store.create_conversation()
+    with workspace_scope(424242):
+        conversation_store.create_conversation(runner_id="runner-target")
+
+    actual = []
+    after = None
+    while True:
+        page = conversation_store.list_runner_session_statuses(
+            "runner-target", after=after, limit=limit
+        )
+        assert len(page) <= limit
+        actual.extend(page)
+        if len(page) < limit:
+            break
+        assert after is None or page[-1][0] > after
+        after = page[-1][0]
+    assert actual == sorted(expected)
+
+
+def test_runner_session_status_page_uses_runner_index(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    if conversation_store._engine.dialect.name != "sqlite":
+        pytest.skip("SQLite query-plan assertion")
+    rows = [conversation_store.create_conversation(runner_id="runner-target") for _ in range(5)]
+    cursor = sorted(row.id for row in rows)[1]
+    queries = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(conversation_store._engine, "before_cursor_execute", capture)
+    try:
+        page = conversation_store.list_runner_session_statuses(
+            "runner-target", after=cursor, limit=2
+        )
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", capture)
+    assert len(page) == 2
+    assert len(queries) == 1, "Teardown needs only the bounded metadata read"
+    statement, parameters = queries[0]
+    with conversation_store._engine.connect() as conn:
+        plan = conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+    description = str(plan)
+    assert "ix_conversation_metadata_runner_id" in description, description
+    assert "id>?" in description, description
+    assert "TEMP B-TREE" not in description, description
+
+
 def test_list_conversations_by_runner_id_filters(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

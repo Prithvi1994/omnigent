@@ -496,6 +496,29 @@ def test_list_conversations_by_runner_id(store: SqlAlchemyConversationStore) -> 
     assert results[0].title == "a"
 
 
+def test_runner_session_status_pages_do_not_read_conversation_db(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    from sqlalchemy import event
+
+    a = store.create_conversation(runner_id="runner_x")
+    b = store.create_conversation(runner_id="runner_x")
+    store.set_session_live_status(a.id, "running")
+    store.set_session_live_status(b.id, "waiting")
+
+    def unavailable(*_args):
+        pytest.fail("runner teardown must not hydrate data from the conversation database")
+
+    event.listen(store._conv_engine, "before_cursor_execute", unavailable)
+    try:
+        first = store.list_runner_session_statuses("runner_x", limit=1)
+        second = store.list_runner_session_statuses("runner_x", after=first[-1][0], limit=1)
+        assert first + second == sorted([(a.id, "running"), (b.id, "waiting")])
+        assert store.list_runner_session_statuses("runner_x", after=second[-1][0], limit=1) == []
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", unavailable)
+
+
 # ── fork_conversation ──────────────────────────────────
 
 

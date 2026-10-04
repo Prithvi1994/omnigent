@@ -3051,7 +3051,7 @@ def register_events_routes(
             for blob_key in orphaned_blob_keys:
                 await asyncio.to_thread(artifact_store.delete, blob_key)
         _interrupt_fenced_sessions.discard(session_id)
-        _intentional_stop_sessions.discard(session_id)
+        _intentional_stop_sessions.pop(session_id, None)
         deleted = await conversation_store.delete_conversation(session_id)
         if not deleted:
             raise _session_not_found()

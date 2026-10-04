@@ -1555,6 +1555,23 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def list_runner_session_statuses(
+        self, runner_id: str, *, after: str | None = None, limit: int = 200
+    ) -> list[tuple[str, str | None]]:
+        """Read a bounded page of session IDs and live statuses for runner teardown.
+
+        Include archived sessions. Read bindings consistently with runner writes,
+        in ascending session-ID order; use the last ID as the next page's cursor.
+        A short page ends iteration. Do not hydrate conversation content or labels.
+
+        :param runner_id: The runner being stopped.
+        :param after: Exclusive session-ID cursor, or ``None`` for the first page.
+        :param limit: Maximum number of rows, between 1 and 1000.
+        :returns: ``(session_id, live_status)`` pairs; status can be unknown (``None``).
+        """
+        ...
+
+    @abstractmethod
     def list_conversations_by_runner_id(
         self,
         runner_id: str,
