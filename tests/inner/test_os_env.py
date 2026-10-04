@@ -15,12 +15,18 @@ from pathlib import Path
 
 import pytest
 
+try:
+    import resource
+except ImportError:  # Windows has no resource module
+    resource = None
+
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import (
     _child_shell_env,
     _HelperProcessClient,
     _project_root,
     _read_impl,
+    _read_stderr_bounded,
     _run_helper,
     _shell_impl,
     build_helper_env,
@@ -528,8 +534,8 @@ def test_shell_command_does_not_see_omnigent_project_root(
     [
         ("exit 0", "exited with code 0"),
         ("echo 'helper: boom' >&2\nexit 3", "exited with code 3: helper: boom"),
-        ("exec >&- 2>&-\nexec sleep 30", "exited with code None"),
-        ("exec >&-\nexec sleep 30", "exited with code None"),
+        ("exec >&- 2>&-\nexec sleep 30", "stopped replying but is still running"),
+        ("exec >&-\nexec sleep 30", "stopped replying but is still running"),
     ],
     ids=["silent-exit-0", "stderr-exit-3", "alive-after-closing-pipes", "alive-with-stderr-open"],
 )
@@ -578,6 +584,36 @@ def test_helper_exit_without_reply_logs_each_attempt_with_exit_detail(
         with pytest.raises(ProcessLookupError):
             os.kill(pid, 0)
     assert records[0].args[5] and not records[1].args[5]
+
+
+_HIGH_FD = 1100  # above select()'s FD_SETSIZE on Linux
+
+
+@pytest.mark.skipif(
+    resource is None or resource.getrlimit(resource.RLIMIT_NOFILE)[1] <= _HIGH_FD,
+    reason="needs a POSIX descriptor above FD_SETSIZE",
+)
+def test_read_stderr_bounded_reads_descriptors_above_fd_setsize() -> None:
+    """Helper stderr is still collected when the runner has many descriptors open."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, _HIGH_FD + 64), hard))
+    read_fd, write_fd = os.pipe()
+    fd = _HIGH_FD
+    try:
+        while True:
+            try:
+                os.fstat(fd)
+            except OSError:
+                break
+            fd += 1
+        os.dup2(read_fd, fd)
+        os.close(read_fd)
+        os.write(write_fd, b"helper: boom\n")
+        os.close(write_fd)
+        with os.fdopen(fd, "r") as stream:
+            assert _read_stderr_bounded(stream, timeout=0.5, exited=True) == "helper: boom"
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
 
 def test_helper_reports_stdin_closed_before_any_request(

@@ -9,7 +9,7 @@ import contextlib
 import json
 import logging
 import os
-import select
+import selectors
 import shutil
 import subprocess
 import sys
@@ -375,19 +375,21 @@ class OSEnvironment(ABC):
 def _read_stderr_bounded(stream: IO[str], *, timeout: float, exited: bool) -> str:
     """Collect the helper's stderr without blocking on a write end that is still open."""
     if IS_WINDOWS:
-        # select() rejects pipes on Windows; read only once the helper has exited.
+        # Selectors cannot watch pipes on Windows; read only once the helper has exited.
         return stream.read().strip() if exited else ""
     fd = stream.fileno()
     chunks: list[bytes] = []
     deadline = time.monotonic() + timeout
-    while (remaining := deadline - time.monotonic()) > 0:
-        readable, _, _ = select.select([fd], [], [], remaining)
-        if not readable:
-            break
-        data = os.read(fd, 65536)
-        if not data:
-            break
-        chunks.append(data)
+    # DefaultSelector (epoll/kqueue) has no FD_SETSIZE ceiling, unlike select().
+    with selectors.DefaultSelector() as selector:
+        selector.register(fd, selectors.EVENT_READ)
+        while (remaining := deadline - time.monotonic()) > 0:
+            if not selector.select(remaining):
+                break
+            data = os.read(fd, 65536)
+            if not data:
+                break
+            chunks.append(data)
     return b"".join(chunks).decode("utf-8", "replace").strip()
 
 
@@ -703,9 +705,11 @@ class _HelperProcessClient:
                 )
             except Exception:  # noqa: BLE001 — stderr read is best-effort for error detail
                 stderr = ""
-        if stderr:
-            return f"OS environment helper exited with code {returncode}: {stderr}"
-        return f"OS environment helper exited with code {returncode}"
+        if returncode is None:
+            detail = "OS environment helper stopped replying but is still running"
+        else:
+            detail = f"OS environment helper exited with code {returncode}"
+        return f"{detail}: {stderr}" if stderr else detail
 
     def _stop_locked(self) -> None:
         proc = self._proc
