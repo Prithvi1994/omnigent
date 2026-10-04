@@ -1358,7 +1358,9 @@ def _stringify_tool_payload(value: Any) -> str:
         return value
     if isinstance(value, list):
         if any(
-            isinstance(block, dict) and block.get("type") in _ACP_TOOL_CALL_CONTENT_TYPES
+            isinstance(block, dict)
+            and isinstance(block.get("type"), str)
+            and block["type"] in _ACP_TOOL_CALL_CONTENT_TYPES
             for block in value
         ):
             # ACP entries are self-contained summaries; keep each on its own line.
@@ -1398,6 +1400,10 @@ def _render_acp_tool_call_content(block: Any) -> str:
         elif block_type == "terminal":
             terminal_id = block.get("terminalId")
             return f"[terminal {terminal_id}]" if terminal_id else "[terminal]"
+        # A flat text block mixed into an ACP list keeps its text, as the legacy join did.
+        block_text = block.get("text")
+        if isinstance(block_text, str):
+            return block_text
     return _json_or_repr(block)
 
 

@@ -2825,3 +2825,8 @@ def test_stringify_tool_payload_preserves_flat_blocks_and_fallbacks() -> None:
     assert _stringify_tool_payload([foreign_block, terminal]) == (
         f"{json.dumps(foreign_block)}\n[terminal term-1]"
     )
+    assert _stringify_tool_payload([{"type": "text", "text": "ok"}, terminal]) == (
+        "ok\n[terminal term-1]"
+    )
+    unhashable_type = [{"type": ["content"]}]
+    assert _stringify_tool_payload(unhashable_type) == json.dumps(unhashable_type)
