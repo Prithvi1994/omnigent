@@ -79,6 +79,8 @@ def _unwrap_env(command: str, args: list[str], path: str) -> tuple[str, list[str
         options, remaining = getopt.getopt(args, "iu:", ["ignore-environment", "unset="])
     except getopt.GetoptError:
         return None
+    if remaining[:1] == ["-"]:
+        return None  # env's legacy -i spelling; keep this wrapper opaque.
     for option, value in options:
         if option in ("-i", "--ignore-environment") or value == "PATH":
             path = os.defpath

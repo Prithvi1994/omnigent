@@ -1,10 +1,13 @@
 """Launch precedence, env PATH semantics, and privacy at the host boundary."""
 
+import os
 import subprocess
 
 import pytest
 
 from omnigent.host import harness_startup as startup
+
+pytestmark = pytest.mark.skipif(os.name != "posix", reason="requires /usr/bin/env and sh")
 
 
 @pytest.fixture
@@ -85,7 +88,15 @@ def test_env_resolution_matches_real_env(config, tmp_path, prefix, found):
 
 
 @pytest.mark.parametrize(
-    "args", [["-S", "tool --api-key SECRET"], ["TOKEN=SECRET"], ["-u"], ["=SECRET", "tool"]]
+    "args",
+    [
+        ["-S", "tool --api-key SECRET"],
+        ["TOKEN=SECRET"],
+        ["-u"],
+        ["=SECRET", "tool"],
+        ["-", "tool", "--SECRET"],
+        ["-u", "PATH", "-", "tool", "--SECRET"],
+    ],
 )
 def test_unsupported_env_syntax_never_exports_arguments(config, args):
     config["harness"]["codex-native"] = {"command": "/usr/bin/env", "args": args}
