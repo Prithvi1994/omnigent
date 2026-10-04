@@ -769,7 +769,7 @@ _effort_catalog_cache: TTLCache[str, list[_JsonObject]] = TTLCache(maxsize=128, 
 
 async def resolve_codex_effort_for_model(
     client: CodexAppServerClient,
-    effort: str,
+    effort: str | None,
     model: str | None,
     *,
     transport: str | None = None,
@@ -779,6 +779,8 @@ async def resolve_codex_effort_for_model(
     A transport key lets successive turn clients share the catalog for their
     app-server. New server transports and expired entries fetch fresh rows;
     discovery failures are never cached and retain the gateway fallback.
+    An explicit reset requires the model's advertised default because Codex
+    treats a null effort in ``thread/settings/update`` as unchanged.
     """
     catalog = _effort_catalog_cache.get(transport) if transport is not None else None
     if model and catalog is None:
@@ -793,6 +795,16 @@ async def resolve_codex_effort_for_model(
             _logger.warning(
                 "Could not read Codex model capabilities for effort validation", exc_info=True
             )
+    if effort is None:
+        entry = _codex_model_catalog_entry(catalog, model) if model else None
+        default = (
+            entry.get("defaultReasoningEffort", entry.get("default_reasoning_level"))
+            if entry is not None
+            else None
+        )
+        if not isinstance(default, str) or not default:
+            raise ValueError("Codex model catalog did not provide a default reasoning effort")
+        effort = default
     return clamp_codex_effort_for_model(effort, model, catalog) or effort
 
 
@@ -1218,6 +1230,11 @@ async def list_codex_model_options(
                 raise
             # Older servers list visible models by default but reject this field.
             include_hidden_supported = False
+            if include_hidden:
+                _logger.info(
+                    "Codex model/list rejected includeHidden; hidden model capabilities "
+                    "are unavailable from this server"
+                )
             continue
         result = response.get("result")
         if not isinstance(result, dict):

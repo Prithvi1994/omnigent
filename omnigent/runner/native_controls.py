@@ -292,18 +292,29 @@ def build_native_controls(
             await codex_client.connect()
             if "model" in settings or "effort" in settings:
                 model = settings.get("model") or read_codex_config_model(bridge_dir)
-                # An explicit null clears the selection; only an absent key inherits config.
+                # Only an absent key inherits config; null selects the model's default.
                 effort = (
                     settings["effort"]
                     if "effort" in settings
                     else read_codex_config_effort(bridge_dir)
                 )
-                if "model" in settings and isinstance(model, str) and effort is None:
+                if (
+                    "model" in settings
+                    and "effort" not in settings
+                    and isinstance(model, str)
+                    and effort is None
+                ):
                     effort = effort_for_model_switch(None, model)
                     if effort is not None:
                         settings["effort"] = effort
-                if isinstance(model, str) and isinstance(effort, str):
-                    resolved = await resolve_codex_effort_for_model(codex_client, effort, model)
+                if "effort" in settings and effort is None and not isinstance(model, str):
+                    raise ValueError("Codex effort reset requires a current model")
+                if isinstance(model, str) and (
+                    isinstance(effort, str) or ("effort" in settings and effort is None)
+                ):
+                    resolved = await resolve_codex_effort_for_model(
+                        codex_client, effort, model, transport=state.socket_path
+                    )
                     if resolved != effort:
                         settings["effort"] = resolved
             await codex_client.request(

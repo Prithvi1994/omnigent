@@ -88,7 +88,8 @@ Cross-harness journeys:
 - **`model-and-effort`, Codex runtime settings:**
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_clamps_unsupported_effort`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_preserves_supported_effort`,
-  `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_model_switch_clamps_inherited_effort`.
+  `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_model_switch_clamps_inherited_effort`,
+  `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_effort_reset_survives_next_turn`.
   These own their environment: run with plain `uv run pytest`. They drive a
   real Codex TUI and REST session settings, checking the outgoing Responses
   effort, native settings, private config, and session state. Only the model

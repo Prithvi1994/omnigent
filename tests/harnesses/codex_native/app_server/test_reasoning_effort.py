@@ -145,6 +145,28 @@ async def test_live_effort_validation_reads_hidden_models_and_later_pages() -> N
     ]
 
 
+@pytest.mark.parametrize("default", ["high", None])
+async def test_effort_reset_requires_the_models_advertised_default(default: str | None) -> None:
+    """A reset uses the actual default or fails instead of sending Codex a null no-op."""
+    client = AsyncMock(spec=app_server.CodexAppServerClient)
+    client.request.return_value = {
+        "result": {
+            "data": [
+                {
+                    "id": "gpt-5.4",
+                    "defaultReasoningEffort": default,
+                    "supportedReasoningEfforts": [{"reasoningEffort": "high"}],
+                }
+            ]
+        }
+    }
+    if default is None:
+        with pytest.raises(ValueError, match="default reasoning effort"):
+            await app_server.resolve_codex_effort_for_model(client, None, "gpt-5.4")
+    else:
+        assert await app_server.resolve_codex_effort_for_model(client, None, "gpt-5.4") == default
+
+
 @pytest.mark.parametrize("boundary", ["same-server", "new-server", "expired"])
 async def test_successful_catalog_discovery_is_shared_between_turn_clients(
     monkeypatch: pytest.MonkeyPatch, boundary: str

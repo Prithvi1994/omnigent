@@ -405,6 +405,21 @@ def test_codex_model_switch_clamps_inherited_effort(codex_effort_rig: _Rig) -> N
         _assert_turn(rig, session, "gpt-5.4", "xhigh")
 
 
+def test_codex_effort_reset_survives_next_turn(codex_effort_rig: _Rig) -> None:
+    """Clearing the picker uses the real model default without restoring the saved effort."""
+    rig = codex_effort_rig
+    assert "xhigh" in rig.capabilities("gpt-5.4")
+    with _session(rig, "gpt-5.4", "xhigh") as session:
+        _assert_turn(rig, session, "gpt-5.4", "xhigh")
+        settings = asyncio.run(_native_settings(session, "gpt-5.4"))
+        default = settings["model"]["defaultReasoningEffort"]
+        assert default != "xhigh", "Reset must select a different effort than the prior setting"
+        # REST's default selection forwards an explicit effort:null to the native runner.
+        _json(rig.api.patch(f"/v1/sessions/{session.id}", json={"reasoning_effort": "default"}))
+        _assert_turn(rig, session, "gpt-5.4", default, terminal=True)
+        _assert_turn(rig, session, "gpt-5.4", default)
+
+
 def test_codex_resume_clamps_persisted_effort(codex_effort_rig: _Rig) -> None:
     """Restart the real runner, resume the same Codex thread, and send from its TUI."""
     rig = codex_effort_rig
