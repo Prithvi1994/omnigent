@@ -185,9 +185,6 @@ def test_table_marks_only_ungated_p95_deltas(monkeypatch: pytest.MonkeyPatch) ->
     baseline["journeys"]["list_sessions"] = _journey([100, 101, 102], [120, 125, 130])
     candidate["journeys"]["list_sessions"] = _journey([110, 111, 112], [125, 130, 135])
     _, rows = compare_reports(baseline, candidate, threshold=1.0, backend="sqlite")
-    monkeypatch.setenv("TERM", "xterm")
-    monkeypatch.delenv("NO_COLOR", raising=False)
-    monkeypatch.delenv("COLUMNS", raising=False)
     console = Console(file=io.StringIO(), width=200, force_terminal=False)
     monkeypatch.setattr(compare, "console", console)
 
