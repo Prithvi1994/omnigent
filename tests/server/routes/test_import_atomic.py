@@ -1,8 +1,13 @@
-"""All-or-nothing session import: write order, rollback on cancel, abandoned partials."""
+"""All-or-nothing session import: write order, rollback on cancel, abandoned partials.
+
+Every write after the create targets the id the store assigned, which a store
+may choose itself instead of the requested deterministic id.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 import time
 from typing import Any
@@ -11,6 +16,7 @@ import pytest
 
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes import imports as imports_module
+from omnigent.stores.conversation_store import ConversationAlreadyExistsError
 from tests.server.import_tunnel_harness import (
     FakeConversationStore,
     FakePermissionStore,
@@ -414,3 +420,207 @@ async def test_local_import_keeps_a_partial_replaced_while_judged(
     done = await _stream_one(monkeypatch, store, "s0")
     assert (done["imported"], done["already_imported"], done["failed"]) == (0, 1, 0)
     _assert_fresh_row_kept(store, cid)
+
+
+class _StoreAssignedIdStore(FakeConversationStore):
+    """A store whose create ignores the requested id and assigns its own.
+
+    Later writes reject any id the store never issued, so a write that targets
+    the requested deterministic id fails loudly.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.requested: list[str | None] = []
+        self.writes: list[tuple[str, str]] = []
+        self._next_id = 4_100_000_000_000_001
+
+    def create_conversation(self, **kwargs: Any) -> Any:
+        self.requested.append(kwargs.get("conversation_id"))
+        assigned = str(self._next_id)
+        self._next_id += 1
+        return super().create_conversation(**{**kwargs, "conversation_id": assigned})
+
+    def _write(self, method: str, conversation_id: str) -> None:
+        if conversation_id not in self.conversations:
+            raise KeyError(f"{method}: no conversation {conversation_id}")
+        self.writes.append((method, conversation_id))
+
+    def append(self, conversation_id: str, items: list[Any]) -> list[Any]:
+        self._write("append", conversation_id)
+        return super().append(conversation_id, items)
+
+    def set_labels(self, conversation_id: str, labels: dict[str, str]) -> None:
+        self._write("set_labels", conversation_id)
+        super().set_labels(conversation_id, labels)
+
+    def set_external_session_id(self, conversation_id: str, external_session_id: str) -> None:
+        self._write("set_external_session_id", conversation_id)
+        super().set_external_session_id(conversation_id, external_session_id)
+
+
+class _IntegerIdPermissions(FakePermissionStore):
+    """A permission store that binds conversation ids as int64 keys."""
+
+    def grant(self, user_id: str, conversation_id: str, level: int) -> None:
+        node_id = int(conversation_id)  # a hex import id fails here
+        if not 0 < node_id < 2**63:
+            raise ValueError("Value out of range")
+        super().grant(user_id, conversation_id, level)
+
+
+def _assert_written_under(
+    store: _StoreAssignedIdStore,
+    permissions: FakePermissionStore,
+    user_id: str,
+    external_id: str,
+    session_id: str,
+) -> None:
+    assert store.writes == [
+        ("append", session_id),
+        ("set_labels", session_id),
+        ("set_external_session_id", session_id),
+    ]
+    assert permissions.grants == {(user_id, session_id): imports_module.LEVEL_OWNER}
+    assert store.find_conversation_by_external_session_id(external_id).id == session_id
+    assert len(store.items[session_id]) == 1
+
+
+async def _stream_events(
+    monkeypatch: pytest.MonkeyPatch,
+    store: FakeConversationStore,
+    permissions: FakePermissionStore,
+    session_id: str,
+) -> list[dict[str, Any]]:
+    pair = TunnelPair()
+    # The host belongs to "local", who is importing.
+    app = imports_app(
+        store,
+        host_registry=pair.registry,
+        host=host_record(),
+        permission_store=permissions,
+        user_id="local",
+    )
+    serve_local_sessions(monkeypatch, {session_id: local_session(session_id)})
+    async with pair:
+        return await post_stream(app)
+
+
+async def test_cli_import_writes_under_the_store_assigned_id() -> None:
+    """Every write after the create, and the returned id, use the id the store assigned."""
+    store, permissions = _StoreAssignedIdStore(), _IntegerIdPermissions()
+    response = await _post_cli(store, permissions=permissions, user_id="alice")
+    assert response.status_code == 201, response.text
+    assert store.requested == [_CID]
+    (session_id,) = store.conversations
+    assert session_id != _CID
+    assert response.json()["session_id"] == session_id
+    _assert_written_under(store, permissions, "alice", _EXT, session_id)
+
+
+async def test_stream_import_writes_under_the_store_assigned_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, permissions = _StoreAssignedIdStore(), _IntegerIdPermissions()
+    events = await _stream_events(monkeypatch, store, permissions, "s0")
+    (session_id,) = store.conversations
+    assert [e["session_id"] for e in events if e["event"] == "session"] == [session_id]
+    done = events[-1]
+    assert (done["imported"], done["already_imported"], done["failed"]) == (1, 0, 0)
+    _assert_written_under(store, permissions, "local", "s0", session_id)
+
+
+async def test_reimport_names_the_store_assigned_id() -> None:
+    store, permissions = _StoreAssignedIdStore(), _IntegerIdPermissions()
+    first = await _post_cli(store, permissions=permissions, user_id="alice")
+    session_id = first.json()["session_id"]
+    again = await _post_cli(store, permissions=permissions, user_id="alice")
+    assert again.status_code == 409, again.text
+    error = again.json()["error"]
+    assert (error["import_code"], error["session_id"]) == ("already_imported", session_id)
+    assert error["message"] == f"This claude session already exists as {session_id}"
+    assert list(store.conversations) == [session_id]
+
+
+async def test_stream_reimport_with_store_assigned_ids_is_already_imported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, permissions = _StoreAssignedIdStore(), _IntegerIdPermissions()
+    await _stream_events(monkeypatch, store, permissions, "s0")
+    events = await _stream_events(monkeypatch, store, permissions, "s0")
+    done = events[-1]
+    assert (done["imported"], done["already_imported"], done["failed"]) == (0, 1, 0)
+    assert [e for e in events if e["event"] == "session"] == []
+    assert len(store.requested) == 1
+
+
+async def test_failure_after_create_rolls_back_the_store_assigned_id() -> None:
+    store, permissions = _StoreAssignedIdStore(), _IntegerIdPermissions()
+
+    def fail(_conversation_id: str, _value: str) -> None:
+        raise RuntimeError("storage unavailable")
+
+    store.on_set_external = fail
+    response = await _post_cli(store, permissions=permissions, user_id="alice")
+    assert response.status_code == 500, response.text
+    assert response.json()["error"]["import_code"] == "internal"
+    (granted,) = {cid for _user, cid in permissions.grants}
+    assert store.deleted == [granted]
+    assert store.conversations == {}
+
+    store.on_set_external = None
+    again = await _post_cli(store, permissions=permissions, user_id="alice")
+    assert again.status_code == 201, again.text
+
+
+async def test_cancelled_import_rolls_back_the_store_assigned_id() -> None:
+    store = _StoreAssignedIdStore()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_append(_conversation_id: str, _items: list[Any]) -> None:
+        entered.set()
+        release.wait(timeout=10)
+
+    store.on_append = slow_append
+    request = asyncio.create_task(_post_cli(store))
+    try:
+        await wait_until(entered.is_set)
+        request.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await request
+        (session_id,) = store.conversations
+    finally:
+        release.set()
+    await wait_until(lambda: store.deleted == [session_id])
+    assert store.conversations == {}
+
+
+class _AliasingStore(FakeConversationStore):
+    """Keeps the requested id unique but stores the row under an id of its own."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.aliases: dict[str, str] = {}
+
+    def create_conversation(self, **kwargs: Any) -> Any:
+        requested = kwargs["conversation_id"]
+        if requested in self.aliases:
+            raise ConversationAlreadyExistsError(requested)
+        assigned = f"node-{len(self.aliases) + 1}"
+        self.aliases[requested] = assigned
+        return super().create_conversation(**{**kwargs, "conversation_id": assigned})
+
+    def get_conversation(self, conversation_id: str) -> Any:
+        return super().get_conversation(self.aliases.get(conversation_id, conversation_id))
+
+
+async def test_conflict_on_the_requested_id_names_the_existing_row() -> None:
+    """The 409 for a create conflict points at the row the store holds, not the requested id."""
+    # An import still writing (young, no external id yet) holds the requested id.
+    store = _AliasingStore()
+    store.create_conversation(conversation_id=_CID, title="in flight")
+    response = await _post_cli(store)
+    assert response.status_code == 409, response.text
+    error = response.json()["error"]
+    assert (error["import_code"], error["session_id"]) == ("already_imported", "node-1")

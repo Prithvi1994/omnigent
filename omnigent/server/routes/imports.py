@@ -980,9 +980,22 @@ def create_imports_router(
         # a later write raised or the request was cancelled mid-write.
         created: list[str] = []
 
+        async def _already_imported(existing: Any | None) -> LocalImportError:
+            # Name the session that holds the import; a store may assign its own
+            # ids, so the requested id is only the last resort.
+            if existing is None:
+                existing = await asyncio.to_thread(
+                    conversation_store.find_conversation_by_external_session_id,
+                    external_session_id,
+                )
+            return _already_imported_error(
+                "This source session has already been imported",
+                existing.id if existing is not None else conversation_id,
+            )
+
         async def _write() -> None:
             try:
-                await asyncio.to_thread(_create)
+                conversation = await asyncio.to_thread(_create)
             except ConversationAlreadyExistsError as exc:
                 # The deterministic id is taken: by a finished import (a real
                 # duplicate), or by one a crash left half-written, which would
@@ -993,40 +1006,36 @@ def create_imports_router(
                 if existing is None or not await _is_abandoned_import(
                     existing, source, external_session_id, user_id
                 ):
-                    raise _already_imported_error(
-                        "This source session has already been imported", conversation_id
-                    ) from exc
+                    raise await _already_imported(existing) from exc
                 if not await _discard_abandoned_import(existing):
-                    raise _already_imported_error(
-                        "This source session has already been imported", conversation_id
-                    ) from exc
+                    raise await _already_imported(None) from exc
                 try:
-                    await asyncio.to_thread(_create)
+                    conversation = await asyncio.to_thread(_create)
                 except ConversationAlreadyExistsError as again:
-                    raise _already_imported_error(
-                        "This source session has already been imported", conversation_id
-                    ) from again
-            created.append(conversation_id)
-            await asyncio.to_thread(conversation_store.append, conversation_id, items)
+                    raise await _already_imported(None) from again
+            # A store may assign its own id (e.g. a numeric key), so every
+            # later write targets the created row, not the requested id.
+            created.append(conversation.id)
+            await asyncio.to_thread(conversation_store.append, conversation.id, items)
             labels = {
                 **native_agent.presentation_labels,
                 IMPORT_SOURCE_LABEL_KEY: source,
                 IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY: external_session_id,
             }
-            await asyncio.to_thread(conversation_store.set_labels, conversation_id, labels)
+            await asyncio.to_thread(conversation_store.set_labels, conversation.id, labels)
             if permission_store is not None and user_id is not None:
                 await asyncio.to_thread(permission_store.ensure_user, user_id)
                 await asyncio.to_thread(
                     permission_store.grant,
                     user_id,
-                    conversation_id,
+                    conversation.id,
                     LEVEL_OWNER,
                 )
             # Last: the external id is the dedupe key, so the source session only
             # counts as imported once everything above has landed.
             await asyncio.to_thread(
                 conversation_store.set_external_session_id,
-                conversation_id,
+                conversation.id,
                 external_session_id,
             )
 
@@ -1038,12 +1047,12 @@ def create_imports_router(
             await asyncio.shield(write)
         except Exception:
             if created:
-                await _rollback_import(conversation_store, conversation_id)
+                await _rollback_import(conversation_store, created[0])
             raise
         except BaseException:
             _rollback_import_in_background(conversation_store, write, created)
             raise
-        return conversation_id, title
+        return created[0], title
 
     async def _is_abandoned_import(
         conversation: Any, source: ImportSource, external_session_id: str, user_id: str | None
