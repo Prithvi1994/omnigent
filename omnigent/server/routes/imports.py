@@ -7,10 +7,11 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import secrets
 import threading
 import time
-from collections.abc import AsyncIterator, Iterable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast, get_args
 
@@ -42,7 +43,7 @@ from omnigent.server.routes._host_launch import (
     resolve_host_owner,
 )
 from omnigent.server.routes._session_create_validation import resolve_project_session_create
-from omnigent.server.routes.host_tunnel import PING_INTERVAL_S
+from omnigent.server.routes.host_tunnel import PING_INTERVAL_S, LazyImportSessionPayload
 from omnigent.server.schemas import SessionCreateRequest
 from omnigent.session_import import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
@@ -352,6 +353,116 @@ _LOCAL_IMPORT_STREAM_DEADLINE_S: float = 270.0
 # than this many ping intervals is dead but not yet reaped (the ping loop only
 # declares it dead at 3x); importing through it would just wait out a timeout.
 _HOST_STALE_PING_MULTIPLE = 1.5
+# Saves one host import runs at once. Each save mostly waits on the store, so
+# overlapping them is what closes most of the gap with the CLI's parallel
+# uploads; 1 is fully serial. Every save holds one asyncio default-executor
+# thread while it writes, and all saves of an import land on the replica holding
+# the host's tunnel, so this stays well under that pool: Python 3.12 sizes it
+# min(32, cpu_count + 4), and with 4 per import three concurrent imports on one
+# replica still leave over half of it to other requests. A deployment tunes it
+# with ``OMNIGENT_LOCAL_IMPORT_CONCURRENCY`` or, per request, through
+# ``app.state.local_import_concurrency``.
+LOCAL_IMPORT_CONCURRENCY = 4
+_LOCAL_IMPORT_MAX_CONCURRENCY = 32
+# Overrides LOCAL_IMPORT_CONCURRENCY for every request; 1 restores serial saves.
+LOCAL_IMPORT_CONCURRENCY_ENV = "OMNIGENT_LOCAL_IMPORT_CONCURRENCY"
+# Estimated memory of one save, which holds the decoded items, their validated
+# models and their JSON at once: ~2 bytes per serialized item byte plus ~1.7 KiB
+# per item, measured on 100,000-item (21 MiB) and 12,600-item (125 MiB)
+# transcripts, before the store's own copies. Serialized bytes alone miss the
+# per-item part: four 100,000-item sessions fit in 128 MiB of them, yet held
+# ~4 GiB and exhausted a replica.
+_IMPORT_SAVE_COST_PER_BYTE = 2
+_IMPORT_SAVE_COST_PER_ITEM = 1700
+# Saves in flight, except the most expensive one, stay within this estimated
+# cost, so a concurrent import peaks at most this much above a serial one
+# (which holds its most expensive session) whatever the input: two large
+# sessions never save at once. Typical sessions are far smaller (a real
+# last-100: largest ~6 MiB estimated), so they still save four at a time.
+_LOCAL_IMPORT_IN_FLIGHT_EXTRA_COST = 64 * 1024 * 1024
+# How long saves still in flight may run past the stream deadline before they
+# are cancelled (and rolled back): 270 + 15 s leaves 15 s under the ~300 s proxy
+# timeout for the closing events and a busy event loop, instead of the response
+# being cut mid-body.
+_LOCAL_IMPORT_DRAIN_GRACE_S = 15.0
+# Strong refs to save tasks and stream closes that outlive their request
+# (cancelled client, deadline overrun) until they finish rolling back.
+# custom-lint: disable-next=workspace-scoped-cache -- holds task objects, no tenant keys
+_ABANDONED_IMPORT_TASKS: set[asyncio.Task[Any]] = set()
+# What a stream pull returns once the host stream has ended.
+_STREAM_END: Any = object()
+
+
+def _clamp_local_import_concurrency(value: int) -> int:
+    return min(max(value, 1), _LOCAL_IMPORT_MAX_CONCURRENCY)
+
+
+def _local_import_concurrency_from_env() -> int:
+    """:data:`LOCAL_IMPORT_CONCURRENCY_ENV` clamped to 1-32, else the default."""
+    raw = os.environ.get(LOCAL_IMPORT_CONCURRENCY_ENV, "").strip()
+    if not raw:
+        return LOCAL_IMPORT_CONCURRENCY
+    try:
+        value = int(raw)
+    except ValueError:
+        _logger.warning(
+            "%s=%r is not an integer; using %d",
+            LOCAL_IMPORT_CONCURRENCY_ENV,
+            raw,
+            LOCAL_IMPORT_CONCURRENCY,
+        )
+        return LOCAL_IMPORT_CONCURRENCY
+    return _clamp_local_import_concurrency(value)
+
+
+def _keep_until_done(task: asyncio.Task[Any]) -> None:
+    """Hold a strong ref to a task nobody awaits until it finishes."""
+    _ABANDONED_IMPORT_TASKS.add(task)
+    task.add_done_callback(_ABANDONED_IMPORT_TASKS.discard)
+
+
+def _session_save_cost(raw_items: object) -> int:
+    """Estimated in-memory cost of saving one streamed session's items.
+
+    Runs in a thread, like :func:`_session_item_bytes`. Anything the save
+    rejects up front (not a list, over the item cap) costs nothing.
+    """
+    if not isinstance(raw_items, list) or len(raw_items) > _MAX_IMPORT_ITEMS:
+        return 0
+    serialized = _session_item_bytes(raw_items)
+    return _IMPORT_SAVE_COST_PER_BYTE * serialized + _IMPORT_SAVE_COST_PER_ITEM * len(raw_items)
+
+
+def _admits_save(in_flight_costs: Iterable[int], cost: int | None) -> bool:
+    """Whether a save of estimated ``cost`` may start beside ``in_flight_costs``.
+
+    ``None`` is a session still undecoded (a chunked one, so large): it counts
+    as the most expensive. See :data:`_LOCAL_IMPORT_IN_FLIGHT_EXTRA_COST`.
+    """
+    costs = list(in_flight_costs)
+    if not costs:
+        return True
+    if cost is None:
+        return sum(costs) <= _LOCAL_IMPORT_IN_FLIGHT_EXTRA_COST
+    costs.append(cost)
+    return sum(costs) - max(costs) <= _LOCAL_IMPORT_IN_FLIGHT_EXTRA_COST
+
+
+def _session_item_bytes(raw_items: object) -> int:
+    """Approximate serialized size of one streamed session's items.
+
+    Runs in a thread: a near-cap session is tens of MiB, and encoding item by
+    item lets the event loop take the GIL back between items.
+    """
+    if not isinstance(raw_items, list) or len(raw_items) > _MAX_IMPORT_ITEMS:
+        return 0
+    size = 0
+    for raw in raw_items:
+        try:
+            size += len(json.dumps(raw, ensure_ascii=False, separators=(",", ":"), default=str))
+        except (TypeError, ValueError):
+            continue
+    return size
 
 
 @dataclass(frozen=True)
@@ -484,7 +595,7 @@ async def _stream_local_sessions_from_host(
     ping_interval_s: float | None = None,
     deadline_s: float | None = None,
     skip_external_session_ids: Sequence[str] = (),
-) -> AsyncIterator[dict[str, Any] | ImportProgress]:
+) -> AsyncGenerator[Mapping[str, Any] | ImportProgress, None]:
     """Yield requested local sessions one at a time as they stream in.
 
     Sends a recent or exact import frame and drains the per-request queue the
@@ -537,7 +648,7 @@ async def _stream_local_sessions_from_host(
         )
     )
     frame = encode_host_frame(request_frame)
-    queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
+    queue: asyncio.Queue[tuple[str, Mapping[str, Any]]] = asyncio.Queue()
     host_conn.pending_import_local[request_id] = queue
     deadline = time.monotonic() + (
         deadline_s if deadline_s is not None else _LOCAL_IMPORT_STREAM_DEADLINE_S
@@ -1256,6 +1367,23 @@ def create_imports_router(
             raise absent
         return user_id, host_conn, host
 
+    def _local_import_concurrency(request: Request) -> int:
+        """Concurrent saves for this host import, as the deployment configured it.
+
+        ``app.state.local_import_concurrency`` (a callable, read per request
+        inside its request context) wins over :data:`LOCAL_IMPORT_CONCURRENCY_ENV`;
+        any failure of either read falls back to the default.
+        """
+        concurrency_fn = getattr(request.app.state, "local_import_concurrency", None)
+        if concurrency_fn is None:
+            return _local_import_concurrency_from_env()
+        try:
+            value = int(concurrency_fn())
+        except Exception:  # noqa: BLE001 - a broken override must not fail the import
+            _logger.warning("local_import_concurrency failed; using the default", exc_info=True)
+            return LOCAL_IMPORT_CONCURRENCY
+        return _clamp_local_import_concurrency(value)
+
     async def _import_local_core(
         body: LocalImportRequest,
         user_id: str | None,
@@ -1266,9 +1394,13 @@ def create_imports_router(
         skipped_sessions: list[ImportFailureRef] | None = None,
         host: object | None = None,
         ping_interval_s: float | None = None,
+        concurrency: int = 1,
     ) -> AsyncIterator[ImportedSessionRef | ImportProgress]:
-        """Import the host's requested sessions, one at a time.
+        """Import the host's requested sessions, up to ``concurrency`` saves at once.
 
+        Keeps reading the host's stream while earlier sessions save, bounded by
+        ``concurrency`` saves and their estimated memory (:func:`_admits_save`);
+        refs come out as saves finish, so their order may differ from the host's.
         Yields one ref per newly imported session, plus an :class:`ImportProgress`
         after each processed session and each host heartbeat, and tracks the
         running tally in ``counts`` (``imported`` / ``already_imported`` /
@@ -1277,8 +1409,8 @@ def create_imports_router(
         ``len(failures) == counts["failed"]``, and each skipped one (no history
         to import) to ``skipped_sessions``.
         Persists each session as its frame arrives, so a large batch never
-        buffers. Raises if the host read drops mid-stream, after the sessions
-        read so far are already committed (retry is idempotent, and re-import of a
+        buffers. Raises if the host read drops mid-stream, after the saves
+        already started have finished (retry is idempotent, and re-import of a
         success comes back as already-imported, never a duplicate); a
         :class:`LocalImportError` raised for the host's liveness carries a message
         naming the machine and how far the batch got.
@@ -1401,7 +1533,11 @@ def create_imports_router(
                     counts["already_imported"] += 1
                     confirmed.append(external_session_id)
                     return None
-                items = [ImportItemInput.model_validate(raw).to_item() for raw in raw_items]
+                # Off the event loop: a near-cap session is 100,000 validations,
+                # and other saves of the same import run meanwhile.
+                items = await asyncio.to_thread(
+                    lambda: [ImportItemInput.model_validate(raw).to_item() for raw in raw_items]
+                )
                 workspace = session.get("workspace")
                 native_title = session.get("title")
                 session_id, title = await _persist_import(
@@ -1457,17 +1593,107 @@ def create_imports_router(
         # arrives for them): a count (every host) plus per-session reasons (newer
         # hosts). Folded into ``failed`` after the loop.
         stats: dict[str, Any] = {}
+        stream = _stream_local_sessions_from_host(
+            host_registry=host_registry,
+            host_conn=host_conn,
+            source=body.source,
+            limit=body.limit,
+            session_id=body.session_id,
+            stats=stats,
+            ping_interval_s=ping_interval_s,
+            skip_external_session_ids=skip_ids,
+        )
+
+        async def _pull() -> Any:
+            try:
+                return await stream.__anext__()
+            except StopAsyncIteration:
+                return _STREAM_END
+
+        def _close_stream() -> None:
+            # Closing a stream parked at a yield runs its cleanup, which tells
+            # the host to stop.
+            _keep_until_done(asyncio.get_running_loop().create_task(stream.aclose()))
+
+        max_saves = max(1, concurrency)
+        loop = asyncio.get_running_loop()
+        # Each save task and the estimated memory of the session it holds.
+        in_flight: dict[asyncio.Task[ImportedSessionRef | None], int] = {}
+        next_frame: asyncio.Task[Any] | None = None
+        # A session read but not yet admitted, and its cost (None: undecoded).
+        waiting_session: Any = None
+        waiting_cost: int | None = None
+        # Reading more frames; ``stream_open`` stays set until the stream
+        # itself has finished (ended or raised), which a deadline cut doesn't do.
+        streaming = True
+        stream_open = True
+        stream_error: Exception | None = None
+        # The stream stops at its own deadline; saves already running get a grace
+        # period past it, then are cancelled (and rolled back).
+        drain_by = time.monotonic() + _LOCAL_IMPORT_STREAM_DEADLINE_S + _LOCAL_IMPORT_DRAIN_GRACE_S
         try:
-            async for session in _stream_local_sessions_from_host(
-                host_registry=host_registry,
-                host_conn=host_conn,
-                source=body.source,
-                limit=body.limit,
-                session_id=body.session_id,
-                stats=stats,
-                ping_interval_s=ping_interval_s,
-                skip_external_session_ids=skip_ids,
-            ):
+            while streaming or in_flight or waiting_session is not None:
+                if waiting_session is not None and (
+                    max_saves == 1 or _admits_save(in_flight.values(), waiting_cost)
+                ):
+                    session, waiting_session = waiting_session, None
+                    if isinstance(session, LazyImportSessionPayload):
+                        session = await asyncio.to_thread(session.take)
+                        if max_saves > 1:
+                            waiting_cost = await asyncio.to_thread(
+                                _session_save_cost, session.get("items")
+                            )
+                    # Copies this context (request, workspace, audit) like to_thread.
+                    save = loop.create_task(_import_one(session))
+                    in_flight[save] = waiting_cost or 0
+                if (
+                    streaming
+                    and next_frame is None
+                    and waiting_session is None
+                    and len(in_flight) < max_saves
+                ):
+                    next_frame = loop.create_task(_pull())
+                waiting: set[asyncio.Task[Any]] = set(in_flight)
+                if next_frame is not None:
+                    waiting.add(next_frame)
+                done, _pending = await asyncio.wait(
+                    waiting,
+                    timeout=max(0.0, drain_by - time.monotonic()),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    # Saves still running this late would end past the proxy
+                    # timeout. Undo them (none is reported or remembered); the
+                    # re-run imports them.
+                    for task in in_flight:
+                        task.cancel()
+                        _keep_until_done(task)
+                    in_flight.clear()
+                    # A host failure that ended the stream first is still the
+                    # reason the import stopped.
+                    if stream_error is None:
+                        stream_error = _time_limit_error()
+                    streaming = False
+                    break
+                for task in [t for t in done if t is not next_frame]:
+                    in_flight.pop(task)
+                    ref = task.result()
+                    if ref is not None:
+                        yield ref
+                    yield ImportProgress(done=max(_processed(), host_done), total=total)
+                if next_frame is None or next_frame not in done:
+                    continue
+                pulled = next_frame
+                next_frame = None
+                try:
+                    session = pulled.result()
+                except Exception as exc:  # noqa: BLE001 - raised once the saves in flight finish
+                    streaming = stream_open = False
+                    stream_error = exc
+                    continue
+                if session is _STREAM_END:
+                    streaming = stream_open = False
+                    continue
                 if isinstance(session, ImportProgress):
                     _note_skipped(session.skipped)
                     host_done = max(host_done, session.done)
@@ -1480,22 +1706,46 @@ def create_imports_router(
                 if isinstance(session.get("total"), int) and session["total"] > 0:
                     total = session["total"]
                     counts["total"] = total
-                ref = await _import_one(session)
-                if ref is not None:
-                    yield ref
-                yield ImportProgress(done=max(_processed(), host_done), total=total)
-        except LocalImportError as exc:
+                waiting_session = session
+                waiting_cost = (
+                    None
+                    if isinstance(session, LazyImportSessionPayload) or max_saves == 1
+                    else await asyncio.to_thread(_session_save_cost, session.get("items"))
+                )
+        finally:
+            # Only an early exit (client gone, an unexpected error) leaves saves
+            # here: a cancelled save rolls back once its writes finish, through
+            # _persist_import's shielded path. Nothing is awaited (this also runs
+            # under GeneratorExit), so a cancelled caller can't be held up.
+            for task in in_flight:
+                task.cancel()
+                _keep_until_done(task)
+            if next_frame is not None and not next_frame.done():
+                # A pull cancelled mid-read runs the stream's cleanup (the host's
+                # cancel frame) itself; one cancelled before it started leaves
+                # the stream parked, so close it once the pull settles (a close
+                # can't overlap a running pull, and is a no-op on a finished one).
+                next_frame.cancel()
+                next_frame.add_done_callback(lambda _task: _close_stream())
+            else:
+                if next_frame is not None and not next_frame.cancelled():
+                    next_frame.exception()  # consumed: an early exit dropped this frame
+                if stream_open:
+                    _close_stream()
+        if stream_error is not None:
+            if not isinstance(stream_error, LocalImportError):
+                raise stream_error
             if body.session_id is None:
                 _remember_continue_skip_ids(user_id, host_conn.host_id, [*skip_ids, *confirmed])
             raise _interrupted_import_error(
-                exc,
+                stream_error,
                 host=host,
                 processed=_processed(),
                 imported=counts["imported"],
                 already_imported=counts["already_imported"],
                 total=total,
                 host_skips_known=_host_skips_known(host_conn),
-            ) from exc
+            ) from stream_error
         _note_skipped(int(stats.get("host_skipped", 0)))
         if body.session_id is None:
             # Ran to the end: nothing left to continue.
@@ -1581,6 +1831,9 @@ def create_imports_router(
                 skipped_sessions=skipped_sessions,
                 host=host,
                 ping_interval_s=PING_INTERVAL_S,
+                # Serial, as before: this is the fallback for clients without
+                # the stream, and its session list keeps the host's order.
+                concurrency=1,
             ):
                 if isinstance(event, ImportedSessionRef):
                     sessions.append(event)
@@ -1624,8 +1877,9 @@ def create_imports_router(
 
         Same import as the buffered ``POST /v1/imports/local``, but responds with
         NDJSON: one ``{"event": "session", ...}`` line per newly imported session
-        as its frame lands, so the caller lists sessions as they arrive rather
-        than waiting out the whole batch, and ``{"event": "progress", "done",
+        as its save finishes (several save at once, so not in the host's order),
+        so the caller lists sessions as they arrive rather than waiting out the
+        whole batch, and ``{"event": "progress", "done",
         "total"}`` lines as the host works through the batch. Each session that
         could not be imported emits one ``{"event": "failed",
         "external_session_id", "source", "reason"}`` line (after the successes),
@@ -1639,6 +1893,7 @@ def create_imports_router(
         error.
         """
         user_id, host_conn, host = _resolve_import_target(request, body)
+        concurrency = _local_import_concurrency(request)
 
         async def _events() -> AsyncIterator[bytes]:
             counts: dict[str, int] = {}
@@ -1657,6 +1912,7 @@ def create_imports_router(
                     skipped_sessions=skipped_sessions,
                     host=host,
                     ping_interval_s=PING_INTERVAL_S,
+                    concurrency=concurrency,
                 ):
                     if isinstance(event, ImportProgress):
                         # Heartbeats and per-session updates often repeat a count.

@@ -372,9 +372,10 @@ class HostConnection:
     )
     # Import streams one session per frame, so the tunnel pushes each onto a
     # per-request queue the /imports/local handler drains (vs a single future).
-    # Each item is a ("session" | "progress" | "done", dict) tuple, or a terminal
-    # ("disconnected", dict) the registry pushes when this connection goes away.
-    pending_import_local: dict[str, asyncio.Queue[tuple[str, dict[str, Any]]]] = field(
+    # Each item is a ("session" | "progress" | "done", mapping) tuple, or a
+    # terminal ("disconnected", {}) the registry pushes when this connection goes
+    # away. A chunked session's mapping decodes lazily, when it is read.
+    pending_import_local: dict[str, asyncio.Queue[tuple[str, Mapping[str, Any]]]] = field(
         default_factory=dict,
     )
 

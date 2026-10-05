@@ -1895,6 +1895,21 @@ class ImportLocalSessionChunkAssembler:
             the slices do not reassemble into a valid session object. The
             caller counts one failed session and keeps the stream alive.
         """
+        text = self.add_text(frame, budget=budget)
+        return None if text is None else decode_imported_local_session_json(text)
+
+    def add_text(
+        self,
+        frame: HostImportLocalSessionChunkFrame,
+        *,
+        budget: int | None = None,
+    ) -> str | None:
+        """Like :meth:`add`, but return the reassembled session JSON undecoded.
+
+        For a caller that queues the session and decodes it later with
+        :func:`decode_imported_local_session_json`. Raises like :meth:`add`
+        except for an invalid session object, which only decoding finds.
+        """
         if frame.seq == 0:
             self._reset()
         elif self._skipping:
@@ -1917,11 +1932,19 @@ class ImportLocalSessionChunkAssembler:
             return None
         parts = self._parts
         self._reset()
-        try:
-            raw = json.loads("".join(parts))
-        except (json.JSONDecodeError, RecursionError) as exc:
-            raise ValueError(f"chunked session is not valid JSON: {exc}") from exc
-        return _decode_imported_local_session(raw)
+        return "".join(parts)
+
+
+def decode_imported_local_session_json(text: str) -> HostImportedLocalSession:
+    """Decode a reassembled chunked session's JSON.
+
+    :raises ValueError: If it is not valid JSON or not a valid session object.
+    """
+    try:
+        raw = json.loads(text)
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError(f"chunked session is not valid JSON: {exc}") from exc
+    return _decode_imported_local_session(raw)
 
 
 def decode_host_frame(text: str) -> HostFrame:

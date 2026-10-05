@@ -169,6 +169,8 @@ async def test_cancelled_stream_rolls_back_only_the_session_in_flight(
     store.on_append = on_append
     pair = TunnelPair()
     app = imports_app(store, host_registry=pair.registry, host=host_record())
+    # Serial, so s0 is still unread when s1 blocks.
+    app.state.local_import_concurrency = lambda: 1
     # The host imports oldest first: s2, s1, s0.
     serve_local_sessions(monkeypatch, {f"s{i}": local_session(f"s{i}") for i in range(3)})
     async with pair:
