@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { AlertTriangleIcon, ChevronRightIcon } from "lucide-react";
 import { useHosts } from "@/hooks/useHosts";
 import { Link } from "@/lib/routing";
 import { HostLabel } from "./HostLabel";
@@ -59,29 +60,42 @@ function hostListLooksStale(error: ImportErrorInfo, thrown: unknown): boolean {
 }
 
 /**
- * "Imported 12 · 3 already imported · 2 failed" (zero parts omitted), or
- * null when there is nothing to report beside an error. A run that stopped
- * early (`complete: false`) never reads "Nothing new to import": it leads with
- * what it imported and says it stopped, e.g. "Imported 0 · 10 already
- * imported · stopped early".
+ * "Imported 12 · 2 failed" (zero parts omitted), or null when there is nothing
+ * to report beside an error. Already-imported and skipped (empty) sessions get
+ * their own lines (`alreadyImportedText`, `skippedText`), so they aren't
+ * counted here. A run that stopped early (`complete: false`) never reads
+ * "Nothing new to import": it leads with what it imported and says it stopped,
+ * e.g. "Imported 0 · stopped early".
  */
 function importSummary(result: LocalImportResult): string | null {
   const stoppedEarly = !result.complete || result.error !== null;
   const parts = [
     result.imported > 0 ? `Imported ${result.imported}` : null,
-    result.alreadyImported > 0 ? `${result.alreadyImported} already imported` : null,
     result.failed > 0 ? `${result.failed} failed` : null,
   ].filter((p): p is string => p !== null);
   if (stoppedEarly) {
-    if (parts.length === 0) return null;
+    if (parts.length === 0 && result.alreadyImported === 0 && result.skipped === 0) return null;
     if (result.imported === 0) parts.unshift("Imported 0");
     return [...parts, "stopped early"].join(" · ");
   }
   if (result.imported === 0 && result.failed === 0) {
-    if (result.alreadyImported > 0) return `Nothing new to import · ${parts.join(" · ")}`;
+    if (result.alreadyImported > 0 || result.skipped > 0) return "Nothing new to import";
     return result.error === null ? "No sessions to import." : null;
   }
   return parts.join(" · ");
+}
+
+/** "1 session was already imported before" / "45 sessions were …"; null for none. */
+function alreadyImportedText(count: number): string | null {
+  if (count <= 0) return null;
+  return count === 1
+    ? "1 session was already imported before"
+    : `${count} sessions were already imported before`;
+}
+
+/** "1 session skipped: no history to import" / "3 sessions skipped: …". */
+function skippedText(count: number): string {
+  return `${count} ${count === 1 ? "session" : "sessions"} skipped: no history to import`;
 }
 
 /** "Importing 7 of 20…" / "Importing… 7 so far" / "Importing…". */
@@ -150,6 +164,52 @@ function ImportFailureRow({ failure }: { failure: ImportFailureRef }) {
         testId="import-failure-details"
       />
     </li>
+  );
+}
+
+/**
+ * Sessions skipped because they hold no history (opened and closed without a
+ * prompt). A warning, not an error: nothing was lost, so they are not counted
+ * as failed and offer no retry. Collapsed so a long list stays one line.
+ */
+function ImportSkippedNotice({ count, sessions }: { count: number; sessions: ImportFailureRef[] }) {
+  return (
+    <details className="group text-sm" data-testid="import-skipped">
+      <summary
+        className="flex cursor-pointer list-none items-start gap-1.5 text-warning select-none [&::-webkit-details-marker]:hidden"
+        data-testid="import-skipped-summary"
+      >
+        <AlertTriangleIcon className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+        <span>{skippedText(count)}</span>
+        <ChevronRightIcon
+          className="mt-0.5 size-3.5 shrink-0 transition-transform group-open:rotate-90"
+          aria-hidden="true"
+        />
+      </summary>
+      <div className="mt-1 flex flex-col gap-1 pl-5">
+        <p className="text-xs text-muted-foreground">
+          These sessions have no messages, so there is nothing to import.
+        </p>
+        {sessions.length > 0 && (
+          <ul className="flex max-h-48 flex-col gap-0.5 overflow-y-auto">
+            {sessions.map((s, i) => {
+              const label = [sourceLabel(s.source), s.externalSessionId].filter(
+                (p): p is string => p !== null,
+              );
+              return (
+                <li
+                  key={s.externalSessionId ?? `skipped-${i}`}
+                  className="font-mono text-xs text-muted-foreground"
+                  data-testid="import-skipped-item"
+                >
+                  {label.length > 0 ? label.join(" · ") : s.reason}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
+    </details>
   );
 }
 
@@ -279,6 +339,7 @@ export function ImportSessionsPanel() {
         ? "Import again"
         : null;
   const summary = result !== null ? importSummary(result) : null;
+  const alreadyImported = result !== null ? alreadyImportedText(result.alreadyImported) : null;
   const noHostsOnline = onlineHosts.length === 0;
   const hasOutcome = result !== null || streamed.length > 0 || submitting || error !== null;
 
@@ -304,24 +365,37 @@ export function ImportSessionsPanel() {
           {summary}
         </p>
       ) : null}
+      {alreadyImported !== null && !submitting && (
+        <p className="text-sm text-muted-foreground" data-testid="import-already-imported">
+          {alreadyImported}
+        </p>
+      )}
+      {result !== null && result.skipped > 0 && !submitting && (
+        <ImportSkippedNotice count={result.skipped} sessions={result.skippedSessions} />
+      )}
       {error !== null && !submitting && <ImportErrorBanner error={error} />}
       {streamed.length > 0 && (
-        <ul
-          className="flex max-h-64 flex-col gap-1 overflow-y-auto"
-          data-testid="import-result-sessions"
-        >
-          {streamed.map((s) => (
-            <li key={s.id}>
-              <Link
-                to={`/c/${s.id}`}
-                className="block truncate text-sm text-primary hover:underline"
-                data-testid={`import-result-link-${s.id}`}
-              >
-                {s.title || "Untitled session"}
-              </Link>
-            </li>
-          ))}
-        </ul>
+        <div className="flex flex-col gap-2" data-testid="import-new-sessions">
+          <span className="text-sm font-medium" data-testid="import-new-sessions-heading">
+            Newly imported sessions
+          </span>
+          <ul
+            className="flex max-h-64 flex-col gap-1 overflow-y-auto"
+            data-testid="import-result-sessions"
+          >
+            {streamed.map((s) => (
+              <li key={s.id}>
+                <Link
+                  to={`/c/${s.id}`}
+                  className="block truncate text-sm text-primary hover:underline"
+                  data-testid={`import-result-link-${s.id}`}
+                >
+                  {s.title || "Untitled session"}
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
       {result !== null && result.failures.length > 0 && (
         <div className="flex flex-col gap-2" data-testid="import-failures">

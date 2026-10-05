@@ -78,11 +78,23 @@ function result(overrides: Partial<LocalImportResult> = {}): LocalImportResult {
     failed: 0,
     sessions: [],
     failures: [],
+    skipped: 0,
+    skippedSessions: [],
     total: null,
     complete: true,
     error: null,
     ...overrides,
   };
+}
+
+function emptySession(id: string, source = "codex"): ImportFailureRef {
+  return failure({
+    externalSessionId: id,
+    source,
+    reason: `Codex session '${id}' has no importable history`,
+    code: "session_empty",
+    retryable: false,
+  });
 }
 
 function failure(overrides: Partial<ImportFailureRef> = {}): ImportFailureRef {
@@ -173,8 +185,13 @@ describe("ImportSessionsPanel", () => {
       undefined,
       { onProgress: expect.any(Function) },
     );
-    expect(screen.getByTestId("import-result")).toHaveTextContent(
-      "Imported 2 · 1 already imported",
+    expect(screen.getByTestId("import-result").textContent).toBe("Imported 2");
+    expect(screen.getByTestId("import-already-imported").textContent).toBe(
+      "1 session was already imported before",
+    );
+    // The streamed list holds only this run's sessions, under its own heading.
+    expect(screen.getByTestId("import-new-sessions-heading")).toHaveTextContent(
+      "Newly imported sessions",
     );
     // Nothing failed and nothing is retryable: no retry button, no banner.
     expect(screen.queryByTestId("import-retry")).toBeNull();
@@ -270,20 +287,42 @@ describe("ImportSessionsPanel import outcomes", () => {
       imported: 12,
       alreadyImported: 3,
       failed: 2,
-      text: "Imported 12 · 3 already imported · 2 failed",
+      text: "Imported 12 · 2 failed",
+      already: "3 sessions were already imported before",
     },
-    { imported: 4, alreadyImported: 0, failed: 0, text: "Imported 4" },
-    { imported: 0, alreadyImported: 0, failed: 2, text: "2 failed" },
+    { imported: 4, alreadyImported: 0, failed: 0, text: "Imported 4", already: null },
+    { imported: 0, alreadyImported: 0, failed: 2, text: "2 failed", already: null },
     {
       imported: 0,
-      alreadyImported: 3,
+      alreadyImported: 45,
       failed: 0,
-      text: "Nothing new to import · 3 already imported",
+      text: "Nothing new to import",
+      already: "45 sessions were already imported before",
     },
-    { imported: 0, alreadyImported: 0, failed: 0, text: "No sessions to import." },
-  ])("summarizes $imported/$alreadyImported/$failed", async ({ text, ...counts }) => {
+    {
+      imported: 0,
+      alreadyImported: 1,
+      failed: 0,
+      text: "Nothing new to import",
+      already: "1 session was already imported before",
+    },
+    {
+      imported: 0,
+      alreadyImported: 0,
+      failed: 0,
+      text: "No sessions to import.",
+      already: null,
+    },
+  ])("summarizes $imported/$alreadyImported/$failed", async ({ text, already, ...counts }) => {
     await runImport(result(counts));
     expect(screen.getByTestId("import-result").textContent).toBe(text);
+    if (already === null) {
+      expect(screen.queryByTestId("import-already-imported")).toBeNull();
+    } else {
+      expect(screen.getByTestId("import-already-imported").textContent).toBe(already);
+    }
+    // No session streamed in, so no "Newly imported sessions" heading.
+    expect(screen.queryByTestId("import-new-sessions-heading")).toBeNull();
   });
 
   it("shows live progress from progress events", async () => {
@@ -346,7 +385,13 @@ describe("ImportSessionsPanel import outcomes", () => {
     fireEvent.click(screen.getByTestId("import-submit"));
 
     await waitFor(() => expect(screen.getByTestId("import-error")).toBeInTheDocument());
-    expect(screen.getByTestId("import-result")).toHaveTextContent("Imported 2 · 1 failed");
+    expect(screen.getByTestId("import-result").textContent).toBe(
+      "Imported 2 · 1 failed · stopped early",
+    );
+    expect(screen.queryByTestId("import-already-imported")).toBeNull();
+    expect(screen.getByTestId("import-new-sessions-heading")).toHaveTextContent(
+      "Newly imported sessions",
+    );
     expect(screen.getByTestId("import-result-link-c1")).toHaveTextContent("One");
     expect(screen.getByTestId("import-result-link-c2")).toHaveTextContent("Two");
     expect(screen.getAllByTestId("import-failure-item")).toHaveLength(1);
@@ -678,8 +723,11 @@ describe("ImportSessionsPanel import outcomes", () => {
         }),
       );
       const summary = screen.getByTestId("import-result");
-      expect(summary).toHaveTextContent("Imported 0 · 10 already imported · stopped early");
+      expect(summary.textContent).toBe("Imported 0 · stopped early");
       expect(summary).not.toHaveTextContent("Nothing new");
+      expect(screen.getByTestId("import-already-imported").textContent).toBe(
+        "10 sessions were already imported before",
+      );
       expect(screen.getByTestId("import-error-message")).toHaveTextContent(message);
     },
   );
@@ -693,8 +741,9 @@ describe("ImportSessionsPanel import outcomes", () => {
         error: importError({ code: "time_limit_reached" }),
       }),
     );
-    expect(screen.getByTestId("import-result")).toHaveTextContent(
-      "Imported 3 · 2 already imported · stopped early",
+    expect(screen.getByTestId("import-result").textContent).toBe("Imported 3 · stopped early");
+    expect(screen.getByTestId("import-already-imported").textContent).toBe(
+      "2 sessions were already imported before",
     );
   });
 
@@ -733,5 +782,101 @@ describe("ImportSessionsPanel import outcomes", () => {
     );
     expect(screen.queryByTestId("import-error")).toBeNull();
     expect(screen.queryByTestId("import-retry")).toBeNull();
+  });
+});
+
+describe("ImportSessionsPanel skipped (empty) sessions", () => {
+  it("shows empty sessions as a collapsed warning, not as failures", async () => {
+    await runImport(
+      result({
+        imported: 2,
+        sessions: [
+          { id: "c1", title: "One" },
+          { id: "c2", title: "Two" },
+        ],
+        skipped: 3,
+        skippedSessions: [emptySession("e1"), emptySession("e2"), emptySession("e3", "claude")],
+      }),
+    );
+    expect(screen.getByTestId("import-result").textContent).toBe("Imported 2");
+    const notice = screen.getByTestId("import-skipped");
+    expect(notice.tagName).toBe("DETAILS");
+    expect(notice).not.toHaveAttribute("open");
+    const summary = screen.getByTestId("import-skipped-summary");
+    expect(summary).toHaveTextContent("3 sessions skipped: no history to import");
+    expect(summary).toHaveClass("text-warning");
+    expect(summary).not.toHaveClass("text-destructive");
+    expect(screen.getAllByTestId("import-skipped-item").map((item) => item.textContent)).toEqual([
+      "Codex · e1",
+      "Codex · e2",
+      "Claude Code · e3",
+    ]);
+    // Not failures: no red list and nothing to retry.
+    expect(screen.queryByTestId("import-failures")).toBeNull();
+    expect(screen.queryByTestId("import-failure-item")).toBeNull();
+    expect(screen.queryByTestId("import-retry")).toBeNull();
+    expect(screen.queryByTestId("import-error")).toBeNull();
+  });
+
+  it("reads a re-run with only empty and already-imported sessions as nothing new", async () => {
+    await runImport(
+      result({ alreadyImported: 22, skipped: 1, skippedSessions: [emptySession("e1")] }),
+    );
+    expect(screen.getByTestId("import-result").textContent).toBe("Nothing new to import");
+    expect(screen.getByTestId("import-already-imported").textContent).toBe(
+      "22 sessions were already imported before",
+    );
+    expect(screen.getByTestId("import-skipped-summary")).toHaveTextContent(
+      "1 session skipped: no history to import",
+    );
+    expect(screen.queryByTestId("import-retry")).toBeNull();
+  });
+
+  it("reads a batch of only empty sessions as nothing new", async () => {
+    await runImport(
+      result({ skipped: 2, skippedSessions: [emptySession("e1"), emptySession("e2")] }),
+    );
+    expect(screen.getByTestId("import-result").textContent).toBe("Nothing new to import");
+    expect(screen.queryByTestId("import-already-imported")).toBeNull();
+  });
+
+  it("counts failures without the skipped sessions and retries only the failures", async () => {
+    await runImport(
+      result({
+        imported: 1,
+        failed: 1,
+        failures: [failure({ externalSessionId: "f1", code: "session_save_timeout" })],
+        skipped: 2,
+        skippedSessions: [emptySession("e1"), emptySession("e2")],
+      }),
+    );
+    expect(screen.getByTestId("import-result").textContent).toBe("Imported 1 · 1 failed");
+    expect(screen.getByText("1 couldn't be imported")).toBeInTheDocument();
+    expect(screen.getAllByTestId("import-failure-item")).toHaveLength(1);
+    expect(screen.getByTestId("import-retry")).toHaveTextContent("Retry failed (1)");
+    expect(screen.getByTestId("import-skipped-summary")).toHaveTextContent(
+      "2 sessions skipped: no history to import",
+    );
+  });
+
+  it("shows the count even when the server listed no skipped sessions", async () => {
+    await runImport(result({ imported: 1, skipped: 2 }));
+    expect(screen.getByTestId("import-skipped-summary")).toHaveTextContent(
+      "2 sessions skipped: no history to import",
+    );
+    expect(screen.queryByTestId("import-skipped-item")).toBeNull();
+  });
+
+  it("keeps a stopped-early run with only skipped sessions as stopped early", async () => {
+    await runImport(
+      result({
+        skipped: 1,
+        skippedSessions: [emptySession("e1")],
+        complete: false,
+        error: importError({ code: "host_disconnected" }),
+      }),
+    );
+    expect(screen.getByTestId("import-result").textContent).toBe("Imported 0 · stopped early");
+    expect(screen.getByTestId("import-skipped")).toBeInTheDocument();
   });
 });

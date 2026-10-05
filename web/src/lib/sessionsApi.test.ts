@@ -1807,6 +1807,8 @@ describe("importLocalSessions", () => {
         { id: "c2", title: null },
       ],
       failures: [],
+      skipped: 0,
+      skippedSessions: [],
       // An older server's `done` (no total / complete) still reads as complete.
       total: null,
       complete: true,
@@ -2334,6 +2336,8 @@ describe("importLocalSessions", () => {
         { id: "c2", title: null },
       ],
       failures: [],
+      skipped: 0,
+      skippedSessions: [],
       total: null,
       complete: true,
       error: null,
@@ -2341,6 +2345,182 @@ describe("importLocalSessions", () => {
     // First the stream endpoint (404), then the buffered fallback.
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/imports/local/stream");
     expect(fetchMock.mock.calls[1][0]).toBe("/v1/imports/local");
+  });
+});
+
+describe("importLocalSessions skipped (empty) sessions", () => {
+  const emptyWire = (id: string) => ({
+    external_session_id: id,
+    source: "codex",
+    reason: `Codex session '${id}' has no importable history`,
+    code: "session_empty",
+    retryable: false,
+    error_id: null,
+  });
+  const emptyRef = (id: string) => ({
+    externalSessionId: id,
+    source: "codex",
+    reason: `Codex session '${id}' has no importable history`,
+    code: "session_empty",
+    retryable: false,
+    errorId: null,
+  });
+
+  it("reports skipped events apart from failures", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({ event: "session", session_id: "c1", title: "Good" }),
+        JSON.stringify({
+          event: "failed",
+          external_session_id: "bad-1",
+          source: "codex",
+          reason: "This session's transcript could not be read.",
+          code: "session_unreadable",
+          retryable: false,
+        }),
+        JSON.stringify({ event: "skipped", ...emptyWire("empty-1") }),
+        JSON.stringify({ event: "skipped", ...emptyWire("empty-2") }),
+        JSON.stringify({
+          event: "done",
+          imported: 1,
+          already_imported: 0,
+          failed: 1,
+          failures: [],
+          skipped: 2,
+          skipped_sessions: [emptyWire("empty-1"), emptyWire("empty-2")],
+          total: 4,
+          complete: true,
+        }),
+      ]),
+    );
+
+    const result = await importLocalSessions("host_1", "all", 25);
+
+    expect(result.failed).toBe(1);
+    expect(result.failures.map((f) => f.externalSessionId)).toEqual(["bad-1"]);
+    expect(result.skipped).toBe(2);
+    expect(result.skippedSessions).toEqual([emptyRef("empty-1"), emptyRef("empty-2")]);
+    expect(result.complete).toBe(true);
+  });
+
+  it("reads skipped sessions from done when no skipped events were streamed", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({
+          event: "done",
+          imported: 0,
+          already_imported: 3,
+          failed: 0,
+          failures: [],
+          skipped: 1,
+          skipped_sessions: [emptyWire("empty-1")],
+        }),
+      ]),
+    );
+
+    const result = await importLocalSessions("host_1", "codex", 25);
+
+    expect(result.skipped).toBe(1);
+    expect(result.skippedSessions).toEqual([emptyRef("empty-1")]);
+    expect(result.failed).toBe(0);
+  });
+
+  it("moves session_empty failures out of failed for a server without skipped", async () => {
+    // A server that predates `skipped` lists an empty session as a failure
+    // (and, not knowing the code, as retryable).
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({ event: "failed", ...emptyWire("empty-1"), retryable: true }),
+        JSON.stringify({
+          event: "failed",
+          external_session_id: "big-1",
+          source: "claude",
+          reason: "too large",
+          code: "session_too_large",
+          retryable: false,
+        }),
+        JSON.stringify({ event: "done", imported: 2, already_imported: 0, failed: 2 }),
+      ]),
+    );
+
+    const result = await importLocalSessions("host_1", "all", 25);
+
+    expect(result.failed).toBe(1);
+    expect(result.failures.map((f) => f.code)).toEqual(["session_too_large"]);
+    expect(result.skipped).toBe(1);
+    expect(result.skippedSessions.map((f) => f.externalSessionId)).toEqual(["empty-1"]);
+  });
+
+  it("keeps an old server's uncoded failures as failures", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({
+          event: "failed",
+          external_session_id: "empty-1",
+          source: "codex",
+          reason: "Codex session 'empty-1' has no importable history",
+        }),
+        JSON.stringify({ event: "done", imported: 0, already_imported: 0, failed: 1 }),
+      ]),
+    );
+
+    const result = await importLocalSessions("host_1", "all", 25);
+
+    expect(result.failed).toBe(1);
+    expect(result.skipped).toBe(0);
+    expect(result.skippedSessions).toEqual([]);
+  });
+
+  it("reads skipped sessions from the buffered fallback", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 404 }));
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        imported: 1,
+        already_imported: 0,
+        failed: 0,
+        sessions: [{ session_id: "c1", title: "One" }],
+        failures: [],
+        skipped: 1,
+        skipped_sessions: [emptyWire("empty-1")],
+      }),
+    );
+
+    const result = await importLocalSessions("host_1", "all", 25);
+
+    expect(result.imported).toBe(1);
+    expect(result.skipped).toBe(1);
+    expect(result.skippedSessions).toEqual([emptyRef("empty-1")]);
+  });
+});
+
+describe("importLocalSessions host read failures", () => {
+  it("treats host_read_failed as not retryable and keeps the host's message", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({
+          event: "error",
+          code: "host_read_failed",
+          message: "Codex sessions could not be listed on this machine.",
+          error_id: "err_1",
+        }),
+        JSON.stringify({
+          event: "done",
+          imported: 0,
+          already_imported: 0,
+          failed: 0,
+          complete: false,
+        }),
+      ]),
+    );
+
+    const result = await importLocalSessions("host_1", "codex", 25);
+
+    expect(result.complete).toBe(false);
+    expect(result.error).toMatchObject({
+      code: "host_read_failed",
+      message: "Codex sessions could not be listed on this machine.",
+      retryable: false,
+    });
   });
 });
 

@@ -667,6 +667,13 @@ export interface LocalImportResult {
   sessions: ImportedSessionRef[];
   /** One entry per failed session, with a reason; length equals `failed`. */
   failures: ImportFailureRef[];
+  /**
+   * Sessions not imported because there was nothing to import (code
+   * `session_empty`: no history). Not failures: nothing was lost.
+   */
+  skipped: number;
+  /** One entry per skipped session; length equals `skipped`. */
+  skippedSessions: ImportFailureRef[];
   /** How many sessions the host found; null when it didn't say. */
   total: number | null;
   /** False when the import stopped early (`error` set) — the tally is partial. */
@@ -690,13 +697,38 @@ const IMPORT_CODE_RETRYABLE: Readonly<Record<string, boolean>> = {
   host_disconnected: true,
   host_unresponsive: true,
   session_unreadable: false,
+  session_empty: false,
   session_save_timeout: true,
+  host_read_failed: false,
   encryption_unavailable: true,
   time_limit_reached: true,
   stream_interrupted: true,
   invalid_request: false,
   internal: true,
 };
+
+// Codes for sessions that weren't imported because there was nothing to import.
+const SKIPPED_IMPORT_CODES: ReadonlySet<string> = new Set(["session_empty"]);
+
+/**
+ * Move skip-coded entries out of `failures` into `skippedSessions`, for a
+ * server that reports an empty session as a failure, and fix both counts.
+ */
+function separateSkipped(
+  failed: number,
+  failures: ImportFailureRef[],
+  skipped: number,
+  skippedSessions: ImportFailureRef[],
+): Pick<LocalImportResult, "failed" | "failures" | "skipped" | "skippedSessions"> {
+  const moved = failures.filter((f) => f.code !== null && SKIPPED_IMPORT_CODES.has(f.code));
+  if (moved.length === 0) return { failed, failures, skipped, skippedSessions };
+  return {
+    failed: Math.max(0, failed - moved.length),
+    failures: failures.filter((f) => !moved.includes(f)),
+    skipped: skipped + moved.length,
+    skippedSessions: [...skippedSessions, ...moved],
+  };
+}
 
 /** Whether an import that failed with `code` can succeed when simply re-run. */
 export function importCodeIsRetryable(code: string | null): boolean {
@@ -901,6 +933,8 @@ export async function importLocalSessions(
       failed: 0,
       sessions: [],
       failures: [],
+      skipped: 0,
+      skippedSessions: [],
       total: null,
       complete: false,
       error: streamInterruptedError(0),
@@ -919,16 +953,25 @@ export async function importLocalSessions(
 
   const sessions: ImportedSessionRef[] = [];
   const failures: ImportFailureRef[] = [];
+  const skippedEvents: ImportFailureRef[] = [];
   // Assigned from the line handler; an object so the reads after the loop
   // aren't narrowed to their initial nulls.
   const stream: {
     done: Record<string, unknown> | null;
-    // `done.failures` backs up the streamed `failed` events for a server that
-    // sends only the terminal list.
+    // `done.failures` / `done.skipped_sessions` back up the streamed `failed` /
+    // `skipped` events for a server that sends only the terminal lists.
     doneFailures: ImportFailureRef[];
+    doneSkipped: ImportFailureRef[];
     error: ImportErrorInfo | null;
     progress: ImportProgress | null;
-  } = { done: null, doneFailures: [], error: null, progress: null };
+  } = { done: null, doneFailures: [], doneSkipped: [], error: null, progress: null };
+
+  const failureRefs = (value: unknown): ImportFailureRef[] =>
+    Array.isArray(value)
+      ? value
+          .filter((f): f is Record<string, unknown> => f !== null && typeof f === "object")
+          .map(toImportFailureRef)
+      : [];
 
   const handleLine = (line: string): void => {
     let evt: Record<string, unknown>;
@@ -953,13 +996,12 @@ export async function importLocalSessions(
       options.onProgress?.(progress);
     } else if (evt.event === "failed") {
       failures.push(toImportFailureRef(evt));
+    } else if (evt.event === "skipped") {
+      skippedEvents.push(toImportFailureRef(evt));
     } else if (evt.event === "done") {
       stream.done = evt;
-      if (Array.isArray(evt.failures)) {
-        stream.doneFailures = evt.failures
-          .filter((f): f is Record<string, unknown> => f !== null && typeof f === "object")
-          .map(toImportFailureRef);
-      }
+      stream.doneFailures = failureRefs(evt.failures);
+      stream.doneSkipped = failureRefs(evt.skipped_sessions);
     } else if (evt.event === "error") {
       stream.error = importErrorFromEvent(evt);
     }
@@ -1001,22 +1043,32 @@ export async function importLocalSessions(
   }
 
   const { done, progress } = stream;
-  const allFailures = failures.length > 0 ? failures : stream.doneFailures;
+  const listedFailures = failures.length > 0 ? failures : stream.doneFailures;
+  const listedSkipped = skippedEvents.length > 0 ? skippedEvents : stream.doneSkipped;
   // The server always ends with `done` (even after `error`), so a body without
   // it was cut off. A server `error` that arrived first is the better reason.
   const error =
     stream.error ??
     (done === null
-      ? streamInterruptedError(Math.max(progress?.done ?? 0, sessions.length + allFailures.length))
+      ? streamInterruptedError(
+          Math.max(
+            progress?.done ?? 0,
+            sessions.length + listedFailures.length + listedSkipped.length,
+          ),
+        )
       : null);
   const num = (value: unknown, fallback: number): number =>
     typeof value === "number" ? value : fallback;
   return {
     imported: num(done?.imported, sessions.length),
     alreadyImported: num(done?.already_imported, 0),
-    failed: num(done?.failed, allFailures.length),
+    ...separateSkipped(
+      num(done?.failed, listedFailures.length),
+      listedFailures,
+      num(done?.skipped, listedSkipped.length),
+      listedSkipped,
+    ),
     sessions,
-    failures: allFailures,
     total: typeof done?.total === "number" ? done.total : (progress?.total ?? null),
     // An older server's `done` has no `complete`; then only an error marks it partial.
     complete: error === null && (typeof done?.complete === "boolean" ? done.complete : true),
@@ -1047,17 +1099,24 @@ async function importLocalSessionsBuffered(
     failed: number;
     sessions: { session_id: string; title: string | null }[];
     failures?: Record<string, unknown>[];
+    skipped?: number;
+    skipped_sessions?: Record<string, unknown>[];
   }>(res);
   const sessions = wire.sessions.map((s) => ({ id: s.session_id, title: s.title }));
   for (const s of sessions) onSession?.(s);
+  const skippedSessions = (wire.skipped_sessions ?? []).map(toImportFailureRef);
   return {
     imported: wire.imported,
     alreadyImported: wire.already_imported,
-    failed: wire.failed,
-    sessions,
     // Absent from a server predating failure detail (only a count); default to
     // none so the caller can still render the tally.
-    failures: (wire.failures ?? []).map(toImportFailureRef),
+    ...separateSkipped(
+      wire.failed,
+      (wire.failures ?? []).map(toImportFailureRef),
+      wire.skipped ?? skippedSessions.length,
+      skippedSessions,
+    ),
+    sessions,
     total: null,
     complete: true,
     error: null,
