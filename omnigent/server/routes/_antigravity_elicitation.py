@@ -446,9 +446,8 @@ def to_tui_selection_keys(
             return [_AGY_TUI_PERMISSION_REJECT_OPTION, _AGY_TUI_CONFIRM_KEY]
         persist = result.meta.get("persist") if result.meta is not None else None
         delivered_pattern = _suggested_persist_pattern(spec)
-        # Persist consent is bound to the pattern the user saw: when the verdict
-        # lands on a fallback gate, only always-allow if it advertises that same
-        # pattern, so a stale accept can never durably grant another command.
+        # Bind persist to the pattern the user consented to: a fallback gate may
+        # always-allow only when it advertises that same pattern, never another.
         consented_pattern = (
             _suggested_persist_pattern(consented_spec)
             if consented_spec is not None

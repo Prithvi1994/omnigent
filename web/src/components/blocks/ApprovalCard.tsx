@@ -181,14 +181,7 @@ interface ApprovalCardProps {
   rememberScope?: RememberScope | null;
   /** Codex-native MCP persistence scopes advertised by the request. */
   codexPersistModes?: CodexPersistMode[];
-  /**
-   * Antigravity (agy) permission details advertised by the current prompt.
-   * ``actionDescription`` renders as the card's context line;
-   * ``alwaysAllowPattern``, when set, grows the "Allow <pattern> for this
-   * session" / "Always allow <pattern>" accepts (carrying ``_meta.persist``).
-   * Null for every other elicitation, so these affordances never appear where
-   * agy's prompt does not offer them.
-   */
+  /** Antigravity prompt details (see {@link AgyPermission}); null outside agy permission requests. */
   agyPermission?: AgyPermission | null;
   /**
    * Verdict submitter override. Defaults to `chatStore.submitApproval`

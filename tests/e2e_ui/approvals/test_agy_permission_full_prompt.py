@@ -27,6 +27,7 @@ equivalent persist-capable prompt.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import threading
@@ -174,7 +175,23 @@ def _reject_and_join(
     hook_thread: threading.Thread,
     result_holder: dict,
 ) -> None:
-    """Reject to settle the parked long-poll, then join so a late POST failure surfaces."""
+    """Settle the parked long-poll, then join so a late POST failure surfaces.
+
+    When setup failed before the card rendered, resolve the parked elicitation
+    directly so the hook long-poll thread cannot leak onto the shared server.
+    """
+    if card is None:
+        with contextlib.suppress(Exception):
+            for pending in _pending_elicitations(base_url, session_id):
+                eid = pending.get("elicitation_id")
+                if eid:
+                    httpx.post(
+                        f"{base_url}/v1/sessions/{session_id}/elicitations/{eid}/resolve",
+                        json={"action": "reject"},
+                        timeout=10.0,
+                    )
+        hook_thread.join(timeout=30)
+        return
     card.get_by_role("button", name="Reject", exact=True).click()
     _wait_for(
         lambda: not _pending_elicitations(base_url, session_id),
@@ -202,9 +219,10 @@ def test_agy_permission_card_offers_always_allow_choice(
     result_holder: dict = {}
     hook_thread = _park_agy_permission_elicitation(base_url, session_id, result_holder)
 
-    card = _open_pending_agy_card(page, base_url, session_id, result_holder)
-
+    card = None
     try:
+        card = _open_pending_agy_card(page, base_url, session_id, result_holder)
+
         # Sanity: the card names the gated command and still offers the binary pair.
         expect(card).to_contain_text("pwd")
         expect(card.get_by_role("button", name="Approve", exact=True)).to_be_visible()
@@ -232,9 +250,10 @@ def test_agy_permission_card_shows_action_description(
     result_holder: dict = {}
     hook_thread = _park_agy_permission_elicitation(base_url, session_id, result_holder)
 
-    card = _open_pending_agy_card(page, base_url, session_id, result_holder)
-
+    card = None
     try:
+        card = _open_pending_agy_card(page, base_url, session_id, result_holder)
+
         # Sanity: the card names the gated command.
         expect(card).to_contain_text("pwd")
 

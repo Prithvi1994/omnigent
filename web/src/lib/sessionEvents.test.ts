@@ -925,7 +925,7 @@ describe("response.elicitation_request (FLAT envelope)", () => {
         mode: "form",
         message: "Antigravity wants to run: pwd",
         phase: "agy_permission",
-        policy_name: "antigravity_native_permission",
+        policy_name: "agy_native_permission",
         content_preview: "",
         requestedSchema: {},
         action_description: "Running pwd command",
@@ -949,7 +949,7 @@ describe("response.elicitation_request (FLAT envelope)", () => {
         mode: "form",
         message: "Antigravity wants to run: pwd",
         phase: "agy_permission",
-        policy_name: "antigravity_native_permission",
+        policy_name: "agy_native_permission",
         content_preview: "",
         requestedSchema: {},
         // action_description absent; always_allow_pattern a non-string.
