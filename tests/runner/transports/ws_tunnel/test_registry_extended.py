@@ -341,7 +341,31 @@ async def test_send_text_enqueues_on_outbound_queue() -> None:
     await reg.send_text(session, '{"kind":"ping"}')
 
     item = session.outbound_queue.get_nowait()
-    assert item == '{"kind":"ping"}'
+    assert item is not None
+    assert item.data == '{"kind":"ping"}'
+
+
+async def test_send_diagnostics_follow_owner_loop_and_connection_generation() -> None:
+    registry = TunnelRegistry()
+    first = registry.register("r1", _NoopWS(), _hello())
+    await asyncio.to_thread(
+        lambda: asyncio.run(registry.send_text(first, "heartbeat", app_ping_ts=123))
+    )
+    queued = first.outbound_queue.get_nowait()
+    assert queued is not None
+    assert queued.data == "heartbeat"
+    assert queued.app_ping_ts == 123
+    snapshot = first.diagnostics.snapshot()
+    assert snapshot["app_pings_queued"] == 1
+    assert snapshot["outbound_queue_depth"] == 1
+    assert snapshot["enqueue_delay_s"] >= 0
+
+    second = registry.register("r1", _NoopWS(), _hello())
+    with pytest.raises(ConnectionError, match="replaced"):
+        await registry.send_text(first, "stale", app_ping_ts=456)
+    assert second.diagnostics.snapshot()["app_pings_queued"] == 0
+    assert second.diagnostics.snapshot()["last_app_ping_queued_age_s"] is None
+    assert first.diagnostics.snapshot()["app_pings_queued"] == 1
 
 
 @pytest.mark.asyncio
