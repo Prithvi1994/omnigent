@@ -290,6 +290,8 @@ async def test_done_total_is_null_when_the_host_never_said(
             "already_imported": 0,
             "failed": 0,
             "failures": [],
+            "skipped": 0,
+            "skipped_sessions": [],
             "total": None,
             "complete": True,
         }

@@ -52,11 +52,13 @@ from omnigent.session_import import (
 )
 from omnigent.session_import.errors import (
     MISSING_SQLITE_MESSAGE,
+    SKIPPED_IMPORT_CODES,
     ImportErrorCode,
     LocalImportError,
     import_code_is_retryable,
     mentions_missing_sqlite,
     missing_sqlite_error,
+    reports_empty_session,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.conversation_store import ConversationAlreadyExistsError
@@ -67,7 +69,9 @@ from omnigent.stores.project_store import ProjectStore
 _logger = logging.getLogger(__name__)
 
 # Upper bound on items in one imported session, shared by the CLI-normalized
-# ``/imports`` body and the host-streamed ``/imports/local`` path.
+# ``/imports`` body and the host-streamed ``/imports/local`` path. Current
+# loaders trim a longer history to ``session_import.local.IMPORT_MAX_ITEMS``
+# (at most this), so this backstop only rejects older CLIs and hosts.
 _MAX_IMPORT_ITEMS = 100_000
 _LOCAL_IMPORT_STREAM_ERROR_MESSAGE = (
     "The local session import stopped unexpectedly. Retry the import or contact an administrator."
@@ -255,7 +259,9 @@ class ImportFailureRef(BaseModel):
     ``external_session_id`` / ``source`` name the source session when known (a
     host that reports only a count leaves them ``None``); ``reason`` explains the
     failure so the UI can show it instead of an anonymous "N failed". Also the
-    shape of each ``{"event": "failed", ...}`` line on the stream endpoint.
+    shape of each ``{"event": "failed", ...}`` line on the stream endpoint, and
+    of each skipped session (``{"event": "skipped", ...}``, code
+    ``session_empty``): one that wasn't imported because it has no history.
     """
 
     external_session_id: str | None = None
@@ -283,6 +289,11 @@ class LocalImportResponse(BaseModel):
     sessions: list[ImportedSessionRef]
     # One entry per failed session (with a reason); its length equals ``failed``.
     failures: list[ImportFailureRef] = Field(default_factory=list)
+    # Sessions not imported because there was nothing to import (e.g. no
+    # history); not failures, so older clients that read only ``failed`` and
+    # ``failures`` never show them as errors. Its length equals ``skipped``.
+    skipped: int = 0
+    skipped_sessions: list[ImportFailureRef] = Field(default_factory=list)
 
 
 @dataclass
@@ -589,8 +600,15 @@ async def _stream_local_sessions_from_host(
                     # An older host imports sqlite3 eagerly, so a Python built
                     # without it fails the whole read; say how to fix it.
                     raise missing_sqlite_error()
-                raise OmnigentError(
-                    data.get("error") or "host failed to read local sessions",
+                # The host's own words (it keeps paths out of them), classified
+                # so the client shows them instead of "stopped unexpectedly":
+                # re-running reads the same files, so it isn't retryable.
+                host_error = data.get("error")
+                raise LocalImportError(
+                    host_error
+                    if isinstance(host_error, str) and host_error.strip()
+                    else "The machine couldn't read its local sessions.",
+                    import_code=ImportErrorCode.HOST_READ_FAILED,
                     code=ErrorCode.INTERNAL_ERROR,
                 )
             # Sessions the host enumerated but couldn't read send no frame;
@@ -707,13 +725,17 @@ def _host_failure_code(entry: dict[str, Any]) -> str:
     """The import code for one host-reported per-session failure.
 
     Newer hosts send a ``code`` for the kinds they classify; older hosts send
-    only a reason, which means the transcript couldn't be read.
+    only a reason, which means the transcript couldn't be read, unless it is
+    the loaders' "has no importable history" (an empty session).
     """
     code = entry.get("code")
     if isinstance(code, str) and code:
         return code
-    if mentions_missing_sqlite(entry.get("reason")):
+    reason = entry.get("reason")
+    if mentions_missing_sqlite(reason):
         return ImportErrorCode.HOST_PYTHON_MISSING_SQLITE
+    if reports_empty_session(reason):
+        return ImportErrorCode.SESSION_EMPTY
     return ImportErrorCode.SESSION_UNREADABLE
 
 
@@ -750,11 +772,12 @@ def _log_import_outcome(
     outcome = "error" if error is not None else ("partial" if failures else "ok")
     log = _logger.warning if error is not None else _logger.info
     log(
-        "Local session import finished (%s): imported=%d already_imported=%d failed=%d",
+        "Local session import finished (%s): imported=%d already_imported=%d failed=%d skipped=%d",
         outcome,
         counts.get("imported", 0),
         counts.get("already_imported", 0),
         counts.get("failed", 0),
+        counts.get("skipped", 0),
         extra=debug_event(
             "import_local_finished",
             route=route,
@@ -763,6 +786,7 @@ def _log_import_outcome(
             imported=counts.get("imported", 0),
             already_imported=counts.get("already_imported", 0),
             failed=counts.get("failed", 0),
+            skipped=counts.get("skipped", 0),
             total=counts.get("total"),
             code=error.import_code if error is not None else None,
             error_id=(error.error_id or None) if error is not None else None,
@@ -1239,6 +1263,7 @@ def create_imports_router(
         counts: dict[str, int],
         failures: list[ImportFailureRef],
         *,
+        skipped_sessions: list[ImportFailureRef] | None = None,
         host: object | None = None,
         ping_interval_s: float | None = None,
     ) -> AsyncIterator[ImportedSessionRef | ImportProgress]:
@@ -1247,8 +1272,10 @@ def create_imports_router(
         Yields one ref per newly imported session, plus an :class:`ImportProgress`
         after each processed session and each host heartbeat, and tracks the
         running tally in ``counts`` (``imported`` / ``already_imported`` /
-        ``failed``); each failed session appends an :class:`ImportFailureRef`
-        (with a reason) to ``failures``, so ``len(failures) == counts["failed"]``.
+        ``failed`` / ``skipped``); each failed session appends an
+        :class:`ImportFailureRef` (with a reason) to ``failures``, so
+        ``len(failures) == counts["failed"]``, and each skipped one (no history
+        to import) to ``skipped_sessions``.
         Persists each session as its frame arrives, so a large batch never
         buffers. Raises if the host read drops mid-stream, after the sessions
         read so far are already committed (retry is idempotent, and re-import of a
@@ -1263,6 +1290,8 @@ def create_imports_router(
         counts["imported"] = 0
         counts["already_imported"] = 0
         counts["failed"] = 0
+        counts["skipped"] = 0
+        skipped_refs = skipped_sessions if skipped_sessions is not None else []
         # The host's own count (including sessions it failed to read, which
         # send no frame) and the batch size, from heartbeats and session frames.
         host_done = 0
@@ -1305,8 +1334,27 @@ def create_imports_router(
                 )
             )
 
+        def _skip(external_session_id: object, source: object, reason: str, code: str) -> None:
+            counts["skipped"] += 1
+            skipped_refs.append(
+                ImportFailureRef(
+                    external_session_id=(
+                        external_session_id if isinstance(external_session_id, str) else None
+                    ),
+                    source=source if isinstance(source, str) else None,
+                    reason=reason,
+                    code=code,
+                    retryable=import_code_is_retryable(code),
+                )
+            )
+
         def _processed() -> int:
-            return counts["imported"] + counts["already_imported"] + counts["failed"]
+            return (
+                counts["imported"]
+                + counts["already_imported"]
+                + counts["failed"]
+                + counts["skipped"]
+            )
 
         async def _import_one(session: dict[str, Any]) -> ImportedSessionRef | None:
             external_session_id = session.get("external_session_id")
@@ -1460,6 +1508,9 @@ def create_imports_router(
             for entry in host_failures:
                 reason = str(entry.get("reason") or "This session could not be read on the host.")
                 code = _host_failure_code(entry)
+                if code in SKIPPED_IMPORT_CODES:
+                    _skip(entry.get("external_session_id"), entry.get("source"), reason, code)
+                    continue
                 if code == ImportErrorCode.HOST_PYTHON_MISSING_SQLITE:
                     # A legacy host's raw ImportError text isn't actionable.
                     reason = MISSING_SQLITE_MESSAGE
@@ -1499,6 +1550,7 @@ def create_imports_router(
         counts: dict[str, int] = {}
         sessions: list[ImportedSessionRef] = []
         failures: list[ImportFailureRef] = []
+        skipped_sessions: list[ImportFailureRef] = []
         started_at = time.monotonic()
 
         def _finish(error: _ImportFailureReport | None) -> None:
@@ -1516,6 +1568,7 @@ def create_imports_router(
                 imported=counts.get("imported", 0),
                 already_imported=counts.get("already_imported", 0),
                 failed=counts.get("failed", 0),
+                skipped=counts.get("skipped", 0),
             )
 
         try:
@@ -1525,6 +1578,7 @@ def create_imports_router(
                 host_conn,
                 counts,
                 failures,
+                skipped_sessions=skipped_sessions,
                 host=host,
                 ping_interval_s=PING_INTERVAL_S,
             ):
@@ -1551,6 +1605,8 @@ def create_imports_router(
             failed=counts.get("failed", 0),
             sessions=sessions,
             failures=failures,
+            skipped=counts.get("skipped", 0),
+            skipped_sessions=skipped_sessions,
         )
 
     @router.post(
@@ -1573,8 +1629,10 @@ def create_imports_router(
         "total"}`` lines as the host works through the batch. Each session that
         could not be imported emits one ``{"event": "failed",
         "external_session_id", "source", "reason"}`` line (after the successes),
-        and a terminal ``{"event": "done", ...}`` carries the tally plus the full
-        ``failures`` list. A mid-stream failure emits ``{"event": "error",
+        each one skipped because it has no history one ``{"event": "skipped",
+        ...}`` line (same shape, code ``session_empty``), and a terminal
+        ``{"event": "done", ...}`` carries the tally plus the full ``failures``
+        and ``skipped_sessions`` lists. A mid-stream failure emits ``{"event": "error",
         "error_id", "message", "code", "retryable"}`` before ``done`` (the
         sessions read so far are already committed and a retry is idempotent).
         Request validation still fails ahead of the stream with the usual HTTP
@@ -1585,6 +1643,7 @@ def create_imports_router(
         async def _events() -> AsyncIterator[bytes]:
             counts: dict[str, int] = {}
             failures: list[ImportFailureRef] = []
+            skipped_sessions: list[ImportFailureRef] = []
             error: _ImportFailureReport | None = None
             started_at = time.monotonic()
             last_progress: tuple[int, int | None] | None = None
@@ -1595,6 +1654,7 @@ def create_imports_router(
                     host_conn,
                     counts,
                     failures,
+                    skipped_sessions=skipped_sessions,
                     host=host,
                     ping_interval_s=PING_INTERVAL_S,
                 ):
@@ -1640,6 +1700,10 @@ def create_imports_router(
             # caller can name each one, not just count them.
             for failure in failures:
                 yield _import_event_line({"event": "failed", **failure.model_dump()})
+            # A separate event so clients that predate it ignore it instead of
+            # listing an empty session as a failure.
+            for skipped in skipped_sessions:
+                yield _import_event_line({"event": "skipped", **skipped.model_dump()})
             if error is not None:
                 yield _import_event_line(error.stream_event())
             total = counts.get("total")
@@ -1650,6 +1714,8 @@ def create_imports_router(
                     "already_imported": counts.get("already_imported", 0),
                     "failed": counts.get("failed", 0),
                     "failures": [failure.model_dump() for failure in failures],
+                    "skipped": counts.get("skipped", 0),
+                    "skipped_sessions": [skipped.model_dump() for skipped in skipped_sessions],
                     "total": total if isinstance(total, int) else None,
                     "complete": error is None,
                 }

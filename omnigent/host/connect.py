@@ -2586,14 +2586,31 @@ class HostProcess:
                 list_recent_local_session_ids,
                 list_recent_sessions_across_harnesses,
             )
-            from omnigent.session_import.models import ImportSource, SessionImportNotFoundError
+            from omnigent.session_import.models import (
+                IMPORT_SOURCE_LABELS,
+                ImportSource,
+                SessionImportNotFoundError,
+            )
 
             if isinstance(frame, HostImportLocalByIdFrame):
                 return [(frame.source, frame.session_id)], None
             if frame.source == "all":
                 # Each harness is listed independently there, so one broken
-                # reader skips only its own sessions.
-                return list(list_recent_sessions_across_harnesses(limit=frame.limit)), None
+                # reader skips only its own sessions; say which were skipped.
+                targets = list_recent_sessions_across_harnesses(limit=frame.limit)
+                for skipped_source, error_type in getattr(targets, "skipped_harnesses", ()):
+                    _logger.warning(
+                        "import_local: skipped %s sessions, listing them failed (%s)",
+                        skipped_source,
+                        error_type,
+                        extra=debug_event(
+                            "import_local_harness_skipped",
+                            request_id=frame.request_id,
+                            source=skipped_source,
+                            error_type=error_type,
+                        ),
+                    )
+                return list(targets), None
             source = cast(ImportSource, frame.source)
             try:
                 ids = list_recent_local_session_ids(source, limit=frame.limit)
@@ -2605,26 +2622,35 @@ class HostProcess:
                 # is passed on, so the server can say how to fix it.
                 if isinstance(exc, ImportError) and mentions_missing_sqlite(str(exc)):
                     return [], str(exc)
-                return [], "Local sessions could not be listed on the host."
+                label = IMPORT_SOURCE_LABELS.get(source, source)
+                return [], f"{label} sessions could not be listed on this machine."
             return [(source, sid) for sid in ids], None
 
         def _load(
             source: str, session_id: str
-        ) -> tuple[HostImportedLocalSession | None, str | None]:
+        ) -> tuple[HostImportedLocalSession | None, dict[str, object] | None]:
             from omnigent.session_import.local import load_local_session
-            from omnigent.session_import.models import ImportSource, SessionImportNotFoundError
+            from omnigent.session_import.models import (
+                ImportSource,
+                SessionImportEmptyError,
+                SessionImportNotFoundError,
+            )
 
             try:
                 local = load_local_session(cast(ImportSource, source), session_id)
+            except SessionImportEmptyError as exc:
+                # Nothing to import, not a failure: the code lets the server
+                # report it as skipped (older servers still count it failed).
+                return None, {"reason": str(exc), "code": ImportErrorCode.SESSION_EMPTY}
             except SessionImportNotFoundError as exc:
-                # Designed to be surfaced (e.g. "…has no importable history"),
-                # so pass it through as the per-session failure reason.
-                return None, str(exc)
+                # Designed to be surfaced (e.g. "…was not found"), so pass it
+                # through as the per-session failure reason.
+                return None, {"reason": str(exc)}
             except (OSError, ValueError, TypeError):
                 _logger.exception(
                     "import_local: could not read session source=%r id=%r", source, session_id
                 )
-                return None, "This session's transcript could not be read."
+                return None, {"reason": "This session's transcript could not be read."}
             return (
                 HostImportedLocalSession(
                     external_session_id=local.external_session_id,
@@ -2730,16 +2756,18 @@ class HostProcess:
                     if session_id in skip_ids:
                         progress_skipped += 1
                         continue
-                    session, reason = await asyncio.to_thread(_load, source, session_id)
+                    session, failure = await asyncio.to_thread(_load, source, session_id)
                     if session is None:
-                        # Unreadable/corrupt transcript: no frame to send, but
-                        # report it (with a reason) on the done frame so the
-                        # server's counts stay honest and the UI can explain it.
+                        # Unreadable, corrupt, or empty transcript: no frame to
+                        # send, but report it (with a reason) on the done frame
+                        # so the server's counts stay honest and the UI can
+                        # explain it.
                         failures.append(
                             {
                                 "external_session_id": session_id,
                                 "source": source,
-                                "reason": reason or "This session could not be read.",
+                                "reason": "This session could not be read.",
+                                **(failure or {}),
                             }
                         )
                         continue
@@ -2839,6 +2867,11 @@ class HostProcess:
                     sent=sent_count,
                     chunked=chunked_count,
                     failed=len(failures),
+                    empty=sum(
+                        1
+                        for entry in failures
+                        if entry.get("code") == ImportErrorCode.SESSION_EMPTY
+                    ),
                     skipped=progress_skipped,
                     total=progress_total,
                 ),

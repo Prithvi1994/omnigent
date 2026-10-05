@@ -27,7 +27,12 @@ class ImportErrorCode:
     HOST_DISCONNECTED = "host_disconnected"
     HOST_UNRESPONSIVE = "host_unresponsive"
     SESSION_UNREADABLE = "session_unreadable"
+    # Not a failure: the session holds no history (e.g. the harness was opened
+    # and closed without a prompt), so it is reported as skipped.
+    SESSION_EMPTY = "session_empty"
     SESSION_SAVE_TIMEOUT = "session_save_timeout"
+    # The host couldn't list or read its local sessions (it says why).
+    HOST_READ_FAILED = "host_read_failed"
     ENCRYPTION_UNAVAILABLE = "encryption_unavailable"
     TIME_LIMIT_REACHED = "time_limit_reached"
     # Client-side only: the response stream broke before its terminal event.
@@ -47,7 +52,10 @@ _RETRYABLE: Mapping[str, bool] = {
     ImportErrorCode.HOST_DISCONNECTED: True,
     ImportErrorCode.HOST_UNRESPONSIVE: True,
     ImportErrorCode.SESSION_UNREADABLE: False,
+    ImportErrorCode.SESSION_EMPTY: False,
     ImportErrorCode.SESSION_SAVE_TIMEOUT: True,
+    # The same transcripts fail the same way until something on the machine changes.
+    ImportErrorCode.HOST_READ_FAILED: False,
     # Key-service denials are usually transient.
     ImportErrorCode.ENCRYPTION_UNAVAILABLE: True,
     ImportErrorCode.TIME_LIMIT_REACHED: True,
@@ -64,6 +72,20 @@ def import_code_is_retryable(code: str) -> bool:
     fails again is cheaper than hiding one that would have worked.
     """
     return _RETRYABLE.get(code, True)
+
+
+# Import codes that mean "nothing to import" rather than a failure: reported in
+# a separate ``skipped`` tally so a successful import doesn't read as broken.
+SKIPPED_IMPORT_CODES: frozenset[str] = frozenset({ImportErrorCode.SESSION_EMPTY})
+
+# The loaders' wording for an empty session (``SessionImportEmptyError``). Hosts
+# that predate ``session_empty`` send only this text, so the server matches it.
+_EMPTY_SESSION_REASON_SUFFIX = "has no importable history"
+
+
+def reports_empty_session(text: object) -> bool:
+    """Whether a host-reported failure reason says the session has no history."""
+    return isinstance(text, str) and text.rstrip(". ").endswith(_EMPTY_SESSION_REASON_SUFFIX)
 
 
 MISSING_SQLITE_MESSAGE = (
@@ -159,9 +181,11 @@ class LocalImportError(OmnigentError):
 __all__ = [
     "MISSING_SQLITE_FIX_COMMANDS",
     "MISSING_SQLITE_MESSAGE",
+    "SKIPPED_IMPORT_CODES",
     "ImportErrorCode",
     "LocalImportError",
     "import_code_is_retryable",
     "mentions_missing_sqlite",
     "missing_sqlite_error",
+    "reports_empty_session",
 ]

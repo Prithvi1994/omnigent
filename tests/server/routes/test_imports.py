@@ -685,13 +685,16 @@ async def test_local_import_stream_emits_ndjson_session_then_done(
     events = [json.loads(line) for line in resp.text.splitlines() if line.strip()]
     session_events = [e for e in events if e["event"] == "session"]
     assert [e["title"] for e in session_events] == ["Streamed 1", "Streamed 2"]
-    # The terminal line carries the tally plus the (here empty) failures list.
+    # The terminal line carries the tally plus the (here empty) failures and
+    # skipped lists.
     assert events[-1] == {
         "event": "done",
         "imported": 2,
         "already_imported": 0,
         "failed": 0,
         "failures": [],
+        "skipped": 0,
+        "skipped_sessions": [],
         "total": None,
         "complete": True,
     }

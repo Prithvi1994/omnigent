@@ -318,14 +318,20 @@ def test_422_keeps_a_field_named_body(home: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("exc", "retry_hint"),
-    [(OSError("disk read failed"), True), (ValueError("bad transcript"), False)],
+    ("exc", "reason", "retry_hint"),
+    [
+        (OSError("disk read failed"), "its transcript file couldn't be opened (OSError)", True),
+        (ValueError("bad transcript"), "its transcript couldn't be parsed (ValueError)", False),
+    ],
     ids=["read-fault", "parse-fault"],
 )
 def test_local_read_fault_is_retryable_but_parse_fault_is_not(
-    home: Path, monkeypatch: pytest.MonkeyPatch, exc: Exception, retry_hint: bool
+    home: Path, monkeypatch: pytest.MonkeyPatch, exc: Exception, reason: str, retry_hint: bool
 ) -> None:
-    """A read fault may clear on retry and gets the retry hint; a parse fault does not."""
+    """A read fault may clear on retry and gets the retry hint; a parse fault does not.
+
+    Either is named by its kind, never by the exception text (it can hold local paths).
+    """
     real_load = local_import.load_local_session
 
     def _load(source: Any, session_id: str) -> Any:
@@ -336,7 +342,10 @@ def test_local_read_fault_is_retryable_but_parse_fault_is_not(
     monkeypatch.setattr(local_import, "load_local_session", _load)
     result = _run(home, {}, "--last", "2")
     assert result.exit_code == 1, result.output
-    assert f"Failed {_IDS[2]}: {exc}" in result.output
+    assert f"Failed {_IDS[2]}: Couldn't read Claude Code session {_IDS[2]}: {reason}." in (
+        result.output
+    )
+    assert str(exc) not in result.output
     assert "Imported: 1" in result.output
     assert ("Run the same command again to retry" in result.output) is retry_hint
 

@@ -291,7 +291,7 @@ async def test_listing_error_is_reported_without_its_text(
     ws = await _list_failing_with(monkeypatch, exc)
     done = _done(ws)
     assert done.status == "failed"
-    assert done.error == "Local sessions could not be listed on the host."
+    assert done.error == "Codex sessions could not be listed on this machine."
     assert not any("/Users/alice" in text for text in ws.sent)
 
 
